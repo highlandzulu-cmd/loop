@@ -138,6 +138,19 @@ async fn real_main() -> anyhow::Result<()> {
 
     if let Some(prompt) = cli.print {
         let msg = runtime.harness.prompt(prompt).await?;
+        if let Some(a) = msg.as_assistant() {
+            if matches!(
+                a.stop_reason,
+                loop_ai::StopReason::Error | loop_ai::StopReason::Aborted
+            ) {
+                anyhow::bail!(
+                    "{}",
+                    a.error_message
+                        .clone()
+                        .unwrap_or_else(|| format!("assistant stopped with {:?}", a.stop_reason))
+                );
+            }
+        }
         if let Some(text) = msg.as_llm().and_then(|m| match m {
             loop_ai::Message::Assistant(a) => Some(
                 a.content
