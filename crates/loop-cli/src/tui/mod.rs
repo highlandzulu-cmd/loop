@@ -113,17 +113,15 @@ pub const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 /// Options for drawing the inline footer.
 pub struct FooterOpts<'a> {
     pub theme: &'a Theme,
-    /// Unflushed / streaming items shown above the input.
-    pub live: &'a [ChatItem],
+    /// Unflushed / streaming lines shown above the input.
+    /// Overflow above this viewport is spilled into native scrollback by the app loop.
+    pub live_lines: &'a [Line<'static>],
     pub input: &'a str,
     pub cursor: usize,
     pub working: bool,
     pub spinner_frame: usize,
     pub status: &'a str,
     pub picker: &'a PickerView,
-    /// Global tools/thinking expand state (pi-style single flag).
-    pub expanded: bool,
-    pub hide_thinking: bool,
     pub setup_mode: bool,
     pub mask_input: bool,
     /// Left status (e.g. `~/loop (main)`).
@@ -408,21 +406,12 @@ pub fn format_item_lines(
                     Span::styled("  ctrl+o to collapse".to_string(), theme.dim()),
                 ]));
                 let body_w = w.saturating_sub(4).max(1);
-                let mut shown = 0usize;
-                'outer: for l in text.lines() {
+                for l in text.lines() {
                     for part in soft_wrap(l, body_w) {
-                        if shown >= 200 {
-                            lines.push(Line::from(vec![
-                                Span::styled("  │ ".to_string(), theme.style("borderMuted")),
-                                Span::styled("…".to_string(), theme.dim()),
-                            ]));
-                            break 'outer;
-                        }
                         lines.push(Line::from(vec![
                             Span::styled("  │ ".to_string(), theme.style("borderMuted")),
                             Span::styled(part, think),
                         ]));
-                        shown += 1;
                     }
                 }
             } else {
@@ -500,32 +489,37 @@ pub fn format_item_lines(
             lines.push(bg_spans_line(theme, bg, head, w));
 
             // Body: full detail when expanded; error previews stay visible.
-            let preview = if expanded {
-                200
+            let max_body: Option<usize> = if expanded {
+                None
             } else if matches!(status, CardStatus::Error) {
-                4
+                Some(4)
             } else {
-                0
+                Some(0)
             };
-            if preview > 0 && !detail.is_empty() {
+            if max_body != Some(0) && !detail.is_empty() {
                 let body_w = w.saturating_sub(5).max(1);
                 let fallback = theme.style("toolOutput");
                 let highlighted = highlight_tool_detail(name, summary, detail, theme, fallback);
-                for spans in highlighted.into_iter().take(preview) {
+                let total = highlighted.len();
+                let take_n = max_body.unwrap_or(usize::MAX);
+                let mut shown = 0usize;
+                for spans in highlighted.into_iter().take(take_n) {
                     let mut row = vec![Span::styled(
                         "  │ ".to_string(),
                         theme.style("borderMuted"),
                     )];
                     row.extend(highlight::truncate_spans(spans, body_w));
                     lines.push(Line::from(row));
+                    shown += 1;
                 }
-                if detail_lines > preview {
-                    let hint = if expanded {
-                        format!("  … {} more lines truncated", detail_lines - preview)
-                    } else {
-                        format!("  … {} more lines · ctrl+o", detail_lines - preview)
-                    };
-                    lines.push(Line::from(Span::styled(hint, theme.dim())));
+                if total > shown {
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  … {} more lines · ctrl+o",
+                            total.saturating_sub(shown)
+                        ),
+                        theme.dim(),
+                    )));
                 }
             }
             lines.push(Line::from(""));
@@ -582,20 +576,21 @@ pub fn format_item_lines(
             }
             lines.push(bg_spans_line(theme, bg, head, w));
 
-            let preview = if expanded {
-                200
+            let max_body: Option<usize> = if expanded {
+                None
             } else if matches!(status, CardStatus::Error) {
-                4
+                Some(4)
             } else {
                 // Always show a short result preview so workflow output is visible
                 // after cards flush into scrollback (ctrl+o can't rewrite history).
-                12
+                Some(12)
             };
-            if preview > 0 && !output.is_empty() {
+            if max_body != Some(0) && !output.is_empty() {
                 let body_w = w.saturating_sub(5).max(1);
                 let fallback = theme.style("toolOutput");
+                let take_n = max_body.unwrap_or(usize::MAX);
                 let mut shown = 0usize;
-                for line in output.lines().take(preview) {
+                for line in output.lines().take(take_n) {
                     let mut row = vec![Span::styled(
                         "  │ ".to_string(),
                         theme.style("borderMuted"),
@@ -606,12 +601,13 @@ pub fn format_item_lines(
                     shown += 1;
                 }
                 if detail_lines > shown {
-                    let hint = if expanded {
-                        format!("  … {} more lines truncated", detail_lines - shown)
-                    } else {
-                        format!("  … {} more lines · ctrl+o", detail_lines - shown)
-                    };
-                    lines.push(Line::from(Span::styled(hint, theme.dim())));
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "  … {} more lines · ctrl+o",
+                            detail_lines.saturating_sub(shown)
+                        ),
+                        theme.dim(),
+                    )));
                 }
             }
             lines.push(Line::from(""));
@@ -742,63 +738,111 @@ pub fn render_lines_to_buffer(lines: &[Line<'static>], buf: &mut Buffer, theme: 
         .render(buf.area, buf);
 }
 
+/// Layout of the inline footer (live stream + input + picker + status).
+struct FooterLayout {
+    live_h: u16,
+    input_h: u16,
+    picker_h: u16,
+    status_h: u16,
+}
+
+fn footer_layout(area_height: u16, area_width: u16, input: &str, picker: &PickerView) -> FooterLayout {
+    let picker_h = picker_height(picker);
+    let status_h = 2u16;
+    let max_input_body = area_height
+        .saturating_sub(picker_h + status_h + 2)
+        .max(1)
+        .min(MAX_INPUT_BODY_LINES);
+    let input_body_lines = count_input_visual_lines(input, area_width.max(1) as usize)
+        .clamp(1, max_input_body as usize) as u16;
+    let input_h = input_body_lines + 2; // top + bottom rules
+    let used = input_h + picker_h + status_h;
+    FooterLayout {
+        live_h: area_height.saturating_sub(used),
+        input_h,
+        picker_h,
+        status_h,
+    }
+}
+
+/// Rows available for live/streaming content in the inline footer.
+pub fn footer_live_height(
+    area_height: u16,
+    area_width: u16,
+    input: &str,
+    picker: &PickerView,
+) -> u16 {
+    footer_layout(area_height, area_width, input, picker).live_h
+}
+
+/// Format uncommitted transcript items (plus a spinner when idle-working).
+pub fn format_live_lines(
+    live: &[ChatItem],
+    theme: &Theme,
+    expanded: bool,
+    hide_thinking: bool,
+    width: u16,
+    working: bool,
+    spinner_frame: usize,
+    status: &str,
+) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    for item in live {
+        out.extend(format_item_lines(
+            item,
+            theme,
+            expanded,
+            hide_thinking,
+            width,
+        ));
+    }
+    if working && out.is_empty() {
+        let spin = SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()];
+        out.push(Line::from(Span::styled(
+            format!(" {spin} {status}"),
+            theme.muted(),
+        )));
+    }
+    out
+}
+
+/// How many live lines belong in native scrollback (above the footer viewport).
+pub fn live_overflow_count(total_lines: usize, live_h: usize) -> usize {
+    total_lines.saturating_sub(live_h)
+}
+
+/// After committing an item with `item_lines` visual lines, skip already-spilled
+/// prefix lines and return the frozen count for whatever is still live.
+pub fn consume_frozen_lines(live_frozen: usize, item_lines: usize) -> (usize, usize) {
+    let skip = live_frozen.min(item_lines);
+    (skip, live_frozen.saturating_sub(item_lines))
+}
+
 /// Draw the inline footer (live stream + input + picker + status).
 pub fn draw_footer(frame: &mut Frame, opts: FooterOpts<'_>) {
     let area = frame.area();
     frame.buffer_mut().set_style(area, opts.theme.page());
     let width = area.width.max(1);
-
-    let live_lines = {
-        let mut out = Vec::new();
-        for item in opts.live {
-            out.extend(format_item_lines(
-                item,
-                opts.theme,
-                opts.expanded,
-                opts.hide_thinking,
-                width,
-            ));
-        }
-        if opts.working && out.is_empty() {
-            let spin = SPINNER_FRAMES[opts.spinner_frame % SPINNER_FRAMES.len()];
-            out.push(Line::from(Span::styled(
-                format!(" {spin} {}", opts.status),
-                opts.theme.muted(),
-            )));
-        }
-        out
-    };
-
-    let picker_h = picker_height(opts.picker);
-    let status_h = 2u16;
-    let max_input_body = area
-        .height
-        .saturating_sub(picker_h + status_h + 2)
-        .max(1)
-        .min(MAX_INPUT_BODY_LINES);
-    let input_body_lines =
-        count_input_visual_lines(opts.input, width as usize).clamp(1, max_input_body as usize) as u16;
-    let input_h = input_body_lines + 2; // top + bottom rules
-    let used = input_h + picker_h + status_h;
-    let live_h = area.height.saturating_sub(used);
+    let layout = footer_layout(area.height, width, opts.input, opts.picker);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(live_h),
-            Constraint::Length(input_h),
-            Constraint::Length(picker_h),
-            Constraint::Length(status_h),
+            Constraint::Length(layout.live_h),
+            Constraint::Length(layout.input_h),
+            Constraint::Length(layout.picker_h),
+            Constraint::Length(layout.status_h),
         ])
         .split(area);
 
-    // Live / spacer
-    if live_h > 0 {
-        let visible = if live_lines.len() as u16 > live_h {
-            let skip = live_lines.len() - live_h as usize;
-            live_lines[skip..].to_vec()
+    // Live / spacer. Overflow has already been spilled into scrollback; keep a
+    // tail-slice as a safety net if the layout shrank this frame.
+    if layout.live_h > 0 {
+        let visible = if opts.live_lines.len() as u16 > layout.live_h {
+            let skip = opts.live_lines.len() - layout.live_h as usize;
+            opts.live_lines[skip..].to_vec()
         } else {
-            live_lines
+            opts.live_lines.to_vec()
         };
         frame.render_widget(
             Paragraph::new(visible)
@@ -1767,5 +1811,51 @@ mod tests {
             4,
         );
         assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn live_overflow_spills_prefix_above_viewport() {
+        assert_eq!(live_overflow_count(10, 10), 0);
+        assert_eq!(live_overflow_count(10, 4), 6);
+        assert_eq!(live_overflow_count(3, 8), 0);
+        assert_eq!(live_overflow_count(0, 8), 0);
+    }
+
+    #[test]
+    fn consume_frozen_covers_prefix_then_rest() {
+        assert_eq!(consume_frozen_lines(0, 10), (0, 0));
+        assert_eq!(consume_frozen_lines(4, 10), (4, 0));
+        assert_eq!(consume_frozen_lines(10, 10), (10, 0));
+        assert_eq!(consume_frozen_lines(15, 10), (10, 5));
+    }
+
+    #[test]
+    fn expanded_thinking_keeps_all_lines() {
+        let theme = Theme::dark();
+        let text = (0..250)
+            .map(|i| format!("thought {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let item = ChatItem::Thinking {
+            text,
+            done: true,
+        };
+        let lines = format_item_lines(&item, &theme, true, false, 80);
+        assert!(
+            lines.len() > 250,
+            "expanded thinking should not cap body lines, got {}",
+            lines.len()
+        );
+        assert!(
+            lines.iter().any(|l| l.to_string().contains("thought 249")),
+            "last thinking line should remain visible"
+        );
+    }
+
+    #[test]
+    fn footer_live_height_leaves_room_for_chrome() {
+        let h = footer_live_height(FOOTER_HEIGHT, 80, "", &PickerView::None);
+        assert!(h > 0);
+        assert!(h < FOOTER_HEIGHT);
     }
 }

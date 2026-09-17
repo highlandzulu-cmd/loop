@@ -36,8 +36,9 @@ use crate::tool_approval::{
     ApprovalPolicy, ApprovalPrompt, ToolApprovalBridge, GROUP_BASH, GROUP_FILE,
 };
 use crate::tui::{
-    chat_items_from_agent_messages, filter_files, find_at_mention, find_tool_index,
-    format_item_lines, format_token_usage_line, insert_text, item_is_committed, list_files,
+    chat_items_from_agent_messages, consume_frozen_lines, filter_files, find_at_mention,
+    find_tool_index, footer_live_height, format_item_lines, format_live_lines,
+    format_token_usage_line, insert_text, item_is_committed, list_files, live_overflow_count,
     render_lines_to_buffer, tool_args_summary, welcome_lines, CardStatus, ChatItem,
     CommandHistory, FileEntry, FOOTER_HEIGHT, FooterOpts, InputBuffer, PickerRow, PickerView,
 };
@@ -321,6 +322,8 @@ async fn run_loop(
         }
     };
     let mut flushed = 0usize;
+    // Visual lines of `chat[flushed..]` already pushed into native scrollback.
+    let mut live_frozen = 0usize;
     let mut input = InputBuffer::new();
     let mut history = CommandHistory::load(crate::config::paths::history_path(&runtime.agent_dir));
     let mut status: String = if runtime.needs_api_key_setup {
@@ -388,11 +391,13 @@ async fn run_loop(
         // Flush finished transcript items into native scrollback.
         if flushed > chat.len() {
             flushed = chat.len();
+            live_frozen = 0;
         }
         flush_committed(
             terminal,
             &chat,
             &mut flushed,
+            &mut live_frozen,
             streaming_assistant,
             streaming_thinking,
             &runtime.theme,
@@ -584,21 +589,47 @@ async fn run_loop(
             refresh_token_bar = false;
         }
         let usage_line = token_bar.usage_line();
+        let term_width = terminal.size()?.width;
+        let live_h = footer_live_height(
+            FOOTER_HEIGHT,
+            term_width,
+            input.as_str(),
+            &picker,
+        ) as usize;
+        let live_lines = format_live_lines(
+            &live,
+            &runtime.theme,
+            expand_details,
+            hide_thinking,
+            term_width,
+            working,
+            spinner_frame,
+            &status_line,
+        );
+        spill_live_overflow(
+            terminal,
+            &live_lines,
+            &mut live_frozen,
+            live_h,
+            &runtime.theme,
+        )?;
+        let shown_live = {
+            let skip = live_frozen.min(live_lines.len());
+            &live_lines[skip..]
+        };
 
         terminal.draw(|f| {
             crate::tui::draw_footer(
                 f,
                 FooterOpts {
                     theme: &runtime.theme,
-                    live: &live,
+                    live_lines: shown_live,
                     input: input.as_str(),
                     cursor: input.cursor(),
                     working,
                     spinner_frame,
                     status: &status_line,
                     picker: &picker,
-                    expanded: expand_details,
-                    hide_thinking,
                     setup_mode,
                     mask_input: setup_mode,
                     path_line: &path_line,
@@ -706,6 +737,7 @@ async fn run_loop(
                 version,
                 &chat,
                 &mut flushed,
+                &mut live_frozen,
                 streaming_assistant,
                 streaming_thinking,
                 expand_details,
@@ -741,6 +773,7 @@ fn flush_committed(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     chat: &[ChatItem],
     flushed: &mut usize,
+    live_frozen: &mut usize,
     streaming_assistant: Option<usize>,
     streaming_thinking: Option<usize>,
     theme: &Theme,
@@ -759,14 +792,54 @@ fn flush_committed(
         }
         // Items land in scrollback with the current global expand state; toggling
         // ctrl+o clears and reprints everything (see `reset_and_redraw`).
+        // Prefix lines may already have spilled while the item was streaming.
         let lines = format_item_lines(&chat[*flushed], theme, expanded, hide_thinking, width);
-        if !lines.is_empty() {
-            let h = lines.len() as u16;
-            terminal.insert_before(h, |buf| {
-                render_lines_to_buffer(&lines, buf, theme);
-            })?;
+        let (skip, next_frozen) = consume_frozen_lines(*live_frozen, lines.len());
+        if skip < lines.len() {
+            insert_scrollback_lines(terminal, &lines[skip..], theme)?;
         }
+        *live_frozen = next_frozen;
         *flushed += 1;
+    }
+    Ok(())
+}
+
+fn insert_scrollback_lines(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    lines: &[ratatui::text::Line<'static>],
+    theme: &Theme,
+) -> io::Result<()> {
+    const CHUNK: usize = 256;
+    for chunk in lines.chunks(CHUNK) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let h = chunk.len() as u16;
+        terminal.insert_before(h, |buf| {
+            render_lines_to_buffer(chunk, buf, theme);
+        })?;
+    }
+    Ok(())
+}
+
+/// Push live/streaming lines that no longer fit in the footer into native
+/// scrollback so the transcript stays continuous and terminal-scrollable.
+fn spill_live_overflow(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    live_lines: &[ratatui::text::Line<'static>],
+    live_frozen: &mut usize,
+    live_h: usize,
+    theme: &Theme,
+) -> io::Result<()> {
+    let overflow = live_overflow_count(live_lines.len(), live_h);
+    // Only rewind when the render itself shrank (viewport growth must not
+    // re-show lines that are already in scrollback).
+    if live_lines.len() < *live_frozen {
+        *live_frozen = overflow;
+    }
+    if overflow > *live_frozen {
+        insert_scrollback_lines(terminal, &live_lines[*live_frozen..overflow], theme)?;
+        *live_frozen = overflow;
     }
     Ok(())
 }
@@ -782,6 +855,7 @@ fn reset_and_redraw(
     version: &str,
     chat: &[ChatItem],
     flushed: &mut usize,
+    live_frozen: &mut usize,
     streaming_assistant: Option<usize>,
     streaming_thinking: Option<usize>,
     expanded: bool,
@@ -814,10 +888,12 @@ fn reset_and_redraw(
 
     print_welcome(terminal, runtime, version)?;
     *flushed = 0;
+    *live_frozen = 0;
     flush_committed(
         terminal,
         chat,
         flushed,
+        live_frozen,
         streaming_assistant,
         streaming_thinking,
         &runtime.theme,
