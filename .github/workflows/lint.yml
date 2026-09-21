@@ -1,0 +1,108 @@
+name: Lint
+
+# Static checks that never run the code: rustfmt (formatting) and clippy
+# (likely bugs and bad patterns). Kept separate from ci.yml (build + test) so
+# a lint failure never hides a real test result, and the other way round.
+#
+# Runs on pull requests and pushes to main, and can be started by hand from
+# Actions -> Lint -> Run workflow.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Read-only: nothing here needs to write to the repo.
+permissions:
+  contents: read
+
+# A newer push to the same ref makes an older, still-running lint run pointless.
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+  # The crates ci.yml builds and tests. loop-desktop is left out on purpose,
+  # same as ci.yml: it pulls in the GUI stack, which needs system libraries
+  # a stock runner doesn't have.
+  LINT_PACKAGES: -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration -p loop-app-core -p loop-cli
+
+  # rustfmt gate. "false" = report unformatted code as a warning and in the
+  # job summary, but don't fail the run. The existing code base is not yet
+  # rustfmt-clean (hundreds of hunks across many files), so a hard gate would
+  # turn every pull request red until a one-time `cargo fmt --all` commit
+  # lands. After that commit, set this to "true" to enforce it from then on.
+  FMT_BLOCKING: "false"
+
+jobs:
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: |
+          if cargo fmt --all --check > fmt.diff 2>&1; then
+            echo "All files are rustfmt-clean." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          hunks=$(grep -c '^Diff in ' fmt.diff || true)
+          files=$(grep '^Diff in ' fmt.diff | sed -E 's/^Diff in (.*):[0-9]+.*/\1/' | sort -u | wc -l | tr -d ' ')
+          {
+            echo "### rustfmt: ${hunks} hunk(s) in ${files} file(s) need formatting"
+            echo
+            echo 'Fix locally with `cargo fmt --all`.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          head -n 200 fmt.diff
+
+          if [ "$FMT_BLOCKING" = "true" ]; then
+            echo "::error::rustfmt found ${hunks} hunk(s) in ${files} file(s). Run 'cargo fmt --all'."
+            exit 1
+          fi
+          echo "::warning::rustfmt found ${hunks} hunk(s) in ${files} file(s); not blocking yet (FMT_BLOCKING=false in lint.yml)."
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Blocking: only the two lint groups that flag code that is almost
+      # certainly wrong (correctness = bugs, suspicious = probable bugs).
+      # The current code passes both, so this can enforce from day one
+      # without a cleanup. Denying *all* warnings would fail today on ~40
+      # style and complexity hints, so those stay advisory (next step).
+      - name: Clippy (deny correctness + suspicious)
+        run: >
+          cargo clippy ${LINT_PACKAGES} --locked --all-targets
+          -- -D clippy::correctness -D clippy::suspicious
+
+      # Advisory: how many ordinary clippy warnings exist, so the number is
+      # visible on every run and a rise is noticed. Does not fail the run.
+      - name: Clippy warning count (advisory)
+        run: |
+          # --color never: CARGO_TERM_COLOR=always above would otherwise put
+          # ANSI codes inside the text this greps. sort -u: a warning in shared
+          # code is otherwise counted once per target (lib and tests).
+          count=$(cargo clippy ${LINT_PACKAGES} --locked --all-targets --color never --message-format=short 2>&1 | grep ': warning: ' | sort -u | wc -l | tr -d ' ')
+          echo "### clippy: ${count} advisory warning(s)" >> "$GITHUB_STEP_SUMMARY"
+          echo "clippy reported ${count} advisory warning(s)."
