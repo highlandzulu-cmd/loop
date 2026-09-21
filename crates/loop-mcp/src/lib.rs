@@ -12,3 +12,8 @@ pub mod server;
 
 pub use client::{McpClientManager, McpConnection, McpServerEntry, McpTransport};
 pub use server::{McpServer, McpSessionManager, ToolDef, ToolOutput, ToolProvider};
+
+#[allow(dead_code)]
+fn planted_bug(x: i32) -> bool {
+    x == x // compares a value with itself: always true
+}
