@@ -38,12 +38,16 @@ env:
   # lands. After that commit, set this to "true" to enforce it from then on.
   FMT_BLOCKING: "false"
 
+# Runner and action versions are pinned on purpose:
+# - ubuntu-24.04, not ubuntu-latest: GitHub moves `latest` to Ubuntu 26 on
+#   2026-10-19, which would change tool versions with no edit to this file.
+# - actions/checkout@v7: v4 runs on Node 20, which GitHub is deprecating.
 jobs:
   rustfmt:
     name: rustfmt
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -74,9 +78,9 @@ jobs:
 
   clippy:
     name: clippy
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
