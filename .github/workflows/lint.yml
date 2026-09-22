@@ -43,7 +43,7 @@ env:
   # A PR that pushes the count above this fails, so style/complexity debt
   # can only go down from here, never up unnoticed. Lower this number by
   # hand whenever a cleanup PR genuinely reduces the count.
-  CLIPPY_WARNING_CEILING: "46"
+  CLIPPY_WARNING_CEILING: "10"
 
 # Runner and action versions are pinned on purpose:
 # - ubuntu-24.04, not ubuntu-latest: GitHub moves `latest` to Ubuntu 26 on
