@@ -38,6 +38,13 @@ env:
   # lands. After that commit, set this to "true" to enforce it from then on.
   FMT_BLOCKING: "false"
 
+  # clippy's ordinary (non-blocking) warnings, as a ceiling rather than just
+  # a count: today's baseline is 46 (see the doc this workflow ships with).
+  # A PR that pushes the count above this fails, so style/complexity debt
+  # can only go down from here, never up unnoticed. Lower this number by
+  # hand whenever a cleanup PR genuinely reduces the count.
+  CLIPPY_WARNING_CEILING: "46"
+
 # Runner and action versions are pinned on purpose:
 # - ubuntu-24.04, not ubuntu-latest: GitHub moves `latest` to Ubuntu 26 on
 #   2026-10-19, which would change tool versions with no edit to this file.
@@ -100,13 +107,19 @@ jobs:
           cargo clippy ${LINT_PACKAGES} --locked --all-targets
           -- -D clippy::correctness -D clippy::suspicious
 
-      # Advisory: how many ordinary clippy warnings exist, so the number is
-      # visible on every run and a rise is noticed. Does not fail the run.
-      - name: Clippy warning count (advisory)
+      # Ceiling, not just a count: fails if the number of ordinary (non-
+      # blocking) clippy warnings rises above CLIPPY_WARNING_CEILING, so
+      # style/complexity debt can only shrink, never grow unnoticed.
+      - name: Clippy warning count (ceiling)
         run: |
           # --color never: CARGO_TERM_COLOR=always above would otherwise put
           # ANSI codes inside the text this greps. sort -u: a warning in shared
           # code is otherwise counted once per target (lib and tests).
           count=$(cargo clippy ${LINT_PACKAGES} --locked --all-targets --color never --message-format=short 2>&1 | grep ': warning: ' | sort -u | wc -l | tr -d ' ')
-          echo "### clippy: ${count} advisory warning(s)" >> "$GITHUB_STEP_SUMMARY"
-          echo "clippy reported ${count} advisory warning(s)."
+          echo "### clippy: ${count} warning(s) (ceiling: ${CLIPPY_WARNING_CEILING})" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$count" -gt "$CLIPPY_WARNING_CEILING" ]; then
+            echo "::error::clippy warning count rose to ${count}, above the ${CLIPPY_WARNING_CEILING} ceiling. Fix the new warning(s), or if this PR is a deliberate cleanup that lowers the count, update CLIPPY_WARNING_CEILING in lint.yml to match."
+            exit 1
+          fi
+          echo "clippy reported ${count} warning(s), at or below the ${CLIPPY_WARNING_CEILING} ceiling."
