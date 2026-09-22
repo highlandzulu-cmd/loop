@@ -97,25 +97,39 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      # Blocking: only the two lint groups that flag code that is almost
-      # certainly wrong (correctness = bugs, suspicious = probable bugs).
-      # The current code passes both, so this can enforce from day one
-      # without a cleanup. Denying *all* warnings would fail today on ~40
-      # style and complexity hints, so those stay advisory (next step).
-      - name: Clippy (deny correctness + suspicious)
-        run: >
-          cargo clippy ${LINT_PACKAGES} --locked --all-targets
-          -- -D clippy::correctness -D clippy::suspicious
-
-      # Ceiling, not just a count: fails if the number of ordinary (non-
-      # blocking) clippy warnings rises above CLIPPY_WARNING_CEILING, so
-      # style/complexity debt can only shrink, never grow unnoticed.
-      - name: Clippy warning count (ceiling)
+      # A single cargo clippy run does both jobs that used to be two full
+      # compiles: --message-format=json gives every diagnostic as structured
+      # data, so the same run both (a) denies correctness/suspicious (a
+      # nonzero exit means a real bug was found - fail immediately, no need
+      # to count anything) and (b) counts the rest against
+      # CLIPPY_WARNING_CEILING, so style/complexity debt can only shrink,
+      # never grow unnoticed. jq ships on GitHub's ubuntu-24.04 runner.
+      - name: Clippy (deny correctness/suspicious; ceiling on the rest)
         run: |
-          # --color never: CARGO_TERM_COLOR=always above would otherwise put
-          # ANSI codes inside the text this greps. sort -u: a warning in shared
-          # code is otherwise counted once per target (lib and tests).
-          count=$(cargo clippy ${LINT_PACKAGES} --locked --all-targets --color never --message-format=short 2>&1 | grep ': warning: ' | sort -u | wc -l | tr -d ' ')
+          set +e
+          cargo clippy ${LINT_PACKAGES} --locked --all-targets --color never \
+            --message-format=json -- -D clippy::correctness -D clippy::suspicious \
+            >clippy.json 2>clippy.stderr
+          clippy_exit=$?
+          set -e
+
+          if [ "$clippy_exit" -ne 0 ]; then
+            cat clippy.stderr
+            jq -r 'select(.reason=="compiler-message") | .message | select(.level=="error") | .rendered' clippy.json 2>/dev/null
+            echo "::error::clippy found a correctness/suspicious issue (or failed to build) - see above."
+            exit 1
+          fi
+
+          # Reconstructs "file:line:col: warning: message", the same unique
+          # key --message-format=short + grep + sort -u counted before - a
+          # naive dedupe on the full rendered block undercounts/overcounts:
+          # it either merges distinct warnings sharing the same short text,
+          # or splits one multi-line block across several "unique" lines.
+          count=$(jq -r '
+            select(.reason=="compiler-message") | .message | select(.level=="warning") |
+            ((.spans[]? | select(.is_primary)) as $s |
+             "\($s.file_name):\($s.line_start):\($s.column_start): warning: \(.message)")
+          ' clippy.json 2>/dev/null | sort -u | wc -l | tr -d ' ')
           echo "### clippy: ${count} warning(s) (ceiling: ${CLIPPY_WARNING_CEILING})" >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$count" -gt "$CLIPPY_WARNING_CEILING" ]; then
