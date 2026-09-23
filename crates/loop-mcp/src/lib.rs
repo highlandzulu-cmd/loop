@@ -12,3 +12,8 @@ pub mod server;
 
 pub use client::{McpClientManager, McpConnection, McpServerEntry, McpTransport};
 pub use server::{McpServer, McpSessionManager, ToolDef, ToolOutput, ToolProvider};
+
+#[allow(dead_code)]
+fn trial_bug_3(mut x: i32) {
+    x = x; // self-assignment: a different lint than x == x
+}
