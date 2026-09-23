@@ -12,3 +12,14 @@ pub mod server;
 
 pub use client::{McpClientManager, McpConnection, McpServerEntry, McpTransport};
 pub use server::{McpServer, McpSessionManager, ToolDef, ToolOutput, ToolProvider};
+
+#[allow(dead_code)]
+fn trial_bug_4() -> i32 {
+    let mut total = 0;
+    let mut limit = 3;
+    for i in 0..limit {
+        total += i;
+        limit += 1; // looks like it extends the loop - it does not (clippy::suspicious, not correctness)
+    }
+    total
+}
