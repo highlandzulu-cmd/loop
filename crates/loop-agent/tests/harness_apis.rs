@@ -89,6 +89,8 @@ async fn compact_with_aggressive_settings() {
             enabled: true,
             reserve_tokens: 0,
             keep_recent_tokens: 1,
+            trigger_tokens: None,
+            ..Default::default()
         })
         .await;
 
@@ -194,6 +196,8 @@ async fn hook_cancels_compact() {
             enabled: true,
             reserve_tokens: 0,
             keep_recent_tokens: 1,
+            trigger_tokens: None,
+            ..Default::default()
         })
         .await;
 

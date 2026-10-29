@@ -1386,6 +1386,15 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     harness
         .set_response_header_timeout_ms(settings.response_header_timeout_ms)
         .await;
+    harness
+        .set_compaction_settings(loop_agent::harness::compaction::CompactionSettings {
+            enabled: settings.compaction.enabled,
+            reserve_tokens: settings.compaction.reserve_tokens,
+            keep_recent_tokens: settings.compaction.keep_recent_tokens,
+            trigger_tokens: settings.compaction.trigger_tokens,
+            trigger_percent: settings.compaction.trigger_percent,
+        })
+        .await;
 
     let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
     let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();

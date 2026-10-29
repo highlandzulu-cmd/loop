@@ -29,8 +29,9 @@ use crate::messages::{convert_to_llm, user_message_with_images};
 use crate::stream_fn::{stream_fn_from_models, StreamFn};
 use crate::types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentEventSink,
-    AgentLoopConfig, AgentMessage, AgentThinkingLevel, AgentTool, BeforeToolCallContext,
-    BeforeToolCallResult, PromptInput, QueueMode, ToolExecutionMode,
+    AgentLoopConfig, AgentLoopTurnUpdate, AgentMessage, AgentThinkingLevel, AgentTool,
+    BeforeToolCallContext, BeforeToolCallResult, PromptInput, QueueMode,
+    ShouldStopAfterTurnContext, ToolExecutionMode,
 };
 
 type BeforeToolHook = Arc<
@@ -1222,6 +1223,74 @@ impl AgentHarness {
         config.stream_options.reasoning = snapshot.thinking_level.to_reasoning();
         config.before_tool_call = self.before_tool_call.lock().clone();
         config.after_tool_call = self.after_tool_call.lock().clone();
+
+        // Auto-compaction between turns: once the context reaches the configured
+        // threshold, older messages are replaced by a model-written summary.
+        let compaction = self.compaction_settings.read().await.clone();
+        if compaction.enabled {
+            let stream_fn = Arc::clone(&self.stream_fn);
+            let model = snapshot.model.clone();
+            let summary_options = snapshot.stream_options.clone();
+            config.prepare_next_turn = Some(Arc::new({
+                let stream_fn = Arc::clone(&stream_fn);
+                let model = model.clone();
+                let summary_options = summary_options.clone();
+                let compaction = compaction.clone();
+                move |turn: ShouldStopAfterTurnContext| {
+                    let stream_fn = Arc::clone(&stream_fn);
+                    let model = model.clone();
+                    let summary_options = summary_options.clone();
+                    let compaction = compaction.clone();
+                    Box::pin(async move {
+                        // Nothing follows a turn without tool calls, so don't spend a model
+                        // call compacting a context that is about to be discarded.
+                        if turn.tool_results.is_empty() {
+                            return None;
+                        }
+                        crate::harness::compaction::auto_compact_context(
+                            &turn.context,
+                            &model,
+                            &stream_fn,
+                            summary_options,
+                            &compaction,
+                        )
+                        .await
+                        .map(|done| AgentLoopTurnUpdate {
+                            context: Some(done.context),
+                            notice: Some(done.notice),
+                            ..Default::default()
+                        })
+                    })
+                }
+            }));
+            // The provider can reject a request as too long before our trigger fires (its own
+            // size check may count more tokens than our estimate): compact and retry once.
+            config.recover_from_overflow = Some(Arc::new(move |context: AgentContext| {
+                let stream_fn = Arc::clone(&stream_fn);
+                let model = model.clone();
+                let summary_options = summary_options.clone();
+                let compaction = compaction.clone();
+                Box::pin(async move {
+                    crate::harness::compaction::force_compact_context(
+                        &context,
+                        &model,
+                        &stream_fn,
+                        summary_options,
+                        &compaction,
+                    )
+                    .await
+                    .map(|done| {
+                        (
+                            done.context,
+                            format!(
+                                "Provider said the request was too long. {}; retrying",
+                                done.notice
+                            ),
+                        )
+                    })
+                })
+            }));
+        }
 
         let steer_q = Arc::clone(&self.steering);
         let follow_q = Arc::clone(&self.follow_up);
