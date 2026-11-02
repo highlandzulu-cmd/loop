@@ -12,7 +12,7 @@ pub use paths::*;
 pub use providers::{
     is_web_search_provider, web_search_display_name, CustomProviderEntry, ProviderLoginRequest,
 };
-pub use settings::{load_settings, Settings};
+pub use settings::{load_settings, RuntimeSettings, Settings};
 #[cfg(feature = "telemetry")]
 pub use tracing::{
     describe_tracing_status, resolve_tracing_destination, TracingControl, TracingSetupRequest,

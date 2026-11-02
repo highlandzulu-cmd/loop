@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use loop_protocol::rpc::{
-    methods, ClientCapabilities, InitializeParams, InitializeResult, LoadParams, PeerInfo,
-    PromptParams, PromptResult, RpcErrorBody, SessionParams,
+    methods, AttachParams, AttachResult, ClientCapabilities, CloseParams, InitializeParams,
+    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
+    RuntimeStatus, SessionInfo, SessionParams,
 };
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
@@ -38,6 +39,9 @@ pub struct RemoteBackend {
     /// Sessions with a turn running, from the update stream and from
     /// prompts this client sent.
     busy: Arc<Mutex<HashSet<SessionKey>>>,
+    /// Sessions with a prompt this client sent still unanswered. Unlike
+    /// `busy`, observation (detach) never clears these.
+    local: Arc<Mutex<HashSet<SessionKey>>>,
 }
 
 impl RemoteBackend {
@@ -81,12 +85,73 @@ impl RemoteBackend {
             server: result.server_info,
             updates,
             busy,
+            local: Arc::default(),
         }))
     }
 
     /// The server, as it introduced itself.
     pub fn server(&self) -> &PeerInfo {
         &self.server
+    }
+
+    /// Every Session the Runtime knows (`session/list`). Needs the
+    /// `multi_session` capability.
+    pub async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
+        call(&self.conn, methods::SESSION_LIST, &serde_json::json!({})).await
+    }
+
+    /// Watch a Session (`session/attach`). Updates after `after_seq` arrive on
+    /// [`AgentBackend::subscribe`] as `origin: replay` and then live, with
+    /// contiguous `seq`; subscribe *before* calling so none is missed. Needs
+    /// the `attach` capability.
+    pub async fn attach(
+        &self,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<AttachResult> {
+        let params = AttachParams {
+            session: session.clone(),
+            after_seq,
+        };
+        call(&self.conn, methods::SESSION_ATTACH, &params).await
+    }
+
+    /// Stop receiving a Session's updates. The turn keeps running.
+    pub async fn detach(&self, session: &SessionRef) -> BackendResult<()> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call::<Value>(&self.conn, methods::SESSION_DETACH, &params).await?;
+        // The `turn_ended` of a turn someone else is running will never
+        // arrive now; stop believing the Session is busy because of it.
+        if !self.local.lock().contains(&session.key) {
+            self.busy.lock().remove(&session.key);
+        }
+        Ok(())
+    }
+
+    /// The Runtime process and its Session counts (`runtime/status`).
+    pub async fn status(&self) -> BackendResult<RuntimeStatus> {
+        call(&self.conn, methods::RUNTIME_STATUS, &serde_json::json!({})).await
+    }
+
+    /// Ask the Runtime to shut down (`runtime/stop`). It answers first, then
+    /// closes every connection; send nothing more on this one.
+    pub async fn stop(&self) -> BackendResult<()> {
+        call::<Value>(&self.conn, methods::RUNTIME_STOP, &serde_json::json!({}))
+            .await
+            .map(|_| ())
+    }
+
+    /// Close a Session; a busy one needs `force`.
+    pub async fn close(&self, session: &SessionRef, force: bool) -> BackendResult<()> {
+        let params = CloseParams {
+            session: session.clone(),
+            force,
+        };
+        call::<Value>(&self.conn, methods::SESSION_CLOSE, &params)
+            .await
+            .map(|_| ())
     }
 }
 
@@ -142,6 +207,8 @@ impl AgentBackend for RemoteBackend {
         let (done, handle) = TurnHandle::channel();
         let conn = Arc::clone(&self.conn);
         let busy = Arc::clone(&self.busy);
+        let local = Arc::clone(&self.local);
+        local.lock().insert(session.key.clone());
         let key = session.key.clone();
         // The response comes when the turn ends. A turn another client
         // started first shows up here as a failed outcome, not as `Busy`.
@@ -157,6 +224,7 @@ impl AgentBackend for RemoteBackend {
                     other => ErrorInfo::new(ErrorCategory::Agent, other.to_string()),
                 }),
             };
+            local.lock().remove(&key);
             busy.lock().remove(&key);
             let _ = done.send(outcome);
         });

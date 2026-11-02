@@ -11,6 +11,9 @@ pub mod keybindings;
 pub mod mcp_serve;
 pub mod print_mode;
 pub mod provider_setup;
+pub mod runtime_cmd;
+pub mod runtime_signals;
+pub mod session_cmd;
 pub mod setup_prompt;
 #[cfg(feature = "telemetry")]
 pub mod tracing_setup;

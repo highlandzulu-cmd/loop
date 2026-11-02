@@ -38,6 +38,7 @@ Common settings in `settings.json`:
 | `skills`, `disabledSkills` | empty | Extra skill paths, and skills to hide |
 | `mcpServers`, `disabledMcpServers` | empty | MCP servers (stdio `command` or remote `url`) |
 | `providers` | empty | Custom providers added with `/login custom` |
+| `runtime.maxSessions`, `runtime.maxActiveTurns` | `16`, `8` | Limits of `loop runtime start`; see [the Runtime](runtime.md#start-the-runtime). Each must be a whole number of at least 1. A command-line flag overrides it (global only) |
 
 Environment variables:
 

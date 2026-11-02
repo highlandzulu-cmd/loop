@@ -1,0 +1,1077 @@
+//! `loop session …`: a plain-text Surface for a shared Runtime. No
+//! application bootstrap.
+use std::path::PathBuf;
+
+/// What `loop session list|new|attach|close` asked for. With neither `id`
+/// nor `new`, it lists.
+#[derive(Debug, Default)]
+pub struct SessionArgs {
+    pub id: Option<String>,
+    pub new: bool,
+    pub cwd: Option<PathBuf>,
+    pub socket: Option<PathBuf>,
+    /// List finished Subagent children too.
+    pub all: bool,
+    /// Print every Session as a JSON array of `SessionInfo` instead.
+    pub json: bool,
+    /// Close the Session `id` instead of attaching (`loop session close`).
+    pub close: bool,
+    /// With `close`: cancel a running turn, and its Subagents, first.
+    pub force: bool,
+}
+
+#[cfg(not(unix))]
+pub async fn run(_: SessionArgs) -> anyhow::Result<()> {
+    anyhow::bail!("`loop session` is unsupported on this platform; Linux and macOS are supported")
+}
+
+#[cfg(unix)]
+pub use unix::{connect, drive, AttachClient, Input, Terminal};
+
+#[cfg(unix)]
+pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
+    let mut terminal = unix::StdioTerminal::new()?;
+    let socket = match args.socket.clone() {
+        Some(socket) => socket,
+        None => crate::config::paths::runtime_socket_path(&crate::config::paths::get_agent_dir())?,
+    };
+    let stream = tokio::net::UnixStream::connect(&socket)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Cannot connect to Runtime at {}: {e}. Start one with `loop runtime start`.",
+                socket.display()
+            )
+        })?;
+    let (backend, events) = connect(loop_wire::socket::unix(stream)).await?;
+    drive(backend, events, args, &mut terminal).await
+}
+
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use loop_protocol::{
+        rpc::{methods, InteractWithdrawnParams, PeerInfo, SessionInfo},
+        AgentBackend, ContentBlock, HostServices, InteractionOutcome, InteractionRequest,
+        SessionKey, SessionRef, SessionSpec,
+    };
+    use loop_wire::{transport::Transport, RemoteBackend};
+    use std::{
+        collections::VecDeque,
+        io::{BufRead, Write},
+        sync::Arc,
+    };
+    use tokio::sync::{mpsc, oneshot};
+
+    #[derive(Debug)]
+    pub enum Input {
+        Line(String),
+        Interrupt,
+        Eof,
+    }
+
+    /// Cancellation-safe input and flushed text output, scripted in tests.
+    #[async_trait::async_trait]
+    pub trait Terminal: Send {
+        async fn read(&mut self) -> anyhow::Result<Input>;
+        fn write(&mut self, text: &str) -> anyhow::Result<()>;
+        /// Columns available for a line, when output is a terminal.
+        fn width(&self) -> Option<usize> {
+            None
+        }
+        /// When the line [`Self::read`] last returned was typed, if known.
+        /// A line typed before an approval appeared never answers it.
+        fn typed_at(&self) -> Option<std::time::Instant> {
+            None
+        }
+    }
+
+    pub struct StdioTerminal {
+        lines: mpsc::UnboundedReceiver<(std::time::Instant, std::io::Result<String>)>,
+        interrupt: tokio::signal::unix::Signal,
+        stdin_ended: bool,
+        typed: Option<std::time::Instant>,
+    }
+    impl StdioTerminal {
+        pub fn new() -> anyhow::Result<Self> {
+            let interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let (tx, lines) = mpsc::unbounded_channel();
+            // A detached OS thread avoids Tokio's blocking-stdin shutdown wait.
+            std::thread::spawn(move || {
+                for line in std::io::stdin().lock().lines() {
+                    if tx.send((std::time::Instant::now(), line)).is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok(Self {
+                lines,
+                interrupt,
+                stdin_ended: false,
+                typed: None,
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Terminal for StdioTerminal {
+        async fn read(&mut self) -> anyhow::Result<Input> {
+            tokio::select! {
+                _ = self.interrupt.recv() => Ok(Input::Interrupt),
+                line = self.lines.recv(), if !self.stdin_ended => match line {
+                    Some((typed, line)) => { self.typed = Some(typed); Ok(Input::Line(line?)) },
+                    None => { self.stdin_ended = true; Ok(Input::Eof) },
+                }
+            }
+        }
+        fn typed_at(&self) -> Option<std::time::Instant> {
+            self.typed
+        }
+        fn width(&self) -> Option<usize> {
+            use std::io::IsTerminal;
+            std::io::stdout()
+                .is_terminal()
+                .then(|| crossterm::terminal::size().ok())
+                .flatten()
+                .map(|(columns, _)| usize::from(columns))
+        }
+        fn write(&mut self, text: &str) -> anyhow::Result<()> {
+            let mut out = std::io::stdout().lock();
+            out.write_all(text.as_bytes())?;
+            out.flush()?;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("Lost contact with Runtime; reattach to resume")]
+    struct LostContact;
+
+    pub enum HostEvent {
+        /// Which Session a `host/interact` request that follows came from.
+        Origin(loop_protocol::InteractionId, SessionRef),
+        Request(Box<InteractionRequest>, oneshot::Sender<InteractionOutcome>),
+        Withdrawn(InteractWithdrawnParams),
+        Disconnected,
+    }
+    struct Host(mpsc::UnboundedSender<HostEvent>);
+    #[async_trait::async_trait]
+    impl HostServices for Host {
+        async fn interact(&self, request: InteractionRequest) -> InteractionOutcome {
+            let (tx, rx) = oneshot::channel();
+            if self
+                .0
+                .send(HostEvent::Request(Box::new(request), tx))
+                .is_err()
+            {
+                return std::future::pending().await;
+            }
+            // No answer when this Surface detaches or exits with the request
+            // still shown: replying would answer it for everyone. The
+            // Runtime keeps it pending for the other Surfaces.
+            match rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => std::future::pending().await,
+            }
+        }
+    }
+
+    /// Owns the local transport lifetime independently of cleanup RPC replies.
+    pub struct AttachClient {
+        backend: Arc<RemoteBackend>,
+        closed: tokio_util::sync::CancellationToken,
+    }
+    impl Drop for AttachClient {
+        fn drop(&mut self) {
+            self.closed.cancel();
+        }
+    }
+    impl AttachClient {
+        async fn cleanup_rpc<T>(
+            &self,
+            rpc: impl std::future::Future<Output = T>,
+        ) -> anyhow::Result<T> {
+            tokio::select! {
+                biased;
+                _ = self.closed.cancelled() => Err(LostContact.into()),
+                result = tokio::time::timeout(std::time::Duration::from_secs(2), rpc) => {
+                    result.map_err(|_| anyhow::anyhow!("Runtime cleanup timed out; closing the local connection"))
+                }
+            }
+        }
+        async fn shutdown(&self) {
+            let _ = self.cleanup_rpc(self.backend.shutdown()).await;
+        }
+    }
+
+    /// Connect the approval host and expose withdrawals ignored by older wire clients.
+    pub async fn connect(
+        mut transport: Transport,
+    ) -> anyhow::Result<(AttachClient, mpsc::UnboundedReceiver<HostEvent>)> {
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let (tx, incoming) = mpsc::unbounded_channel();
+        let (outgoing, mut from_wire) = mpsc::unbounded_channel();
+        let notices = events_tx.clone();
+        let closed = tokio_util::sync::CancellationToken::new();
+        let pump_closed = closed.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = pump_closed.cancelled() => break,
+                    raw = transport.incoming.recv() => {
+                        let Some(raw) = raw else { break; };
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+                            if value["method"] == methods::HOST_INTERACT_WITHDRAWN {
+                                if let Ok(params) = serde_json::from_value(value["params"].clone()) {
+                                    let _ = notices.send(HostEvent::Withdrawn(params));
+                                }
+                            }
+                            // The wire client drops the request's Session; a
+                            // Subagent's requests reach its ancestors' Surfaces.
+                            if value["method"] == methods::HOST_INTERACT {
+                                let params = &value["params"];
+                                if let (Ok(id), Ok(session)) = (
+                                    serde_json::from_value(params["id"].clone()),
+                                    serde_json::from_value(params["session"].clone()),
+                                ) {
+                                    let _ = notices.send(HostEvent::Origin(id, session));
+                                }
+                            }
+                        }
+                        if tx.send(raw).is_err() { break; }
+                    }
+                    raw = from_wire.recv() => {
+                        let Some(raw) = raw else { break; };
+                        if transport.outgoing.send(raw).is_err() { break; }
+                    }
+                }
+            }
+            pump_closed.cancel();
+            let _ = notices.send(HostEvent::Disconnected);
+            // Dropping both transport directions closes locally even when the
+            // peer never replies and the wire reader already drained requests.
+        });
+        let backend = match RemoteBackend::connect(
+            Transport { incoming, outgoing },
+            PeerInfo {
+                name: "loop session".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+            Arc::new(Host(events_tx)),
+        )
+        .await
+        {
+            Ok(backend) => backend,
+            Err(error) => {
+                closed.cancel();
+                return Err(error.into());
+            }
+        };
+        Ok((AttachClient { backend, closed }, events))
+    }
+
+    /// Most Sessions the default listing shows.
+    const DEFAULT_LIST: usize = 20;
+
+    /// What `loop session list` shows, newest first, and how many it leaves
+    /// out. By default: loaded Sessions and those in `here` (not closed
+    /// Subagents), at most [`DEFAULT_LIST`]. With `all`: every Session.
+    pub(super) fn select(
+        mut sessions: Vec<SessionInfo>,
+        here: &std::path::Path,
+        all: bool,
+    ) -> (Vec<SessionInfo>, usize) {
+        sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+        if all {
+            return (sessions, 0);
+        }
+        let total = sessions.len();
+        let here = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_path_buf());
+        let in_here = |cwd: &std::path::Path| {
+            std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()) == here
+        };
+        let mut shown: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| s.live || (s.parent.is_none() && in_here(&s.cwd)))
+            .collect();
+        shown.truncate(DEFAULT_LIST);
+        let more = total - shown.len();
+        (shown, more)
+    }
+
+    /// `path` with the home folder as `~`, cut in the middle to `max` characters.
+    fn folder(path: &std::path::Path, max: Option<usize>) -> String {
+        let mut text = path.display().to_string();
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            if let Ok(rest) = path.strip_prefix(&home) {
+                text = if rest.as_os_str().is_empty() {
+                    "~".into()
+                } else {
+                    format!("~/{}", rest.display())
+                };
+            }
+        }
+        match max {
+            Some(max) if text.chars().count() > max && max > 1 => {
+                let chars: Vec<char> = text.chars().collect();
+                let tail = (max - 1) / 2 + (max - 1) % 2;
+                let head = max - 1 - tail;
+                let mut cut: String = chars[..head].iter().collect();
+                cut.push('…');
+                cut.extend(&chars[chars.len() - tail..]);
+                cut
+            }
+            _ => text,
+        }
+    }
+
+    fn list_text(sessions: &mut [SessionInfo], width: Option<usize>) -> String {
+        if sessions.is_empty() {
+            return "No Sessions. Use `loop session new` to create one.\n".into();
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64);
+        // Within a terminal, the folder and title share what the other
+        // columns leave; a pipe gets them whole.
+        let (folder_max, title_max) = match width {
+            Some(width) => {
+                let id = sessions
+                    .iter()
+                    .map(|s| s.r#ref.key.as_str().chars().count())
+                    .max()
+                    .unwrap_or(2);
+                // ID, BUSY, LAST ACTIVE and PARENT, plus the gaps of six columns.
+                let fixed = id + 4 + 11 + 8 + 5 * 2;
+                let left = width.saturating_sub(fixed).max(20);
+                let folder = (left * 3 / 5).max(10);
+                (Some(folder), (left - folder).clamp(6, 40))
+            }
+            None => (None, 40),
+        };
+        let mut rows =
+            vec![["ID", "FOLDER", "TITLE", "BUSY", "LAST ACTIVE", "PARENT"].map(String::from)];
+        for s in sessions.iter() {
+            rows.push([
+                s.r#ref.key.to_string(),
+                folder(&s.cwd, folder_max),
+                clip(s.name.as_deref().unwrap_or("(untitled)"), title_max),
+                if s.busy { "yes" } else { "no" }.into(),
+                ago(now, s.last_active_ms),
+                s.parent
+                    .as_ref()
+                    .map_or("-".into(), |p| p.key.as_str().chars().take(8).collect()),
+            ]);
+        }
+        let mut widths = [0; 6];
+        for row in &rows {
+            for (width, cell) in widths.iter_mut().zip(row) {
+                *width = (*width).max(cell.chars().count());
+            }
+        }
+        let mut text = String::new();
+        for row in rows {
+            let mut line = String::new();
+            for (i, cell) in row.iter().enumerate() {
+                if i + 1 == row.len() {
+                    line.push_str(cell);
+                } else {
+                    line.push_str(cell);
+                    let pad = widths[i] - cell.chars().count() + 2;
+                    line.extend(std::iter::repeat_n(' ', pad));
+                }
+            }
+            text.push_str(line.trim_end());
+            text.push('\n');
+        }
+        text
+    }
+
+    /// At most `max` characters, marking a cut with an ellipsis.
+    fn clip(text: &str, max: usize) -> String {
+        let line = text.lines().next().unwrap_or_default();
+        if line.chars().count() <= max && line.len() == text.len() {
+            return line.into();
+        }
+        let mut clipped: String = line.chars().take(max - 1).collect();
+        clipped.push('…');
+        clipped
+    }
+
+    /// How long ago `then_ms` was, for a person: "just now", "42s ago", "2m ago".
+    pub(super) fn ago(now_ms: u64, then_ms: u64) -> String {
+        let secs = now_ms.saturating_sub(then_ms) / 1000;
+        match secs {
+            0..10 => "just now".into(),
+            10..60 => format!("{secs}s ago"),
+            60..3600 => format!("{}m ago", secs / 60),
+            3600..86400 => format!("{}h ago", secs / 3600),
+            _ => format!("{}d ago", secs / 86400),
+        }
+    }
+
+    fn matches(sessions: &[SessionInfo], id: &str) -> Vec<SessionInfo> {
+        let exact: Vec<_> = sessions
+            .iter()
+            .filter(|s| s.r#ref.key.as_str() == id || s.r#ref.native_id == id)
+            .cloned()
+            .collect();
+        if !exact.is_empty() {
+            return exact;
+        }
+        sessions
+            .iter()
+            .filter(|s| s.r#ref.key.as_str().starts_with(id) || s.r#ref.native_id.starts_with(id))
+            .cloned()
+            .collect()
+    }
+
+    struct Pending {
+        request: InteractionRequest,
+        reply: oneshot::Sender<InteractionOutcome>,
+        session: SessionKey,
+        /// Set when the request comes from a Subagent of the attached Session.
+        from: Option<String>,
+        /// When its choices were put on screen.
+        shown: Option<std::time::Instant>,
+    }
+    impl Pending {
+        /// Its choices, numbered from 1; remembers when they were shown.
+        fn show(&mut self) -> String {
+            self.shown = Some(std::time::Instant::now());
+            show(&self.request, 1, self.from.as_deref())
+        }
+        /// Whether a line typed at `typed` was meant for this request: it
+        /// must have been typed after the request was shown.
+        fn typed_for(&self, typed: Option<std::time::Instant>) -> bool {
+            match (typed, self.shown) {
+                (Some(typed), Some(shown)) => typed >= shown,
+                _ => true,
+            }
+        }
+    }
+    fn show(request: &InteractionRequest, first_choice: usize, from: Option<&str>) -> String {
+        let mut text = match from {
+            Some(from) => format!("\nEscalation from {from}: "),
+            None => String::from("\nEscalation: "),
+        };
+        match request {
+            InteractionRequest::Permission {
+                tool_call, options, ..
+            } => {
+                text.push_str(&format!(
+                    "{}\n",
+                    tool_call
+                        .as_ref()
+                        .and_then(|t| t.title.as_deref())
+                        .unwrap_or("Tool approval")
+                ));
+                for (i, option) in options.iter().enumerate() {
+                    text.push_str(&format!("  {}. {}\n", i + first_choice, option.label));
+                }
+            }
+            InteractionRequest::Question {
+                prompt, choices, ..
+            } => {
+                text.push_str(&format!("{prompt}\n"));
+                for (i, choice) in choices.iter().flatten().enumerate() {
+                    text.push_str(&format!("  {}. {}\n", i + first_choice, choice.label));
+                }
+            }
+            _ => text.push_str("This request cannot be presented.\n"),
+        }
+        text
+    }
+    fn answer(
+        request: &InteractionRequest,
+        line: &str,
+        first_choice: usize,
+    ) -> Option<InteractionOutcome> {
+        let index = line
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| i.checked_sub(first_choice));
+        let id = match request {
+            InteractionRequest::Permission { options, .. } => {
+                options.get(index?)?.native_id.clone()
+            }
+            InteractionRequest::Question {
+                choices: Some(choices),
+                ..
+            } => choices.get(index?)?.native_id.clone(),
+            InteractionRequest::Question { choices: None, .. } => {
+                return Some(InteractionOutcome::Answered { value: line.into() })
+            }
+            _ => return None,
+        };
+        Some(InteractionOutcome::Selected {
+            native_id: id,
+            note: None,
+        })
+    }
+
+    /// "Subagent 1a2b3c4d (its task)" for a child Session's request.
+    /// Request bookkeeping that keeps only the newest entries, so requests
+    /// that never arrive (or are never withdrawn) cannot grow it without bound.
+    pub(super) struct Recent<T>(VecDeque<T>);
+    impl<T> Default for Recent<T> {
+        fn default() -> Self {
+            Self(VecDeque::new())
+        }
+    }
+    impl<T> Recent<T> {
+        pub(super) const CAP: usize = 256;
+        pub(super) fn push(&mut self, item: T) {
+            if self.0.len() == Self::CAP {
+                self.0.pop_front();
+            }
+            self.0.push_back(item);
+        }
+        /// Remove and return the oldest entry matching `pred`.
+        pub(super) fn take(&mut self, pred: impl Fn(&T) -> bool) -> Option<T> {
+            let index = self.0.iter().position(pred)?;
+            self.0.remove(index)
+        }
+        pub(super) fn any(&self, pred: impl Fn(&T) -> bool) -> bool {
+            self.0.iter().any(pred)
+        }
+        #[cfg(test)]
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    fn short_label(child: &SessionKey) -> String {
+        let short: String = child.as_str().chars().take(8).collect();
+        format!("Subagent {short}")
+    }
+    /// The child's name (its task), looked up off the input loop.
+    async fn subagent_name(backend: Arc<RemoteBackend>, child: SessionKey) -> Option<String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), backend.list())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .and_then(|list| list.into_iter().find(|s| s.r#ref.key == child))
+            .and_then(|s| s.name)
+    }
+
+    /// One line on connect: which Session, where, and how to leave.
+    fn header(what: &str, session: &SessionRef, cwd: &std::path::Path) -> String {
+        format!(
+            "{what} {} in {}. Ctrl+D or Ctrl+C twice detaches; the Session keeps running.\n",
+            session.key,
+            cwd.display()
+        )
+    }
+
+    /// `Busy` from opening a Session: the Runtime is at its Session limit and
+    /// none of its Sessions can be unloaded. The limit comes from the Runtime.
+    async fn full(backend: &RemoteBackend, error: loop_protocol::BackendError) -> anyhow::Error {
+        if !matches!(error, loop_protocol::BackendError::Busy) {
+            return error.into();
+        }
+        match backend.status().await {
+            Ok(status) => {
+                let (n, noun) = match status.loaded {
+                    1 => ("the 1".to_owned(), "Session is"),
+                    n => (format!("all {n}"), "Sessions are"),
+                };
+                anyhow::anyhow!(
+                    "The Runtime is full: {n} loaded {noun} busy or watched (limit {}). Close one with `loop session close <id>`, or restart the Runtime with a higher --max-sessions.",
+                    status.max_sessions
+                )
+            }
+            Err(_) => anyhow::anyhow!(
+                "The Runtime is full: every loaded Session is busy or watched. Close one with `loop session close <id>`."
+            ),
+        }
+    }
+
+    /// The lease refusal suggests `loop session attach`, which is what just failed.
+    fn load_error(error: loop_protocol::BackendError) -> anyhow::Error {
+        let text = error.to_string();
+        match text.split_once(" Use `loop session attach") {
+            Some((held, _)) if text.contains(" is in use by ") => anyhow::anyhow!(
+                "{held} Close it there, or wait until that process has exited for 30 s, then attach again."
+            ),
+            _ => error.into(),
+        }
+    }
+
+    /// Close one Session. Its data stays: attaching loads it again.
+    async fn close(
+        backend: &RemoteBackend,
+        id: &str,
+        force: bool,
+        terminal: &mut dyn Terminal,
+    ) -> anyhow::Result<()> {
+        let sessions = backend.list().await?;
+        let mut found = matches(&sessions, id);
+        let found = match found.len() {
+            0 => anyhow::bail!("No Session matches `{id}`"),
+            1 => found.remove(0),
+            _ => {
+                found.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+                terminal.write(&list_text(&mut found, terminal.width()))?;
+                anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
+            }
+        };
+        let key = &found.r#ref.key;
+        let not_loaded = format!("Session {key} is not loaded; nothing to close.\n");
+        if !found.live {
+            terminal.write(&not_loaded)?;
+            return Ok(());
+        }
+        let busy = || {
+            let children = sessions
+                .iter()
+                .filter(|s| s.live && s.parent.as_ref().is_some_and(|p| p.key == *key))
+                .count();
+            let (with, and) = match children {
+                0 => (String::new(), ""),
+                1 => (", with 1 running Subagent".into(), " and its Subagent"),
+                n => (
+                    format!(", with {n} running Subagents"),
+                    " and its Subagents",
+                ),
+            };
+            anyhow::anyhow!(
+                "Session {key} is busy (a turn is running{with}). Use `loop session close {key} --force` to cancel the turn{and} and close it."
+            )
+        };
+        if found.busy && !force {
+            return Err(busy());
+        }
+        match backend.close(&found.r#ref, force).await {
+            Ok(()) => terminal.write(&format!(
+                "Closed Session {key}. Its history is kept; `loop session attach {key}` loads it again.\n"
+            )),
+            Err(loop_protocol::BackendError::SessionNotFound(_)) => terminal.write(&not_loaded),
+            Err(loop_protocol::BackendError::Busy) => Err(busy()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn drive(
+        client: AttachClient,
+        mut events: mpsc::UnboundedReceiver<HostEvent>,
+        args: SessionArgs,
+        terminal: &mut dyn Terminal,
+    ) -> anyhow::Result<()> {
+        let backend = client.backend.clone();
+        if args.close {
+            let id = args.id.unwrap_or_default();
+            let result = close(&backend, &id, args.force, terminal).await;
+            client.shutdown().await;
+            return result;
+        }
+        let (session, header) = if args.new {
+            let cwd = std::path::absolute(args.cwd.unwrap_or(std::env::current_dir()?))?;
+            let session = match backend
+                .new_session(SessionSpec {
+                    cwd: Some(cwd.clone()),
+                    ..Default::default()
+                })
+                .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    let error = full(&backend, error).await;
+                    client.shutdown().await;
+                    return Err(error);
+                }
+            };
+            let header = header("New Session", &session, &cwd);
+            (session, header)
+        } else {
+            let sessions = backend.list().await?;
+            let Some(id) = args.id else {
+                let here = match args.cwd.clone() {
+                    Some(cwd) => cwd,
+                    None => std::env::current_dir()?,
+                };
+                let (mut shown, more) = select(sessions.clone(), &here, args.all);
+                if args.json {
+                    let mut text = serde_json::to_string_pretty(&shown)?;
+                    text.push('\n');
+                    terminal.write(&text)?;
+                    client.shutdown().await;
+                    return Ok(());
+                }
+                let mut text = if shown.is_empty() && more > 0 {
+                    "No Sessions are loaded or in this folder.\n".to_owned()
+                } else {
+                    list_text(&mut shown, terminal.width())
+                };
+                if more > 0 {
+                    text.push_str(&format!("\n{more} more; `loop session list --all`\n"));
+                }
+                terminal.write(&text)?;
+                client.shutdown().await;
+                return Ok(());
+            };
+            let mut found = matches(&sessions, &id);
+            match found.len() {
+                0 => {
+                    client.shutdown().await;
+                    anyhow::bail!("No Session matches `{id}`");
+                }
+                1 => {
+                    let found = found.remove(0);
+                    let header =
+                        |session: &SessionRef| header("Attached to Session", session, &found.cwd);
+                    // A Subagent runs only for its parent and is never reloaded;
+                    // its Event Log stays readable.
+                    if found.live || found.parent.is_some() {
+                        let header = if found.live {
+                            header(&found.r#ref)
+                        } else {
+                            format!(
+                                "Replaying finished Subagent Session {} in {}. It cannot take prompts; Ctrl+D detaches.\n",
+                                found.r#ref.key,
+                                found.cwd.display()
+                            )
+                        };
+                        (found.r#ref.clone(), header)
+                    } else {
+                        // Not loaded (e.g. after a Runtime restart). Loading takes
+                        // its lease, so prompts typed here can run.
+                        match backend
+                            .load_session(&found.r#ref, SessionSpec::default())
+                            .await
+                        {
+                            Ok(session) => {
+                                let header = header(&session);
+                                (session, header)
+                            }
+                            Err(loop_protocol::BackendError::Busy) => {
+                                let error = full(&backend, loop_protocol::BackendError::Busy).await;
+                                client.shutdown().await;
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                client.shutdown().await;
+                                return Err(load_error(error));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    found.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+                    terminal.write(&list_text(&mut found, terminal.width()))?;
+                    client.shutdown().await;
+                    anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
+                }
+            }
+        };
+        terminal.write(&header)?;
+        let mut updates = backend.subscribe();
+        let snapshot = backend.attach(&session, 0).await?;
+        let result = attached(
+            &backend,
+            &session,
+            &mut updates,
+            &mut events,
+            terminal,
+            snapshot.latest_seq,
+        )
+        .await;
+        // A dead connection cannot acknowledge cleanup RPCs. The Runtime owns
+        // the Session independently and will remove this recipient itself.
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.is::<LostContact>())
+        {
+            return result;
+        }
+        // Detach is observation only: never cancel or close a Session on exit.
+        let detached = client
+            .cleanup_rpc(backend.detach(&session))
+            .await
+            .and_then(|result| result.map_err(anyhow::Error::from));
+        // Never enqueue a fresh RPC after detach observes a dead transport.
+        if detached.is_ok() {
+            client.shutdown().await;
+        }
+        result?;
+        detached
+    }
+
+    async fn attached(
+        backend: &Arc<RemoteBackend>,
+        session: &SessionRef,
+        updates: &mut tokio::sync::broadcast::Receiver<loop_protocol::UpdateEnvelope>,
+        events: &mut mpsc::UnboundedReceiver<HostEvent>,
+        terminal: &mut dyn Terminal,
+        replay_until: u64,
+    ) -> anyhow::Result<()> {
+        let mut last_seq = 0;
+        let mut deferred = VecDeque::new();
+        let mut pending: Vec<Pending> = Vec::new();
+        // Each approval is numbered from 1. A line typed before an approval
+        // was shown (buffered while another was withdrawn) never answers it.
+        let mut approvals_shown = false;
+        let mut withdrawn: Recent<(SessionKey, loop_protocol::InteractionId)> = Recent::default();
+        // Origins of requests not yet received, in arrival order.
+        let mut origins: Recent<(loop_protocol::InteractionId, SessionRef)> = Recent::default();
+        let mut labels: std::collections::HashMap<SessionKey, String> = Default::default();
+        let mut naming = tokio::task::JoinSet::new();
+        let mut interrupted = false;
+        let mut renderer = crate::print_mode::TextRenderer::default();
+        // Prompts this Surface sent: their terminal already shows them, so
+        // their rendered copy is skipped once.
+        let mut sent: VecDeque<String> = VecDeque::new();
+        let mut prompts: Prompts = tokio::task::JoinSet::new();
+        // Prompts typed while a turn runs; the first goes when it ends.
+        let mut queued: VecDeque<String> = VecDeque::new();
+        // When to try the queue again: a turn's end reaches Surfaces just
+        // before the Runtime takes new prompts.
+        let mut retry: Option<tokio::time::Instant> = None;
+        loop {
+            tokio::select! {
+                Some(event) = events.recv() => match event {
+                    HostEvent::Origin(id, from) => origins.push((id, from)),
+                    HostEvent::Request(request, reply) => {
+                        let request = *request;
+                        let from = origins
+                            .take(|(id, _)| id == request.id())
+                            .map(|(_, from)| from)
+                            .unwrap_or_else(|| session.clone());
+                        if withdrawn.take(|(key, id)| *key == from.key && id == request.id()).is_some() { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
+                        if !matches!(request, InteractionRequest::Permission {..} | InteractionRequest::Question {..}) {
+                            let _ = reply.send(InteractionOutcome::Rejected { reason: "loop session attach supports choices and text questions".into() }); continue;
+                        }
+                        approvals_shown = true;
+                        let label = if from.key == session.key {
+                            None
+                        } else {
+                            if !labels.contains_key(&from.key) {
+                                labels.insert(from.key.clone(), short_label(&from.key));
+                                let (backend, child) = (backend.clone(), from.key.clone());
+                                naming.spawn(async move { let name = subagent_name(backend, child.clone()).await; (child, name) });
+                            }
+                            labels.get(&from.key).cloned()
+                        };
+                        let mut item = Pending { request, reply, session: from.key, from: label, shown: None };
+                        if pending.is_empty() { terminal.write(&item.show())?; }
+                        pending.push(item);
+                    }
+                    HostEvent::Withdrawn(params) => {
+                        let key = (params.session.key.clone(), params.id.clone());
+                        let held = pending.iter().position(|p| p.session == key.0 && p.request.id() == &key.1);
+                        if let Some(index) = held {
+                            let item = pending.remove(index);
+                            let _ = item.reply.send(InteractionOutcome::Cancelled);
+                        } else if key.0 == session.key || origins.any(|(id, s)| s.key == key.0 && *id == key.1) {
+                            // It may arrive before its request does.
+                            withdrawn.push(key.clone());
+                        }
+                        if held.is_some() || key.0 == session.key {
+                            terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
+                            if let Some(next) = pending.first_mut() { terminal.write(&next.show())?; }
+                        }
+                    }
+                    HostEvent::Disconnected => return Err(LostContact.into()),
+                },
+                update = updates.recv() => {
+                    let envelope = update.map_err(|e| anyhow::anyhow!("Runtime updates interrupted ({e}); reattach to replay"))?;
+                    if envelope.session != session.key { continue; }
+                    last_seq = envelope.seq;
+                    if let loop_protocol::SessionUpdate::MessageChunk { role: loop_protocol::Role::User, content, .. } = &envelope.update {
+                        if content.as_text().map(str::trim).is_some_and(|text| sent.front().is_some_and(|mine| mine.trim() == text)) {
+                            sent.pop_front();
+                            continue;
+                        }
+                    }
+                    let text = renderer.render(&envelope.update);
+                    if !text.is_empty() { terminal.write(&text)?; }
+                    if let loop_protocol::SessionUpdate::TurnEnded { error, stop, .. } = envelope.update {
+                        if stop == loop_protocol::StopReason::RuntimeRestarted {
+                            terminal.write("Turn ended uncertain — Runtime restarted. Its tools may or may not have run; nothing was retried.\n")?;
+                        }
+                        if let Some(error) = error { terminal.write(&format!("loop: {}\n", error.message))?; }
+                        if !queued.is_empty() { retry = Some(tokio::time::Instant::now() + QUEUE_RETRY); }
+                    }
+                },
+                Some(named) = naming.join_next(), if !naming.is_empty() => {
+                    if let Ok((child, Some(name))) = named {
+                        let label = format!("{} ({name})", short_label(&child));
+                        if pending.first().is_some_and(|p| p.session == child) {
+                            terminal.write(&format!("  {label}\n"))?;
+                        }
+                        for item in pending.iter_mut().filter(|p| p.session == child) {
+                            item.from = Some(label.clone());
+                        }
+                        labels.insert(child, label);
+                    }
+                },
+                Some(result) = prompts.join_next(), if !prompts.is_empty() => {
+                    let (line, result) = result?;
+                    match result {
+                        // The Runtime was still ending the last turn: wait.
+                        Err(error) if error.to_string() == loop_protocol::BackendError::Busy.to_string() => {
+                            if let Some(at) = sent.iter().rposition(|mine| *mine == line) { sent.remove(at); }
+                            queued.push_front(line);
+                            retry = Some(tokio::time::Instant::now() + QUEUE_RETRY);
+                        }
+                        Err(error) => terminal.write(&format!("loop: {error}\n"))?,
+                        Ok(()) => { send_queued(backend, session, &mut queued, &mut sent, &mut prompts, terminal).await?; }
+                    }
+                },
+                _ = async { if let Some(at) = retry { tokio::time::sleep_until(at).await } }, if retry.is_some() => {
+                    retry = None;
+                    if !send_queued(backend, session, &mut queued, &mut sent, &mut prompts, terminal).await? && !queued.is_empty() && prompts.is_empty() {
+                        retry = Some(tokio::time::Instant::now() + QUEUE_RETRY);
+                    }
+                },
+                // Lines and piped EOF wait for the snapshot, but controls must
+                // stay responsive even while history is still being delivered.
+                input = async {
+                    if last_seq >= replay_until {
+                        if let Some(input) = deferred.pop_front() { return Ok(input); }
+                    }
+                    let input = terminal.read().await?;
+                    Ok::<_, anyhow::Error>((terminal.typed_at(), input))
+                } => {
+                    let (typed, input) = input?;
+                    if last_seq < replay_until && !matches!(input, Input::Interrupt) {
+                        deferred.push_back((typed, input));
+                        continue;
+                    }
+                    match input {
+                    Input::Eof => {
+                        if !queued.is_empty() {
+                            terminal.write(&format!("Detaching; {} queued prompt(s) not sent.\n", queued.len()))?;
+                        }
+                        return Ok(());
+                    }
+                    Input::Interrupt if interrupted => return Ok(()),
+                    Input::Interrupt => {
+                        interrupted = true;
+                        backend.cancel(session);
+                        terminal.write("\nTurn cancelled. Ctrl+C again to detach.\n")?;
+                        // Cancelling stops what was asked for, including what waits.
+                        let dropped = queued.len();
+                        queued.clear();
+                        retry = None;
+                        match dropped {
+                            0 => {}
+                            1 => terminal.write("Dropped 1 queued prompt.\n")?,
+                            n => terminal.write(&format!("Dropped {n} queued prompts.\n"))?,
+                        }
+                    }
+                    Input::Line(line) => {
+                        let explicit_prompt = line.starts_with("> ");
+                        let line = line.strip_prefix("> ").unwrap_or(&line).to_owned();
+                        if pending.first().is_some_and(|item| !explicit_prompt && !item.typed_for(typed)) {
+                            terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
+                        } else if let Some(item) = pending.first().filter(|_| !explicit_prompt) {
+                            if let Some(outcome) = answer(&item.request, &line, 1) {
+                                let item = pending.remove(0);
+                                let _ = item.reply.send(outcome);
+                                if let Some(next) = pending.first_mut() { terminal.write(&next.show())?; }
+                            } else { terminal.write("Enter one of the numbered choices.\n")?; }
+                        } else if !explicit_prompt && approvals_shown && line.trim().parse::<usize>().is_ok() {
+                            terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
+                        } else if !line.trim().is_empty() {
+                            interrupted = false;
+                            // Behind a running turn, or behind earlier queued
+                            // prompts: wait, keeping their order.
+                            queued.push_back(line);
+                            if !send_queued(backend, session, &mut queued, &mut sent, &mut prompts, terminal).await? {
+                                terminal.write("queued; sends when the current turn ends\n")?;
+                            }
+                        }
+                    }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Prompts this Surface sent, each with its line and how its turn ended.
+    type Prompts = tokio::task::JoinSet<(String, Result<(), loop_protocol::BackendError>)>;
+    /// Pause before trying a queued prompt again.
+    const QUEUE_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// Send the oldest queued prompt unless a turn is running. Returns
+    /// whether one was sent.
+    async fn send_queued(
+        backend: &Arc<RemoteBackend>,
+        session: &SessionRef,
+        queued: &mut VecDeque<String>,
+        sent: &mut VecDeque<String>,
+        prompts: &mut Prompts,
+        terminal: &mut dyn Terminal,
+    ) -> anyhow::Result<bool> {
+        if queued.is_empty() || backend.is_busy(session) {
+            return Ok(false);
+        }
+        let line = queued.pop_front().unwrap_or_default();
+        match backend
+            .prompt(session, vec![ContentBlock::text(line.clone())])
+            .await
+        {
+            Ok(turn) => {
+                sent.push_back(line.clone());
+                prompts.spawn(async move {
+                    let result = match turn.outcome().await {
+                        loop_protocol::TurnOutcome::Failed(error) => {
+                            Err(loop_protocol::BackendError::Failed(error))
+                        }
+                        loop_protocol::TurnOutcome::Uncertain => {
+                            Err(loop_protocol::BackendError::failed(
+                                loop_protocol::ErrorCategory::Network,
+                                "Lost contact with Runtime",
+                            ))
+                        }
+                        _ => Ok(()),
+                    };
+                    (line, result)
+                });
+                Ok(true)
+            }
+            // Another Surface started a turn first: keep waiting.
+            Err(loop_protocol::BackendError::Busy) => {
+                queued.push_front(line);
+                Ok(false)
+            }
+            Err(error) => {
+                terminal.write(&format!("loop: {error}\n"))?;
+                Ok(false)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ago, Recent};
+
+        #[test]
+        fn request_bookkeeping_keeps_only_the_newest_entries() {
+            let mut recent = Recent::default();
+            for n in 0..Recent::<u32>::CAP as u32 + 10 {
+                recent.push(n);
+            }
+            assert_eq!(recent.len(), Recent::<u32>::CAP);
+            assert_eq!(recent.take(|n| *n == 3), None, "the oldest are dropped");
+            assert_eq!(recent.take(|n| *n == 20), Some(20));
+            assert_eq!(recent.take(|n| *n == 20), None);
+            assert!(recent.any(|n| *n == 21));
+        }
+
+        #[test]
+        fn last_activity_reads_as_a_relative_time() {
+            let now = 10_000_000_000;
+            assert_eq!(ago(now, now), "just now");
+            assert_eq!(ago(now, now + 5_000), "just now");
+            assert_eq!(ago(now, now - 9_000), "just now");
+            assert_eq!(ago(now, now - 42_000), "42s ago");
+            assert_eq!(ago(now, now - 2 * 60_000 - 5_000), "2m ago");
+            assert_eq!(ago(now, now - 3 * 3_600_000), "3h ago");
+            assert_eq!(ago(now, now - 49 * 3_600_000), "2d ago");
+        }
+    }
+}

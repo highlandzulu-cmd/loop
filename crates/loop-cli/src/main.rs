@@ -103,6 +103,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Run, stop or check the Runtime: one process that holds many Sessions
+    /// and serves them over a local socket.
+    #[command(subcommand)]
+    Runtime(RuntimeCommand),
+    /// List, create, watch or close the Runtime's Sessions.
+    #[command(subcommand)]
+    Session(SessionCommand),
     /// Show config directory paths.
     Config,
     /// Print version (same as --version).
@@ -126,6 +133,98 @@ enum Commands {
     /// Show usage (tokens, models, tools, agents, sessions) in the terminal.
     #[cfg(feature = "usage")]
     Usage,
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    /// Run the Runtime in the foreground until Ctrl+C, SIGTERM or
+    /// `loop runtime stop`. Never reads stdin or prompts.
+    ///
+    /// Folders without recorded trust get global settings only. Use the
+    /// global `--permission-mode` flag to choose a mode; `full-access` takes
+    /// effect only through that flag, never from settings. The global
+    /// `--cwd` sets the folder for Sessions that name none.
+    Start {
+        /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Most Sessions held at once [default: `runtime.maxSessions` in
+        /// settings.json, else 16].
+        #[arg(long)]
+        max_sessions: Option<usize>,
+        /// Most turns running at once; further turns queue [default:
+        /// `runtime.maxActiveTurns` in settings.json, else 8].
+        #[arg(long)]
+        max_active_turns: Option<usize>,
+    },
+    /// Ask the running Runtime to stop, through its socket, and wait up to
+    /// 10 s for it to go. Never signals a process.
+    Stop {
+        /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Show whether a Runtime is running and how many Sessions it holds.
+    /// Exits 0 when one is running and 1 when not.
+    Status {
+        /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Print the status as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// List Sessions: those loaded in the Runtime and those in this folder,
+    /// newest first, at most 20.
+    List {
+        /// List every Session: all folders, closed Subagents included.
+        #[arg(long)]
+        all: bool,
+        /// Print the same Sessions as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Create a Session and attach to it. Ctrl+D detaches.
+    New {
+        /// Working directory for the Session (default: the current folder).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Replay a Session and follow it live. Ctrl+D detaches; the Session
+    /// keeps running.
+    Attach {
+        /// Session id or unique prefix.
+        id: String,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Unload a Session from the Runtime. Its history is kept, and
+    /// `loop session attach` loads it again.
+    ///
+    /// A busy Session, including a parent whose Subagents are running, is
+    /// refused unless `--force`, which cancels the turn (and its Subagents)
+    /// first.
+    Close {
+        /// Session id or unique prefix.
+        id: String,
+        /// Cancel a running turn, and its Subagents, then close.
+        #[arg(long)]
+        force: bool,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -222,6 +321,68 @@ async fn real_main() -> anyhow::Result<()> {
                 tokio::task::block_in_place(|| loop_dashboard::run(options))?;
                 return Ok(());
             }
+            // Before bootstrap: no stdin, no trust prompt, no TUI.
+            Commands::Runtime(command) => {
+                use loop_cli::runtime_cmd;
+                return match command {
+                    RuntimeCommand::Start {
+                        socket,
+                        max_sessions,
+                        max_active_turns,
+                    } => {
+                        let cwd = match &cli.cwd {
+                            Some(cwd) => std::path::absolute(cwd)?,
+                            None => std::env::current_dir()?,
+                        };
+                        runtime_cmd::start(runtime_cmd::StartArgs {
+                            socket: socket.clone(),
+                            max_sessions: *max_sessions,
+                            max_active_turns: *max_active_turns,
+                            permission_mode: cli.permission_mode.clone(),
+                            cwd,
+                        })
+                        .await
+                    }
+                    RuntimeCommand::Stop { socket } => runtime_cmd::stop(socket.clone()).await,
+                    RuntimeCommand::Status { socket, json } => {
+                        if !runtime_cmd::status(socket.clone(), *json).await? {
+                            std::process::exit(1);
+                        }
+                        Ok(())
+                    }
+                };
+            }
+            Commands::Session(command) => {
+                use loop_cli::session_cmd::{run, SessionArgs};
+                let args = match command {
+                    SessionCommand::List { all, json, socket } => SessionArgs {
+                        cwd: cli.cwd.clone(),
+                        socket: socket.clone(),
+                        all: *all,
+                        json: *json,
+                        ..Default::default()
+                    },
+                    SessionCommand::New { cwd, socket } => SessionArgs {
+                        new: true,
+                        cwd: cwd.clone().or(cli.cwd.clone()),
+                        socket: socket.clone(),
+                        ..Default::default()
+                    },
+                    SessionCommand::Attach { id, socket } => SessionArgs {
+                        id: Some(id.clone()),
+                        socket: socket.clone(),
+                        ..Default::default()
+                    },
+                    SessionCommand::Close { id, force, socket } => SessionArgs {
+                        id: Some(id.clone()),
+                        close: true,
+                        force: *force,
+                        socket: socket.clone(),
+                        ..Default::default()
+                    },
+                };
+                return run(args).await;
+            }
             _ => (),
         }
     }
@@ -310,6 +471,23 @@ async fn real_main() -> anyhow::Result<()> {
     if cli.serve_mcp && pending_agent.is_some() {
         anyhow::bail!("--serve-mcp serves Loop's own tools; it cannot run with an external agent");
     }
+    // Refuse a bad mode before any Session is opened and leased.
+    if let Some(mode) = &cli.permission_mode {
+        if loop_app_core::permissions::PermissionMode::parse(mode).is_none() {
+            anyhow::bail!(
+                "unknown --permission-mode `{mode}`: use read-only, ask, accept-edits or full-access"
+            );
+        }
+    }
+    // Before startup opens a Session: a signal from here on releases it.
+    let shutdown_slot = loop_cli::runtime_signals::ShutdownSlot::default();
+    if let Err(error) = loop_cli::runtime_signals::release_on_signals(
+        shutdown_slot.clone(),
+        !cli.serve_mcp,
+        interactive,
+    ) {
+        tracing::warn!(%error, "could not register signal handlers");
+    }
     let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
         provider,
@@ -354,6 +532,15 @@ async fn real_main() -> anyhow::Result<()> {
         tracing::warn!(error = %err, "Langfuse tracing disabled");
     }
 
+    // Kept before the Runtime is moved: every exit path below, and signals,
+    // end the Session work and release its leases through it.
+    let shutdown = runtime.session_shutdown();
+    let _ = shutdown_slot.set(shutdown.clone());
+    let release = || async {
+        if let Err(error) = shutdown.run().await {
+            eprintln!("loop: {error:#}");
+        }
+    };
     let result = if cli.serve_mcp {
         loop_cli::mcp_serve::run_mcp_server(
             runtime.inner,
@@ -366,6 +553,7 @@ async fn real_main() -> anyhow::Result<()> {
         let result =
             print_mode::run_print(&mut runtime, prompt, cli.output_format, &cli.trace).await;
         runtime.agents.shutdown().await;
+        release().await;
         match result {
             Ok(0) => Ok(()),
             Ok(code) => {
@@ -378,7 +566,155 @@ async fn real_main() -> anyhow::Result<()> {
     } else {
         loop_cli::app::run(runtime).await
     };
+    // Idempotent: the TUI and `--print` already released.
+    release().await;
     #[cfg(feature = "telemetry")]
     print_mode::shutdown_telemetry(&telemetry).await;
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
+
+    #[test]
+    fn the_command_tree_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn serve_and_attach_are_gone() {
+        for args in [
+            &["loop", "serve"][..],
+            &["loop", "attach"],
+            &["loop", "attach", "abc"],
+            &["loop", "attach", "--new"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?} still parses");
+        }
+    }
+
+    #[test]
+    fn runtime_subcommands_parse() {
+        let cli = parse(&["loop", "runtime", "start"]);
+        let Some(Commands::Runtime(RuntimeCommand::Start {
+            socket,
+            max_sessions,
+            max_active_turns,
+        })) = cli.command
+        else {
+            panic!("not runtime start")
+        };
+        assert_eq!((socket, max_sessions, max_active_turns), (None, None, None));
+        let cli = parse(&[
+            "loop",
+            "runtime",
+            "start",
+            "--socket",
+            "/tmp/x.sock",
+            "--max-sessions",
+            "3",
+            "--max-active-turns",
+            "2",
+            "--permission-mode",
+            "full-access",
+            "--cwd",
+            "/work",
+        ]);
+        assert_eq!(cli.permission_mode.as_deref(), Some("full-access"));
+        assert_eq!(cli.cwd, Some(PathBuf::from("/work")));
+        let Some(Commands::Runtime(RuntimeCommand::Start {
+            socket,
+            max_sessions,
+            max_active_turns,
+        })) = cli.command
+        else {
+            panic!("not runtime start")
+        };
+        assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
+        assert_eq!((max_sessions, max_active_turns), (Some(3), Some(2)));
+        let cli = parse(&["loop", "runtime", "stop", "--socket", "/tmp/x.sock"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime(RuntimeCommand::Stop { socket: Some(_) }))
+        ));
+        let cli = parse(&["loop", "runtime", "status", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime(RuntimeCommand::Status {
+                json: true,
+                socket: None
+            }))
+        ));
+        assert!(Cli::try_parse_from(["loop", "runtime"]).is_err());
+    }
+
+    #[test]
+    fn session_subcommands_parse() {
+        let cli = parse(&["loop", "session", "list", "--all", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session(SessionCommand::List {
+                all: true,
+                json: true,
+                socket: None
+            }))
+        ));
+        let cli = parse(&[
+            "loop",
+            "session",
+            "new",
+            "--cwd",
+            "/tmp",
+            "--socket",
+            "/tmp/r.sock",
+        ]);
+        let Some(Commands::Session(SessionCommand::New { cwd, socket })) = cli.command else {
+            panic!("not session new")
+        };
+        assert_eq!(cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(socket, Some(PathBuf::from("/tmp/r.sock")));
+        let cli = parse(&["loop", "session", "attach", "abc"]);
+        let Some(Commands::Session(SessionCommand::Attach { id, .. })) = cli.command else {
+            panic!("not session attach")
+        };
+        assert_eq!(id, "abc");
+        assert!(Cli::try_parse_from(["loop", "session", "attach"]).is_err());
+        let cli = parse(&["loop", "session", "close", "abc", "--force"]);
+        let Some(Commands::Session(SessionCommand::Close { id, force, .. })) = cli.command else {
+            panic!("not session close")
+        };
+        assert_eq!((id.as_str(), force), ("abc", true));
+        let cli = parse(&["loop", "session", "close", "abc"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session(SessionCommand::Close {
+                force: false,
+                ..
+            }))
+        ));
+        assert!(Cli::try_parse_from(["loop", "session", "close"]).is_err());
+        assert!(Cli::try_parse_from(["loop", "session", "new", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["loop", "session"]).is_err());
+    }
+
+    #[test]
+    fn runtime_start_help_describes_the_command() {
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        let help = cmd
+            .find_subcommand_mut("runtime")
+            .unwrap()
+            .find_subcommand_mut("start")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--socket") && help.contains("--max-sessions"));
+        assert!(help.contains("full-access"));
+    }
 }

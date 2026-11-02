@@ -4,7 +4,7 @@ Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model c
 
 Goal: `loop-protocol` runs over a real connection. This is S1, the first step
 of the spine: the Runtime (S2) and the TUI as a Runtime client (S3) build on
-it. This lane adds no `loop serve` and no `--connect`. Its only user-facing
+it. This lane adds no Runtime command and no `--connect`. Its only user-facing
 part is `--print --output-format`.
 
 ## 1. What exists today
@@ -44,7 +44,7 @@ A transport sends and receives whole messages (`Stream<Item = String>` + `Sink<S
 
 Security, carried over from `mcp serve`:
 - **Unix socket:** created with mode 0600, under `~/.loop/run/`.
-- **WebSocket:** binds to loopback by default and always needs a bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. It refuses to bind to a non-loopback address without `--token`. This lane only adds the transport; the flags come with `loop serve` in S2.
+- **WebSocket:** binds to loopback by default and always needs a bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. It refuses to bind to a non-loopback address without `--token`. This lane only adds the transport; the flags come with `loop runtime start` in S2.
 
 ## 4. Methods
 
@@ -133,3 +133,71 @@ Exit codes:
 - The method names: `session/*` follows ACP. Is that the right choice for Loop's own API, which the SDK will expose?
 - Should v1 include `ModelControl`? The TUI uses it to switch models, but S3 can add it.
 - The WebSocket library: `tokio-tungstenite`. axum's `ws` feature covers only the server side.
+
+## 11. Runtime methods (S2)
+
+S2 adds the shared Runtime (`loop runtime` and `loop session`, user guide in [`../runtime.md`](../runtime.md),
+design in [`runtime.md`](runtime.md)). All additions keep `PROTOCOL_VERSION` at 1:
+an older peer ignores the new fields, and an unknown method still returns `-32601`.
+
+**Capabilities.** `Capabilities.multi_session` and `Capabilities.attach` say a
+server offers the methods below. Both default to false when absent. The Runtime
+sets both.
+
+| Method | Direction | Kind | Params → result |
+|---|---|---|---|
+| `session/list` | c → s | request | `{}` → `[SessionInfo{ref, cwd, name, parent, live, busy, created_ms, last_active_ms}]` |
+| `session/close` | c → s | request | `{session, force?}` → `{}`. `force` (default false) cancels a running turn; without it a busy Session returns Busy |
+| `session/attach` | c → s | request | `{session, after_seq?}` → `{latest_seq, generation}`. The cursor defaults to 0 |
+| `session/detach` | c → s | request | `{session}` → `{}`. Stops this connection's updates and approvals for the Session; the turn keeps running |
+| `runtime/status` | c → s | request | `{}` → `RuntimeStatus{pid, socket, generation, loaded, busy, max_sessions, max_active_turns, max_sessions_from?, max_active_turns_from?}`. The `_from` fields say where a limit came from: `flag`, `settings` or `default` |
+| `runtime/stop` | c → s | request | `{}` → `{}`. The Runtime answers, then shuts down as on SIGTERM and closes every connection |
+| `host/interact` | s → c | request | `InteractionRequest` plus optional `session` (a `SessionRef`) → `InteractionOutcome` |
+| `host/interact_withdrawn` | s → c | notification | `{session, id}` |
+
+- **Runtime control.** `runtime/status` and `runtime/stop` are served only on
+  a Runtime's socket, which is mode 0600, so only the same user reaches them.
+  `loop runtime status` and `loop runtime stop` use them instead of the pid
+  file. A server without them returns an error.
+- **Session references.** `session` is always a full `SessionRef`
+  (`instance`, `key`, `native_id`), never a title.
+- **List.** `session/list` returns every stored Session, closed ones
+  included. `parent` is set only for a Subagent child the Runtime opened. A
+  fork also stores a parent, but the list reports `parent: null` for it.
+  `name` of a Subagent child is its task, shortened.
+- **Escalations from Subagents.** A child's `host/interact` goes to clients
+  attached to the child and to any ancestor. Its `session` names the child,
+  and `host/interact_withdrawn` names the child too.
+- **Attach.** The result comes first, then the updates after `after_seq` up to
+  `latest_seq` with `origin: "replay"`, then live updates.
+  - `seq` is the Session's durable, contiguous update sequence from the Event Log.
+    It never resets across reloads or Runtime restarts.
+  - Within one attachment no `seq` is sent twice. A client stores the last `seq`
+    it processed and reattaches from it.
+  - Replayed updates carry the current `generation`.
+- **Escalations.** A `host/interact` request goes to every interactive client
+  attached to the Session.
+  - The first valid answer wins. The other recipients get
+    `host/interact_withdrawn`.
+  - Cancelling the turn, or closing the Session, withdraws the request from
+    every recipient.
+  - A request raised while no interactive client is attached waits for one.
+  - A client that sent `client_capabilities.interact: false` is an observer: it
+    receives updates but never requests.
+  - The interaction `id` names the shared Escalation. JSON-RPC request ids stay
+    per connection.
+- **Connection ownership.** A Runtime connection tracks only the Sessions it
+  created, loaded or attached.
+  - `session/list` does not subscribe to anything.
+  - `shutdown` on a Runtime connection returns `{}` and ends only that
+    connection.
+  - Losing a connection leaves its work running. Its unresolved prompts resolve
+    as `TurnOutcome::Uncertain` on the client.
+- **Crash recovery.** When a Runtime starts, every turn an earlier Runtime left
+  open gets a `turn_ended` update with `stop: "runtime_restarted"`. That means
+  the turn was interrupted and its effects are uncertain. Clients must not
+  retry it automatically.
+
+```json
+{"jsonrpc":"2.0","method":"session/update","params":{"v":1,"instance":"loop","generation":4,"session":"s1","turn":"turn-2","seq":43,"origin":"replay","update":{"type":"turn_ended","turn_id":"turn-2","stop":"runtime_restarted"}}}
+```
