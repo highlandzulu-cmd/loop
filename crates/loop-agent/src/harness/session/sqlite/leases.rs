@@ -414,6 +414,32 @@ pub(super) struct ResumeLeaseGuard {
     released: std::sync::atomic::AtomicBool,
 }
 
+/// Every standalone writer of this process, for [`close_standalone_writers`].
+static WRITERS: parking_lot::Mutex<Vec<std::sync::Weak<ResumeLeaseGuard>>> =
+    parking_lot::Mutex::new(Vec::new());
+/// Set by [`close_standalone_writers`]: no writer of this process claims again.
+static WRITERS_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Close every standalone writer of this process and release its leases,
+/// for a process that is about to exit before anyone owns a shutdown
+/// handle (a signal during startup). Terminal for the whole process: any
+/// writer, including one created later, refuses to claim or write.
+pub async fn close_standalone_writers() -> Result<(), SessionError> {
+    WRITERS_CLOSED.store(true, std::sync::atomic::Ordering::Release);
+    let writers: Vec<_> = WRITERS
+        .lock()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    let mut result = Ok(());
+    for writer in writers {
+        if let Err(error) = writer.release().await {
+            result = Err(error);
+        }
+    }
+    result
+}
+
 /// How long the `Drop` fallback waits for a locked database. Short: it may
 /// run while the process exits, with nobody to retry.
 const DROP_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
@@ -445,11 +471,14 @@ impl ResumeLeaseGuard {
 
     pub(super) fn failed(&self) -> bool {
         self.cancellation.is_cancelled()
+            || WRITERS_CLOSED.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Why a write through this writer is refused.
     pub(super) fn refusal(&self) -> SessionError {
-        if self.releasing.load(std::sync::atomic::Ordering::Acquire) {
+        if self.releasing.load(std::sync::atomic::Ordering::Acquire)
+            || WRITERS_CLOSED.load(std::sync::atomic::Ordering::Acquire)
+        {
             SessionError::Invalid("Session leases were released; this writer is closed.".into())
         } else {
             SessionError::Invalid(
@@ -560,6 +589,11 @@ impl SqliteSessionStore {
             released: std::sync::atomic::AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&guard);
+        {
+            let mut writers = WRITERS.lock();
+            writers.retain(|w| w.strong_count() > 0);
+            writers.push(weak.clone());
+        }
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(

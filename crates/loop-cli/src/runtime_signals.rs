@@ -24,12 +24,18 @@ pub async fn shutdown_signal() -> std::io::Result<()> {
     }
 }
 
+/// Where `main` puts the Surface's shutdown handle once startup has made it.
+pub type ShutdownSlot =
+    std::sync::Arc<std::sync::OnceLock<loop_app_core::runtime::SessionShutdown>>;
+
 /// On SIGTERM or SIGHUP (and SIGINT when `interrupt`), end the Session work,
-/// release its leases and exit with 128 + the signal number. With
+/// release its leases and exit with 128 + the signal number. Install it
+/// before startup opens a Session: until `slot` holds the shutdown handle,
+/// every standalone writer of the process is closed instead. With
 /// `restore_terminal`, leave the TUI's raw mode first. Unix only; elsewhere
 /// this does nothing.
 pub fn release_on_signals(
-    shutdown: loop_app_core::runtime::SessionShutdown,
+    slot: ShutdownSlot,
     interrupt: bool,
     restore_terminal: bool,
 ) -> std::io::Result<()> {
@@ -57,14 +63,21 @@ pub fn release_on_signals(
             if restore_terminal {
                 restore();
             }
-            if let Err(error) = shutdown.run().await {
+            let released = match slot.get() {
+                Some(shutdown) => shutdown.run().await,
+                // Still starting: no turn has run, so close every writer.
+                None => loop_agent::harness::session::sqlite::close_standalone_writers()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("could not release Session leases: {e}")),
+            };
+            if let Err(error) = released {
                 eprintln!("loop: {error:#}");
             }
             std::process::exit(code);
         });
     }
     #[cfg(not(unix))]
-    let _ = (shutdown, interrupt, restore_terminal);
+    let _ = (slot, interrupt, restore_terminal);
     Ok(())
 }
 

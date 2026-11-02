@@ -507,3 +507,57 @@ async fn a_new_terminal_loop_sweeps_rows_of_exited_processes() {
     })
     .await
 }
+
+#[tokio::test]
+async fn an_invalid_permission_mode_leaves_no_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let out = output(fx.command(&["--print", "hi", "--permission-mode", "invalid"])).await;
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("permission"),
+            "{out:?}"
+        );
+        assert_eq!(fx.leases().await, [], "{out:?}");
+    })
+    .await
+}
+
+/// SIGTERM sent while `loop` may still be starting: whenever it lands, no
+/// lease of the exited process stays.
+#[tokio::test]
+async fn a_signal_during_startup_leaves_no_lease() {
+    bounded(async {
+        for delay_ms in [0u64, 20, 60, 120, 250] {
+            let fx = Fixture::new(Model::Hang);
+            let mut cmd = fx.command(&["--print", "hi"]);
+            cmd.stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = tokio::process::Command::from(cmd)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            // Wait for the database file: the process is opening its Session.
+            let started = tokio::time::timeout(WAIT, async {
+                while !fx.db().exists() {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await;
+            assert!(started.is_ok(), "{delay_ms} ms: no database");
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            signal(child.id().unwrap(), "-TERM");
+            tokio::time::timeout(WAIT, child.wait())
+                .await
+                .expect("loop ignored SIGTERM")
+                .unwrap();
+            assert_eq!(
+                fx.leases().await,
+                [],
+                "{delay_ms} ms after the database appeared"
+            );
+        }
+    })
+    .await
+}

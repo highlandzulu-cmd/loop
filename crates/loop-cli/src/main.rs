@@ -467,6 +467,23 @@ async fn real_main() -> anyhow::Result<()> {
     if cli.serve_mcp && pending_agent.is_some() {
         anyhow::bail!("--serve-mcp serves Loop's own tools; it cannot run with an external agent");
     }
+    // Refuse a bad mode before any Session is opened and leased.
+    if let Some(mode) = &cli.permission_mode {
+        if loop_app_core::permissions::PermissionMode::parse(mode).is_none() {
+            anyhow::bail!(
+                "unknown --permission-mode `{mode}`: use read-only, ask, accept-edits or full-access"
+            );
+        }
+    }
+    // Before startup opens a Session: a signal from here on releases it.
+    let shutdown_slot = loop_cli::runtime_signals::ShutdownSlot::default();
+    if let Err(error) = loop_cli::runtime_signals::release_on_signals(
+        shutdown_slot.clone(),
+        !cli.serve_mcp,
+        interactive,
+    ) {
+        tracing::warn!(%error, "could not register signal handlers");
+    }
     let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
         provider,
@@ -514,11 +531,7 @@ async fn real_main() -> anyhow::Result<()> {
     // Kept before the Runtime is moved: every exit path below, and signals,
     // end the Session work and release its leases through it.
     let shutdown = runtime.session_shutdown();
-    if let Err(error) =
-        loop_cli::runtime_signals::release_on_signals(shutdown.clone(), !cli.serve_mcp, interactive)
-    {
-        tracing::warn!(%error, "could not register signal handlers");
-    }
+    let _ = shutdown_slot.set(shutdown.clone());
     let release = || async {
         if let Err(error) = shutdown.run().await {
             eprintln!("loop: {error:#}");

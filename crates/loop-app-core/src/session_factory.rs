@@ -322,6 +322,24 @@ impl SessionFactory {
         workspace: Arc<WorkspaceResources>,
         opts: &BootstrapOpts,
     ) -> anyhow::Result<OpenedSession> {
+        let mut leased = None;
+        let result = self.open_leased(workspace, opts, &mut leased).await;
+        // A standalone open that fails after taking its lease must not leave
+        // it to a Drop that may never run before the process exits.
+        if let (Err(_), Some(store)) = (&result, leased) {
+            if let Err(error) = store.release_leases().await {
+                tracing::warn!(%error, "could not release the lease of a failed Session open");
+            }
+        }
+        result
+    }
+
+    async fn open_leased(
+        &self,
+        workspace: Arc<WorkspaceResources>,
+        opts: &BootstrapOpts,
+        leased: &mut Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    ) -> anyhow::Result<OpenedSession> {
         if absolute_workspace(&opts.cwd)? != workspace.cwd {
             bail!("Session cwd does not match workspace");
         }
@@ -371,6 +389,7 @@ impl SessionFactory {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
+            *leased = Some(Arc::clone(&store));
             (
                 Some(create_session_repository(Arc::clone(&store), None)),
                 Some(store),
@@ -556,6 +575,42 @@ impl SessionFactory {
 #[cfg(all(test, unix))]
 mod lease_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_standalone_open_releases_the_lease_it_took() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = Arc::new(Models::create(Default::default()));
+        let globals =
+            Arc::new(GlobalResources::with_models(dir.path().join("agent"), models).unwrap());
+        let opts = BootstrapOpts {
+            cwd: dir.path().to_path_buf(),
+            provider: None,
+            model: None,
+            theme: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            no_context_files: true,
+            interactive: false,
+            session_id: None,
+            no_web: true,
+            // Refused only after the Session was created and leased.
+            permission_mode: Some("invalid".into()),
+            agent: None,
+        };
+        let workspace = Arc::new(
+            WorkspaceResources::load_resolved(&globals, &opts, false, Settings::default(), true)
+                .await
+                .unwrap(),
+        );
+        let factory = SessionFactory::new(Arc::clone(&globals));
+        assert!(factory.open(workspace, &opts).await.is_err());
+        let store =
+            loop_agent::harness::session::sqlite::SqliteSessionStore::open(&globals.sessions_db)
+                .unwrap();
+        for meta in globals.repository.list(None).await.unwrap() {
+            assert_eq!(store.lease(&meta.id).await.unwrap(), None, "{}", meta.id);
+        }
+    }
 
     #[tokio::test]
     async fn standalone_factory_refuses_runtime_lease_before_opening_session() {
