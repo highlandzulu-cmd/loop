@@ -5326,10 +5326,8 @@ async fn apply_effect(
                         }
                     };
                     let builder = SandboxBuilder::for_current_platform();
-                    let planned = SandboxRequest::from_settings(&runtime.settings.sandbox)
-                        .map(|request| request.with_flags(flags))
-                        .and_then(|request| builder.resolve(&request).map(|plan| (request, plan)));
-                    let (request, plan) = match planned {
+                    let request = SandboxRequest::for_flags(&runtime.settings.sandbox, flags);
+                    let plan = match builder.resolve(&request) {
                         Ok(v) => v,
                         Err(e) => {
                             chat.push(sys(format!("sandbox: {e}")));

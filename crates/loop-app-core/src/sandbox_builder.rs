@@ -167,12 +167,22 @@ impl SandboxRequest {
         })
     }
 
-    /// Replace isolation and runtime with `/sandbox local` flags. A flag left out
-    /// falls back to the platform default, not to the saved setting.
-    pub fn with_flags(mut self, flags: LocalSandboxFlags) -> Self {
-        self.isolation = flags.isolation;
-        self.runtime = flags.runtime;
-        self
+    /// Request for `/sandbox local`: isolation and runtime come from the flags only
+    /// (a flag left out falls back to the platform default, not to the saved
+    /// setting), while network and writable paths come from settings. Saved
+    /// isolation and runtime are not read, so a bad saved value never blocks the
+    /// command that replaces it.
+    pub fn for_flags(settings: &SandboxSettings, flags: LocalSandboxFlags) -> Self {
+        Self {
+            isolation: flags.isolation,
+            runtime: flags.runtime,
+            network: settings.network(),
+            allow_write: settings
+                .allow_write
+                .iter()
+                .map(|p| expand_home(p))
+                .collect(),
+        }
     }
 }
 
@@ -460,7 +470,10 @@ mod tests {
     }
 
     fn flags(args: &[&str]) -> SandboxRequest {
-        SandboxRequest::default().with_flags(parse_local_sandbox_flags(args).unwrap())
+        SandboxRequest::for_flags(
+            &SandboxSettings::default(),
+            parse_local_sandbox_flags(args).unwrap(),
+        )
     }
 
     #[test]
@@ -585,19 +598,25 @@ mod tests {
     fn flags_replace_saved_isolation_and_runtime_but_keep_network() {
         let settings = SandboxSettings {
             isolation: Some("partial".into()),
-            runtime: Some("krun".into()),
+            runtime: Some("docker".into()),
             network: Some(true),
             allow_write: vec!["~/.cargo".into()],
             ..Default::default()
         };
-        let request = SandboxRequest::from_settings(&settings)
-            .unwrap()
-            .with_flags(LocalSandboxFlags::default());
+        let request = SandboxRequest::for_flags(&settings, LocalSandboxFlags::default());
         assert_eq!(request.isolation, None);
         assert_eq!(request.runtime, None);
         assert!(request.network);
         let home = dirs::home_dir().unwrap();
         assert_eq!(request.allow_write, vec![home.join(".cargo")]);
+
+        // A bad saved runtime does not block the flags that replace it.
+        let request =
+            SandboxRequest::for_flags(&settings, parse_local_sandbox_flags(&["--crun"]).unwrap());
+        let plan = builder_with(SandboxPlatform::Linux, None)
+            .resolve(&request)
+            .unwrap();
+        assert_eq!(plan.label(), "--full --crun");
     }
 
     #[tokio::test]
@@ -605,9 +624,10 @@ mod tests {
         let factory = Arc::new(FakeFactory::default());
         let builder = builder_with(SandboxPlatform::Linux, Some(Arc::clone(&factory)));
         let workdir = std::env::temp_dir();
+        let absolute = workdir.join("cache");
         let request = SandboxRequest {
             network: true,
-            allow_write: vec!["/opt/cache".into(), "target".into()],
+            allow_write: vec![absolute.clone(), "target".into()],
             ..flags(&["--partial", "--crun"])
         };
         let (sandbox, plan) = tokio::time::timeout(
@@ -628,7 +648,10 @@ mod tests {
         assert_eq!(options["network"], true);
         assert_eq!(
             options["allowWrite"],
-            json!(["/opt/cache", workdir.join("target").display().to_string()])
+            json!([
+                absolute.display().to_string(),
+                workdir.join("target").display().to_string()
+            ])
         );
     }
 
