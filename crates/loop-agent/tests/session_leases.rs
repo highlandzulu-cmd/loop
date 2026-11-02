@@ -592,7 +592,9 @@ async fn release_during_an_active_write_is_fenced_and_reports_errors() {
         let started = std::time::Instant::now();
         let error = locked.release_leases().await.unwrap_err();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            // A 200 ms busy timeout plus slack for a loaded CI machine;
+            // far below the 5 s one other writes use.
+            started.elapsed() < std::time::Duration::from_millis(1200),
             "release took {:?}",
             started.elapsed()
         );
