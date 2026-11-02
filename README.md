@@ -103,13 +103,15 @@ Run one long-lived Runtime and attach to its Sessions from any terminal. Work
 keeps running when you detach, and approvals wait until a Surface answers.
 
 ```bash
-loop serve                 # start the Runtime (foreground; Ctrl+C stops it)
-loop attach --new          # new Session in this folder, then follow it live
-loop attach                # list Sessions
-loop attach <id>           # replay a Session and follow it
+loop runtime start         # start the Runtime (foreground; Ctrl+C stops it)
+loop runtime status        # is it running, and how many Sessions are loaded
+loop session new           # new Session in this folder, then follow it live
+loop session list          # list Sessions
+loop session attach <id>   # replay a Session and follow it
+loop runtime stop          # stop the Runtime from another terminal
 ```
 
-After a crash, restarting `loop serve` marks interrupted turns as uncertain
+After a crash, restarting `loop runtime start` marks interrupted turns as uncertain
 instead of retrying them. See [The Runtime](docs/runtime.md).
 
 ## Supported models

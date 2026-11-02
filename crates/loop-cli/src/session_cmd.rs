@@ -1,8 +1,11 @@
-//! Plain-text Surface for a shared Runtime. No application bootstrap.
+//! `loop session …`: a plain-text Surface for a shared Runtime. No
+//! application bootstrap.
 use std::path::PathBuf;
 
+/// What `loop session list|new|attach` asked for. With neither `id` nor
+/// `new`, it lists.
 #[derive(Debug, Default)]
-pub struct AttachArgs {
+pub struct SessionArgs {
     pub id: Option<String>,
     pub new: bool,
     pub cwd: Option<PathBuf>,
@@ -14,15 +17,15 @@ pub struct AttachArgs {
 }
 
 #[cfg(not(unix))]
-pub async fn run(_: AttachArgs) -> anyhow::Result<()> {
-    anyhow::bail!("loop attach is unsupported on this platform; Linux and macOS are supported")
+pub async fn run(_: SessionArgs) -> anyhow::Result<()> {
+    anyhow::bail!("`loop session` is unsupported on this platform; Linux and macOS are supported")
 }
 
 #[cfg(unix)]
 pub use unix::{connect, drive, AttachClient, Input, Terminal};
 
 #[cfg(unix)]
-pub async fn run(args: AttachArgs) -> anyhow::Result<()> {
+pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
     let mut terminal = unix::StdioTerminal::new()?;
     let socket = match args.socket.clone() {
         Some(socket) => socket,
@@ -32,7 +35,7 @@ pub async fn run(args: AttachArgs) -> anyhow::Result<()> {
         .await
         .map_err(|e| {
             anyhow::anyhow!(
-                "Cannot connect to Runtime at {}: {e}. Start one with `loop serve`.",
+                "Cannot connect to Runtime at {}: {e}. Start one with `loop runtime start`.",
                 socket.display()
             )
         })?;
@@ -219,7 +222,7 @@ mod unix {
         let backend = match RemoteBackend::connect(
             Transport { incoming, outgoing },
             PeerInfo {
-                name: "loop attach".into(),
+                name: "loop session".into(),
                 version: env!("CARGO_PKG_VERSION").into(),
             },
             Arc::new(Host(events_tx)),
@@ -238,7 +241,7 @@ mod unix {
     fn list_text(sessions: &mut [SessionInfo]) -> String {
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
         if sessions.is_empty() {
-            return "No Sessions. Use `loop attach --new` to create one.\n".into();
+            return "No Sessions. Use `loop session new` to create one.\n".into();
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -448,10 +451,10 @@ mod unix {
         )
     }
 
-    /// The lease refusal suggests `loop attach`, which is what just failed.
+    /// The lease refusal suggests `loop session attach`, which is what just failed.
     fn load_error(error: loop_protocol::BackendError) -> anyhow::Error {
         let text = error.to_string();
-        match text.split_once(" Use `loop attach") {
+        match text.split_once(" Use `loop session attach") {
             Some((held, _)) if text.contains(" is in use by ") => anyhow::anyhow!(
                 "{held} Close it there, or wait until that process has exited for 30 s, then attach again."
             ),
@@ -462,7 +465,7 @@ mod unix {
     pub async fn drive(
         client: AttachClient,
         mut events: mpsc::UnboundedReceiver<HostEvent>,
-        args: AttachArgs,
+        args: SessionArgs,
         terminal: &mut dyn Terminal,
     ) -> anyhow::Result<()> {
         let backend = client.backend.clone();
@@ -503,7 +506,7 @@ mod unix {
                         ("Sessions", "them")
                     };
                     text.push_str(&format!(
-                        "\n{hidden} closed Subagent {noun} not shown (finished, cancelled or interrupted); `loop attach --all` lists {them}.\n"
+                        "\n{hidden} closed Subagent {noun} not shown (finished, cancelled or interrupted); `loop session list --all` lists {them}.\n"
                     ));
                 }
                 terminal.write(&text)?;
@@ -627,7 +630,7 @@ mod unix {
                             .unwrap_or_else(|| session.clone());
                         if withdrawn.take(|(key, id)| *key == from.key && id == request.id()).is_some() { let _ = reply.send(InteractionOutcome::Cancelled); continue; }
                         if !matches!(request, InteractionRequest::Permission {..} | InteractionRequest::Question {..}) {
-                            let _ = reply.send(InteractionOutcome::Rejected { reason: "loop attach supports choices and text questions".into() }); continue;
+                            let _ = reply.send(InteractionOutcome::Rejected { reason: "loop session attach supports choices and text questions".into() }); continue;
                         }
                         let first_choice = next_choice;
                         next_choice += match &request {

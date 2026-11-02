@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use loop_cli::attach_cmd::{connect, drive, AttachArgs, Input, Terminal};
+use loop_cli::session_cmd::{connect, drive, Input, SessionArgs, Terminal};
 use loop_protocol::{rpc::PeerInfo, AgentBackend, ContentBlock, SessionSpec};
 use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
 use std::{
@@ -133,7 +133,7 @@ async fn list_and_ambiguous_prefix_show_session_details_newest_first() {
             let result = drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: id.clone(),
                     ..Default::default()
                 },
@@ -192,7 +192,7 @@ async fn attach_renders_replay_then_live_and_typed_line_becomes_prompt() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key[..8].into()),
                     ..Default::default()
                 },
@@ -244,7 +244,7 @@ async fn new_session_uses_cwd_and_eof_only_detaches() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 new: true,
                 cwd: Some(dir.path().into()),
                 ..Default::default()
@@ -292,7 +292,7 @@ async fn no_runtime_explains_how_to_start_one_without_bootstrap() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let dir = tempfile::tempdir().unwrap();
         let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_loop"))
-            .args(["attach", "--socket"])
+            .args(["session", "list", "--socket"])
             .arg(dir.path().join("missing.sock"))
             .env("LOOP_CODING_AGENT_DIR", dir.path().join("agent"))
             .stdin(std::process::Stdio::null())
@@ -301,7 +301,7 @@ async fn no_runtime_explains_how_to_start_one_without_bootstrap() {
             .await
             .unwrap();
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("loop serve"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("loop runtime start"));
         assert!(!dir.path().join("agent").exists());
     })
     .await
@@ -328,7 +328,7 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
         let served = serve(rt.clone(), loop_wire::transport::Transport { incoming, outgoing: server.outgoing });
         let (backend, events) = connect(client).await.unwrap(); let (tx, mut terminal, output) = script();
         let key = session.key.to_string();
-        let task = tokio::spawn(async move { drive(backend, events, AttachArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
+        let task = tokio::spawn(async move { drive(backend, events, SessionArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
         wait_text(&output, "replayed").await;
         let request = |rpc_id: u64, id: &str| serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
             "session":session, "kind":"permission", "id":id,
@@ -387,7 +387,7 @@ async fn immediate_eof_renders_the_complete_replay_before_detaching() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -479,7 +479,7 @@ async fn eof_detaches_without_stopping_a_running_turn() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -540,7 +540,7 @@ async fn connection_loss_reports_error_and_leaves_the_session_running() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(id),
                     ..Default::default()
                 },
@@ -599,7 +599,7 @@ async fn buffered_withdrawn_answer_never_answers_the_next_request_or_becomes_a_p
             let (backend, events) = connect(client).await.unwrap(); let (tx, script, output) = script();
             let (enable, enabled) = tokio::sync::watch::channel(false); let mut terminal = PausedInput { script, enabled };
             let key = session.key.to_string();
-            let task = tokio::spawn(async move { drive(backend, events, AttachArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
+            let task = tokio::spawn(async move { drive(backend, events, SessionArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
             let approval = |rpc_id: u64, id: &str| serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
                 "session": session, "kind":"permission", "id":id,
                 "options":[{"native_id":"allow", "label":id, "kind_hint":"allow_once"}]
@@ -658,7 +658,7 @@ async fn runtime_loss_after_detach_request_closes_locally_without_a_shutdown_rpc
         let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: server_incoming, outgoing: server.outgoing });
         let (backend, events) = connect(loop_wire::transport::Transport { incoming, outgoing: client.outgoing }).await.unwrap();
         let (tx, mut terminal, _) = script(); tx.send(Input::Eof).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), drive(backend, events, AttachArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
+        let result = tokio::time::timeout(Duration::from_secs(3), drive(backend, events, SessionArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
         assert!(result.is_err());
         tokio::time::timeout(Duration::from_secs(1), closed.notified()).await.expect("local transport stayed open");
         assert!(!messages.lock().unwrap().iter().any(|m| m["method"] == "shutdown"));
@@ -719,7 +719,7 @@ async fn interrupts_cancel_and_detach_before_gated_replay_finishes() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key),
                     ..Default::default()
                 },
@@ -776,7 +776,7 @@ async fn attaching_to_a_session_held_by_another_loop_says_what_to_do() {
         let error = drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -786,7 +786,7 @@ async fn attaching_to_a_session_held_by_another_loop_says_what_to_do() {
         .unwrap_err()
         .to_string();
         assert!(error.contains("in use"), "{error}");
-        assert!(!error.contains("loop attach"), "circular hint: {error}");
+        assert!(!error.contains("session attach"), "circular hint: {error}");
         assert!(error.contains("Close it there"), "{error}");
         served.done.await.unwrap();
         rt.shutdown().await;
@@ -829,7 +829,7 @@ async fn attach_shows_tool_calls_and_starts_each_message_on_its_own_line() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -892,7 +892,7 @@ async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key),
                     ..Default::default()
                 },
@@ -1003,7 +1003,7 @@ async fn a_slow_session_list_never_delays_a_subagents_escalation() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key),
                     ..Default::default()
                 },
@@ -1068,7 +1068,7 @@ async fn json_listing_prints_every_session_as_session_info() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 json: true,
                 ..Default::default()
             },

@@ -305,6 +305,12 @@ async fn handle(
         methods::SESSION_LIST if runtime.is_some() => {
             runtime.unwrap().list().await.map(|l| to_value(&l))
         }
+        methods::RUNTIME_STATUS if runtime.is_some() => {
+            runtime.unwrap().status().await.map(|s| to_value(&s))
+        }
+        methods::RUNTIME_STOP if runtime.is_some() => {
+            runtime.unwrap().stop().await.map(|()| json!({}))
+        }
         methods::SESSION_CLOSE if runtime.is_some() => match parse::<CloseParams>(params) {
             Ok(CloseParams { session, force }) => runtime
                 .unwrap()

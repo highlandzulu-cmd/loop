@@ -235,6 +235,24 @@ fn session_control_wire_and_defaults() {
 }
 
 #[test]
+fn runtime_status_wire() {
+    use loop_protocol::rpc::RuntimeStatus;
+    roundtrip(
+        &RuntimeStatus {
+            pid: 42,
+            socket: "/a/run/runtime.sock".into(),
+            generation: 3,
+            loaded: 2,
+            busy: 1,
+            max_sessions: 16,
+            max_active_turns: 8,
+        },
+        json!({"pid":42,"socket":"/a/run/runtime.sock","generation":3,"loaded":2,"busy":1,
+            "max_sessions":16,"max_active_turns":8}),
+    );
+}
+
+#[test]
 fn runtime_capabilities_are_opt_in() {
     let old: Capabilities = serde_json::from_value(json!({"usage":true,"future":true})).unwrap();
     assert!(!old.multi_session);

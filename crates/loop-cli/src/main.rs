@@ -103,27 +103,13 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Watch a Runtime Session, or list Sessions when no id is given.
-    Attach {
-        /// Session id or unique prefix.
-        #[arg(conflicts_with = "new")]
-        id: Option<String>,
-        /// Create a Session before attaching.
-        #[arg(long)]
-        new: bool,
-        /// Working directory for a new Session.
-        #[arg(long)]
-        cwd: Option<PathBuf>,
-        /// Runtime socket path.
-        #[arg(long)]
-        socket: Option<PathBuf>,
-        /// Also list finished Subagent Sessions.
-        #[arg(long, conflicts_with_all = ["id", "new"])]
-        all: bool,
-        /// Print every Session, closed Subagents included, as JSON.
-        #[arg(long, conflicts_with_all = ["id", "new"])]
-        json: bool,
-    },
+    /// Run, stop or check the Runtime: one process that holds many Sessions
+    /// and serves them over a local socket.
+    #[command(subcommand)]
+    Runtime(RuntimeCommand),
+    /// List, create, watch or close the Runtime's Sessions.
+    #[command(subcommand)]
+    Session(SessionCommand),
     /// Show config directory paths.
     Config,
     /// Print version (same as --version).
@@ -147,13 +133,18 @@ enum Commands {
     /// Show usage (tokens, models, tools, agents, sessions) in the terminal.
     #[cfg(feature = "usage")]
     Usage,
-    /// Run the Runtime: one process that holds many Sessions and serves them
-    /// over a local socket. Never reads stdin or prompts.
+}
+
+#[derive(Debug, Subcommand)]
+enum RuntimeCommand {
+    /// Run the Runtime in the foreground until Ctrl+C, SIGTERM or
+    /// `loop runtime stop`. Never reads stdin or prompts.
     ///
     /// Folders without recorded trust get global settings only. Use the
     /// global `--permission-mode` flag to choose a mode; `full-access` takes
-    /// effect only through that flag, never from settings.
-    Serve {
+    /// effect only through that flag, never from settings. The global
+    /// `--cwd` sets the folder for Sessions that name none.
+    Start {
         /// Socket path (default: `run/runtime.sock` in the agent directory).
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -163,6 +154,57 @@ enum Commands {
         /// Most turns running at once; further turns queue.
         #[arg(long, default_value_t = 8)]
         max_active_turns: usize,
+    },
+    /// Ask the running Runtime to stop, through its socket, and wait up to
+    /// 10 s for it to go. Never signals a process.
+    Stop {
+        /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Show whether a Runtime is running and how many Sessions it holds.
+    /// Exits 0 when one is running and 1 when not.
+    Status {
+        /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        /// Print the status as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SessionCommand {
+    /// List the Runtime's Sessions.
+    List {
+        /// Also list closed Subagent Sessions.
+        #[arg(long)]
+        all: bool,
+        /// Print every Session, closed Subagents included, as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Create a Session and attach to it. Ctrl+D detaches.
+    New {
+        /// Working directory for the Session (default: the current folder).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Replay a Session and follow it live. Ctrl+D detaches; the Session
+    /// keeps running.
+    Attach {
+        /// Session id or unique prefix.
+        id: String,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 }
 
@@ -260,42 +302,59 @@ async fn real_main() -> anyhow::Result<()> {
                 tokio::task::block_in_place(|| loop_dashboard::run(options))?;
                 return Ok(());
             }
-            Commands::Attach {
-                id,
-                new,
-                cwd,
-                socket,
-                all,
-                json,
-            } => {
-                return loop_cli::attach_cmd::run(loop_cli::attach_cmd::AttachArgs {
-                    id: id.clone(),
-                    new: *new,
-                    cwd: cwd.clone().or(cli.cwd.clone()),
-                    socket: socket.clone(),
-                    all: *all,
-                    json: *json,
-                })
-                .await;
-            }
-            Commands::Serve {
-                socket,
-                max_sessions,
-                max_active_turns,
-            } => {
-                // Before bootstrap: no stdin, no trust prompt, no TUI.
-                let cwd = match &cli.cwd {
-                    Some(cwd) => std::path::absolute(cwd)?,
-                    None => std::env::current_dir()?,
+            // Before bootstrap: no stdin, no trust prompt, no TUI.
+            Commands::Runtime(command) => {
+                use loop_cli::runtime_cmd;
+                return match command {
+                    RuntimeCommand::Start {
+                        socket,
+                        max_sessions,
+                        max_active_turns,
+                    } => {
+                        let cwd = match &cli.cwd {
+                            Some(cwd) => std::path::absolute(cwd)?,
+                            None => std::env::current_dir()?,
+                        };
+                        runtime_cmd::start(runtime_cmd::StartArgs {
+                            socket: socket.clone(),
+                            max_sessions: *max_sessions,
+                            max_active_turns: *max_active_turns,
+                            permission_mode: cli.permission_mode.clone(),
+                            cwd,
+                        })
+                        .await
+                    }
+                    RuntimeCommand::Stop { socket } => runtime_cmd::stop(socket.clone()).await,
+                    RuntimeCommand::Status { socket, json } => {
+                        if !runtime_cmd::status(socket.clone(), *json).await? {
+                            std::process::exit(1);
+                        }
+                        Ok(())
+                    }
                 };
-                return loop_cli::serve_cmd::run(loop_cli::serve_cmd::ServeArgs {
-                    socket: socket.clone(),
-                    max_sessions: *max_sessions,
-                    max_active_turns: *max_active_turns,
-                    permission_mode: cli.permission_mode.clone(),
-                    cwd,
-                })
-                .await;
+            }
+            Commands::Session(command) => {
+                use loop_cli::session_cmd::{run, SessionArgs};
+                let args = match command {
+                    SessionCommand::List { all, json, socket } => SessionArgs {
+                        socket: socket.clone(),
+                        all: *all,
+                        json: *json,
+                        ..Default::default()
+                    },
+                    SessionCommand::New { cwd, socket } => SessionArgs {
+                        new: true,
+                        cwd: cwd.clone().or(cli.cwd.clone()),
+                        socket: socket.clone(),
+                        ..Default::default()
+                    },
+                    SessionCommand::Attach { id, socket } => SessionArgs {
+                        id: Some(id.clone()),
+                        socket: socket.clone(),
+                        ..Default::default()
+                    },
+                };
+                return run(args).await;
             }
             _ => (),
         }
@@ -462,82 +521,44 @@ async fn real_main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn attach_parses_and_rejects_conflicting_selection() {
-        for args in [
-            vec!["loop", "attach"],
-            vec!["loop", "attach", "abc"],
-            vec![
-                "loop",
-                "attach",
-                "--new",
-                "--cwd",
-                "/tmp",
-                "--socket",
-                "/tmp/r.sock",
-            ],
-        ] {
-            assert!(Cli::try_parse_from(args).is_ok());
-        }
-        let cli = Cli::try_parse_from([
-            "loop",
-            "attach",
-            "--new",
-            "--cwd",
-            "/tmp",
-            "--socket",
-            "/tmp/r.sock",
-        ])
-        .unwrap();
-        let Some(Commands::Attach {
-            new, cwd, socket, ..
-        }) = cli.command
-        else {
-            panic!("not attach")
-        };
-        assert!(new);
-        assert_eq!(cwd, Some(PathBuf::from("/tmp")));
-        assert_eq!(socket, Some(PathBuf::from("/tmp/r.sock")));
-        assert!(Cli::try_parse_from(["loop", "attach", "abc", "--new"]).is_err());
-        let cli = Cli::try_parse_from(["loop", "attach", "--all"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Attach { all: true, .. })
-        ));
-        assert!(Cli::try_parse_from(["loop", "attach", "abc", "--all"]).is_err());
-        let cli = Cli::try_parse_from(["loop", "attach", "--json"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Attach { json: true, .. })
-        ));
-        assert!(Cli::try_parse_from(["loop", "attach", "--new", "--json"]).is_err());
-        let cli = Cli::try_parse_from(["loop", "attach"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Attach {
-                id: None,
-                new: false,
-                socket: None,
-                ..
-            })
-        ));
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).unwrap_or_else(|e| panic!("{args:?}: {e}"))
     }
 
     #[test]
-    fn serve_parses_with_defaults_and_flags() {
-        let cli = Cli::try_parse_from(["loop", "serve"]).unwrap();
-        let Some(Commands::Serve {
+    fn the_command_tree_is_valid() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn serve_and_attach_are_gone() {
+        for args in [
+            &["loop", "serve"][..],
+            &["loop", "attach"],
+            &["loop", "attach", "abc"],
+            &["loop", "attach", "--new"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?} still parses");
+        }
+    }
+
+    #[test]
+    fn runtime_subcommands_parse() {
+        let cli = parse(&["loop", "runtime", "start"]);
+        let Some(Commands::Runtime(RuntimeCommand::Start {
             socket,
             max_sessions,
             max_active_turns,
-        }) = cli.command
+        })) = cli.command
         else {
-            panic!("not serve")
+            panic!("not runtime start")
         };
         assert_eq!((socket, max_sessions, max_active_turns), (None, 16, 8));
-        let cli = Cli::try_parse_from([
+        let cli = parse(&[
             "loop",
-            "serve",
+            "runtime",
+            "start",
             "--socket",
             "/tmp/x.sock",
             "--max-sessions",
@@ -546,27 +567,80 @@ mod tests {
             "2",
             "--permission-mode",
             "full-access",
-        ])
-        .unwrap();
+            "--cwd",
+            "/work",
+        ]);
         assert_eq!(cli.permission_mode.as_deref(), Some("full-access"));
-        let Some(Commands::Serve {
+        assert_eq!(cli.cwd, Some(PathBuf::from("/work")));
+        let Some(Commands::Runtime(RuntimeCommand::Start {
             socket,
             max_sessions,
             max_active_turns,
-        }) = cli.command
+        })) = cli.command
         else {
-            panic!("not serve")
+            panic!("not runtime start")
         };
         assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
         assert_eq!((max_sessions, max_active_turns), (3, 2));
+        let cli = parse(&["loop", "runtime", "stop", "--socket", "/tmp/x.sock"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime(RuntimeCommand::Stop { socket: Some(_) }))
+        ));
+        let cli = parse(&["loop", "runtime", "status", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Runtime(RuntimeCommand::Status {
+                json: true,
+                socket: None
+            }))
+        ));
+        assert!(Cli::try_parse_from(["loop", "runtime"]).is_err());
     }
 
     #[test]
-    fn serve_help_describes_the_command() {
+    fn session_subcommands_parse() {
+        let cli = parse(&["loop", "session", "list", "--all", "--json"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session(SessionCommand::List {
+                all: true,
+                json: true,
+                socket: None
+            }))
+        ));
+        let cli = parse(&[
+            "loop",
+            "session",
+            "new",
+            "--cwd",
+            "/tmp",
+            "--socket",
+            "/tmp/r.sock",
+        ]);
+        let Some(Commands::Session(SessionCommand::New { cwd, socket })) = cli.command else {
+            panic!("not session new")
+        };
+        assert_eq!(cwd, Some(PathBuf::from("/tmp")));
+        assert_eq!(socket, Some(PathBuf::from("/tmp/r.sock")));
+        let cli = parse(&["loop", "session", "attach", "abc"]);
+        let Some(Commands::Session(SessionCommand::Attach { id, .. })) = cli.command else {
+            panic!("not session attach")
+        };
+        assert_eq!(id, "abc");
+        assert!(Cli::try_parse_from(["loop", "session", "attach"]).is_err());
+        assert!(Cli::try_parse_from(["loop", "session", "new", "abc"]).is_err());
+        assert!(Cli::try_parse_from(["loop", "session"]).is_err());
+    }
+
+    #[test]
+    fn runtime_start_help_describes_the_command() {
         use clap::CommandFactory;
         let mut cmd = Cli::command();
         let help = cmd
-            .find_subcommand_mut("serve")
+            .find_subcommand_mut("runtime")
+            .unwrap()
+            .find_subcommand_mut("start")
             .unwrap()
             .render_long_help()
             .to_string();

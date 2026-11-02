@@ -1,5 +1,5 @@
 #![cfg(unix)]
-//! Runtime end to end: the real `loop serve` and `loop attach` binaries against
+//! Runtime end to end: the real `loop runtime start` and `loop session` binaries against
 //! a fake OpenAI-compatible model, with isolated agent and Session directories.
 
 use loop_protocol::{
@@ -286,14 +286,17 @@ impl Fixture {
         self.serve_with(&[]).await
     }
     async fn serve_with(&self, extra: &[&str]) -> Proc {
-        let mut args = vec!["serve", "--permission-mode", "ask"];
+        let mut args = vec!["runtime", "start", "--permission-mode", "ask"];
         args.extend_from_slice(extra);
         let mut serve = Proc::spawn(self.command(&args));
         // After `kill -9` the old socket file remains; wait for a real listener.
         let ready = async {
             loop {
                 if let Some(status) = serve.child.try_wait().unwrap() {
-                    panic!("loop serve exited early: {status}\n{}", serve.output());
+                    panic!(
+                        "loop runtime start exited early: {status}\n{}",
+                        serve.output()
+                    );
                 }
                 if tokio::net::UnixStream::connect(&self.socket).await.is_ok() {
                     return;
@@ -306,21 +309,21 @@ impl Fixture {
             .unwrap_or_else(|_| panic!("Runtime never listened\n{}", serve.output()));
         serve
     }
-    fn attach(&self, args: &[&str]) -> Proc {
-        let mut all = vec!["attach"];
+    fn session(&self, args: &[&str]) -> Proc {
+        let mut all = vec!["session"];
         all.extend_from_slice(args);
         Proc::spawn(self.command(&all))
     }
-    /// The only Session's id, from `loop attach` listing.
+    /// The only Session's id, from `loop session list --json`.
     async fn only_session(&self) -> String {
-        let listing = self.attach(&["--json"]).finish().await;
+        let listing = self.session(&["list", "--json"]).finish().await;
         let sessions = sessions(&listing);
         assert_eq!(sessions.len(), 1, "{listing}");
         sessions[0].r#ref.key.to_string()
     }
     /// The id of the only Session without a parent.
     async fn only_parent(&self) -> String {
-        let listing = self.attach(&["--json"]).finish().await;
+        let listing = self.session(&["list", "--json"]).finish().await;
         let roots: Vec<_> = sessions(&listing)
             .into_iter()
             .filter(|s| s.parent.is_none())
@@ -415,7 +418,7 @@ impl Proc {
             .unwrap();
         stdin.flush().await.unwrap();
     }
-    /// Close stdin (detach for `loop attach`) and return the full output.
+    /// Close stdin (detach for `loop session attach`) and return the full output.
     async fn finish(mut self) -> String {
         self.stdin.take();
         let status = tokio::time::timeout(WAIT, self.child.wait())
@@ -438,7 +441,7 @@ impl Proc {
         self.signal("-TERM");
         let status = tokio::time::timeout(WAIT, self.child.wait())
             .await
-            .expect("loop serve did not stop")
+            .expect("loop runtime start did not stop")
             .unwrap();
         assert!(status.success(), "{status}\n{}", self.output());
     }
@@ -460,8 +463,8 @@ async fn two_clients_drive_two_sessions_independently() {
         let fx = Fixture::new();
         let serve = fx.serve().await;
         let work = fx.work.to_str().unwrap();
-        let mut a = fx.attach(&["--new", "--cwd", work]);
-        let mut b = fx.attach(&["--new", "--cwd", work]);
+        let mut a = fx.session(&["new", "--cwd", work]);
+        let mut b = fx.session(&["new", "--cwd", work]);
         a.line("say alpha").await;
         b.line("say beta").await;
         a.wait_text("reply alpha").await;
@@ -471,7 +474,7 @@ async fn two_clients_drive_two_sessions_independently() {
         assert!(!b.contains("reply alpha"), "{b}");
 
         // Detaching does not close either Session.
-        let listing = fx.attach(&[]).finish().await;
+        let listing = fx.session(&["list"]).finish().await;
         assert_eq!(listing.lines().count(), 3, "{listing}");
         serve.stop().await;
     })
@@ -573,7 +576,7 @@ async fn approval_parked_without_clients_is_answered_by_one_of_two_surfaces() {
         let work = fx.work.to_str().unwrap();
 
         // Start a turn, then detach before the model asks for approval.
-        let mut starter = fx.attach(&["--new", "--cwd", work]);
+        let mut starter = fx.session(&["new", "--cwd", work]);
         starter.line("NEEDS-APPROVAL GATED").await;
         fx.gate.arrived().await;
         starter.finish().await;
@@ -590,8 +593,8 @@ async fn approval_parked_without_clients_is_answered_by_one_of_two_surfaces() {
 
         // Both Surfaces receive the parked Escalation; one answers.
         let id = fx.only_session().await;
-        let mut b = fx.attach(&[&id]);
-        let c = fx.attach(&[&id]);
+        let mut b = fx.session(&["attach", &id]);
+        let c = fx.session(&["attach", &id]);
         b.wait_text("Escalation:").await;
         c.wait_text("Escalation:").await;
         b.line("1").await;
@@ -624,7 +627,7 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
         let work = fx.work.to_str().unwrap();
 
         // Mid-turn: the tool call waits for approval.
-        let mut surface = fx.attach(&["--new", "--cwd", work]);
+        let mut surface = fx.session(&["new", "--cwd", work]);
         surface.line("NEEDS-APPROVAL").await;
         surface.wait_text("Escalation:").await;
         let id = fx.only_session().await;
@@ -634,7 +637,7 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
         surface.stdin.take();
         let status = tokio::time::timeout(WAIT, surface.child.wait())
             .await
-            .expect("loop attach did not notice the lost Runtime")
+            .expect("loop session attach did not notice the lost Runtime")
             .unwrap();
         assert!(!status.success(), "{}", surface.output());
         assert!(surface.output().contains("Lost contact with Runtime"));
@@ -647,7 +650,7 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
             )
             .await;
 
-        let mut surface = fx.attach(&[&id]);
+        let mut surface = fx.session(&["attach", &id]);
         surface.wait_text("uncertain — Runtime restarted").await;
         surface.line("say again").await;
         surface.wait_text("reply again").await;
@@ -771,7 +774,7 @@ async fn wait_events(
     .await
     .unwrap_or_else(|_| panic!("never saw {what}"));
 }
-/// Sessions from `loop attach --json`.
+/// Sessions from `loop session list --json`.
 fn sessions(listing: &str) -> Vec<loop_protocol::rpc::SessionInfo> {
     serde_json::from_str(listing).unwrap_or_else(|e| panic!("{e}: {listing}"))
 }
@@ -790,7 +793,7 @@ async fn a_parent_runs_two_subagents_in_parallel_and_gets_both_answers() {
         let fx = Fixture::new();
         let serve = fx.serve().await;
         let work = fx.work.to_str().unwrap();
-        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        let mut parent = fx.session(&["new", "--cwd", work]);
         parent.line("SPAWN2").await;
         parent.wait_text("tool done").await;
         parent.finish().await;
@@ -819,13 +822,13 @@ async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
         let fx = Fixture::new();
         let serve = fx.serve().await;
         let work = fx.work.to_str().unwrap();
-        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        let mut parent = fx.session(&["new", "--cwd", work]);
         parent.line("SPAWN1 kid").await;
         parent.wait_text("tool done: kid").await;
         parent.finish().await;
 
         // A finished child is closed: hidden unless asked for.
-        let listing = fx.attach(&[]).finish().await;
+        let listing = fx.session(&["list"]).finish().await;
         assert_eq!(listed(&listing), 1, "{listing}");
         assert!(
             listing.contains(
@@ -833,9 +836,9 @@ async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
             ),
             "{listing}"
         );
-        let listing = fx.attach(&["--all"]).finish().await;
+        let listing = fx.session(&["list", "--all"]).finish().await;
         assert_eq!(listed(&listing), 2, "{listing}");
-        let listing = fx.attach(&["--json"]).finish().await;
+        let listing = fx.session(&["list", "--json"]).finish().await;
         let all = sessions(&listing);
         assert_eq!(all.len(), 2, "{listing}");
         let root = all.iter().find(|s| s.parent.is_none()).expect("root");
@@ -843,7 +846,10 @@ async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
         assert_eq!(child.parent.as_ref(), Some(&root.r#ref), "{listing}");
         assert!(!child.live, "{listing}");
         // The child's log stays; attaching replays its answer.
-        let output = fx.attach(&[child.r#ref.key.as_str()]).finish().await;
+        let output = fx
+            .session(&["attach", child.r#ref.key.as_str()])
+            .finish()
+            .await;
         assert!(
             output.starts_with("Replaying finished Subagent Session"),
             "{output}"
@@ -860,7 +866,7 @@ async fn cancelling_the_parent_cascades_and_withdraws_a_parked_child_escalation(
         let fx = Fixture::new();
         let serve = fx.serve().await;
         let work = fx.work.to_str().unwrap();
-        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        let mut parent = fx.session(&["new", "--cwd", work]);
         parent.line("SPAWN-APPROVAL").await;
         let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
         wait_events(&fx, "the child's Escalation", |e| count(e, raised) == 1).await;
@@ -910,7 +916,7 @@ async fn a_surface_watching_the_parent_answers_its_childs_escalation() {
         let fx = Fixture::new();
         let serve = fx.serve().await;
         let work = fx.work.to_str().unwrap();
-        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        let mut parent = fx.session(&["new", "--cwd", work]);
         parent.line("SPAWN-APPROVAL").await;
         parent.wait_text("Escalation from Subagent ").await;
         // The task arrives once the child's name is looked up.
@@ -938,11 +944,11 @@ async fn kill_9_while_a_child_waits_ends_parent_and_child_uncertain_without_retr
         let fx = Fixture::new();
         let serve = fx.serve().await;
         let work = fx.work.to_str().unwrap();
-        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        let mut parent = fx.session(&["new", "--cwd", work]);
         parent.line("SPAWN-APPROVAL").await;
         let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
         wait_events(&fx, "the child's Escalation", |e| count(e, raised) == 1).await;
-        let listing = fx.attach(&["--json"]).finish().await;
+        let listing = fx.session(&["list", "--json"]).finish().await;
         let root = sessions(&listing)
             .into_iter()
             .find(|s| s.parent.is_none())
@@ -977,7 +983,7 @@ async fn kill_9_while_a_child_waits_ends_parent_and_child_uncertain_without_retr
             .map(|e| e.event.session_key.clone())
             .collect();
         assert_eq!(ended.len(), 2, "parent and child each end once");
-        let surface = fx.attach(&[&root]);
+        let surface = fx.session(&["attach", &root]);
         surface.wait_text("uncertain — Runtime restarted").await;
         surface.finish().await;
         // Nothing was retried: no prompt reached the model again.
@@ -995,7 +1001,7 @@ async fn a_finished_child_frees_its_session_slot() {
         // Room for the parent and one child only.
         let serve = fx.serve_with(&["--max-sessions", "2"]).await;
         let work = fx.work.to_str().unwrap();
-        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        let mut parent = fx.session(&["new", "--cwd", work]);
         parent.line("SPAWN1 one").await;
         parent.wait_text("tool done: one").await;
         let first = parent.finish().await;
@@ -1009,7 +1015,7 @@ async fn a_finished_child_frees_its_session_slot() {
         .await
         .expect("parent turn never ended");
         // A second child fits only if the first one's slot was freed.
-        let mut parent = fx.attach(&[&root]);
+        let mut parent = fx.session(&["attach", &root]);
         parent.line("SPAWN1 two").await;
         parent.wait_text("tool done: two").await;
         let output = first + parent.finish().await.as_str();
@@ -1041,7 +1047,7 @@ async fn the_subagent_depth_limit_is_enforced_through_the_binary() {
         let fx = Fixture::new();
         let serve = fx.serve().await;
         let work = fx.work.to_str().unwrap();
-        let mut parent = fx.attach(&["--new", "--cwd", work]);
+        let mut parent = fx.session(&["new", "--cwd", work]);
         // Every level asks for another child; depth 2 is refused.
         parent.line("DEEP").await;
         parent.wait_text("tool done").await;

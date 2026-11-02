@@ -255,6 +255,8 @@ async fn a_v1_client_works_and_unknown_methods_stay_unknown_without_control_body
     assert!(!old.capabilities().multi_session && !old.capabilities().attach);
     assert!(old.list().await.is_err());
     assert!(old.attach(&session, 0).await.is_err());
+    assert!(old.status().await.is_err());
+    assert!(old.stop().await.is_err());
     // A client of a Runtime connection that never uses the new methods too.
     let (new, _s) = connect(&rt).await;
     assert!(new.capabilities().multi_session && new.capabilities().attach);
@@ -301,6 +303,35 @@ async fn detach_stops_updates_and_close_unloads_the_session_body() {
     };
     assert!(client.attach(&missing, 0).await.is_err());
     rt.shutdown().await;
+}
+
+async fn status_counts_loaded_and_busy_sessions_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new())).await;
+    let (client, _s) = connect(&rt).await;
+    let status = client.status().await.unwrap();
+    assert_eq!(status.pid, std::process::id());
+    assert_eq!(status.generation, rt.generation());
+    assert_eq!((status.loaded, status.busy), (0, 0));
+    assert_eq!((status.max_sessions, status.max_active_turns), (16, 8));
+    let a = client.new_session(SessionSpec::default()).await.unwrap();
+    client.new_session(SessionSpec::default()).await.unwrap();
+    assert_eq!(client.status().await.unwrap().loaded, 2);
+    client.close(&a, false).await.unwrap();
+    assert_eq!(client.status().await.unwrap().loaded, 1);
+    // The Runtime alone does not own a process to stop.
+    assert!(client.stop().await.is_err());
+    rt.shutdown().await;
+}
+
+#[tokio::test]
+async fn status_counts_loaded_and_busy_sessions() {
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        status_counts_loaded_and_busy_sessions_body(),
+    )
+    .await
+    .expect("test timed out");
 }
 
 async fn an_observer_is_not_asked_to_answer_body() {

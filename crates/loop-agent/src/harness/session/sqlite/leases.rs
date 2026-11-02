@@ -121,7 +121,7 @@ fn conflict(id: &str, lease: &SessionLease) -> SessionError {
         &lease.identity.owner
     };
     SessionError::Invalid(format!(
-        "Session {id} is in use by {owner} {}. Use `loop attach {id}` instead.",
+        "Session {id} is in use by {owner} {}. Use `loop session attach {id}` instead.",
         lease.identity.pid
     ))
 }

@@ -1050,6 +1050,61 @@
       ],
       "type": "object"
     },
+    "RuntimeStatus": {
+      "description": "`runtime/status` result: the Runtime process and its Session counts.",
+      "properties": {
+        "busy": {
+          "description": "Loaded Sessions with a turn running.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "generation": {
+          "description": "The Runtime generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "loaded": {
+          "description": "Sessions held in memory.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_active_turns": {
+          "description": "Most turns running at once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sessions": {
+          "description": "Most Sessions held at once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pid": {
+          "description": "The Runtime's process id.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "socket": {
+          "description": "The socket this connection reached.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pid",
+        "socket",
+        "generation",
+        "loaded",
+        "busy",
+        "max_sessions",
+        "max_active_turns"
+      ],
+      "type": "object"
+    },
     "SessionInfo": {
       "description": "One Session in the Runtime's list, including closed Sessions.",
       "properties": {
@@ -1990,6 +2045,26 @@
       },
       "result": {
         "$ref": "#/$defs/InitializeResult"
+      }
+    },
+    "runtime/status": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "$ref": "#/$defs/RuntimeStatus"
+      }
+    },
+    "runtime/stop": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
       }
     },
     "session/attach": {

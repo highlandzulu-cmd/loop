@@ -1,4 +1,4 @@
-# The Runtime: `loop serve` and `loop attach`
+# The Runtime: `loop runtime` and `loop session`
 
 The Runtime is one long-running `loop` process that owns your Sessions. Your
 terminal is then only a Surface. You can close it, open another, or watch the
@@ -6,16 +6,17 @@ same Session from two terminals. Work keeps running in the Runtime, which keeps
 an Event Log so any Surface can catch up later.
 
 The Runtime works on **Linux and macOS** only, because it listens on a Unix
-socket. On other platforms `loop serve` and `loop attach` exit with an error.
+socket. On other platforms `loop runtime` and `loop session` exit with an error.
 
 ## Start the Runtime
 
 ```bash
-loop serve
+loop runtime start
 ```
 
-`loop serve` never reads stdin, never asks questions and never starts the TUI.
-It runs in the foreground until you press Ctrl+C or send SIGTERM. To keep it
+`loop runtime start` never reads stdin, never asks questions and never starts
+the TUI. It runs in the foreground until you press Ctrl+C, send SIGTERM or run
+`loop runtime stop`. To keep it
 running after you close the terminal, use your usual tool, such as `nohup`,
 `tmux` or a systemd user unit.
 
@@ -28,14 +29,33 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
 
 Only one Runtime can use an agent directory, or a Session database, at a time.
-A second `loop serve` exits with `a Runtime is already running (pid N)`, or
+A second `loop runtime start` exits with `a Runtime is already running (pid N)`, or
 with `another Runtime already owns the Session database at …` when only the
 Session database is shared.
+
+### Check and stop it
+
+```bash
+loop runtime status          # pid, socket, generation, loaded and busy Sessions
+loop runtime status --json   # the same as one JSON object, for scripts
+loop runtime stop            # ask the Runtime to shut down, then wait for it
+```
+
+Both talk to the Runtime through its socket, and both take `--socket PATH`.
+They never read the pid file or signal a process: a pid file can be stale and
+its pid may now belong to another program.
+
+- `status` exits 0 when a Runtime answers and 1 when none does. With `--json`
+  it prints nothing in that case.
+- `stop` runs the same shutdown as Ctrl+C: every Session is closed and its
+  lease released, then the socket is removed. It waits up to 10 seconds for
+  the socket to go and fails if it is still there. With no Runtime answering
+  it prints `No Runtime running at …` and exits 0.
 
 ### Permissions and trust
 
 - **`full-access`** applies only when you pass `--permission-mode full-access`
-  to `loop serve`. If your settings ask for it, the Runtime uses `ask` and
+  to `loop runtime start`. If your settings ask for it, the Runtime uses `ask` and
   shows a notice.
 - **Deny rules, hooks and Policy limits** still apply in every mode.
 - **Untrusted folders.** The Runtime never shows a trust prompt. In a folder you
@@ -45,12 +65,12 @@ Session database is shared.
 ## Attach a Surface
 
 ```bash
-loop attach                  # list Sessions: id, folder, title, busy, last activity, parent
-loop attach --all            # also list finished Subagent Sessions
-loop attach --json           # every Session as JSON, for scripts
-loop attach 3f2a             # attach to a Session by id or unique id prefix
-loop attach --new            # create a Session in the current folder and attach
-loop attach --new --cwd DIR  # create a Session in DIR and attach
+loop session list               # list Sessions: id, folder, title, busy, last activity, parent
+loop session list --all         # also list finished Subagent Sessions
+loop session list --json        # every Session as JSON, for scripts
+loop session attach 3f2a        # attach to a Session by id or unique id prefix
+loop session new                # create a Session in the current folder and attach
+loop session new --cwd DIR      # create a Session in DIR and attach
 ```
 
 When you attach, the Surface replays the Session's history and then follows it
@@ -64,7 +84,7 @@ cannot prompt it.
 
 The table is for people: columns are aligned with spaces, titles are cut
 short and PARENT shows the first 8 characters of the parent id. Scripts should
-use `loop attach --json`. It prints a JSON array with one `SessionInfo` per
+use `loop session list --json`. It prints a JSON array with one `SessionInfo` per
 Session, closed Subagents included, with full ids and fields `live`, `busy`,
 `parent`, `created_ms` and `last_active_ms`.
 
@@ -89,7 +109,7 @@ An approval is an Escalation: a tool that needs your decision before it runs.
 
 - Every attached Surface sees the request as numbered choices.
 - A Subagent's request also goes to every Surface attached to its parent, or
-  to any Session above it, so watching the parent is enough. `loop attach`
+  to any Session above it, so watching the parent is enough. `loop session attach`
   labels it with the child, for example
   `Escalation from Subagent 1a2b3c4d (check the tests): bash cargo test`.
 - The first valid answer wins. The other Surfaces show
@@ -112,13 +132,13 @@ other process can write to it. The Runtime renews the lease every 5 seconds.
 Opening the same Session in the terminal app is refused:
 
 ```text
-Session <id> is in use by Runtime <pid>. Use `loop attach <id>` instead.
+Session <id> is in use by Runtime <pid>. Use `loop session attach <id>` instead.
 ```
 
 Closing a Session, or stopping the Runtime cleanly, releases its lease. If the
 Runtime was killed, there are two ways to get the Session back:
 
-- **Restart `loop serve`.** It reclaims its old leases straight away.
+- **Restart `loop runtime start`.** It reclaims its old leases straight away.
 - **Use `loop --resume <id>`.** This works once the lease is at least 30
   seconds old and the old Runtime process is gone.
 
@@ -129,11 +149,11 @@ is never taken over.
 
 ## After a crash
 
-When `loop serve` starts, it checks what the previous Runtime left unfinished,
+When `loop runtime start` starts, it checks what the previous Runtime left unfinished,
 before it accepts any Surface:
 
 - **Interrupted turns** get a final turn-end marked `runtime_restarted`.
-  `loop attach` shows it as
+  `loop session attach` shows it as
   `Turn ended uncertain — Runtime restarted`.
   Loop does not know whether that turn's tools ran, so it never retries the
   prompt. Check the work, then send a new prompt.
@@ -141,7 +161,7 @@ before it accepts any Surface:
   is never shown again or applied to a new turn.
 - **Leases** of the old Runtime are reclaimed.
 
-`loop serve` prints what it recovered, for example
+`loop runtime start` prints what it recovered, for example
 `recovered 1 interrupted turn(s), withdrew 1 Escalation(s), reclaimed 1 lease(s)`.
 It prints nothing when there was nothing to recover. Starting it again
 recovers nothing more.
@@ -151,7 +171,7 @@ recovers nothing more.
   finished. It never loads streamed text. A Runtime that ran for a long time
   without a restart still means more records to check on the next start.
 - **Leases that cannot be reclaimed.** If one Session's lease cannot be
-  reclaimed, `loop serve` prints `Runtime recovery: lease of Session <id>: …`
+  reclaimed, `loop runtime start` prints `Runtime recovery: lease of Session <id>: …`
   to stderr and carries on. Attaching to that Session reports the conflict.
 - **What the model sees.** The Session history may not contain the
   interrupted turn at all. Where it does contain a tool call without a result,

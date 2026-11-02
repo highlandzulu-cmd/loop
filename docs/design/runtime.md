@@ -6,14 +6,14 @@ Current-code claims were checked at
 The approved S2 plan is the scope; this is not a report that S2 is built.
 
 Goal: one **Runtime** keeps many **Sessions** working after a **Surface**
-disconnects. `loop serve` owns the Runtime. `loop attach` watches a Session,
+disconnects. `loop runtime start` owns the Runtime. `loop session attach` watches a Session,
 sends prompts and answers an **Escalation**. The **Event Log** records activity
 for views, replay and audit. The first **Subagent** runs as a child Session.
 
 ## 1. Scope and current foundations
 
-S2 supports Linux and macOS. Windows reports that `serve` and `attach` are
-unsupported. Unix socket code is behind `cfg(unix)`.
+S2 supports Linux and macOS. Windows reports that `loop runtime` and `loop session`
+are unsupported. Unix socket code is behind `cfg(unix)`.
 
 Not in S2:
 - the TUI as a Runtime client, `--connect`, and URL or QR remote control (S3);
@@ -84,7 +84,7 @@ The `Models` injection seam lets tests use the faux provider.
 
 `bootstrap` becomes calls into these tiers, with its existing interactive
 adapter. S2.3 preserves standalone behavior. The daemon's non-interactive
-trust and sandbox rules are applied by `serve`, not silently imposed on
+trust and sandbox rules are applied by `loop runtime start`, not silently imposed on
 the existing TUI bootstrap.
 
 ## 3. Runtime routing and limits
@@ -110,7 +110,7 @@ This leaves a route for later ACP backends without adding them in S2.
 The default cap is 16 live Sessions, including children. `--max-sessions`
 sets the cap. Opening beyond it returns `BackendError::Busy`. No idle
 unloading is added. A separate turn semaphore defaults to 8 concurrent
-active turns, configurable with `loop serve --max-active-turns`. Saturation
+active turns, configurable with `loop runtime start --max-active-turns`. Saturation
 queues the turn until a permit is available; it does not return Busy. The
 turn count is not the live-Session count. A Session still accepts only one
 active turn. A parent blocked inside the `subagent` tool releases its permit
@@ -263,7 +263,7 @@ leases immediately, without waiting 30 s.
 The refusal should be actionable:
 
 ```text
-Session <id> is in use by Runtime <pid>. Use `loop attach <id>` instead.
+Session <id> is in use by Runtime <pid>. Use `loop session attach <id>` instead.
 ```
 
 Change `create`, `append_entry` and `delete` from `.transaction()` to
@@ -293,6 +293,8 @@ An unknown method still returns `-32601`.
 | `session/close` | c → s | request | `{session,force?}` → `{}`; force defaults false |
 | `session/attach` | c → s | request | `{session,after_seq?}` → `{latest_seq,generation}`; cursor defaults 0 |
 | `session/detach` | c → s | request | `{session}` → `{}` |
+| `runtime/status` | c → s | request | `{}` → `{pid,socket,generation,loaded,busy,max_sessions,max_active_turns}` |
+| `runtime/stop` | c → s | request | `{}` → `{}`; answered before shutdown starts |
 | `host/interact` | s → c | request | Existing `InteractionRequest` plus optional `session` → existing `InteractionOutcome` |
 | `host/interact_withdrawn` | s → c | notification | `{session,id}` |
 
@@ -438,11 +440,14 @@ has one winner. Reusing process-local `approval-N` ids after restart must
 not let a stale answer resolve a new request; include generation in identity
 or reject responses outside their original connection/request context.
 
-## 9. `loop serve` lifecycle
+## 9. `loop runtime` lifecycle
 
-Add `Commands::Serve { socket, max_sessions, max_active_turns,
-permission_mode }` and dispatch it before interactive bootstrap in `crates/loop-cli/src/main.rs`.
-It never reads stdin or starts a TUI. The invoking process owns the service;
+`Commands::Runtime(RuntimeCommand)` has `start { socket, max_sessions,
+max_active_turns }`, `stop { socket }` and `status { socket, json }`, and is
+dispatched before interactive bootstrap in `crates/loop-cli/src/main.rs`.
+`stop` and `status` use the `runtime/stop` and `runtime/status` methods on the
+socket; they never read the pid file or signal a pid, which may be stale or
+reused. `start` never reads stdin or starts a TUI. The invoking process owns the service;
 backgrounding it does not require an additional daemon-fork protocol.
 
 1. Resolve agent paths. Default socket: `~/.loop/agent/run/runtime.sock`.
@@ -465,12 +470,12 @@ backgrounding it does not require an additional daemon-fork protocol.
    writes under the cwd's `target/debug/logs`.
 6. Open stores, bump generation and recover (§12), then accept connections.
    Each gets its own `serve()` call with `owns_backend: false`.
-7. SIGINT or SIGTERM stops admission and triggers Runtime shutdown. Flush
+7. SIGINT, SIGTERM or `runtime/stop` stops admission and triggers Runtime shutdown. Flush
    the Event Log, release leases, stop sandboxes, remove owned socket/pid
    files and release the file lock. Do not unlink the lock inode while held.
 
 Permission modes use per-workspace settings. `full-access` requires the
-explicit `loop serve --permission-mode full-access` flag; a settings value
+explicit `loop runtime start --permission-mode full-access` flag; a settings value
 alone falls back to `ask` with a notice. Keep deny rules, hooks and Policy
 ceilings. This extends the existing non-interactive rule in
 `crates/loop-app-core/src/runtime.rs`, `startup_permission_mode`.
@@ -485,11 +490,11 @@ share it; different cwds do not. Refuse a Session if its required sandbox
 fails. Today's bootstrap starts it eagerly and falls back to host execution
 on failure; preserve that standalone behavior during S2.3 extraction.
 
-## 10. `loop attach` UX
+## 10. `loop session` UX
 
-`loop attach` connects to the local Runtime using `RemoteBackend`; it does
+`loop session` connects to the local Runtime using `RemoteBackend`; it does
 not bootstrap an agent. With no id, list folder, title, busy state and last
-activity. With `<id|prefix>`, require an unambiguous match, attach from the
+activity (`loop session list`). With `loop session attach <id|prefix>`, require an unambiguous match, attach from the
 chosen cursor, replay output and follow live updates. Show parent links for
 children. Reuse the text rendering in `crates/loop-cli/src/print_mode.rs`.
 
@@ -501,7 +506,7 @@ children. Reuse the text rendering in `crates/loop-cli/src/print_mode.rs`.
 - Reattach after the last processed cursor to continue the view. A fresh
   view can replay from zero. Explain connection loss and uncertain outcomes.
 
-`loop attach --new [--cwd DIR]` creates a Session through `session/new`,
+`loop session new [--cwd DIR]` creates a Session through `session/new`,
 then attaches to it. Without `--cwd`, use the invoking client's cwd. No-id
 listing and Session creation are distinct modes. The list uses
 `SessionInfo.parent` and `last_active_ms` for child links and last activity.
@@ -528,7 +533,7 @@ descendants, including parked Escalations. While blocked inside the tool,
 the parent releases its active-turn permit and re-acquires it before
 continuing (§3). `max_turns` counts model calls in the child, not tool calls.
 It defaults to no limit; a parent may set it for bounded jobs. Children
-remain visible and closeable in `loop attach`. Once the parent has the final answer, the finished child
+remain visible and closeable in `loop session`. Once the parent has the final answer, the finished child
 closes automatically and releases its live-Session slot. Its log stays.
 
 Persist the parent id and log child lifecycle. The existing
@@ -617,7 +622,7 @@ Decisions (maintainer, 2026-11-01):
   and use `global_seq` order. A partial unique index constrains non-null
   Session sequences. `latest_seq` is the last update's `session_seq`.
 - The turn semaphore defaults to 8 concurrent active turns, configurable
-  with `loop serve --max-active-turns`. Saturation queues rather than
+  with `loop runtime start --max-active-turns`. Saturation queues rather than
   returning Busy. A parent blocked inside `subagent` releases its permit
   while waiting and re-acquires it before continuing.
 - Leases renew every 5 s and become stale after 30 s. On startup, holding
@@ -631,10 +636,10 @@ Decisions (maintainer, 2026-11-01):
 - Crash recovery uses the existing turn-end update with new reason
   `runtime_restarted`. S2.5-types pins it in schema and golden tests.
 - `SessionInfo` includes `parent` and `last_active_ms`.
-  `loop attach --new [--cwd DIR]` creates a Session through `session/new`.
+  `loop session new [--cwd DIR]` creates a Session through `session/new`.
 - Subagent `max_turns` counts child model calls and defaults to no limit.
   A parent may bound a job. Parent cancel cascades; depth is limited to 2;
-  children are visible and closeable in `loop attach`. A finished child
+  children are visible and closeable in `loop session`. A finished child
   closes once the parent has its answer, freeing capacity while keeping
   its log.
 - The WebSocket listener requires a bearer token even on loopback,

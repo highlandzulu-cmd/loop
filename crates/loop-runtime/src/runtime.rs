@@ -404,6 +404,24 @@ impl Runtime {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+    /// This process, its limits and how many Sessions are loaded and busy.
+    /// `socket` is empty: the process serving the Runtime fills it in.
+    pub fn status(&self) -> loop_protocol::rpc::RuntimeStatus {
+        let sessions = self.sessions.lock().unwrap();
+        let busy = sessions
+            .values()
+            .filter(|s| s.busy.load(Ordering::Acquire))
+            .count();
+        loop_protocol::rpc::RuntimeStatus {
+            pid: std::process::id(),
+            socket: PathBuf::new(),
+            generation: self.generation,
+            loaded: sessions.len() as u64,
+            busy: busy as u64,
+            max_sessions: self.limits.max_sessions as u64,
+            max_active_turns: self.limits.max_active_turns as u64,
+        }
+    }
     pub fn event_log(&self) -> &Arc<dyn EventLog> {
         &self.log
     }
@@ -442,7 +460,7 @@ impl Runtime {
                 // Reopened alone it would lose its parent's ceiling and depth.
                 return Err(failed(format!(
                     "Session {} is a Subagent of Session {parent}; a Subagent runs only for its \
-                     parent and cannot be reopened. Its Event Log stays readable with `loop attach`.",
+                     parent and cannot be reopened. Its Event Log stays readable with `loop session attach`.",
                     session.native_id
                 )));
             }
@@ -1026,6 +1044,9 @@ impl loop_wire::RuntimeControl for Runtime {
 
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         Runtime::list(self).await
+    }
+    async fn status(&self) -> BackendResult<loop_protocol::rpc::RuntimeStatus> {
+        Ok(Runtime::status(self))
     }
     async fn close(&self, session: &SessionRef, force: bool) -> BackendResult<()> {
         if session.instance != self.instance || session.key.0 != session.native_id {

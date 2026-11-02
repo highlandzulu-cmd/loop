@@ -10,8 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use loop_protocol::rpc::{
     methods, AttachParams, AttachResult, ClientCapabilities, CloseParams, InitializeParams,
-    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody, SessionInfo,
-    SessionParams,
+    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
+    RuntimeStatus, SessionInfo, SessionParams,
 };
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
@@ -128,6 +128,19 @@ impl RemoteBackend {
             self.busy.lock().remove(&session.key);
         }
         Ok(())
+    }
+
+    /// The Runtime process and its Session counts (`runtime/status`).
+    pub async fn status(&self) -> BackendResult<RuntimeStatus> {
+        call(&self.conn, methods::RUNTIME_STATUS, &serde_json::json!({})).await
+    }
+
+    /// Ask the Runtime to shut down (`runtime/stop`). It answers first, then
+    /// closes every connection; send nothing more on this one.
+    pub async fn stop(&self) -> BackendResult<()> {
+        call::<Value>(&self.conn, methods::RUNTIME_STOP, &serde_json::json!({}))
+            .await
+            .map(|_| ())
     }
 
     /// Close a Session; a busy one needs `force`.

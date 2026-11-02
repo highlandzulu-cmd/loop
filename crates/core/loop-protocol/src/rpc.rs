@@ -50,6 +50,13 @@ pub mod methods {
     /// Client → server request: `{}` → `{}`. The server shuts the backend
     /// down and closes the connection.
     pub const SHUTDOWN: &str = "shutdown";
+    /// Client → server request: `{}` → [`super::RuntimeStatus`]. Served only
+    /// by a shared Runtime.
+    pub const RUNTIME_STATUS: &str = "runtime/status";
+    /// Client → server request: `{}` → `{}`. The Runtime answers, then runs
+    /// its normal signal shutdown: it closes every Session, removes its
+    /// socket and exits. Served only by a shared Runtime.
+    pub const RUNTIME_STOP: &str = "runtime/stop";
 }
 
 /// Who is on the other end, for logs. Never used for feature checks.
@@ -129,6 +136,26 @@ pub struct SessionInfo {
     pub created_ms: u64,
     /// Last activity time in milliseconds since the Unix epoch.
     pub last_active_ms: u64,
+}
+
+/// `runtime/status` result: the Runtime process and its Session counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeStatus {
+    /// The Runtime's process id.
+    pub pid: u32,
+    /// The socket this connection reached.
+    pub socket: std::path::PathBuf,
+    /// The Runtime generation.
+    pub generation: u64,
+    /// Sessions held in memory.
+    pub loaded: u64,
+    /// Loaded Sessions with a turn running.
+    pub busy: u64,
+    /// Most Sessions held at once.
+    pub max_sessions: u64,
+    /// Most turns running at once.
+    pub max_active_turns: u64,
 }
 
 /// `session/close` params. Closing a busy Session requires `force`.
@@ -367,6 +394,7 @@ pub fn json_schema() -> Value {
     let session_params = reference(generator.subschema_for::<SessionParams>());
     let session_list = reference(generator.subschema_for::<Vec<SessionInfo>>());
     let close = reference(generator.subschema_for::<CloseParams>());
+    let status = reference(generator.subschema_for::<RuntimeStatus>());
     let attach = reference(generator.subschema_for::<AttachParams>());
     let attached = reference(generator.subschema_for::<AttachResult>());
     let withdrawn = reference(generator.subschema_for::<InteractWithdrawnParams>());
@@ -411,6 +439,8 @@ pub fn json_schema() -> Value {
             methods::HOST_INTERACT: method(down, "request", &interaction, Some(&interaction_outcome)),
             methods::HOST_INTERACT_WITHDRAWN: method(down, "notification", &withdrawn, None),
             methods::SHUTDOWN: method(up, "request", &empty, Some(&empty)),
+            methods::RUNTIME_STATUS: method(up, "request", &empty, Some(&status)),
+            methods::RUNTIME_STOP: method(up, "request", &empty, Some(&empty)),
         },
         "error": error,
         "$defs": generator.definitions(),

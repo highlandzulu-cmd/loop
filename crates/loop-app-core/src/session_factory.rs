@@ -598,7 +598,7 @@ mod lease_tests {
         };
         assert!(
             error.contains(&format!(
-                "Session {id} is in use by Runtime {}. Use `loop attach {id}` instead.",
+                "Session {id} is in use by Runtime {}. Use `loop session attach {id}` instead.",
                 std::process::id()
             )),
             "{error}"

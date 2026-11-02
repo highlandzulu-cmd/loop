@@ -1,10 +1,17 @@
-//! `loop serve`: the Runtime command. Never reads stdin, never prompts, never starts a TUI.
+//! `loop runtime start|stop|status`. `start` runs the Runtime: it never
+//! reads stdin, never prompts and never starts a TUI. `stop` and `status`
+//! talk to it only through its socket, never through the pid file: a pid
+//! file can be stale and a pid can be reused by another process.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
-/// Options of `loop serve`.
+/// How long `loop runtime stop` waits for the socket to disappear.
+pub const STOP_WAIT: Duration = Duration::from_secs(10);
+
+/// Options of `loop runtime start`.
 #[derive(Debug, Clone)]
-pub struct ServeArgs {
+pub struct StartArgs {
     /// Socket path; default is the agent directory's Runtime socket.
     pub socket: Option<PathBuf>,
     /// Most Sessions the Runtime holds at once.
@@ -17,15 +24,31 @@ pub struct ServeArgs {
     pub cwd: PathBuf,
 }
 
-/// Run the Runtime until SIGINT or SIGTERM.
 #[cfg(not(unix))]
-pub async fn run(_args: ServeArgs) -> anyhow::Result<()> {
-    anyhow::bail!("`loop serve` is not supported on this platform (it needs Unix sockets)")
+const UNSUPPORTED: &str =
+    "`loop runtime` is not supported on this platform (it needs Unix sockets); Linux and macOS are supported";
+
+/// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
+#[cfg(not(unix))]
+pub async fn start(_args: StartArgs) -> anyhow::Result<()> {
+    anyhow::bail!(UNSUPPORTED)
 }
 
-/// Run the Runtime until SIGINT or SIGTERM.
+/// Ask the Runtime on `socket` to stop.
+#[cfg(not(unix))]
+pub async fn stop(_socket: Option<PathBuf>) -> anyhow::Result<()> {
+    anyhow::bail!(UNSUPPORTED)
+}
+
+/// Print the Runtime's status. `Ok(false)` when no Runtime answers.
+#[cfg(not(unix))]
+pub async fn status(_socket: Option<PathBuf>, _json: bool) -> anyhow::Result<bool> {
+    anyhow::bail!(UNSUPPORTED)
+}
+
+/// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
 #[cfg(unix)]
-pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
+pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     use anyhow::Context;
     use loop_app_core::{
         config::{paths, Settings},
@@ -124,7 +147,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Runtime recovery failed: {e}"))?;
     if recovered != loop_runtime::Recovery::default() {
         eprintln!(
-            "loop serve: recovered {} interrupted turn(s), withdrew {} Escalation(s), reclaimed {} lease(s)",
+            "loop runtime: recovered {} interrupted turn(s), withdrew {} Escalation(s), reclaimed {} lease(s)",
             recovered.turns_ended, recovered.escalations_withdrawn, recovered.leases_reclaimed
         );
     }
@@ -144,7 +167,13 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         leases_reclaimed = recovered.leases_reclaimed,
         "Runtime listening"
     );
-    eprintln!("loop serve: listening on {}", socket.display());
+    eprintln!("loop runtime: listening on {}", socket.display());
+    let stop = tokio_util::sync::CancellationToken::new();
+    let control: Arc<dyn loop_wire::RuntimeControl> = Arc::new(Control {
+        runtime: runtime.clone(),
+        socket: std::path::absolute(&socket).unwrap_or_else(|_| socket.clone()),
+        stop: stop.clone(),
+    });
 
     let info = PeerInfo {
         name: "loop".into(),
@@ -162,10 +191,14 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
                 }
                 shutdown_ready = true;
             }
+            _ = stop.cancelled() => {
+                tracing::info!("Runtime stop requested over the socket");
+                shutdown_ready = true;
+            }
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => {
                     let backend: Arc<dyn AgentBackend> = runtime.clone();
-                    let control: Arc<dyn loop_wire::RuntimeControl> = runtime.clone();
+                    let control = control.clone();
                     let served = serve_with_control(
                         backend,
                         control,
@@ -201,6 +234,179 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 use std::sync::Arc;
+
+/// The Runtime as one socket serves it: `runtime/status` names this socket
+/// and `runtime/stop` ends the accept loop like a signal does.
+#[cfg(unix)]
+struct Control {
+    runtime: Arc<loop_runtime::Runtime>,
+    socket: PathBuf,
+    stop: tokio_util::sync::CancellationToken,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl loop_wire::RuntimeControl for Control {
+    async fn recipient(
+        &self,
+        session: &loop_protocol::SessionRef,
+        connection: u64,
+        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
+    ) -> loop_protocol::BackendResult<()> {
+        loop_wire::RuntimeControl::recipient(self.runtime.as_ref(), session, connection, recipient)
+            .await
+    }
+    async fn disconnected(&self, connection: u64) {
+        loop_wire::RuntimeControl::disconnected(self.runtime.as_ref(), connection).await
+    }
+    async fn list(&self) -> loop_protocol::BackendResult<Vec<loop_protocol::rpc::SessionInfo>> {
+        loop_wire::RuntimeControl::list(self.runtime.as_ref()).await
+    }
+    async fn close(
+        &self,
+        session: &loop_protocol::SessionRef,
+        force: bool,
+    ) -> loop_protocol::BackendResult<()> {
+        loop_wire::RuntimeControl::close(self.runtime.as_ref(), session, force).await
+    }
+    async fn attach(
+        &self,
+        session: &loop_protocol::SessionRef,
+        after_seq: u64,
+    ) -> loop_protocol::BackendResult<loop_wire::Attachment> {
+        loop_wire::RuntimeControl::attach(self.runtime.as_ref(), session, after_seq).await
+    }
+    async fn status(&self) -> loop_protocol::BackendResult<loop_protocol::rpc::RuntimeStatus> {
+        let mut status = self.runtime.status();
+        status.socket = self.socket.clone();
+        Ok(status)
+    }
+    async fn stop(&self) -> loop_protocol::BackendResult<()> {
+        // Only request it: the accept loop tears down after this answer.
+        self.stop.cancel();
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn socket_or_default(socket: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    match socket {
+        Some(socket) => Ok(socket),
+        None => Ok(crate::config::paths::runtime_socket_path(
+            &crate::config::paths::get_agent_dir(),
+        )?),
+    }
+}
+
+/// A control connection to the Runtime on `socket`, or `None` when nothing
+/// answers there.
+#[cfg(unix)]
+async fn control_client(
+    socket: &std::path::Path,
+) -> anyhow::Result<Option<Arc<loop_wire::RemoteBackend>>> {
+    let Ok(stream) = tokio::net::UnixStream::connect(socket).await else {
+        return Ok(None);
+    };
+    let backend = tokio::time::timeout(
+        Duration::from_secs(5),
+        loop_wire::RemoteBackend::connect(
+            loop_wire::socket::unix(stream),
+            loop_protocol::rpc::PeerInfo {
+                name: "loop runtime".into(),
+                version: env!("CARGO_PKG_VERSION").into(),
+            },
+            Arc::new(NoInteraction),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the Runtime at {} did not answer", socket.display()))??;
+    Ok(Some(backend))
+}
+
+#[cfg(unix)]
+struct NoInteraction;
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl loop_protocol::HostServices for NoInteraction {
+    async fn interact(
+        &self,
+        _: loop_protocol::InteractionRequest,
+    ) -> loop_protocol::InteractionOutcome {
+        loop_protocol::InteractionOutcome::Rejected {
+            reason: "`loop runtime` answers no Escalations".into(),
+        }
+    }
+}
+
+/// Ask the Runtime on `socket` to stop and wait for its socket to go. Never
+/// signals a process: with nothing answering it only says so.
+#[cfg(unix)]
+pub async fn stop(socket: Option<PathBuf>) -> anyhow::Result<()> {
+    let socket = socket_or_default(socket)?;
+    let Some(backend) = control_client(&socket).await? else {
+        println!("No Runtime running at {}.", socket.display());
+        return Ok(());
+    };
+    let pid = backend.status().await.ok().map(|s| s.pid);
+    match backend.stop().await {
+        Ok(()) => {}
+        // The Runtime may close the connection before its answer arrives.
+        Err(loop_protocol::BackendError::Failed(info))
+            if info.category == loop_protocol::ErrorCategory::Network => {}
+        Err(error) => return Err(error.into()),
+    }
+    // No `shutdown` RPC: the Runtime is already closing this connection.
+    drop(backend);
+    let gone = tokio::time::timeout(STOP_WAIT, async {
+        while socket.exists() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .is_ok();
+    if !gone {
+        anyhow::bail!(
+            "the Runtime was asked to stop but its socket {} is still there after {} s; it may still be closing Sessions",
+            socket.display(),
+            STOP_WAIT.as_secs()
+        );
+    }
+    match pid {
+        Some(pid) => println!("Runtime (pid {pid}) stopped."),
+        None => println!("Runtime stopped."),
+    }
+    Ok(())
+}
+
+/// Print the Runtime's status. `Ok(false)` when no Runtime answers.
+#[cfg(unix)]
+pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool> {
+    let socket = socket_or_default(socket)?;
+    let Some(backend) = control_client(&socket).await? else {
+        eprintln!("No Runtime running at {}.", socket.display());
+        return Ok(false);
+    };
+    let status = backend.status().await?;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        loop_protocol::AgentBackend::shutdown(backend.as_ref()),
+    )
+    .await;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status)?);
+    } else {
+        println!(
+            "Runtime running (pid {}, generation {})",
+            status.pid, status.generation
+        );
+        println!("socket:  {}", status.socket.display());
+        println!(
+            "Sessions: {} loaded of {}, {} busy; at most {} turns at once",
+            status.loaded, status.max_sessions, status.busy, status.max_active_turns
+        );
+    }
+    Ok(true)
+}
 
 /// Outcome of the first poll of the shutdown future.
 pub enum Registered<F> {

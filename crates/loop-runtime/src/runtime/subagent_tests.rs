@@ -616,7 +616,7 @@ async fn ask_mode_spawns_without_asking_and_cancel_withdraws_child_escalations()
             ("helper", _) => ready(text("helped")),
             _ => ready(text("done")),
         });
-        // `loop serve` defaults to ask mode; no Surface is attached here.
+        // `loop runtime start` defaults to ask mode; no Surface is attached here.
         let (rt, log, seen) = runtime(dir.path(), "ask", RuntimeLimits::default(), script).await;
         let root = rt.new_session(SessionSpec::default()).await.unwrap();
         assert!(matches!(

@@ -2,8 +2,8 @@
 //! owner, so `loop-wire` does not depend on the Runtime crate.
 
 use async_trait::async_trait;
-use loop_protocol::rpc::SessionInfo;
-use loop_protocol::{BackendResult, SessionRef, UpdateEnvelope};
+use loop_protocol::rpc::{RuntimeStatus, SessionInfo};
+use loop_protocol::{BackendError, BackendResult, ErrorCategory, SessionRef, UpdateEnvelope};
 
 /// A consistent view of one Session's Event Log, for `session/attach`.
 pub struct Attachment {
@@ -40,6 +40,23 @@ pub trait RuntimeControl: Send + Sync {
     /// update committed after the snapshot is delivered live; the overlap is
     /// removed by sequence number.
     async fn attach(&self, session: &SessionRef, after_seq: u64) -> BackendResult<Attachment>;
+    /// The Runtime process and its Session counts (`runtime/status`).
+    async fn status(&self) -> BackendResult<RuntimeStatus> {
+        Err(unsupported("runtime/status"))
+    }
+    /// Ask the process that owns the Runtime to shut down (`runtime/stop`).
+    /// Returns once shutdown is requested, before it runs, so the caller can
+    /// still answer.
+    async fn stop(&self) -> BackendResult<()> {
+        Err(unsupported("runtime/stop"))
+    }
+}
+
+fn unsupported(method: &str) -> BackendError {
+    BackendError::failed(
+        ErrorCategory::Protocol,
+        format!("{method} is not supported by this server"),
+    )
 }
 
 /// An interactive connection that can receive a Session's Escalations.

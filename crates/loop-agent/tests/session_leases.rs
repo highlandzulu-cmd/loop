@@ -52,7 +52,7 @@ async fn acquire_conflicts_and_renew_release_are_fenced() {
     store.acquire_lease(id, &owner).await.unwrap();
     let error = store.check_resume(id).await.unwrap_err().to_string();
     assert!(error.contains(&format!(
-        "Session {id} is in use by Runtime 42. Use `loop attach {id}` instead."
+        "Session {id} is in use by Runtime 42. Use `loop session attach {id}` instead."
     )));
     assert!(store
         .acquire_lease(id, &identity("standalone", 7, 1))
