@@ -564,10 +564,15 @@ async fn release_during_an_active_write_is_fenced_and_reports_errors() {
             let (writer, id) = (writer.clone(), id.clone());
             writes.spawn(async move { writer.append_entry(&id, label(&format!("w{n}"))).await });
         }
-        writer.release_leases().await.unwrap();
+        // Release closes the writer at once; its delete may lose to a write
+        // holding the lock, and then says so, and a repeat finishes it.
+        if let Err(error) = writer.release_leases().await {
+            assert!(error.to_string().contains("locked"), "{error}");
+        }
         while let Some(done) = writes.join_next().await {
             let _ = done.unwrap();
         }
+        writer.release_leases().await.unwrap();
         assert!(base.lease(&id).await.unwrap().is_none());
         assert!(writer.append_entry(&id, label("late")).await.is_err());
 
@@ -582,7 +587,15 @@ async fn release_during_an_active_write_is_fenced_and_reports_errors() {
             .clone();
         let holder = rusqlite::Connection::open(&path).unwrap();
         holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // It fails fast: exit must not hang on a locked database; the
+        // startup sweep removes what is left.
+        let started = std::time::Instant::now();
         let error = locked.release_leases().await.unwrap_err();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "release took {:?}",
+            started.elapsed()
+        );
         assert!(error.to_string().contains("locked"), "{error}");
         holder.execute_batch("ROLLBACK").unwrap();
         assert!(

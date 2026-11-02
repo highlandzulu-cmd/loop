@@ -439,6 +439,10 @@ pub async fn close_standalone_writers() -> Result<(), SessionError> {
     result
 }
 
+/// How long an explicit release waits for a locked database. Short, like
+/// the `Drop` fallback: it runs while the process exits.
+const RELEASE_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// How long the `Drop` fallback waits for a locked database. Short: it may
 /// run while the process exits, with nobody to retry.
 const DROP_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
@@ -495,8 +499,17 @@ impl ResumeLeaseGuard {
         let path = self.store.path.clone();
         let identity = self.identity.clone();
         tokio::task::spawn_blocking(move || {
+            // One short attempt, no retries: this runs on the way out, and a
+            // locked database must not hold up exit. The writer is closed
+            // already; a row left behind expires and the startup sweep
+            // removes it.
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn).map_err(storage)?;
+            conn.busy_timeout(RELEASE_BUSY_TIMEOUT).map_err(storage)?;
+            let tx = rusqlite::Transaction::new_unchecked(
+                &conn,
+                rusqlite::TransactionBehavior::Immediate,
+            )
+            .map_err(storage)?;
             delete_identity_rows(&tx, &identity)?;
             tx.commit().map_err(storage)
         })
