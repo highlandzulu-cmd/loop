@@ -108,6 +108,7 @@ loop runtime status        # is it running, and how many Sessions are loaded
 loop session new           # new Session in this folder, then follow it live
 loop session list          # list Sessions
 loop session attach <id>   # replay a Session and follow it
+loop session close <id>    # unload a Session; its history is kept
 loop runtime stop          # stop the Runtime from another terminal
 ```
 

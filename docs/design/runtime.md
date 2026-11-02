@@ -108,8 +108,9 @@ This leaves a route for later ACP backends without adding them in S2.
   leases and stops workspace resources.
 
 The default cap is 16 live Sessions, including children. `--max-sessions`
-sets the cap. Opening beyond it returns `BackendError::Busy`. No idle
-unloading is added. A separate turn semaphore defaults to 8 concurrent
+sets the cap. Opening a Session at the cap first unloads the least recently
+active Session that nothing needs (see Decisions); only when every loaded
+Session is needed does it return `BackendError::Busy`. A separate turn semaphore defaults to 8 concurrent
 active turns, configurable with `loop runtime start --max-active-turns`. Saturation
 queues the turn until a permit is available; it does not return Busy. The
 turn count is not the live-Session count. A Session still accepts only one
@@ -245,6 +246,8 @@ take a lease. Acquire happens before a harness can write a Session.
 | Release | Delete only the matching owner, pid and generation row |
 | Runtime startup reclaim | Holding the associated `runtime.lock` proves the previous Runtime is dead; reclaim its `owner = "runtime"` leases immediately |
 | Other takeover | Replace only when heartbeat is at least 30 s old **and** the recorded pid is dead; recheck while holding the transaction |
+| Standalone exit | Every exit path ends the turn, waits for its writes, then releases its rows; SIGTERM, SIGHUP and SIGINT too. Release is terminal for that writer |
+| Startup sweep | A new standalone writer, and `loop runtime start`, delete rows whose heartbeat is at least 30 s old **and** whose pid is dead, naming the exact row judged; Runtime rows also need this database's `runtime.lock` |
 
 A live owner is never taken over. Runtime startup reclamation applies only
 to leases in the acquired file lock's ownership domain. Other takeover
@@ -642,6 +645,20 @@ Decisions (maintainer, 2026-11-01):
   children are visible and closeable in `loop session`. A finished child
   closes once the parent has its answer, freeing capacity while keeping
   its log.
+- Updated 2026-11-02, replacing "no idle unloading in S2": at the cap, the
+  Runtime unloads the least recently active Session that nothing needs and
+  logs `SessionClosed{reason: "unloaded"}`. A Session is needed while it is
+  busy or closing, has a parked Escalation, has an attached Surface, is a
+  parent waiting on or running Subagents, or is itself a Subagent (its
+  `subagent` call closes it). A per-Session lifecycle lock, taken by unload,
+  close, prompt admission and attach, makes the choice race-free; a prompt
+  or attach that finds its Session being unloaded loads it again.
+  `BackendError::Busy` stays a unit variant; the CLI explains it from
+  `runtime/status`.
+- 2026-11-02: `loop serve` and `loop attach` became `loop runtime
+  start|stop|status` and `loop session list|new|attach|close`, with no
+  aliases. `stop` and `status` use `runtime/stop` and `runtime/status` on the
+  socket and never signal a pid.
 - The WebSocket listener requires a bearer token even on loopback,
   matching `loop-wire/src/socket.rs`, not the tokenless-loopback HTTP rule
   in `loop-cli/src/mcp_serve.rs`. It stays last and may slip to S3.

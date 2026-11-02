@@ -23,7 +23,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | Flag | Default | Meaning |
 |---|---|---|
 | `--socket PATH` | `~/.loop/agent/run/runtime.sock` | Where Surfaces connect |
-| `--max-sessions N` | 16 | Most Sessions loaded at once |
+| `--max-sessions N` | 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
 | `--max-active-turns N` | 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits` or `full-access` |
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
@@ -71,6 +71,7 @@ loop session list --json        # every Session as JSON, for scripts
 loop session attach 3f2a        # attach to a Session by id or unique id prefix
 loop session new                # create a Session in the current folder and attach
 loop session new --cwd DIR      # create a Session in DIR and attach
+loop session close 3f2a         # unload a Session from the Runtime; its history is kept
 ```
 
 When you attach, the Surface replays the Session's history and then follows it
@@ -102,6 +103,33 @@ Session, closed Subagents included, with full ids and fields `live`, `busy`,
 
 Detaching, or losing the connection, never stops the agent. Attach again to
 continue watching.
+
+## Close and unload Sessions
+
+`loop session close <id>` unloads a Session from the Runtime and releases its
+lease. Nothing is deleted: `loop session attach <id>` loads it again with its
+full history.
+
+- A busy Session is refused, and so is a parent whose Subagents are running.
+  `--force` cancels the turn, and its Subagents, then closes.
+- A Session that is not loaded is reported, and the command succeeds.
+
+The Runtime also unloads Sessions by itself. When `--max-sessions` Sessions
+are loaded and another one is opened, it unloads the least recently active
+Session that nothing needs, and logs it as `unloaded`. A Session is kept
+while any of these is true:
+
+- a turn is running, or it is closing;
+- an approval is waiting;
+- a Surface is attached to it;
+- it is a parent waiting on Subagents, or it is itself a running Subagent.
+
+Prompting or attaching to a Session that was just unloaded loads it again.
+If every loaded Session must be kept, opening another fails with, for example:
+
+```text
+The Runtime is full: all 16 loaded Sessions are busy or watched (limit 16). Close one with `loop session close <id>`, or restart the Runtime with a higher --max-sessions.
+```
 
 ## Approvals
 
@@ -142,6 +170,13 @@ Runtime was killed, there are two ways to get the Session back:
 - **Use `loop --resume <id>`.** This works once the lease is at least 30
   seconds old and the old Runtime process is gone.
 
+A terminal `loop` releases its lease whenever it ends: when you quit, after
+`--print` (whatever its exit code), on an error, and on SIGTERM, SIGHUP or
+Ctrl+C. Only a hard kill (SIGKILL, a crash, power loss) leaves a lease
+behind. The next terminal `loop`, or `loop runtime start`, removes such a
+row once it is at least 30 seconds old and its process is gone. A row whose
+process may still be running is never removed.
+
 The same rule works the other way round. If a terminal `loop` crashed while
 holding a Session, the Runtime loads that Session once the lease is at least
 30 seconds old and that process is gone. A lease whose owner is still running
@@ -159,10 +194,11 @@ before it accepts any Surface:
   prompt. Check the work, then send a new prompt.
 - **Pending approvals** from the old Runtime are withdrawn. An old approval
   is never shown again or applied to a new turn.
-- **Leases** of the old Runtime are reclaimed.
+- **Leases** of the old Runtime are reclaimed, and stale leases of terminal
+  `loop` processes that exited are removed.
 
 `loop runtime start` prints what it recovered, for example
-`recovered 1 interrupted turn(s), withdrew 1 Escalation(s), reclaimed 1 lease(s)`.
+`recovered 1 interrupted turn(s), withdrew 1 Escalation(s), reclaimed 1 lease(s), removed 0 stale lease(s) of exited processes`.
 It prints nothing when there was nothing to recover. Starting it again
 recovers nothing more.
 
