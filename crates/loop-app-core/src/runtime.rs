@@ -128,7 +128,11 @@ impl SessionShutdown {
     /// Stop admission, cancel the current turn and wait (bounded) for it to
     /// finish writing, then release this store's leases. Safe to repeat.
     pub async fn run(&self) -> anyhow::Result<()> {
-        self.harness.request_shutdown();
+        // Requested once per harness: it clears queued work and runs the
+        // `shutdown_requested` hooks, which must not fire again on a repeat.
+        if !self.harness.is_shutting_down() {
+            self.harness.request_shutdown();
+        }
         if tokio::time::timeout(SHUTDOWN_GRACE, self.harness.wait_for_shutdown())
             .await
             .is_err()

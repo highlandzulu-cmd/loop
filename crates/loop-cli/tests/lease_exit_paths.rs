@@ -230,6 +230,20 @@ async fn print_that_succeeds_leaves_no_lease() {
         assert!(out.status.success(), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
         assert_eq!(fx.leases().await, [], "{out:?}");
+        // The shutdown barrier ran before release: the turn is stored.
+        use loop_agent::harness::session::SessionStore;
+        let store = SqliteSessionStore::open(fx.db()).unwrap();
+        let sessions = store.list(None).await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        let entries = store
+            .load(&sessions[0].id)
+            .await
+            .unwrap()
+            .read_entries(None)
+            .await
+            .unwrap();
+        let text = serde_json::to_string(&entries).unwrap();
+        assert!(text.contains("hello") && text.contains("hi"), "{text}");
     })
     .await
 }
