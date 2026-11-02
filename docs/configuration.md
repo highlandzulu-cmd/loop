@@ -34,8 +34,8 @@ Common settings in `settings.json`:
 | `bash.defaultTimeoutMs`, `bash.maxTimeoutMs` | `120000`, `600000` | `bash` time limits; a call may ask for up to the maximum (global only) |
 | `fileEditReview` | `newSession` | Kept for old settings files: with no `permissionMode`, `never` starts in `accept-edits`. Other values change nothing |
 | `sandbox.mode` | `off` | `off` or `local`. The local sandbox runs on Linux (Podman); on macOS it is not available yet |
-| `sandbox.isolation` | platform default | `full` or `partial`. Unset means `full` on Linux and `partial` on macOS. `full` on macOS is an error |
-| `sandbox.runtime` | platform default | `runc`, `crun`, `runsc` or `krun`. Unset means `runc` on Linux. These are Linux container runtimes: setting one on macOS is an error |
+| `sandbox.isolation` | platform default | `full` or `partial`. Unset means `full` on Linux and `partial` on macOS. `full` on macOS is an error. Any other value is an error when `mode` is `local`. A project value overrides the global one only when the project sets it |
+| `sandbox.runtime` | platform default | `runc`, `crun`, `runsc` or `krun`. Unset means `runc` on Linux. These are Linux container runtimes: setting one on macOS is an error. Any other value is an error when `mode` is `local`. A project value overrides the global one only when the project sets it. Older versions saved `"isolation": "full", "runtime": "runc"` into every settings file; exactly that pair is read as unset |
 | `sandbox.network` | `false` | Allow network access from sandboxed commands. Stored for the macOS sandbox; the Linux sandbox does not enforce it yet. A project may turn it off but not on |
 | `sandbox.allowWrite` | empty | Extra paths sandboxed commands may write, such as `~/.cargo`. Stored for the macOS sandbox; the Linux sandbox does not enforce it yet (global only) |
 | `compaction` | enabled | `reserveTokens`, `keepRecentTokens` for `/compact` |

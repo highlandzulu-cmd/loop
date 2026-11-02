@@ -155,6 +155,16 @@ impl SandboxRequest {
                 })
             })
             .transpose()?;
+        // Older builds saved this exact pair into every settings file, whether or
+        // not the user chose it. Read it as unset so it inherits the platform
+        // default (the same values on Linux; no error on macOS).
+        let (isolation, runtime) = if isolation == Some(KrunIsolation::Full)
+            && runtime == Some(LocalSandboxRuntime::Runc)
+        {
+            (None, None)
+        } else {
+            (isolation, runtime)
+        };
         Ok(Self {
             isolation,
             runtime,
@@ -577,6 +587,66 @@ mod tests {
             builder.resolve(&request),
             Err(SandboxBuildError::FullIsolationUnavailable { .. })
         ));
+    }
+
+    fn local_settings(isolation: Option<&str>, runtime: Option<&str>) -> SandboxRequest {
+        SandboxRequest::from_settings(&SandboxSettings {
+            mode: "local".into(),
+            isolation: isolation.map(Into::into),
+            runtime: runtime.map(Into::into),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_full_runc_pair_is_read_as_unset() {
+        let request = local_settings(Some("full"), Some("runc"));
+        assert_eq!(request.isolation, None);
+        assert_eq!(request.runtime, None);
+
+        let mac = builder_with(SandboxPlatform::MacOs, None)
+            .resolve(&request)
+            .unwrap();
+        assert_eq!(mac.label(), "--partial");
+        let linux = builder_with(SandboxPlatform::Linux, None)
+            .resolve(&request)
+            .unwrap();
+        assert_eq!(linux.label(), "--full --runc");
+    }
+
+    #[test]
+    fn only_the_exact_legacy_pair_is_forgiven_on_macos() {
+        let mac = builder_with(SandboxPlatform::MacOs, None);
+        for (isolation, runtime) in [
+            (None, Some("runc")),
+            (Some("full"), None),
+            (Some("full"), Some("krun")),
+            (Some("partial"), Some("runc")),
+            (Some("full"), Some("crun")),
+        ] {
+            let request = local_settings(isolation, runtime);
+            assert!(
+                mac.resolve(&request).is_err(),
+                "{isolation:?} {runtime:?} should be explicit"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_full_runc_still_errors_on_macos() {
+        let mac = builder_with(SandboxPlatform::MacOs, None);
+        let settings = SandboxSettings {
+            mode: "local".into(),
+            isolation: Some("full".into()),
+            runtime: Some("runc".into()),
+            ..Default::default()
+        };
+        for args in [&["--full", "--runc"][..], &["--runc"], &["--full"]] {
+            let request =
+                SandboxRequest::for_flags(&settings, parse_local_sandbox_flags(args).unwrap());
+            assert!(mac.resolve(&request).is_err(), "{args:?}");
+        }
     }
 
     #[test]
