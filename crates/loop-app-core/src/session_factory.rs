@@ -138,16 +138,9 @@ impl WorkspaceResources {
         if let Some(theme) = &opts.theme {
             settings.theme = theme.clone();
         }
-        if settings.sandbox.mode == "local" {
-            settings.sandbox.isolation = KrunIsolation::parse(&settings.sandbox.isolation)
-                .unwrap_or(KrunIsolation::Full)
-                .as_str()
-                .into();
-            settings.sandbox.runtime = LocalSandboxRuntime::parse(&settings.sandbox.runtime)
-                .unwrap_or(LocalSandboxRuntime::Runc)
-                .as_str()
-                .into();
-        } else {
+        // Isolation and runtime stay as the user wrote them, so a later save never
+        // turns an inherited platform default into an explicit choice.
+        if settings.sandbox.mode != "local" {
             settings.sandbox.mode = "off".into();
         }
         let resources = load_resources(&globals.agent_dir, &cwd, project_trusted, &settings);
@@ -219,26 +212,19 @@ impl WorkspaceResources {
                 let (sandbox, tool_env): (SandboxMode, Arc<dyn loop_agent::harness::ExecutionEnv>) =
                     match settings.sandbox.mode.as_str() {
                         "local" => {
-                            let isolation = KrunIsolation::parse(&settings.sandbox.isolation)
-                                .unwrap_or(KrunIsolation::Full);
-                            let oci_runtime = LocalSandboxRuntime::parse(&settings.sandbox.runtime)
-                                .unwrap_or(LocalSandboxRuntime::Runc);
-                            settings.sandbox.isolation = isolation.as_str().into();
-                            settings.sandbox.runtime = oci_runtime.as_str().into();
-                            let sb = KrunSandbox::new(KrunSandbox::config_for(
-                                self.cwd.clone(),
-                                isolation,
-                                oci_runtime,
-                            ));
-                            match sb.start().await {
-                                Ok(()) => {
+                            let builder =
+                                crate::sandbox_builder::SandboxBuilder::for_current_platform();
+                            let started =
+                                match crate::sandbox_builder::SandboxRequest::from_settings(
+                                    &settings.sandbox,
+                                ) {
+                                    Ok(request) => builder.start(&self.cwd, &request).await,
+                                    Err(e) => Err(e),
+                                };
+                            match started {
+                                Ok((sb, _plan)) => {
                                     let env = sb.env();
-                                    (
-                                        SandboxMode::Enabled {
-                                            sandbox: Arc::new(sb),
-                                        },
-                                        env,
-                                    )
+                                    (SandboxMode::Enabled { sandbox: sb }, env)
                                 }
                                 Err(e) => {
                                     if !self.standalone {

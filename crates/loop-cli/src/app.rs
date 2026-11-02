@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 use loop_agent::harness::{
     format_prompt_template_invocation,
     session::{SessionTreeRow, SessionTreeRowKind},
-    KrunSandbox, Sandbox, SandboxMode, SessionForkPoint, SessionForkSelection,
+    SandboxMode, SessionForkPoint, SessionForkSelection,
 };
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, CredentialStore, ModelsRefreshOptions, Usage};
@@ -147,8 +147,13 @@ struct WorkflowDoneOk {
 enum SandboxDoneOk {
     /// Sandbox disabled.
     Off,
-    /// Local sandbox enabled.
-    Local { isolation: String, runtime: String },
+    /// Local sandbox enabled. `isolation` and `runtime` are what the user typed
+    /// (`None` inherits the platform default); `label` is what was started.
+    Local {
+        label: String,
+        isolation: Option<String>,
+        runtime: Option<String>,
+    },
 }
 
 /// Pending accept/reject prompt for a tool call.
@@ -1692,14 +1697,15 @@ async fn drain_ui_events(
                         *status = "ready".into();
                     }
                     Ok(SandboxDoneOk::Local {
+                        label,
                         isolation,
                         runtime: oci,
                     }) => {
                         runtime.settings.sandbox.mode = "local".into();
-                        runtime.settings.sandbox.isolation = isolation.clone();
-                        runtime.settings.sandbox.runtime = oci.clone();
+                        runtime.settings.sandbox.isolation = isolation;
+                        runtime.settings.sandbox.runtime = oci;
                         let _ = runtime.save_settings();
-                        chat.push(sys(format!("sandbox → local --{isolation} --{oci}")));
+                        chat.push(sys(format!("sandbox → local {label}")));
                         *status = "ready".into();
                     }
                     Err(e) => {
@@ -5311,10 +5317,20 @@ async fn apply_effect(
                     return Ok(false);
                 }
                 ["local", rest @ ..] => {
-                    let (isolation, oci_runtime) = match commands::parse_local_sandbox_flags(rest) {
+                    use loop_app_core::sandbox_builder::{SandboxBuilder, SandboxRequest};
+                    let flags = match commands::parse_local_sandbox_flags(rest) {
                         Ok(v) => v,
                         Err(e) => {
                             chat.push(sys(e));
+                            return Ok(false);
+                        }
+                    };
+                    let builder = SandboxBuilder::for_current_platform();
+                    let request = SandboxRequest::for_flags(&runtime.settings.sandbox, flags);
+                    let plan = match builder.resolve(&request) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            chat.push(sys(format!("sandbox: {e}")));
                             return Ok(false);
                         }
                     };
@@ -5324,20 +5340,17 @@ async fn apply_effect(
                     let search = runtime.tool_gate.search_filter();
                     let bash = runtime.bash_limits();
                     let tx = tx.clone();
-                    let iso_s = isolation.as_str().to_string();
-                    let rt_s = oci_runtime.as_str().to_string();
+                    let label = plan.label();
                     *working = true;
-                    *status = format!("enabling sandbox (--{iso_s} --{rt_s})…");
+                    *status = format!("enabling sandbox ({label})…");
                     chat.push(sys(" "));
-                    chat.push(sys(format!("enabling sandbox (--{iso_s} --{rt_s})…")));
+                    chat.push(sys(format!("enabling sandbox ({label})…")));
                     tokio::spawn(async move {
                         let result = async {
-                            let sb = KrunSandbox::new(KrunSandbox::config_for(
-                                cwd,
-                                isolation,
-                                oci_runtime,
-                            ));
-                            sb.start().await.map_err(|e| e.to_string())?;
+                            let (sb, _plan) = builder
+                                .start(&cwd, &request)
+                                .await
+                                .map_err(|e| e.to_string())?;
                             let env = sb.env();
                             if let Err(e) = harness
                                 .set_tools(build_tools(Arc::clone(&env), &web, bash, search))
@@ -5347,13 +5360,12 @@ async fn apply_effect(
                                 return Err(format!("sandbox: {e}"));
                             }
                             harness
-                                .set_sandbox(SandboxMode::Enabled {
-                                    sandbox: Arc::new(sb),
-                                })
+                                .set_sandbox(SandboxMode::Enabled { sandbox: sb })
                                 .await;
                             Ok(SandboxDoneOk::Local {
-                                isolation: iso_s,
-                                runtime: rt_s,
+                                label,
+                                isolation: flags.isolation.map(|i| i.as_str().to_string()),
+                                runtime: flags.runtime.map(|r| r.as_str().to_string()),
                             })
                         }
                         .await;
