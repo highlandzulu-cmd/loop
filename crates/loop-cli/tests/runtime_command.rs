@@ -24,9 +24,11 @@ fn serve(agent: &Path, args: &[&str]) -> Command {
     cmd
 }
 
+/// Wait until the Runtime accepts connections on `path`. The socket file
+/// appears when it is bound, a moment before the Runtime listens.
 async fn wait_for(path: &Path, child: &mut Child) {
     let wait = async {
-        while !path.exists() {
+        while tokio::net::UnixStream::connect(path).await.is_err() {
             if let Some(status) = child.try_wait().unwrap() {
                 panic!("loop runtime start exited early: {status}");
             }
