@@ -286,6 +286,9 @@ pub struct OpenedSession {
     pub selected_model: Option<loop_ai::Model>,
     pub model_note: Option<String>,
     pub startup_notices: Vec<String>,
+    /// The standalone Surface's own Session store, which holds its leases.
+    /// `None` when the Runtime owns ownership (and non-Unix standalone).
+    pub session_store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
 }
 
 impl SessionFactory {
@@ -360,7 +363,7 @@ impl SessionFactory {
 
         // Unix standalone Surfaces own their writer lease; Runtime callers manage
         // ownership separately before opening through the shared repository.
-        let standalone_repository = if workspace.standalone {
+        let (standalone_repository, session_store) = if workspace.standalone {
             let store =
                 loop_agent::harness::session::sqlite::create_sqlite_session_store_for_resume(
                     &globals.sessions_db,
@@ -368,9 +371,12 @@ impl SessionFactory {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
-            Some(create_session_repository(store, None))
+            (
+                Some(create_session_repository(Arc::clone(&store), None)),
+                Some(store),
+            )
         } else {
-            None
+            (None, None)
         };
         let repository = standalone_repository
             .as_ref()
@@ -542,6 +548,7 @@ impl SessionFactory {
             selected_model: model,
             model_note,
             startup_notices,
+            session_store,
         })
     }
 }

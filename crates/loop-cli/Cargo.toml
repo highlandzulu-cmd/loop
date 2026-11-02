@@ -84,6 +84,7 @@ name = "tracing_runtime"
 required-features = ["telemetry"]
 
 [dev-dependencies]
+rusqlite = { workspace = true, features = ["bundled"] }
 tempfile = { workspace = true }
 loop-test-support = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }

@@ -350,6 +350,11 @@ pub async fn run(mut runtime: CliRuntime) -> anyhow::Result<()> {
     // Clear the inline footer so the shell prompt lands cleanly.
     let _ = terminal.clear();
     terminal.show_cursor()?;
+    // This function owns the Runtime: end its work and release the Session
+    // leases before the process exits; nothing after this does it reliably.
+    if let Err(error) = runtime.session_shutdown().run().await {
+        eprintln!("loop: {error:#}");
+    }
 
     match result {
         Ok(Some(session_id)) => {

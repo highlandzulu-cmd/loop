@@ -308,6 +308,24 @@ pub(super) struct ResumeLeaseGuard {
     ids: parking_lot::Mutex<std::collections::HashSet<String>>,
     identity: LeaseIdentity,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
+    /// Set when release begins: from then on the writer is closed.
+    releasing: std::sync::atomic::AtomicBool,
+    /// Set once the rows are gone; `Drop` then has nothing to do.
+    released: std::sync::atomic::AtomicBool,
+}
+
+/// How long the `Drop` fallback waits for a locked database. Short: it may
+/// run while the process exits, with nobody to retry.
+const DROP_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Delete every lease row of this exact identity, fenced against successors.
+fn delete_identity_rows(conn: &Connection, identity: &LeaseIdentity) -> Result<(), SessionError> {
+    conn.execute(
+        "DELETE FROM session_leases WHERE owner=?1 AND pid=?2 AND generation=?3",
+        params![identity.owner, identity.pid, identity.generation],
+    )
+    .map_err(storage)?;
+    Ok(())
 }
 impl ResumeLeaseGuard {
     pub(super) fn track(&self, id: &str) {
@@ -328,21 +346,66 @@ impl ResumeLeaseGuard {
     pub(super) fn failed(&self) -> bool {
         self.cancellation.is_cancelled()
     }
+
+    /// Why a write through this writer is refused.
+    pub(super) fn refusal(&self) -> SessionError {
+        if self.releasing.load(std::sync::atomic::Ordering::Acquire) {
+            SessionError::Invalid("Session leases were released; this writer is closed.".into())
+        } else {
+            SessionError::Invalid(
+                "Session lease renewal failed; stop writing and cancel work.".into(),
+            )
+        }
+    }
+
+    /// Close the writer, then delete its lease rows. Writes already inside
+    /// their transaction finish first; any later one is refused.
+    pub(super) async fn release(&self) -> Result<(), SessionError> {
+        self.releasing
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancellation.cancel();
+        let path = self.store.path.clone();
+        let identity = self.identity.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            delete_identity_rows(&tx, &identity)?;
+            tx.commit().map_err(storage)
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))??;
+        self.ids.lock().clear();
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
 }
 impl Drop for ResumeLeaseGuard {
     fn drop(&mut self) {
-        // Drop cannot await. Release on the blocking pool, fenced against any successor.
+        if self.released.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // A fallback for owners that never called `release`. Drop cannot
+        // await: inside a Tokio runtime, delete on its blocking pool; outside
+        // one, delete now with a short busy timeout.
         let path = self.store.path.clone();
         let identity = self.identity.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || {
-                if let Ok(conn) = open(&path) {
-                    let _ = conn.execute(
-                        "DELETE FROM session_leases WHERE owner=?1 AND pid=?2 AND generation=?3",
-                        params![identity.owner, identity.pid, identity.generation],
-                    );
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    if let Ok(conn) = open(&path) {
+                        let _ = delete_identity_rows(&conn, &identity);
+                    }
+                });
+            }
+            Err(_) => {
+                if let Ok(conn) = Connection::open(&path) {
+                    let _ = conn.busy_timeout(DROP_BUSY_TIMEOUT);
+                    let _ = delete_identity_rows(&conn, &identity);
                 }
-            });
+            }
         }
     }
 }
@@ -393,6 +456,8 @@ impl SqliteSessionStore {
             ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
             identity: identity.clone(),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            releasing: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::atomic::AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&guard);
         tokio::spawn(async move {

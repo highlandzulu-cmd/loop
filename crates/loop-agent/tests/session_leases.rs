@@ -488,3 +488,140 @@ async fn repository_open_and_harness_switch_admit_writers_but_readers_do_not() {
         store.lease(&initial_id).await.unwrap().unwrap().identity
     );
 }
+
+fn label(text: &str) -> PendingSessionWrite {
+    PendingSessionWrite::Label { label: text.into() }
+}
+
+#[tokio::test]
+async fn release_leases_is_terminal_idempotent_and_spares_other_owners() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let base = SqliteSessionStore::open(&path).unwrap();
+        let writer = base.standalone_writer();
+        let a = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let b = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        // Another writer's Session keeps its lease.
+        let other = base.standalone_writer();
+        let c = other
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        writer.append_entry(&a, label("before")).await.unwrap();
+
+        writer.release_leases().await.unwrap();
+        assert!(base.lease(&a).await.unwrap().is_none());
+        assert!(base.lease(&b).await.unwrap().is_none());
+        assert!(base.lease(&c).await.unwrap().is_some());
+        // Terminal: nothing more is written or claimed through it.
+        assert!(writer.append_entry(&a, label("after")).await.is_err());
+        assert!(writer.create(None, None).await.is_err());
+        assert!(writer.open_writer(&a).await.is_err());
+        assert!(base.lease(&a).await.unwrap().is_none());
+        // Idempotent.
+        writer.release_leases().await.unwrap();
+        other.append_entry(&c, label("still mine")).await.unwrap();
+        // A store without leases has nothing to release.
+        base.release_leases().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn release_during_an_active_write_is_fenced_and_reports_errors() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let base = SqliteSessionStore::open(&path).unwrap();
+        let writer = Arc::new(base.standalone_writer());
+        let id = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        // Writes race the release; each either lands before it or is refused.
+        let mut writes = tokio::task::JoinSet::new();
+        for n in 0..20 {
+            let (writer, id) = (writer.clone(), id.clone());
+            writes.spawn(async move { writer.append_entry(&id, label(&format!("w{n}"))).await });
+        }
+        writer.release_leases().await.unwrap();
+        while let Some(done) = writes.join_next().await {
+            let _ = done.unwrap();
+        }
+        assert!(base.lease(&id).await.unwrap().is_none());
+        assert!(writer.append_entry(&id, label("late")).await.is_err());
+
+        // A database that stays locked makes the release fail, and says so.
+        let locked = base.standalone_writer();
+        let id = locked
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let error = locked.release_leases().await.unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error}");
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            base.lease(&id).await.unwrap().is_some(),
+            "nothing was released"
+        );
+        locked.release_leases().await.unwrap();
+        assert!(base.lease(&id).await.unwrap().is_none());
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn dropping_the_last_store_without_a_runtime_releases_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (writer, id) = rt.block_on(async {
+        let writer = SqliteSessionStore::open(&path).unwrap().standalone_writer();
+        let id = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        (writer, id)
+    });
+    drop(rt);
+    // No Tokio runtime here: the fallback deletes synchronously.
+    drop(writer);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_leases WHERE session_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+}

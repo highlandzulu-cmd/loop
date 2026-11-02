@@ -140,7 +140,9 @@ impl Fixture {
     /// Wait until the process has written its Session's lease.
     async fn wait_for_lease(&self) {
         let found = tokio::time::timeout(WAIT, async {
-            while self.leases().await.is_empty() {
+            // The process may still be creating the database; never migrate
+            // it from here at the same time.
+            while !lease_table_has_rows(&self.db()) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
@@ -161,6 +163,19 @@ impl Fixture {
         .await;
         assert!(called.is_ok(), "the model was never called");
     }
+}
+
+/// A read-only look that never creates or migrates the database.
+fn lease_table_has_rows(db: &Path) -> bool {
+    let Ok(conn) =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return false;
+    };
+    conn.query_row("SELECT COUNT(*) FROM session_leases", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .is_ok_and(|n| n > 0)
 }
 
 async fn leases(db: &Path) -> Vec<(String, String, u32)> {
@@ -220,7 +235,7 @@ async fn print_that_succeeds_leaves_no_lease() {
 }
 
 #[tokio::test]
-#[ignore = "leaks until B1: --print exits non-zero with process::exit before the store is released"]
+
 async fn print_that_fails_leaves_no_lease() {
     bounded(async {
         let fx = Fixture::new(Model::Fail);
@@ -268,13 +283,13 @@ async fn print_ended_by(name: &str) {
 }
 
 #[tokio::test]
-#[ignore = "leaks until B1: SIGTERM kills --print with no release"]
+
 async fn print_ended_by_sigterm_leaves_no_lease() {
     bounded(print_ended_by("-TERM")).await
 }
 
 #[tokio::test]
-#[ignore = "leaks until B1: SIGHUP kills --print with no release"]
+
 async fn print_ended_by_sighup_leaves_no_lease() {
     bounded(print_ended_by("-HUP")).await
 }
@@ -365,7 +380,7 @@ impl Pty {
 }
 
 #[tokio::test]
-#[ignore = "leaks until B1: the TUI exits 0 without releasing its lease"]
+
 async fn quitting_the_tui_leaves_no_lease() {
     bounded(async {
         let fx = Fixture::new(Model::Answer);
@@ -407,7 +422,7 @@ async fn quitting_the_tui_leaves_no_lease() {
 }
 
 #[tokio::test]
-#[ignore = "leaks until B1: SIGHUP kills the TUI with no release"]
+
 async fn a_tui_ended_by_sighup_leaves_no_lease() {
     bounded(async {
         let fx = Fixture::new(Model::Answer);

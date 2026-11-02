@@ -511,6 +511,19 @@ async fn real_main() -> anyhow::Result<()> {
         tracing::warn!(error = %err, "Langfuse tracing disabled");
     }
 
+    // Kept before the Runtime is moved: every exit path below, and signals,
+    // end the Session work and release its leases through it.
+    let shutdown = runtime.session_shutdown();
+    if let Err(error) =
+        loop_cli::runtime_signals::release_on_signals(shutdown.clone(), !cli.serve_mcp, interactive)
+    {
+        tracing::warn!(%error, "could not register signal handlers");
+    }
+    let release = || async {
+        if let Err(error) = shutdown.run().await {
+            eprintln!("loop: {error:#}");
+        }
+    };
     let result = if cli.serve_mcp {
         loop_cli::mcp_serve::run_mcp_server(
             runtime.inner,
@@ -523,6 +536,7 @@ async fn real_main() -> anyhow::Result<()> {
         let result =
             print_mode::run_print(&mut runtime, prompt, cli.output_format, &cli.trace).await;
         runtime.agents.shutdown().await;
+        release().await;
         match result {
             Ok(0) => Ok(()),
             Ok(code) => {
@@ -535,6 +549,8 @@ async fn real_main() -> anyhow::Result<()> {
     } else {
         loop_cli::app::run(runtime).await
     };
+    // Idempotent: the TUI and `--print` already released.
+    release().await;
     #[cfg(feature = "telemetry")]
     print_mode::shutdown_telemetry(&telemetry).await;
     result

@@ -109,6 +109,50 @@ pub struct Runtime {
     /// Process telemetry, when the host application installed it.
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<loop_telemetry::TelemetryHandle>,
+    /// This Surface's Session store, which holds its Session leases.
+    pub session_store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+}
+
+/// Ends a standalone Surface's Session work and releases its leases. Take it
+/// before the [`Runtime`] is moved, so every exit path can still run it.
+#[derive(Clone)]
+pub struct SessionShutdown {
+    harness: Arc<AgentHarness>,
+    store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+}
+
+/// How long shutdown waits for the current turn to stop writing.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl SessionShutdown {
+    /// Stop admission, cancel the current turn and wait (bounded) for it to
+    /// finish writing, then release this store's leases. Safe to repeat.
+    pub async fn run(&self) -> anyhow::Result<()> {
+        self.harness.request_shutdown();
+        if tokio::time::timeout(SHUTDOWN_GRACE, self.harness.wait_for_shutdown())
+            .await
+            .is_err()
+        {
+            tracing::warn!("the turn did not stop in time; releasing its Session leases anyway");
+        }
+        if let Some(store) = &self.store {
+            store
+                .release_leases()
+                .await
+                .map_err(|e| anyhow::anyhow!("could not release Session leases: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Runtime {
+    /// A handle that ends this Surface's Session work and releases its leases.
+    pub fn session_shutdown(&self) -> SessionShutdown {
+        SessionShutdown {
+            harness: Arc::clone(&self.harness),
+            store: self.session_store.clone(),
+        }
+    }
 }
 
 impl Runtime {
@@ -1352,6 +1396,7 @@ pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         selected_model,
         model_note,
         startup_notices,
+        session_store,
         ..
     } = opened;
     // Standalone Surfaces install their own approval transport, as before.
@@ -1406,6 +1451,7 @@ pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         web_disabled_for_run: opts.no_web,
         #[cfg(feature = "telemetry")]
         telemetry: None,
+        session_store,
     })
 }
 
