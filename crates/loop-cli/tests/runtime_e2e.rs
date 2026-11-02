@@ -419,7 +419,13 @@ impl Proc {
         stdin.flush().await.unwrap();
     }
     /// Close stdin (detach for `loop session attach`) and return the full output.
-    async fn finish(mut self) -> String {
+    async fn finish(self) -> String {
+        let (status, output) = self.exit().await;
+        assert!(status.success(), "{status}\n{output}");
+        output
+    }
+    /// Close stdin and return the exit status and the full output.
+    async fn exit(mut self) -> (std::process::ExitStatus, String) {
         self.stdin.take();
         let status = tokio::time::timeout(WAIT, self.child.wait())
             .await
@@ -427,8 +433,7 @@ impl Proc {
             .unwrap();
         // Let the readers drain the closed pipes.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(status.success(), "{status}\n{}", self.output());
-        self.output()
+        (status, self.output())
     }
     fn signal(&self, name: &str) {
         assert!(std::process::Command::new("kill")
@@ -1079,6 +1084,42 @@ async fn the_subagent_depth_limit_is_enforced_through_the_binary() {
             &fx.model,
             &["subagent not found"]
         ));
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn closing_a_parent_with_a_running_subagent_needs_force_and_cascades() {
+    bounded(async {
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let work = fx.work.to_str().unwrap();
+        let mut parent = fx.session(&["new", "--cwd", work]);
+        parent.line("SPAWN-APPROVAL").await;
+        let raised = |e: &EventKind| matches!(e, EventKind::EscalationRaised(_));
+        wait_events(&fx, "the child's Escalation", |e| count(e, raised) == 1).await;
+        let parent_id = fx.only_parent().await;
+
+        let (status, refused) = fx.session(&["close", &parent_id]).exit().await;
+        assert!(!status.success(), "{refused}");
+        assert!(
+            refused.contains("busy") && refused.contains("1 running Subagent"),
+            "{refused}"
+        );
+        assert!(refused.contains("--force"), "{refused}");
+        let client = fx.client().await;
+        assert!(client.list().await.unwrap().iter().all(|s| s.live));
+
+        let closed = fx.session(&["close", &parent_id, "--force"]).finish().await;
+        assert!(closed.contains("Closed Session"), "{closed}");
+        wait_events(&fx, "the cascade", |e| ended_children(e).len() == 1).await;
+        let sessions = client.list().await.unwrap();
+        assert_eq!(sessions.len(), 2, "{sessions:?}");
+        assert!(sessions.iter().all(|s| !s.live), "{sessions:?}");
+        assert_eq!(client.status().await.unwrap().loaded, 0);
+        drop(client);
+        parent.finish().await;
         serve.stop().await;
     })
     .await

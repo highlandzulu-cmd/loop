@@ -206,6 +206,22 @@ enum SessionCommand {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Unload a Session from the Runtime. Its history is kept, and
+    /// `loop session attach` loads it again.
+    ///
+    /// A busy Session, including a parent whose Subagents are running, is
+    /// refused unless `--force`, which cancels the turn (and its Subagents)
+    /// first.
+    Close {
+        /// Session id or unique prefix.
+        id: String,
+        /// Cancel a running turn, and its Subagents, then close.
+        #[arg(long)]
+        force: bool,
+        /// Runtime socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -350,6 +366,13 @@ async fn real_main() -> anyhow::Result<()> {
                     },
                     SessionCommand::Attach { id, socket } => SessionArgs {
                         id: Some(id.clone()),
+                        socket: socket.clone(),
+                        ..Default::default()
+                    },
+                    SessionCommand::Close { id, force, socket } => SessionArgs {
+                        id: Some(id.clone()),
+                        close: true,
+                        force: *force,
                         socket: socket.clone(),
                         ..Default::default()
                     },
@@ -629,6 +652,20 @@ mod tests {
         };
         assert_eq!(id, "abc");
         assert!(Cli::try_parse_from(["loop", "session", "attach"]).is_err());
+        let cli = parse(&["loop", "session", "close", "abc", "--force"]);
+        let Some(Commands::Session(SessionCommand::Close { id, force, .. })) = cli.command else {
+            panic!("not session close")
+        };
+        assert_eq!((id.as_str(), force), ("abc", true));
+        let cli = parse(&["loop", "session", "close", "abc"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session(SessionCommand::Close {
+                force: false,
+                ..
+            }))
+        ));
+        assert!(Cli::try_parse_from(["loop", "session", "close"]).is_err());
         assert!(Cli::try_parse_from(["loop", "session", "new", "abc"]).is_err());
         assert!(Cli::try_parse_from(["loop", "session"]).is_err());
     }

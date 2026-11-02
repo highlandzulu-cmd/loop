@@ -2,8 +2,8 @@
 //! application bootstrap.
 use std::path::PathBuf;
 
-/// What `loop session list|new|attach` asked for. With neither `id` nor
-/// `new`, it lists.
+/// What `loop session list|new|attach|close` asked for. With neither `id`
+/// nor `new`, it lists.
 #[derive(Debug, Default)]
 pub struct SessionArgs {
     pub id: Option<String>,
@@ -14,6 +14,10 @@ pub struct SessionArgs {
     pub all: bool,
     /// Print every Session as a JSON array of `SessionInfo` instead.
     pub json: bool,
+    /// Close the Session `id` instead of attaching (`loop session close`).
+    pub close: bool,
+    /// With `close`: cancel a running turn, and its Subagents, first.
+    pub force: bool,
 }
 
 #[cfg(not(unix))]
@@ -462,6 +466,59 @@ mod unix {
         }
     }
 
+    /// Close one Session. Its data stays: attaching loads it again.
+    async fn close(
+        backend: &RemoteBackend,
+        id: &str,
+        force: bool,
+        terminal: &mut dyn Terminal,
+    ) -> anyhow::Result<()> {
+        let sessions = backend.list().await?;
+        let mut found = matches(&sessions, id);
+        let found = match found.len() {
+            0 => anyhow::bail!("No Session matches `{id}`"),
+            1 => found.remove(0),
+            _ => {
+                terminal.write(&list_text(&mut found))?;
+                anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
+            }
+        };
+        let key = &found.r#ref.key;
+        let not_loaded = format!("Session {key} is not loaded; nothing to close.\n");
+        if !found.live {
+            terminal.write(&not_loaded)?;
+            return Ok(());
+        }
+        let busy = || {
+            let children = sessions
+                .iter()
+                .filter(|s| s.live && s.parent.as_ref().is_some_and(|p| p.key == *key))
+                .count();
+            let (with, and) = match children {
+                0 => (String::new(), ""),
+                1 => (", with 1 running Subagent".into(), " and its Subagent"),
+                n => (
+                    format!(", with {n} running Subagents"),
+                    " and its Subagents",
+                ),
+            };
+            anyhow::anyhow!(
+                "Session {key} is busy (a turn is running{with}). Use `loop session close {key} --force` to cancel the turn{and} and close it."
+            )
+        };
+        if found.busy && !force {
+            return Err(busy());
+        }
+        match backend.close(&found.r#ref, force).await {
+            Ok(()) => terminal.write(&format!(
+                "Closed Session {key}. Its history is kept; `loop session attach {key}` loads it again.\n"
+            )),
+            Err(loop_protocol::BackendError::SessionNotFound(_)) => terminal.write(&not_loaded),
+            Err(loop_protocol::BackendError::Busy) => Err(busy()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn drive(
         client: AttachClient,
         mut events: mpsc::UnboundedReceiver<HostEvent>,
@@ -469,6 +526,12 @@ mod unix {
         terminal: &mut dyn Terminal,
     ) -> anyhow::Result<()> {
         let backend = client.backend.clone();
+        if args.close {
+            let id = args.id.unwrap_or_default();
+            let result = close(&backend, &id, args.force, terminal).await;
+            client.shutdown().await;
+            return result;
+        }
         let (session, header) = if args.new {
             let cwd = std::path::absolute(args.cwd.unwrap_or(std::env::current_dir()?))?;
             let session = backend

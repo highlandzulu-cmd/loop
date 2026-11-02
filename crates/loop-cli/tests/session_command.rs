@@ -1088,3 +1088,140 @@ async fn json_listing_prints_every_session_as_session_info() {
     .await
     .unwrap();
 }
+
+/// Run `loop session close <id>` against `rt` over an in-memory wire.
+async fn close_via_cli(rt: &Arc<Runtime>, id: &str, force: bool) -> (anyhow::Result<()>, String) {
+    let (server, client) = loop_wire::transport::memory();
+    let served = serve(rt.clone(), server);
+    let (backend, events) = connect(client).await.unwrap();
+    let (_tx, mut terminal, output) = script();
+    let result = drive(
+        backend,
+        events,
+        SessionArgs {
+            id: Some(id.into()),
+            close: true,
+            force,
+            ..Default::default()
+        },
+        &mut terminal,
+    )
+    .await;
+    served.done.await.unwrap();
+    let text = output.lock().unwrap().clone();
+    (result, text)
+}
+
+#[tokio::test]
+async fn close_unloads_an_idle_session_releases_its_lease_and_reload_continues_seq() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        use loop_agent::harness::session::sqlite::SqliteSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime_with_log(dir.path(), log.clone()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.prompt(&session, vec![ContentBlock::text("one")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        let store = SqliteSessionStore::open(dir.path().join("agent/sessions.db")).unwrap();
+        assert!(store.lease(&session.native_id).await.unwrap().is_some());
+        let (result, text) = close_via_cli(&rt, &session.key.as_str()[..8], false).await;
+        result.unwrap();
+        assert!(text.contains("Closed Session"), "{text}");
+        assert!(!rt.list().await.unwrap()[0].live);
+        assert!(store.lease(&session.native_id).await.unwrap().is_none());
+        assert_eq!(rt.status().loaded, 0);
+        // Not loaded any more: say so and succeed.
+        let (result, text) = close_via_cli(&rt, session.key.as_str(), false).await;
+        result.unwrap();
+        assert!(text.contains("is not loaded"), "{text}");
+        // Data is kept: loading again continues the Session's sequence.
+        let before = loop_runtime::log::EventLog::latest_seq(log.as_ref(), &session.key)
+            .await
+            .unwrap();
+        assert!(before > 0);
+        let mut updates = rt.subscribe();
+        let reloaded = rt
+            .load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        rt.prompt(&reloaded, vec![ContentBlock::text("two")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        let first = updates.recv().await.unwrap();
+        assert_eq!(first.seq, before + 1);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn close_refuses_a_busy_session_unless_forced() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        // `ask` mode parks this call on an approval no Surface answers.
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "park".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo parked"}),
+                thought_signature: None,
+            },
+        ]));
+        let rt = runtime_with_script(dir.path(), Arc::new(MemoryEventLog::new()), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let mut updates = rt.subscribe();
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("park")])
+            .await
+            .unwrap();
+        while !matches!(
+            updates.recv().await.unwrap().update,
+            loop_protocol::SessionUpdate::ToolCall(_)
+        ) {}
+        let (result, _) = close_via_cli(&rt, session.key.as_str(), false).await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("busy") && error.contains("--force"),
+            "{error}"
+        );
+        assert!(rt.list().await.unwrap()[0].live);
+        let (result, text) = close_via_cli(&rt, session.key.as_str(), true).await;
+        result.unwrap();
+        assert!(text.contains("Closed Session"), "{text}");
+        assert!(!rt.list().await.unwrap()[0].live);
+        assert_eq!(turn.outcome().await, loop_protocol::TurnOutcome::Cancelled);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn close_with_an_ambiguous_or_unknown_id_closes_nothing() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.new_session(SessionSpec::default()).await.unwrap();
+        let (result, text) = close_via_cli(&rt, "", false).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Ambiguous"), "{error}");
+        assert!(text.contains("ID"), "lists the candidates: {text}");
+        let (result, _) = close_via_cli(&rt, "zzzz-no-such", false).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No Session matches"));
+        assert_eq!(rt.status().loaded, 2);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
