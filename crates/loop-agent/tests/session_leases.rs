@@ -732,3 +732,33 @@ async fn a_renewal_racing_the_sweep_is_never_lost_silently() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn an_acquisition_that_reaches_its_transaction_after_release_is_refused() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let base = SqliteSessionStore::open(&path).unwrap();
+        let writer = base.standalone_writer();
+        let a = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let me = base.lease(&a).await.unwrap().unwrap().identity;
+        // A Session this writer has not claimed yet.
+        let b = base.create(None, None).await.unwrap().metadata().id.clone();
+        writer.release_leases().await.unwrap();
+        // `open_writer` passed its own check before the release; its claim
+        // runs now, in its own transaction.
+        let claimed = writer.takeover_lease(&b, &me, false).await;
+        assert!(claimed.is_err(), "a released writer claimed {b}");
+        assert!(writer.acquire_lease(&b, &me).await.is_err());
+        assert!(base.lease(&b).await.unwrap().is_none());
+        assert!(base.lease(&a).await.unwrap().is_none());
+    })
+    .await
+    .unwrap();
+}

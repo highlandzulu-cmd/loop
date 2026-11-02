@@ -213,9 +213,16 @@ impl SqliteSessionStore {
         let id = id.to_owned();
         let identity = identity.clone();
         let env = Arc::clone(&self.environment);
+        let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = open(&path)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+            // Checked inside the transaction: release deletes in its own
+            // IMMEDIATE transaction after closing the writer, so a claim
+            // either commits before that delete or sees the writer closed.
+            if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
+                return Err(guard.refusal());
+            }
             let now = env.now_ms();
             if !tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)", [&id], |row| row.get::<_, bool>(0)).map_err(storage)? {
                 return Err(SessionError::NotFound(id));
