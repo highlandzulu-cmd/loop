@@ -120,7 +120,7 @@ full ids and fields `live`, `busy`, `parent`, `created_ms` and
 | Input | Effect |
 |---|---|
 | A line of text | Starts a turn with it as the prompt. While a turn runs it is queued (`queued; sends when the current turn ends`) and sent, in order, when the turn ends. Detaching drops prompts still queued |
-| A number, while an approval is shown | Answers the approval with that choice; an approval always comes before queued prompts |
+| A number, while an approval is shown | Answers the approval with that choice. Each approval is numbered from 1; a line typed before it appeared is ignored (`Choice no longer active`). An approval always comes before queued prompts |
 | `> ` then text | Always a prompt, even when it starts with a number |
 | Ctrl+C | Cancels the current turn and drops prompts still queued, saying how many |
 | Ctrl+C again, or Ctrl+D | Detaches |

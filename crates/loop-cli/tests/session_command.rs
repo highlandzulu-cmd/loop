@@ -8,15 +8,36 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+/// Scripted keyboard: each input carries the time it was "typed".
+#[derive(Clone)]
+struct Keys(mpsc::UnboundedSender<(std::time::Instant, Input)>);
+impl Keys {
+    fn send(
+        &self,
+        input: Input,
+    ) -> Result<(), mpsc::error::SendError<(std::time::Instant, Input)>> {
+        self.0.send((std::time::Instant::now(), input))
+    }
+}
 struct Script {
-    input: mpsc::UnboundedReceiver<Input>,
+    input: mpsc::UnboundedReceiver<(std::time::Instant, Input)>,
     output: Arc<Mutex<String>>,
     width: Option<usize>,
+    typed: Option<std::time::Instant>,
 }
 #[async_trait::async_trait]
 impl Terminal for Script {
     async fn read(&mut self) -> anyhow::Result<Input> {
-        Ok(self.input.recv().await.unwrap_or(Input::Eof))
+        Ok(match self.input.recv().await {
+            Some((typed, input)) => {
+                self.typed = Some(typed);
+                input
+            }
+            None => Input::Eof,
+        })
+    }
+    fn typed_at(&self) -> Option<std::time::Instant> {
+        self.typed
     }
     fn write(&mut self, text: &str) -> anyhow::Result<()> {
         self.output.lock().unwrap().push_str(text);
@@ -26,8 +47,9 @@ impl Terminal for Script {
         self.width
     }
 }
-fn script() -> (mpsc::UnboundedSender<Input>, Script, Arc<Mutex<String>>) {
+fn script() -> (Keys, Script, Arc<Mutex<String>>) {
     let (tx, input) = mpsc::unbounded_channel();
+    let tx = Keys(tx);
     let output = Arc::new(Mutex::new(String::new()));
     (
         tx,
@@ -35,6 +57,7 @@ fn script() -> (mpsc::UnboundedSender<Input>, Script, Arc<Mutex<String>>) {
             input,
             output: output.clone(),
             width: None,
+            typed: None,
         },
         output,
     )
@@ -355,7 +378,8 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
         }).await.expect("approval response missing");
         output.lock().unwrap().clear();
         inject.send(request(9002, "approve-2")).unwrap();
-        wait_text(&output, "3. Allow once").await;
+        // Each approval is numbered from 1 again.
+        wait_text(&output, "1. Allow once").await;
         inject.send(serde_json::json!({"jsonrpc":"2.0", "method":"host/interact_withdrawn", "params":{"session":session,"id":"approve-2"}}).to_string()).unwrap();
         wait_text(&output, "Another client answered").await;
         // Release the injection sender so server shutdown closes the transport.
@@ -587,6 +611,9 @@ impl Terminal for PausedInput {
     }
     fn write(&mut self, text: &str) -> anyhow::Result<()> {
         self.script.write(text)
+    }
+    fn typed_at(&self) -> Option<std::time::Instant> {
+        self.script.typed_at()
     }
 }
 
@@ -932,7 +959,8 @@ async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
             )
             .unwrap();
         wait_text(&output, "Escalation: ls parent").await;
-        tx.send(Input::Line("2".into())).unwrap();
+        // Numbered from 1 again, not after the withdrawn child's choices.
+        tx.send(Input::Line("1".into())).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if messages
@@ -1313,7 +1341,7 @@ async fn surface(
     rt: &Arc<Runtime>,
     session: &loop_protocol::SessionRef,
 ) -> (
-    mpsc::UnboundedSender<Input>,
+    Keys,
     Arc<Mutex<String>>,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
@@ -1699,6 +1727,99 @@ async fn the_list_fits_the_terminal_width() {
         let row = text.lines().nth(1).unwrap();
         assert!(row.contains('…'), "folder or title shortened: {row}");
         assert!(row.contains("project"), "the folder keeps its end: {row}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn each_approval_is_numbered_from_one_and_ignores_earlier_typing() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (mut server, client) = loop_wire::transport::memory();
+        let inject = server.outgoing.clone();
+        let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = messages.clone();
+        let (forward, incoming) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(raw) = server.incoming.recv().await {
+                captured.lock().unwrap().push(serde_json::from_str(&raw).unwrap());
+                if forward.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+        let served = serve(
+            rt.clone(),
+            loop_wire::transport::Transport {
+                incoming,
+                outgoing: server.outgoing,
+            },
+        );
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, script, output) = script();
+        let (enable, enabled) = tokio::sync::watch::channel(true);
+        let mut terminal = PausedInput { script, enabled };
+        let key = session.key.to_string();
+        let task = tokio::spawn(async move {
+            drive(
+                backend,
+                events,
+                SessionArgs {
+                    id: Some(key),
+                    ..Default::default()
+                },
+                &mut terminal,
+            )
+            .await
+        });
+        let request = |rpc_id: u64, id: &str| serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
+            "session":session, "kind":"permission", "id":id,
+            "options":[{"native_id":"allow-once", "label":"Allow once", "kind_hint":"allow_once"}, {"native_id":"reject", "label":"Reject", "kind_hint":"reject_once"}]
+        }}).to_string();
+        let answered = |id: u64, choice: &'static str| {
+            let messages = messages.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if messages.lock().unwrap().iter().any(|v| v["id"] == id && v["result"]["native_id"] == choice) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{id} was not answered with {choice}"));
+            }
+        };
+        while !messages.lock().unwrap().iter().any(|m| m["method"] == "session/attach") {
+            tokio::task::yield_now().await;
+        }
+        inject.send(request(9001, "first")).unwrap();
+        wait_text(&output, "1. Allow once").await;
+        tx.send(Input::Line("2".into())).unwrap();
+        answered(9001, "reject").await;
+        // Typed while nothing is shown, read only after the next appears.
+        enable.send(false).unwrap();
+        tx.send(Input::Line("1".into())).unwrap();
+        output.lock().unwrap().clear();
+        inject.send(request(9002, "second")).unwrap();
+        wait_text(&output, "1. Allow once").await;
+        assert!(!output.lock().unwrap().contains("3."), "numbering continued");
+        enable.send(true).unwrap();
+        wait_text(&output, "Choice no longer active").await;
+        assert!(!messages.lock().unwrap().iter().any(|v| v["id"] == 9002 && v.get("result").is_some()),
+            "a line typed before the approval answered it");
+        // Typed after it was shown: answers it.
+        tx.send(Input::Line("1".into())).unwrap();
+        answered(9002, "allow-once").await;
+        drop(inject);
+        tx.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        served.done.await.unwrap();
         rt.shutdown().await;
     })
     .await
