@@ -33,12 +33,14 @@ Common settings in `settings.json`:
 | `toolPermissions` | `write`, `edit`, `bash`: `ask`; `read`, `grep`, `glob`, `ls`, `web_fetch`, `web_search`: `allow` | Per-tool rules, `allow`, `ask` or `deny`, with optional patterns such as `bash(git status*)`. `deny` applies in every mode; with nobody to ask, `ask` refuses the call. A project may only add `ask`/`deny` rules |
 | `bash.defaultTimeoutMs`, `bash.maxTimeoutMs` | `120000`, `600000` | `bash` time limits; a call may ask for up to the maximum (global only) |
 | `fileEditReview` | `newSession` | Kept for old settings files: with no `permissionMode`, `never` starts in `accept-edits`. Other values change nothing |
-| `sandbox.mode` | `off` | `off` or `local` (Linux only) |
+| `sandbox.mode` | `off` | `off` or `local` — Linux only (macOS support is planned) |
 | `compaction` | enabled | `reserveTokens`, `keepRecentTokens` for `/compact` |
 | `skills`, `disabledSkills` | empty | Extra skill paths, and skills to hide |
 | `mcpServers`, `disabledMcpServers` | empty | MCP servers (stdio `command` or remote `url`) |
 | `providers` | empty | Custom providers added with `/login custom` |
 | `runtime.maxSessions`, `runtime.maxActiveTurns` | `16`, `8` | Limits of `loop runtime start`; see [the Runtime](runtime.md#start-the-runtime). Each must be a whole number of at least 1. A command-line flag overrides it (global only) |
+
+On macOS, use `--permission-mode read-only` or `--permission-mode ask` to control tool permissions. Setting `sandbox.mode` to `local` leaves the sandbox off with a warning on platforms other than Linux.
 
 Environment variables:
 
