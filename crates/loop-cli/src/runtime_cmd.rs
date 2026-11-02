@@ -296,6 +296,20 @@ impl loop_wire::RuntimeControl for Control {
     ) -> loop_protocol::BackendResult<loop_wire::Attachment> {
         loop_wire::RuntimeControl::attach(self.runtime.as_ref(), session, after_seq).await
     }
+    async fn attach_watching(
+        &self,
+        connection: u64,
+        session: &loop_protocol::SessionRef,
+        after_seq: u64,
+    ) -> loop_protocol::BackendResult<loop_wire::Attachment> {
+        loop_wire::RuntimeControl::attach_watching(
+            self.runtime.as_ref(),
+            connection,
+            session,
+            after_seq,
+        )
+        .await
+    }
     async fn status(&self) -> loop_protocol::BackendResult<loop_protocol::rpc::RuntimeStatus> {
         let mut status = self.runtime.status();
         status.socket = self.socket.clone();

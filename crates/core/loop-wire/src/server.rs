@@ -328,7 +328,10 @@ async fn handle(
                     key: session.key.clone(),
                     op,
                 });
-                let result = runtime.unwrap().attach(&session, after_seq).await;
+                let result = runtime
+                    .unwrap()
+                    .attach_watching(host.id, &session, after_seq)
+                    .await;
                 let _ = control.send(Control::Attached {
                     id,
                     key: session.key.clone(),

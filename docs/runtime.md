@@ -124,7 +124,8 @@ while any of these is true:
 - a Surface is attached to it, including one that only watches and never answers approvals;
 - it is a parent waiting on Subagents, or it is itself a running Subagent.
 
-Prompting or attaching to a Session that was just unloaded loads it again.
+Prompting or attaching to a Session that was just unloaded loads it again;
+if there is no room, the prompt or attach fails with the message below.
 If every loaded Session must be kept, opening another fails with, for example:
 
 ```text

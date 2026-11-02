@@ -53,6 +53,18 @@ pub trait RuntimeControl: Send + Sync {
     /// update committed after the snapshot is delivered live; the overlap is
     /// removed by sequence number.
     async fn attach(&self, session: &SessionRef, after_seq: u64) -> BackendResult<Attachment>;
+    /// [`Self::attach`] for `connection`. A Runtime records the connection
+    /// as watching the Session before the snapshot, so it is not unloaded
+    /// meanwhile, and loads it first if it was unloaded; when it cannot, the
+    /// attach fails. The default is a plain attach.
+    async fn attach_watching(
+        &self,
+        _connection: u64,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<Attachment> {
+        self.attach(session, after_seq).await
+    }
     /// The Runtime process and its Session counts (`runtime/status`).
     async fn status(&self) -> BackendResult<RuntimeStatus> {
         Err(unsupported("runtime/status"))

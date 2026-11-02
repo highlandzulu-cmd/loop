@@ -1151,33 +1151,7 @@ impl Runtime {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
-        // Registering under the lifecycle lock: an unload either sees this
-        // watcher and keeps the Session, or has already begun, and then the
-        // Session is loaded again below.
-        let target = self.route(session).ok();
-        let _lifecycle = match (&target, attached) {
-            (Some(live), true) => Some(live.lifecycle.lock().await),
-            _ => None,
-        };
-        {
-            let mut watchers = self.watchers.lock().unwrap();
-            if attached {
-                watchers
-                    .entry(session.key.clone())
-                    .or_default()
-                    .insert(connection);
-            } else if let Some(watching) = watchers.get_mut(&session.key) {
-                watching.remove(&connection);
-                if watching.is_empty() {
-                    watchers.remove(&session.key);
-                }
-            }
-        }
-        let reload = attached
-            && self.was_unloaded(&session.key)
-            && target
-                .as_ref()
-                .is_none_or(|live| live.closing.load(Ordering::Acquire));
+        self.set_watch(session, connection, attached).await;
         let mut recipients = self.recipients.lock().await;
         match &recipient {
             Some(recipient) => {
@@ -1209,22 +1183,61 @@ impl Runtime {
                 live.escalations.attach(connection, recipient).await;
             }
         }
-        drop(recipients);
-        if reload {
-            // Not inline: the caller is a connection's ordered output.
-            if let Some(me) = self.me.get().and_then(Weak::upgrade) {
-                let session = session.clone();
-                tokio::spawn(async move {
-                    if let Err(error) = me.reload(&session).await {
-                        eprintln!(
-                            "Runtime: could not load attached Session {} again: {error}",
-                            session.key.0
-                        );
-                    }
-                });
-            }
-        }
         Ok(())
+    }
+    /// Add or remove `connection` as a watcher of `session`, under its
+    /// lifecycle lock when it is loaded: an unload either sees the watcher
+    /// and keeps the Session, or has already begun. Returns whether the
+    /// registry changed.
+    async fn set_watch(&self, session: &SessionRef, connection: u64, attached: bool) -> bool {
+        let target = self.route(session).ok();
+        let _lifecycle = match (&target, attached) {
+            (Some(live), true) => Some(live.lifecycle.lock().await),
+            _ => None,
+        };
+        let mut watchers = self.watchers.lock().unwrap();
+        if attached {
+            watchers
+                .entry(session.key.clone())
+                .or_default()
+                .insert(connection)
+        } else {
+            let removed = watchers
+                .get_mut(&session.key)
+                .is_some_and(|watching| watching.remove(&connection));
+            if watchers.get(&session.key).is_some_and(HashSet::is_empty) {
+                watchers.remove(&session.key);
+            }
+            removed
+        }
+    }
+    /// `session/attach` for `connection`: protect the Session from unloading
+    /// before taking the snapshot, and load it again first if it was
+    /// unloaded to make room. If it cannot be loaded, the attach fails.
+    async fn attach_watched(
+        &self,
+        connection: u64,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<loop_wire::Attachment> {
+        if session.instance != self.instance || session.key.0 != session.native_id {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
+        let added = self.set_watch(session, connection, true).await;
+        let result = async {
+            let unloading = self
+                .route(session)
+                .map_or(true, |live| live.closing.load(Ordering::Acquire));
+            if unloading && self.was_unloaded(&session.key) {
+                self.reload(session).await?;
+            }
+            loop_wire::RuntimeControl::attach(self, session, after_seq).await
+        }
+        .await;
+        if result.is_err() && added {
+            self.set_watch(session, connection, false).await;
+        }
+        result
     }
     async fn disconnect_recipients(&self, connection: u64) {
         let mut recipients = self.recipients.lock().await;
@@ -1259,6 +1272,14 @@ impl loop_wire::RuntimeControl for Runtime {
     ) -> BackendResult<()> {
         self.register_watch(session, connection, attached, recipient)
             .await
+    }
+    async fn attach_watching(
+        &self,
+        connection: u64,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<loop_wire::Attachment> {
+        self.attach_watched(connection, session, after_seq).await
     }
     async fn disconnected(&self, connection: u64) {
         self.watchers.lock().unwrap().retain(|_, watching| {

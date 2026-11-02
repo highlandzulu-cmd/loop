@@ -314,18 +314,19 @@ async fn an_attach_racing_eviction_ends_loaded_and_watched() {
             let dir = tempfile::tempdir().unwrap();
             let (rt, _log) = runtime(dir.path(), 1).await;
             let a = rt.new_session(SessionSpec::default()).await.unwrap();
-            let (opened, ()) =
-                tokio::join!(rt.new_session(SessionSpec::default()), watch(&rt, &a, 3));
+            // The wire's order: attach (snapshot), then register the Surface.
+            let attach = async {
+                loop_wire::RuntimeControl::attach_watching(rt.as_ref(), 3, &a, 0).await?;
+                watch(&rt, &a, 3).await;
+                Ok::<_, BackendError>(())
+            };
+            let (opened, attached) = tokio::join!(rt.new_session(SessionSpec::default()), attach);
             // Either the attach won (no room), or the Session was unloaded
-            // and the attach loads it back, so the Surface is never orphaned.
-            let reloaded = tokio::time::timeout(Duration::from_secs(10), async {
-                while !loaded(&rt, &a) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            })
-            .await;
+            // and the attach loaded it back before succeeding: a successful
+            // attach is never left with its Session unloaded.
+            attached.unwrap_or_else(|e| panic!("round {round}: {e} ({opened:?})"));
             assert!(
-                reloaded.is_ok(),
+                loaded(&rt, &a),
                 "round {round}: attached Session left unloaded ({opened:?})"
             );
             let live = rt.route(&a).unwrap();

@@ -5,13 +5,17 @@
 use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
 use loop_protocol::rpc::{PeerInfo, RpcErrorBody};
 use loop_protocol::{BackendError, SessionKey, SessionRef};
-use loop_runtime::log::{EventLog, MemoryEventLog};
+use loop_runtime::log::{EventLog, LoggedEvent, MemoryEventLog};
 use loop_runtime::{Runtime, RuntimeLimits};
 use loop_wire::server::{serve_with_control, ServeOptions, Served};
 use loop_wire::{transport::memory, Connection, Incoming, RpcError};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 const LIMIT: Duration = Duration::from_secs(60);
 
@@ -179,6 +183,110 @@ async fn a_disconnected_observer_no_longer_keeps_its_session() {
         assert_eq!(loaded(&rt).await, [b.key]);
         rt.shutdown().await;
         let _ = a;
+    })
+    .await
+    .unwrap();
+}
+
+/// Holds `read_after` (the attach snapshot) while `held` is set.
+#[derive(Default)]
+struct GatedLog {
+    inner: MemoryEventLog,
+    held: AtomicBool,
+    reading: Notify,
+    release: Notify,
+}
+#[async_trait::async_trait]
+impl EventLog for GatedLog {
+    async fn append_batch(
+        &self,
+        events: Vec<loop_runtime::log::Event>,
+    ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        self.inner.append_batch(events).await
+    }
+    async fn read_after(
+        &self,
+        key: &SessionKey,
+        seq: u64,
+    ) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        if self.held.swap(false, Ordering::AcqRel) {
+            self.reading.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.read_after(key, seq).await
+    }
+    async fn read_runtime_after(&self, seq: u64) -> loop_runtime::log::Result<Vec<LoggedEvent>> {
+        self.inner.read_runtime_after(seq).await
+    }
+    async fn latest_seq(&self, key: &SessionKey) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(key).await
+    }
+    async fn allocate_generation(
+        &self,
+        owner: &str,
+        pid: u32,
+        ms: i64,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.allocate_generation(owner, pid, ms).await
+    }
+    async fn finish_generation(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
+        self.inner.finish_generation(generation, ms).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_protects_its_session_before_its_snapshot() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(GatedLog::default());
+        let rt = runtime(dir.path(), log.clone()).await;
+        let maker = Client::connect(&rt, true).await;
+        let a = maker.new_session().await.unwrap();
+        maker.detach(&a).await;
+        settle().await;
+        // A's attach is paused in its snapshot...
+        let watcher = Arc::new(Client::connect(&rt, true).await);
+        log.held.store(true, Ordering::Release);
+        let attaching = tokio::spawn({
+            let (watcher, a) = (watcher.clone(), a.clone());
+            async move { watcher.attach(&a).await }
+        });
+        log.reading.notified().await;
+        // ...so B cannot unload A, and gets Busy.
+        let other = Client::connect(&rt, true).await;
+        assert_eq!(other.new_session().await, Err(BackendError::Busy));
+        log.release.notify_one();
+        attaching.await.unwrap().unwrap();
+        assert_eq!(loaded(&rt).await, std::slice::from_ref(&a.key));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_that_cannot_load_its_unloaded_session_fails() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new())).await;
+        let maker = Client::connect(&rt, true).await;
+        let a = maker.new_session().await.unwrap();
+        maker.detach(&a).await;
+        settle().await;
+        // B unloads A and stays watched by its maker.
+        let other = Client::connect(&rt, true).await;
+        let b = other.new_session().await.unwrap();
+        settle().await;
+        assert_eq!(loaded(&rt).await, std::slice::from_ref(&b.key));
+        // A cannot come back while B is watched: the attach says so.
+        let watcher = Client::connect(&rt, true).await;
+        assert_eq!(watcher.attach(&a).await, Err(BackendError::Busy));
+        // With room again, the same attach loads A.
+        other.detach(&b).await;
+        settle().await;
+        watcher.attach(&a).await.unwrap();
+        assert_eq!(loaded(&rt).await, std::slice::from_ref(&a.key));
+        rt.shutdown().await;
     })
     .await
     .unwrap();
