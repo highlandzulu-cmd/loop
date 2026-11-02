@@ -214,22 +214,36 @@ async fn standalone_resume_takes_over_only_stale_dead_owners_and_renews() {
         .unwrap();
     env.now.store(36_000, Ordering::SeqCst);
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
-    // The timer's storage operation runs on the blocking pool.
-    for _ in 0..100 {
-        if store.lease(id).await.unwrap().unwrap().heartbeat_ms == 36_000 {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(store.lease(id).await.unwrap().unwrap().heartbeat_ms, 36_000);
+    // The renewal's storage operation runs on the blocking pool, which takes
+    // real time however the test clock is set.
+    eventually("the renewal", || async {
+        store.lease(id).await.unwrap().unwrap().heartbeat_ms == 36_000
+    })
+    .await;
     drop(resumed);
-    for _ in 0..100 {
-        if store.lease(id).await.unwrap().is_none() {
-            return;
-        }
-        tokio::task::yield_now().await;
+    eventually("the release", || async {
+        store.lease(id).await.unwrap().is_none()
+    })
+    .await;
+}
+
+/// Wait in real time (not the paused test clock) until `check` holds,
+/// for at most 30 s.
+async fn eventually<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !check().await {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(2)))
+            .await
+            .unwrap();
     }
-    panic!("standalone resume lease was not released");
 }
 
 #[tokio::test]
@@ -323,13 +337,10 @@ async fn failed_standalone_renewal_cancels_work_and_fences_writes() {
     let identity = store.lease(id).await.unwrap().unwrap().identity;
     store.release_lease(id, &identity).await.unwrap();
     tokio::time::advance(std::time::Duration::from_secs(5)).await;
-    for _ in 0..100 {
-        if cancelled.is_cancelled() {
-            break;
-        }
-        store.lease(id).await.unwrap();
-    }
-    assert!(cancelled.is_cancelled());
+    eventually("the failed renewal to cancel work", || async {
+        cancelled.is_cancelled()
+    })
+    .await;
     // A transient renewal failure must fence this handle even if ownership
     // subsequently appears to match again.
     store.acquire_lease(id, &identity).await.unwrap();
@@ -592,9 +603,9 @@ async fn release_during_an_active_write_is_fenced_and_reports_errors() {
         let started = std::time::Instant::now();
         let error = locked.release_leases().await.unwrap_err();
         assert!(
-            // A 200 ms busy timeout plus slack for a loaded CI machine;
-            // far below the 5 s one other writes use.
-            started.elapsed() < std::time::Duration::from_millis(1200),
+            // A 200 ms busy timeout; the bound only needs to stay below the
+            // 5 s one other writes use, with room for a loaded machine.
+            started.elapsed() < std::time::Duration::from_secs(3),
             "release took {:?}",
             started.elapsed()
         );

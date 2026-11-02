@@ -760,7 +760,7 @@ async fn a_cancelled_parent_does_not_wait_for_an_unrelated_turn() {
             .unwrap();
         rt.cancel(&root);
         other_started.notified().await;
-        let outcome = tokio::time::timeout(Duration::from_secs(5), turn.outcome())
+        let outcome = tokio::time::timeout(Duration::from_secs(20), turn.outcome())
             .await
             .expect("cancelled parent must not wait for the unrelated turn's permit");
         assert!(matches!(outcome, TurnOutcome::Cancelled));

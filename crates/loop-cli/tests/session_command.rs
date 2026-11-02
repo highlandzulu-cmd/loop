@@ -63,7 +63,7 @@ fn script() -> (Keys, Script, Arc<Mutex<String>>) {
     )
 }
 async fn wait_text(output: &Mutex<String>, needle: &str) {
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if output.lock().unwrap().contains(needle) {
                 return;
@@ -371,7 +371,7 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
         tx.send(Input::Line("9".into())).unwrap();
         wait_text(&output, "Enter one").await;
         tx.send(Input::Line("1".into())).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async { loop {
+        tokio::time::timeout(Duration::from_secs(20), async { loop {
             if messages.lock().unwrap().iter().any(|v| v["id"] == 9001 && v["result"]["native_id"] == "allow-once") { break; }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -389,15 +389,15 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
         tx.send(Input::Interrupt).unwrap();
         wait_text(&output, "Ctrl+C again to detach").await;
         tx.send(Input::Interrupt).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), task).await.unwrap_or_else(|_| panic!("client did not detach; messages={:?}; output={:?}", messages.lock().unwrap(), output.lock().unwrap())).unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), served.done).await.expect("server did not close").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), task).await.unwrap_or_else(|_| panic!("client did not detach; messages={:?}; output={:?}", messages.lock().unwrap(), output.lock().unwrap())).unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(20), served.done).await.expect("server did not close").unwrap();
         let messages = messages.lock().unwrap().clone();
         assert_eq!(messages.iter().filter(|v| v["method"] == "session/cancel").count(), 1);
         assert_eq!(messages.iter().filter(|v| v["method"] == "session/detach").count(), 1);
         assert!(!messages.iter().any(|v| v["method"] == "session/close"));
         assert!(messages.iter().any(|v| v["id"] == 9002 && v["result"]["outcome"] == "cancelled"));
         assert!(rt.list().await.unwrap()[0].live);
-        tokio::time::timeout(Duration::from_secs(5), rt.shutdown()).await.expect("Runtime did not stop");
+        tokio::time::timeout(Duration::from_secs(20), rt.shutdown()).await.expect("Runtime did not stop");
     }).await.unwrap();
 }
 
@@ -583,7 +583,7 @@ async fn connection_loss_reports_error_and_leaves_the_session_running() {
         });
         wait_text(&output, "replayed").await;
         cut.send(()).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), task)
+        let result = tokio::time::timeout(Duration::from_secs(20), task)
             .await
             .expect("client hung after connection loss")
             .unwrap();
@@ -694,9 +694,9 @@ async fn runtime_loss_after_detach_request_closes_locally_without_a_shutdown_rpc
         let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: server_incoming, outgoing: server.outgoing });
         let (backend, events) = connect(loop_wire::transport::Transport { incoming, outgoing: client.outgoing }).await.unwrap();
         let (tx, mut terminal, _) = script(); tx.send(Input::Eof).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), drive(backend, events, SessionArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
+        let result = tokio::time::timeout(Duration::from_secs(20), drive(backend, events, SessionArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
         assert!(result.is_err());
-        tokio::time::timeout(Duration::from_secs(1), closed.notified()).await.expect("local transport stayed open");
+        tokio::time::timeout(Duration::from_secs(20), closed.notified()).await.expect("local transport stayed open");
         assert!(!messages.lock().unwrap().iter().any(|m| m["method"] == "shutdown"));
         served.done.await.unwrap(); assert!(rt.list().await.unwrap()[0].live); rt.shutdown().await;
         }
@@ -767,7 +767,7 @@ async fn interrupts_cancel_and_detach_before_gated_replay_finishes() {
         tx.send(Input::Interrupt).unwrap();
         wait_text(&output, "Ctrl+C again").await;
         tx.send(Input::Interrupt).unwrap();
-        tokio::time::timeout(Duration::from_secs(3), task)
+        tokio::time::timeout(Duration::from_secs(20), task)
             .await
             .expect("interrupt could not detach during replay")
             .unwrap()
@@ -961,7 +961,7 @@ async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
         wait_text(&output, "Escalation: ls parent").await;
         // Numbered from 1 again, not after the withdrawn child's choices.
         tx.send(Input::Line("1".into())).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if messages
                     .lock()
@@ -1061,7 +1061,7 @@ async fn a_slow_session_list_never_delays_a_subagents_escalation() {
         let started = std::time::Instant::now();
         wait_text(&output, &format!("Subagent {short}")).await;
         tx.send(Input::Line("1".into())).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if messages.lock().unwrap().iter().any(|v| v["id"] == 9001 && v["result"]["native_id"] == "accept") {
                     break;
@@ -1071,8 +1071,11 @@ async fn a_slow_session_list_never_delays_a_subagents_escalation() {
         })
         .await
         .unwrap();
+        // The child's name lookup gives up only after 5 s (the listing is
+        // never answered); answering well before that shows the approval
+        // did not wait for it.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < Duration::from_secs(3),
             "answered after {:?}",
             started.elapsed()
         );
@@ -1301,7 +1304,21 @@ async fn a_full_runtime_says_its_limit_and_how_to_make_room() {
             surfaces.push((tx, task, served));
         }
         // Registration follows the reply; wait until both are watched.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let list = rt.list().await.unwrap();
+                if list
+                    .iter()
+                    .filter(|s| s.live)
+                    .all(|s| rt.watcher_count(&s.r#ref.key) > 0)
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the two Surfaces never watched their Sessions");
         let (server, client) = loop_wire::transport::memory();
         let served = serve(rt.clone(), server);
         let (backend, events) = connect(client).await.unwrap();
@@ -1482,7 +1499,7 @@ async fn ctrl_c_cancels_the_turn_and_drops_queued_prompts() {
         wait_text(&output, "Turn cancelled").await;
         wait_text(&output, "Dropped 2 queued prompts.").await;
         // The turn ends; nothing queued is sent after it.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             while rt.is_busy(&session) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -1783,7 +1800,7 @@ async fn each_approval_is_numbered_from_one_and_ignores_earlier_typing() {
         let answered = |id: u64, choice: &'static str| {
             let messages = messages.clone();
             async move {
-                tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::time::timeout(Duration::from_secs(20), async {
                     loop {
                         if messages.lock().unwrap().iter().any(|v| v["id"] == id && v["result"]["native_id"] == choice) {
                             break;

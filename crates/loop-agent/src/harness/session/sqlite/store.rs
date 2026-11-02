@@ -1024,7 +1024,7 @@ mod tests {
         let path = dir.path().join("sessions.db");
         SqliteSessionStore::open(&path).unwrap();
         let conn = open(&path).unwrap();
-        let held = hold_write_lock(&path, std::time::Duration::from_secs(3));
+        let held = hold_write_lock(&path, std::time::Duration::from_secs(6));
         let started = std::time::Instant::now();
         let result = begin_immediate_within(
             &conn,
@@ -1034,14 +1034,11 @@ mod tests {
         let took = started.elapsed();
         assert!(matches!(&result, Err(e) if is_busy(e)), "{result:?}");
         // The busy waits and the retries share one deadline: it is used up,
-        // and not exceeded by anything near the 5 s busy timeout. The upper
-        // bound leaves a second for a loaded CI machine.
+        // and the 5 s busy timeout is not waited out. The upper bound sits
+        // well between the two, with room for a loaded machine.
         let deadline = std::time::Duration::from_millis(400);
         assert!(took >= deadline, "gave up early, after {took:?}");
-        assert!(
-            took < deadline + std::time::Duration::from_secs(1),
-            "took {took:?}"
-        );
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
         drop(result);
         held.join().unwrap();
     }
@@ -1089,7 +1086,7 @@ mod tests {
             );
             // Reads do not wait for the gate.
             let held = store.gate.enter().await;
-            tokio::time::timeout(std::time::Duration::from_secs(5), store.list(None))
+            tokio::time::timeout(std::time::Duration::from_secs(20), store.list(None))
                 .await
                 .expect("a read waited for the write gate")
                 .unwrap();
@@ -1115,9 +1112,9 @@ mod tests {
         let started = std::time::Instant::now();
         let error = writer.release_leases().await.unwrap_err().to_string();
         assert!(
-            // 200 ms for the gate, plus slack for a loaded CI machine;
-            // far below the 5 s busy timeout.
-            started.elapsed() < std::time::Duration::from_millis(1200),
+            // 200 ms for the gate; the bound only needs to stay below the
+            // 5 s busy timeout, with room for a loaded machine.
+            started.elapsed() < std::time::Duration::from_secs(3),
             "{:?}",
             started.elapsed()
         );

@@ -907,6 +907,16 @@ impl Runtime {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
+    /// Connections watching `key`. For tests that must wait for a watch
+    /// registered after a reply.
+    #[doc(hidden)]
+    pub fn watcher_count(&self, key: &SessionKey) -> usize {
+        self.watchers
+            .lock()
+            .unwrap()
+            .get(key)
+            .map_or(0, HashSet::len)
+    }
     fn was_unloaded(&self, key: &SessionKey) -> bool {
         self.unloaded.lock().unwrap().contains(key)
     }

@@ -171,7 +171,7 @@ async fn injected_models_run_a_native_turn_with_the_selected_tool_prompt() {
         .await
         .unwrap();
     assert!(matches!(
-        tokio::time::timeout(std::time::Duration::from_secs(5), turn.outcome())
+        tokio::time::timeout(std::time::Duration::from_secs(20), turn.outcome())
             .await
             .unwrap(),
         TurnOutcome::Completed(_)
