@@ -137,6 +137,10 @@ impl EscalationHost {
             .copied()
             .collect()
     }
+    /// Whether a request is waiting for an answer.
+    pub(crate) async fn has_pending(&self) -> bool {
+        !self.0.state.lock().await.pending.is_empty()
+    }
     /// Detaching only removes this recipient; pending requests stay parked.
     pub async fn detach(&self, connection: u64) {
         let mut state = self.0.state.lock().await;

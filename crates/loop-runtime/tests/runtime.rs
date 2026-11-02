@@ -128,6 +128,18 @@ async fn session_capacity_is_separate_from_queued_turn_admission() {
     for _ in 0..16 {
         sessions.push(rt.new_session(SessionSpec::default()).await.unwrap());
     }
+    // An idle Session nobody watches would be unloaded to make room;
+    // watched ones are kept, so the Runtime is full.
+    for (connection, session) in sessions.iter().enumerate() {
+        loop_wire::RuntimeControl::recipient(
+            &rt,
+            session,
+            connection as u64,
+            Some(Arc::new(Watching)),
+        )
+        .await
+        .unwrap();
+    }
     assert_eq!(
         rt.new_session(SessionSpec::default()).await,
         Err(BackendError::Busy)
@@ -143,6 +155,20 @@ async fn session_capacity_is_separate_from_queued_turn_admission() {
     rt.close(&sessions[0].key, false).await.unwrap();
     rt.new_session(SessionSpec::default()).await.unwrap();
     rt.shutdown().await;
+}
+
+struct Watching;
+#[async_trait::async_trait]
+impl loop_wire::control::EscalationRecipient for Watching {
+    fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
+    async fn interact(
+        &self,
+        _: loop_protocol::rpc::InteractParams,
+        withdrawn: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<loop_protocol::InteractionOutcome, ()> {
+        let _ = withdrawn.await;
+        Err(())
+    }
 }
 
 struct Reject;

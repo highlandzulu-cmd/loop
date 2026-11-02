@@ -455,6 +455,29 @@ mod unix {
         )
     }
 
+    /// `Busy` from opening a Session: the Runtime is at its Session limit and
+    /// none of its Sessions can be unloaded. The limit comes from the Runtime.
+    async fn full(backend: &RemoteBackend, error: loop_protocol::BackendError) -> anyhow::Error {
+        if !matches!(error, loop_protocol::BackendError::Busy) {
+            return error.into();
+        }
+        match backend.status().await {
+            Ok(status) => {
+                let (n, noun) = match status.loaded {
+                    1 => ("the 1".to_owned(), "Session is"),
+                    n => (format!("all {n}"), "Sessions are"),
+                };
+                anyhow::anyhow!(
+                    "The Runtime is full: {n} loaded {noun} busy or watched (limit {}). Close one with `loop session close <id>`, or restart the Runtime with a higher --max-sessions.",
+                    status.max_sessions
+                )
+            }
+            Err(_) => anyhow::anyhow!(
+                "The Runtime is full: every loaded Session is busy or watched. Close one with `loop session close <id>`."
+            ),
+        }
+    }
+
     /// The lease refusal suggests `loop session attach`, which is what just failed.
     fn load_error(error: loop_protocol::BackendError) -> anyhow::Error {
         let text = error.to_string();
@@ -534,12 +557,20 @@ mod unix {
         }
         let (session, header) = if args.new {
             let cwd = std::path::absolute(args.cwd.unwrap_or(std::env::current_dir()?))?;
-            let session = backend
+            let session = match backend
                 .new_session(SessionSpec {
                     cwd: Some(cwd.clone()),
                     ..Default::default()
                 })
-                .await?;
+                .await
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    let error = full(&backend, error).await;
+                    client.shutdown().await;
+                    return Err(error);
+                }
+            };
             let header = header("New Session", &session, &cwd);
             (session, header)
         } else {
@@ -609,6 +640,11 @@ mod unix {
                             Ok(session) => {
                                 let header = header(&session);
                                 (session, header)
+                            }
+                            Err(loop_protocol::BackendError::Busy) => {
+                                let error = full(&backend, loop_protocol::BackendError::Busy).await;
+                                client.shutdown().await;
+                                return Err(error);
                             }
                             Err(error) => {
                                 client.shutdown().await;

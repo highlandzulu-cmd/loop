@@ -63,6 +63,14 @@ async fn runtime_with_script(
     log: Arc<dyn loop_runtime::log::EventLog>,
     responses: loop_ai::providers::FauxScript,
 ) -> Arc<Runtime> {
+    runtime_with_limits(dir, log, responses, RuntimeLimits::default()).await
+}
+async fn runtime_with_limits(
+    dir: &std::path::Path,
+    log: Arc<dyn loop_runtime::log::EventLog>,
+    responses: loop_ai::providers::FauxScript,
+    limits: RuntimeLimits,
+) -> Arc<Runtime> {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(responses));
     let globals =
@@ -81,11 +89,7 @@ async fn runtime_with_script(
         permission_mode: Some("ask".into()),
         agent: None,
     };
-    Arc::new(
-        Runtime::new(globals, opts, log, RuntimeLimits::default())
-            .await
-            .unwrap(),
-    )
+    Arc::new(Runtime::new(globals, opts, log, limits).await.unwrap())
 }
 fn serve(
     rt: Arc<Runtime>,
@@ -1220,6 +1224,79 @@ async fn close_with_an_ambiguous_or_unknown_id_closes_nothing() {
             .to_string()
             .contains("No Session matches"));
         assert_eq!(rt.status().loaded, 2);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_full_runtime_says_its_limit_and_how_to_make_room() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime_with_limits(
+            dir.path(),
+            Arc::new(MemoryEventLog::new()),
+            loop_ai::providers::FauxScript::new(),
+            RuntimeLimits {
+                max_sessions: 2,
+                max_active_turns: 1,
+            },
+        )
+        .await;
+        // Two Sessions, each watched by its own Surface, fill the Runtime.
+        let mut surfaces = Vec::new();
+        for _ in 0..2 {
+            let (server, client) = loop_wire::transport::memory();
+            let served = serve(rt.clone(), server);
+            let (backend, events) = connect(client).await.unwrap();
+            let (tx, mut terminal, output) = script();
+            let task = tokio::spawn(async move {
+                drive(
+                    backend,
+                    events,
+                    SessionArgs {
+                        new: true,
+                        cwd: Some(std::env::temp_dir()),
+                        ..Default::default()
+                    },
+                    &mut terminal,
+                )
+                .await
+            });
+            wait_text(&output, "New Session").await;
+            surfaces.push((tx, task, served));
+        }
+        // Registration follows the reply; wait until both are watched.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (server, client) = loop_wire::transport::memory();
+        let served = serve(rt.clone(), server);
+        let (backend, events) = connect(client).await.unwrap();
+        let (_tx, mut terminal, _) = script();
+        let error = drive(
+            backend,
+            events,
+            SessionArgs {
+                new: true,
+                cwd: Some(std::env::temp_dir()),
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("all 2 loaded Sessions are busy or watched (limit 2)"),
+            "{error}"
+        );
+        assert!(error.contains("loop session close <id>"), "{error}");
+        served.done.await.unwrap();
+        for (tx, task, served) in surfaces {
+            tx.send(Input::Eof).unwrap();
+            task.await.unwrap().unwrap();
+            served.done.await.unwrap();
+        }
         rt.shutdown().await;
     })
     .await
