@@ -115,7 +115,8 @@ A local picker uses the same service calls as its slash command.
 | `/login [provider/custom/agent]`, `/logout [provider]` | Host-only | `runtime/providers`; host saves credentials, then refreshes catalog and affected workspace tools | `crates/loop-cli/src/app.rs:5388` |
 | `/mcp login <name>`, `/mcp logout <name>` | Host-only | `runtime/mcp_auth` with workspace id; OAuth browser/callback and tokens stay on host | `crates/loop-cli/src/app.rs:5940` |
 | `/tracing [status/enable/on/disable/off/setup [langfuse/otlp]]` | Host-only | `runtime/tracing`; configure Runtime telemetry, not the remote TUI | `crates/loop-cli/src/app.rs:5380` |
-| `/ttfb [off/on/duration]` | Host-only | `runtime/ttfb` reads/sets current Session override and separately saves defaults when confirmed | `crates/loop-cli/src/app.rs:5476` |
+| `/ttfb [off/on/duration]` | Session-scoped | `session/ttfb` reads/sets the current Session override; allowed over WebSocket | `crates/loop-cli/src/app.rs:5476` |
+| `/ttfb`: explicit save for new Sessions | Host-only | `runtime/defaults` saves the timeout default after confirmation; forbidden over WebSocket | `crates/loop-cli/src/app.rs:5476` |
 | `/usage` | Session-scoped + Host-only | Live: `session/stats`; history: host-only `runtime/usage`; Runtime panel: `runtime/sessions` | `crates/loop-cli/src/app.rs:5378` |
 | `/theme [name]` | Surface-local | Read/set local theme; no RPC | `crates/loop-cli/src/app.rs:5139` |
 | `/copy` | Surface-local | Copy last assistant text to local clipboard | `crates/loop-cli/src/app.rs:5540` |
@@ -206,6 +207,12 @@ The in-process Native adapter must supply the same event and snapshot contract;
 it cannot bypass serialization or persistence by calling a harness setter directly.
 A flag is feature discovery, not a substitute for server authorization.
 
+Add `ClientCapabilities.branch_reset` to the client's `initialize` request.
+It defaults to false when absent. This is the client's promise that it can replace
+its transcript on BranchReset. It is distinct from the server's `branch_snapshot`
+service flag. Forward BranchReset only to connections that advertised
+`client_capabilities.branch_reset = true`.
+
 Use `s` for a full `SessionRef`; use `w` for a Runtime-issued workspace id.
 No method accepts a caller-supplied host-local boolean. All calls below are
 client-to-server requests. Setters return a committed revision and whether a
@@ -222,11 +229,12 @@ change is pending. JSON spellings use snake_case, as the existing wire types do.
 | `session/config` | `{session:s}` | `SessionSnapshot` | `session_config` |
 | `session/compact` | `{session:s,instructions?}` | `{tokens_before?,summary,branch_revision,seq}` | `compaction` |
 | `session/stats` | `{session:s}` | `{total_tokens,context_tokens?,context_window?,report,turn_state,usage?,taken_at_ms}` | `session_stats` |
+| `session/ttfb` | `{session:s,timeout_ms?,clear_override:false,expected_revision?}` | `{override_ms?,effective_ms,revision,seq?,pending}` | `session_ttfb` |
 | `session/shell` | `{session:s,command,timeout_ms?}` | `{stdout,stderr,exit_code,truncated}` | `local_shell` |
 | `session/tree` | `{session:s,cursor?,limit?}` | `{entries,fork_points,family,branch_revision,next_cursor?}` | `session_tree` |
 | `session/navigate` | `{session:s,target_entry_id?,summarize:false,expected_revision?}` | `{branch_revision,seq}` | `session_tree` |
 | `session/view` | `{session:s,view_id,cursor?,limit?}` | `{updates,next_cursor?,branch_revision,at_seq}` | `branch_snapshot` |
-| `session/rename` | `{session:s,name,expected_revision?}` | `MutationResult` | `session_rename` |
+| `session/rename` | `{session:s,name,expected_revision?}` | `MutationResult`; emits ConfigChanged metadata, never BranchReset | `session_rename` |
 | `session/fork` | `{session:s,before_entry_id,name?,request_id}` | `{session:s,workspace_id,source_branch_revision}` | `session_fork` |
 | `session/clone` | `{session:s,name?,request_id}` | Same as fork, with the full active branch | `session_fork` |
 | `session/export` | `{session:s}` | `{format_version,markdown,jsonl,branch_revision}` | `session_transfer` |
@@ -246,8 +254,7 @@ change is pending. JSON spellings use snake_case, as the existing wire types do.
 | `runtime/providers` | `{action:list/connect/disconnect,provider?,login?}` | `{providers:[{id,name,connected}],notices}`; never returns keys | `host_providers` |
 | `runtime/mcp_auth` | `{workspace_id:w,action:login/logout,name}` | `{status,notices}` | `host_mcp_auth` |
 | `runtime/tracing` | `{action:status/enable/disable/setup,config?}` | `{enabled,backend,status}`; redacted | `host_tracing` |
-| `runtime/ttfb` | `{session:s,timeout_ms?,save_default:false}` | `{effective_ms,default_ms,revision}` | `host_ttfb` |
-| `runtime/defaults` | `{workspace_id:w,patch?,expected_revision?}` | `{revision,model?,effort?,mode?}` | `host_defaults` |
+| `runtime/defaults` | `{workspace_id:w,patch?,expected_revision?}`; patch may set `response_header_timeout_ms` | `{revision,model?,effort?,mode?,response_header_timeout_ms?}` | `host_defaults` |
 | `runtime/usage` | `{filter?,cursor?,limit?}` | `{rows,totals,next_cursor?,taken_at_ms,log_status}` | `host_usage` |
 | `runtime/sessions` | `{}` | `{sessions:[{session,workspace_id,state,model,tokens}],totals,taken_at_ms}` | `runtime_sessions` |
 
@@ -274,10 +281,11 @@ switches native/ACP backend creates or loads the target backend's Session and
 attaches to that reference. It must not replace a live Session's routing identity.
 Native/Remote service accessors and advertised flags must agree. The new
 `attach_snapshot` flag gates the extended attach result. `branch_snapshot` gates
-immutable views and BranchReset handling; tree mutation and compaction support
-require it on S3-capable Surfaces. Old clients may ignore unknown update variants. Keep legacy attach replay
-working, and characterize how those clients display configuration/reset notices.
-The S3 TUI requires both flags before offering branch-changing controls.
+immutable views; tree mutation and compaction support require it on S3-capable
+Surfaces. The S3 TUI requires both server flags before offering branch-changing
+controls, and advertises its own `branch_reset` support at initialize. Keep legacy
+attach replay working. Do not rely on a legacy watcher ignoring BranchReset:
+that would leave its transcript stale. Apply the detach rule in section 3.1.
 
 Bound pages to 100 items by default and 1,000 maximum. Bound a Session transfer
 to 8 MiB of UTF-8 JSONL and the whole encoded response to 16 MiB. Bound shell
@@ -294,7 +302,7 @@ Add typed `SessionUpdate` variants. Current variants are at
 
 | Update | Payload and effect |
 |---|---|
-| `ConfigChanged` / `config_changed` | `{revision,config,effective,pending,applies_after_turn?,workspace_revision}`. Carries the complete public Session config, including model, effort, backend mode, permission mode, sandbox, name and active skills. Replaces the previous config view. |
+| `ConfigChanged` / `config_changed` | `{revision,metadata:{name},config,effective,pending,applies_after_turn?,workspace_revision}`. Carries Session metadata and the complete public config, including model, effort, backend mode, permission mode, sandbox, response-timeout override and active skills. Replaces the previous metadata/config view. Rename changes `metadata.name`, not the branch. |
 | `BranchReset` / `branch_reset` | `{branch_revision,view_id,reason}`. Replaces the chat projection using the immutable paged view. Reasons include navigate and compact. Never append the replacement transcript to the old one. |
 | `WorkflowProgress` / `workflow_progress` | `{workflow_id,state,task_id?,description?,outline?,mermaid?,output?,error?}`. States cover planned, task_started, task_completed, task_failed and ended. Shares Session ordering and replay. |
 
@@ -302,10 +310,27 @@ All use the existing durable `UpdateEnvelope`. They consume contiguous
 `session_seq` values. They are committed before broadcast or RPC success.
 Do not bypass the pump with a direct Surface notification.
 
+When a Session's branch resets, detach every attached connection that did not
+advertise `branch_reset` at initialize. Deliver a visible detach reason:
+“this Session changed branch; attach again”. Stop that subscription before any
+update from the replacement branch reaches it. Never send BranchReset to that
+connection or leave it attached with a stale transcript. Detach only the affected
+Session; preserve other Session subscriptions on the connection. Remove its
+Escalation recipient without answering an approval. Reset-capable watchers stay
+attached and receive the ordered BranchReset. Apply the same rule when replay
+encounters a reset; do not silently skip it for a legacy client. Reattach starts
+a fresh transcript view at the current branch. Keep sequence cursors truthful.
+
+Rename uses ConfigChanged's `metadata.name` field. It leaves `branch_revision`
+and the transcript view unchanged. It does not detach legacy watchers. This
+**deliberately deviates from the revised plan text**, which groups
+`session/tree|navigate|rename` under BranchReset. Rename changes metadata, not
+the active branch.
+
 Extend `session/attach` with optional `snapshot` in its result and advertise
 `attach_snapshot`. Preserve `{latest_seq,generation}` for old clients.
 `SessionSnapshot` contains `{session,workspace_id,at_seq,revision,branch_revision,
-view_id,config,effective,pending,capabilities,turn_state,stats,workspace_revision}`.
+view_id,metadata,config,effective,pending,capabilities,turn_state,stats,workspace_revision}`.
 The snapshot excludes secrets. Stats may contain unknown values for ACP.
 Pending Escalation ids are display state only; actionable requests still arrive
 through `host/interact` after recipient registration. Never answer an id recovered
@@ -338,8 +363,8 @@ busy state. Close/unload must wait for settlement or cancel it safely.
 | Operation | While a turn or exclusive operation runs |
 |---|---|
 | Model selection, sandbox replacement, navigate, compact, skill activation, workflow start, shell | Refuse Busy. No silent cancellation. |
-| Effort, backend mode and permission mode | Commit desired state as pending for the next turn. Current turn keeps its captured state. Recheck Policy ceilings and Locks. |
-| Rename | Serialize the metadata write; allowed without changing current execution. |
+| Effort, backend mode, permission mode and response-timeout override | Commit desired state as pending for the next turn. Current turn keeps its captured state. Recheck Policy ceilings and Locks. |
+| Rename | Serialize the metadata write and emit ConfigChanged with `metadata.name`; allowed without changing current execution or branch revision. |
 | Tree/export/fork/clone | Read a committed branch snapshot. Do not include uncommitted turn output. Do not interrupt the source turn. |
 | Stats/config/list | Read consistent public state without changing ownership. |
 | Cancel/approval answer | Remain responsive; cancellation must not wait on a long operation holding the lifecycle lock. |
@@ -379,7 +404,16 @@ separate explicit “save for new Sessions” action through `runtime/defaults`.
 That action is host-local. Existing commands currently save defaults
 (`crates/loop-app-core/src/runtime.rs:255`, `crates/loop-app-core/src/runtime.rs:947`);
 characterization tests and release notes must call out this deliberate UX change.
-`/ttfb` follows the same distinction for its current override and saved default.
+`/ttfb` reads or sets the current Session response-timeout override through
+`session/ttfb`. This is Session-scoped and allowed over authenticated WebSocket
+when `session_ttfb` is supported. Without `timeout_ms` or a clear request, read
+state. A value of
+zero means unlimited. `clear_override = true` removes the override and inherits
+the default; reject a request that also supplies `timeout_ms`. A change during a
+turn applies to the next turn and emits ConfigChanged. It never saves a default.
+Only an explicit host-local `runtime/defaults` write saves
+`response_header_timeout_ms` for new Sessions. Refuse that write over WebSocket,
+without preventing the Session read or override change.
 
 Keep effective permission Policy separate from the backend's mode id. Native
 `session/set_mode` and `session/permission_mode` must share one transition path
@@ -556,8 +590,8 @@ Do not switch the default early to simplify an intermediate slice.
 | Slice | Deliverable | Prerequisites |
 |---|---|---|
 | S3.1 | Native ModelControl, model/effort/mode wire methods, capabilities, ConfigChanged, state/default split and explicit-Off restore | Approved S3.0; GLM lane merged first |
-| S3.2 | Compact/stats/shell routing, service flags, bounded output and cancellation | S3.1; coordinates BranchReset/view types with S3.3 |
-| S3.3 | Tree/view/navigate/rename, snapshot contract, BranchReset, leased fork/clone, payload export/import, list summaries | S3.1; shared event/snapshot types land once before parallel consumers |
+| S3.2 | Compact/stats/shell and Session timeout routing, service flags, bounded output and cancellation | S3.1; coordinates BranchReset/view types with S3.3 |
+| S3.3 | Tree/view/navigate, metadata-only rename, snapshot contract, reset capability and legacy detach, leased fork/clone, payload export/import, list summaries | S3.1; shared event/snapshot types land once before parallel consumers |
 | S3.4 | Workspace admin, host-only methods, reload/trust, usage history and Runtime panel data | S3.1; SB1a platform builder; snapshot/type agreement with S3.3 |
 | S3.5 | SurfaceClient over current NativeBackend; app and dashboard take only facade/view types; skills/templates/workflow API and progress | S3.2–S3.4; SB1a base for sandbox migration |
 | S3.6 | Unix-socket `--connect`, Session choice, detach priority, replay/snapshot rendering and capability parity | S3.5 |
@@ -584,6 +618,24 @@ limits, forbidden host methods, token files and lost connections. Never retry a
 prompt after an uncertain outcome. Exercise live embedded/daemon coexistence and
 SIGKILL recovery, not only clean exits. Async tests use bounded timeouts and wait
 for outcomes. Implementation gates follow the repo's required Cargo checks.
+Required regression scenarios for these contracts:
+
+- Attach a reset-capable TUI and a legacy client to one Session. Omit the legacy
+  client's `branch_reset` field at initialize. Navigate the branch, then repeat
+  with compaction. Only the capable client receives BranchReset and replaces its
+  transcript. The legacy client renders “this Session changed branch; attach
+  again”, is detached before replacement-branch updates, and can attach again to
+  the current branch. Other Session subscriptions and approval arbitration remain
+  valid. Repeat with explicit false and a reset encountered during cursor replay.
+- Over an authenticated WebSocket, read and set `session/ttfb`, including explicit
+  zero and clearing the override. Check current/next-turn behavior. Verify that
+  neither operation changes new-Session defaults. A `runtime/defaults` timeout
+  write is forbidden there and succeeds only with host-local authority.
+- Rename with two watchers, including a legacy watcher. Both observe the metadata
+  change. Assert ConfigChanged contains `metadata.name`; branch revision and
+  transcript view are unchanged. Assert no BranchReset or detach occurs. Check
+  the name in a fresh attach snapshot and after restart.
+
 No Cargo checks are required for this documentation-only slice.
 
 ## 10. Open questions for approval
