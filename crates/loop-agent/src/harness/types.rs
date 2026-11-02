@@ -314,6 +314,9 @@ pub enum SessionError {
     /// Storage.
     #[error("storage: {0}")]
     Storage(String),
+    /// Another process owns the Session. The text is meant for people as is.
+    #[error("{0}")]
+    InUse(String),
 }
 
 /// Compaction error.

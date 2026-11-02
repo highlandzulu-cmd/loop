@@ -68,7 +68,7 @@ impl GlobalResources {
     ) -> anyhow::Result<Self> {
         let sessions_db = sessions_db_path(&agent_dir);
         let store = create_sqlite_session_store(&sessions_db)
-            .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
+            .map_err(|e| session_error("sqlite session store", e))?;
         Ok(Self {
             agent_dir,
             credentials,
@@ -273,6 +273,15 @@ pub struct SessionFactory {
 }
 
 /// One Session's mutable harness, gate and approval state.
+/// A Session store error for people: a Session owned by another process
+/// is reported as is; anything else names what failed.
+fn session_error(context: &str, error: loop_agent::harness::types::SessionError) -> anyhow::Error {
+    match error {
+        loop_agent::harness::types::SessionError::InUse(message) => anyhow::anyhow!(message),
+        other => anyhow::anyhow!("{context}: {other}"),
+    }
+}
+
 pub struct OpenedSession {
     pub workspace: Arc<WorkspaceResources>,
     pub harness: Arc<AgentHarness>,
@@ -388,7 +397,7 @@ impl SessionFactory {
                     opts.session_id.as_deref(),
                 )
                 .await
-                .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
+                .map_err(|e| session_error("sqlite session store", e))?;
             *leased = Some(Arc::clone(&store));
             (
                 Some(create_session_repository(Arc::clone(&store), None)),
@@ -412,12 +421,12 @@ impl SessionFactory {
             repository
                 .open(id)
                 .await
-                .map_err(|e| anyhow::anyhow!("load session: {e}"))?
+                .map_err(|e| session_error("load session", e))?
         } else {
             repository
                 .create(Some(workspace.cwd.to_string_lossy().into_owned()), None)
                 .await
-                .map_err(|e| anyhow::anyhow!("create session: {e}"))?
+                .map_err(|e| session_error("create session", e))?
         };
 
         // Restore model from the session branch when resuming (unless CLI overrides).
@@ -658,12 +667,13 @@ mod lease_tests {
             Ok(_) => panic!("standalone resume accepted an owned Session"),
             Err(error) => error.to_string(),
         };
-        assert!(
-            error.contains(&format!(
+        // Only the sentence meant for people: no store or error-kind prefix.
+        assert_eq!(
+            error,
+            format!(
                 "Session {id} is in use by Runtime {}. Use `loop session attach {id}` instead.",
                 std::process::id()
-            )),
-            "{error}"
+            )
         );
     }
 }
