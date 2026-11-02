@@ -78,8 +78,13 @@ impl SqliteSessionStore {
     }
 }
 
-/// Attempts at starting a write transaction that finds the database busy,
-/// each after the connection's own busy timeout has run out.
+/// How long a connection waits for another's write lock before SQLite
+/// reports BUSY.
+pub(super) const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Most time starting one write transaction may take, busy waits and
+/// retries together.
+const BEGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6);
+/// Most attempts at starting one write transaction.
 const BEGIN_ATTEMPTS: u32 = 5;
 
 /// Whether SQLite refused for another connection's lock.
@@ -91,12 +96,25 @@ pub(super) fn is_busy(error: &rusqlite::Error) -> bool {
     )
 }
 
-/// Start an IMMEDIATE (write) transaction. When the database stays busy
-/// past the busy timeout, as under heavy concurrent writing on a slow disk,
-/// try again a few times after a short, jittered pause (20–200 ms).
+/// Start an IMMEDIATE (write) transaction, waiting at most about 6 s in
+/// all for another connection's lock. Under heavy concurrent writing (a
+/// slow disk) SQLite can report BUSY before that; it is then tried again
+/// after a short, jittered pause (20–200 ms), within the same deadline.
 pub(super) fn begin_immediate(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    begin_immediate_within(conn, BEGIN_DEADLINE)
+}
+
+/// [`begin_immediate`] with an explicit overall deadline.
+pub(super) fn begin_immediate_within(
+    conn: &Connection,
+    limit: std::time::Duration,
+) -> rusqlite::Result<Transaction<'_>> {
+    let deadline = std::time::Instant::now() + limit;
     let mut attempt = 1;
-    loop {
+    let result = loop {
+        // Each attempt's busy wait only spends what is left of the deadline.
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        conn.busy_timeout(left.min(BUSY_TIMEOUT))?;
         match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
             Err(error) if is_busy(&error) && attempt < BEGIN_ATTEMPTS => {
                 let base = (20u64 << (attempt - 1)).min(200);
@@ -106,19 +124,25 @@ pub(super) fn begin_immediate(conn: &Connection) -> rusqlite::Result<Transaction
                         .unwrap_or_default()
                         .subsec_nanos(),
                 ) % (base / 2 + 1);
-                std::thread::sleep(std::time::Duration::from_millis(
-                    (base / 2 + jitter).clamp(20, 200),
-                ));
+                let pause = std::time::Duration::from_millis((base / 2 + jitter).clamp(20, 200));
+                if std::time::Instant::now() + pause >= deadline {
+                    break Err(error);
+                }
+                std::thread::sleep(pause);
                 attempt += 1;
             }
-            result => return result,
+            result => break result,
         }
-    }
+    };
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    result
 }
 
 pub(super) fn open(path: &Path) -> Result<Connection, SessionError> {
     let conn = Connection::open(path).map_err(|e| SessionError::Storage(e.to_string()))?;
-    conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
+    conn.execute_batch("PRAGMA foreign_keys=ON;")
+        .map_err(|e| SessionError::Storage(e.to_string()))?;
+    conn.busy_timeout(BUSY_TIMEOUT)
         .map_err(|e| SessionError::Storage(e.to_string()))?;
     Ok(conn)
 }
@@ -873,6 +897,26 @@ mod tests {
         tx.execute("UPDATE session_sequences SET next_seq = next_seq", [])
             .unwrap();
         tx.commit().unwrap();
+        held.join().unwrap();
+    }
+
+    #[test]
+    fn a_write_that_stays_busy_gives_up_at_its_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        SqliteSessionStore::open(&path).unwrap();
+        let conn = open(&path).unwrap();
+        let held = hold_write_lock(&path, std::time::Duration::from_secs(3));
+        let started = std::time::Instant::now();
+        let result = begin_immediate_within(&conn, std::time::Duration::from_millis(400));
+        let took = started.elapsed();
+        assert!(matches!(&result, Err(e) if is_busy(e)), "{result:?}");
+        // The busy timeout and the retries share one deadline.
+        assert!(
+            took < std::time::Duration::from_millis(900),
+            "took {took:?}"
+        );
+        drop(result);
         held.join().unwrap();
     }
 
