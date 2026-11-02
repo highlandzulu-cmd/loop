@@ -716,6 +716,9 @@ mod unix {
         let mut naming = tokio::task::JoinSet::new();
         let mut interrupted = false;
         let mut renderer = crate::print_mode::TextRenderer::default();
+        // Prompts this Surface sent: their terminal already shows them, so
+        // their rendered copy is skipped once.
+        let mut sent: VecDeque<String> = VecDeque::new();
         let mut prompts = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
@@ -772,6 +775,12 @@ mod unix {
                     let envelope = update.map_err(|e| anyhow::anyhow!("Runtime updates interrupted ({e}); reattach to replay"))?;
                     if envelope.session != session.key { continue; }
                     last_seq = envelope.seq;
+                    if let loop_protocol::SessionUpdate::MessageChunk { role: loop_protocol::Role::User, content, .. } = &envelope.update {
+                        if content.as_text().map(str::trim).is_some_and(|text| sent.front().is_some_and(|mine| mine.trim() == text)) {
+                            sent.pop_front();
+                            continue;
+                        }
+                    }
                     let text = renderer.render(&envelope.update);
                     if !text.is_empty() { terminal.write(&text)?; }
                     if let loop_protocol::SessionUpdate::TurnEnded { error, stop, .. } = envelope.update {
@@ -830,8 +839,8 @@ mod unix {
                             terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
                         } else if !line.trim().is_empty() {
                             interrupted = false;
-                            match backend.prompt(session, vec![ContentBlock::text(line)]).await {
-                                Ok(turn) => { prompts.spawn(async move {
+                            match backend.prompt(session, vec![ContentBlock::text(line.clone())]).await {
+                                Ok(turn) => { sent.push_back(line); prompts.spawn(async move {
                                     match turn.outcome().await {
                                         loop_protocol::TurnOutcome::Failed(error) => Err(loop_protocol::BackendError::Failed(error)),
                                         loop_protocol::TurnOutcome::Uncertain => Err(loop_protocol::BackendError::failed(loop_protocol::ErrorCategory::Network, "Lost contact with Runtime")),

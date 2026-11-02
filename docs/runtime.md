@@ -91,7 +91,8 @@ loop session close 3f2a         # unload a Session from the Runtime; its history
 ```
 
 When you attach, the Surface replays the Session's history and then follows it
-live. A Session that is not loaded, for example after the Runtime restarted, is
+live. Prompts show as `› <text>`, whichever Surface sent them; the Surface you
+typed a prompt in does not print it a second time. A Session that is not loaded, for example after the Runtime restarted, is
 loaded when you attach. Child Sessions started by a Subagent are named after
 their task and show their parent in the list. Once the parent has its answer,
 a finished child is closed: it frees its slot and is listed only with

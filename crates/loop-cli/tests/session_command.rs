@@ -402,7 +402,7 @@ async fn immediate_eof_renders_the_complete_replay_before_detaching() {
         let text = output.lock().unwrap().clone();
         let (header, replay) = text.split_once('\n').unwrap();
         assert!(header.starts_with("Attached to Session"), "{text:?}");
-        assert_eq!(replay, "replayed\n");
+        assert_eq!(replay, "› history\nreplayed\n");
         served.done.await.unwrap();
         rt.shutdown().await;
     })
@@ -843,7 +843,7 @@ async fn attach_shows_tool_calls_and_starts_each_message_on_its_own_line() {
         .unwrap();
         let text = output.lock().unwrap().clone();
         assert!(
-            text.ends_with("LIVE-OK\n• ls .\n  └ done\nThe folder is empty.\n"),
+            text.ends_with("› first\nLIVE-OK\n› second\n• ls .\n  └ done\nThe folder is empty.\n"),
             "{text:?}"
         );
         served.done.await.unwrap();
@@ -1296,6 +1296,77 @@ async fn a_full_runtime_says_its_limit_and_how_to_make_room() {
             tx.send(Input::Eof).unwrap();
             task.await.unwrap().unwrap();
             served.done.await.unwrap();
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Attach a scripted Surface to `session`; returns its input and output.
+async fn surface(
+    rt: &Arc<Runtime>,
+    session: &loop_protocol::SessionRef,
+) -> (
+    mpsc::UnboundedSender<Input>,
+    Arc<Mutex<String>>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (server, client) = loop_wire::transport::memory();
+    let _served = serve(rt.clone(), server);
+    let (backend, events) = connect(client).await.unwrap();
+    let (tx, mut terminal, output) = script();
+    let id = session.key.to_string();
+    let task = tokio::spawn(async move {
+        drive(
+            backend,
+            events,
+            SessionArgs {
+                id: Some(id),
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+    });
+    (tx, output, task)
+}
+
+#[tokio::test]
+async fn user_messages_are_shown_in_replay_and_live_but_not_twice_to_their_sender() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "first answer".into(),
+        ));
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "second answer".into(),
+        ));
+        let rt = runtime_with_script(dir.path(), Arc::new(MemoryEventLog::new()), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.prompt(&session, vec![ContentBlock::text("first question")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        let (typing, typed, typing_task) = surface(&rt, &session).await;
+        let (watching, watched, watching_task) = surface(&rt, &session).await;
+        for output in [&typed, &watched] {
+            wait_text(output, "› first question").await;
+            wait_text(output, "first answer").await;
+        }
+        typing.send(Input::Line("second question".into())).unwrap();
+        for output in [&typed, &watched] {
+            wait_text(output, "second answer").await;
+        }
+        assert!(watched.lock().unwrap().contains("› second question"));
+        // The sender's terminal already shows what it typed.
+        let sender = typed.lock().unwrap().clone();
+        assert!(!sender.contains("› second question"), "{sender}");
+        for (input, task) in [(typing, typing_task), (watching, watching_task)] {
+            input.send(Input::Eof).unwrap();
+            task.await.unwrap().unwrap();
         }
         rt.shutdown().await;
     })
