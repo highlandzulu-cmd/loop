@@ -852,6 +852,15 @@ mod unix {
                         interrupted = true;
                         backend.cancel(session);
                         terminal.write("\nTurn cancelled. Ctrl+C again to detach.\n")?;
+                        // Cancelling stops what was asked for, including what waits.
+                        let dropped = queued.len();
+                        queued.clear();
+                        retry = None;
+                        match dropped {
+                            0 => {}
+                            1 => terminal.write("Dropped 1 queued prompt.\n")?,
+                            n => terminal.write(&format!("Dropped {n} queued prompts.\n"))?,
+                        }
                     }
                     Input::Line(line) => {
                         let explicit_prompt = line.starts_with("> ");

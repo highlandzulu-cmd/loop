@@ -1418,3 +1418,60 @@ async fn a_line_typed_during_a_turn_is_queued_and_sent_when_it_ends() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn ctrl_c_cancels_the_turn_and_drops_queued_prompts() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo approved"}),
+                thought_signature: None,
+            },
+        ]));
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "must not run".into(),
+        ));
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime_with_script(dir.path(), log.clone(), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (input, output, task) = surface(&rt, &session).await;
+        wait_text(&output, "Attached").await;
+        input.send(Input::Line("start".into())).unwrap();
+        wait_text(&output, "Escalation").await;
+        input.send(Input::Line("> later".into())).unwrap();
+        input.send(Input::Line("> even later".into())).unwrap();
+        wait_text(&output, "queued; sends when the current turn ends").await;
+        input.send(Input::Interrupt).unwrap();
+        wait_text(&output, "Turn cancelled").await;
+        wait_text(&output, "Dropped 2 queued prompts.").await;
+        // The turn ends; nothing queued is sent after it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while rt.is_busy(&session) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!rt.is_busy(&session));
+        // Only the first prompt ever reached the Runtime.
+        use loop_runtime::log::EventLog;
+        let prompts = log
+            .read_runtime_after(0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| matches!(r.event.kind, loop_runtime::log::EventKind::PromptSent(_)))
+            .count();
+        assert_eq!(prompts, 1, "{}", output.lock().unwrap());
+        input.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
