@@ -611,7 +611,10 @@ async fn cancellation_during_raised_commit_still_logs_withdrawal() {
 
 #[tokio::test]
 async fn attaching_to_an_unloaded_session_routes_escalations_when_it_is_loaded() {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    // A hang guard, not a speed check: it covers creating the databases and
+    // opening the Session twice, which a slow disk (Windows CI) can take
+    // more than 2 s for. The Runtime tests here use 10 s.
+    tokio::time::timeout(Duration::from_secs(10), async {
         use loop_protocol::{AgentBackend, ContentBlock, SessionSpec};
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(MemoryEventLog::new());
