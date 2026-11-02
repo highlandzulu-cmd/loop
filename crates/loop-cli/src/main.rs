@@ -178,12 +178,13 @@ enum RuntimeCommand {
 
 #[derive(Debug, Subcommand)]
 enum SessionCommand {
-    /// List the Runtime's Sessions.
+    /// List Sessions: those loaded in the Runtime and those in this folder,
+    /// newest first, at most 20.
     List {
-        /// Also list closed Subagent Sessions.
+        /// List every Session: all folders, closed Subagents included.
         #[arg(long)]
         all: bool,
-        /// Print every Session, closed Subagents included, as JSON.
+        /// Print the same Sessions as JSON.
         #[arg(long)]
         json: bool,
         /// Runtime socket path.
@@ -355,6 +356,7 @@ async fn real_main() -> anyhow::Result<()> {
                 use loop_cli::session_cmd::{run, SessionArgs};
                 let args = match command {
                     SessionCommand::List { all, json, socket } => SessionArgs {
+                        cwd: cli.cwd.clone(),
                         socket: socket.clone(),
                         all: *all,
                         json: *json,

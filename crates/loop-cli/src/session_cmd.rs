@@ -75,6 +75,10 @@ mod unix {
     pub trait Terminal: Send {
         async fn read(&mut self) -> anyhow::Result<Input>;
         fn write(&mut self, text: &str) -> anyhow::Result<()>;
+        /// Columns available for a line, when output is a terminal.
+        fn width(&self) -> Option<usize> {
+            None
+        }
     }
 
     pub struct StdioTerminal {
@@ -112,6 +116,14 @@ mod unix {
                     None => { self.stdin_ended = true; Ok(Input::Eof) },
                 }
             }
+        }
+        fn width(&self) -> Option<usize> {
+            use std::io::IsTerminal;
+            std::io::stdout()
+                .is_terminal()
+                .then(|| crossterm::terminal::size().ok())
+                .flatten()
+                .map(|(columns, _)| usize::from(columns))
         }
         fn write(&mut self, text: &str) -> anyhow::Result<()> {
             let mut out = std::io::stdout().lock();
@@ -248,21 +260,92 @@ mod unix {
         Ok((AttachClient { backend, closed }, events))
     }
 
-    fn list_text(sessions: &mut [SessionInfo]) -> String {
+    /// Most Sessions the default listing shows.
+    const DEFAULT_LIST: usize = 20;
+
+    /// What `loop session list` shows, newest first, and how many it leaves
+    /// out. By default: loaded Sessions and those in `here` (not closed
+    /// Subagents), at most [`DEFAULT_LIST`]. With `all`: every Session.
+    pub(super) fn select(
+        mut sessions: Vec<SessionInfo>,
+        here: &std::path::Path,
+        all: bool,
+    ) -> (Vec<SessionInfo>, usize) {
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+        if all {
+            return (sessions, 0);
+        }
+        let total = sessions.len();
+        let here = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_path_buf());
+        let in_here = |cwd: &std::path::Path| {
+            std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()) == here
+        };
+        let mut shown: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| s.live || (s.parent.is_none() && in_here(&s.cwd)))
+            .collect();
+        shown.truncate(DEFAULT_LIST);
+        let more = total - shown.len();
+        (shown, more)
+    }
+
+    /// `path` with the home folder as `~`, cut in the middle to `max` characters.
+    fn folder(path: &std::path::Path, max: Option<usize>) -> String {
+        let mut text = path.display().to_string();
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            if let Ok(rest) = path.strip_prefix(&home) {
+                text = if rest.as_os_str().is_empty() {
+                    "~".into()
+                } else {
+                    format!("~/{}", rest.display())
+                };
+            }
+        }
+        match max {
+            Some(max) if text.chars().count() > max && max > 1 => {
+                let chars: Vec<char> = text.chars().collect();
+                let tail = (max - 1) / 2 + (max - 1) % 2;
+                let head = max - 1 - tail;
+                let mut cut: String = chars[..head].iter().collect();
+                cut.push('…');
+                cut.extend(&chars[chars.len() - tail..]);
+                cut
+            }
+            _ => text,
+        }
+    }
+
+    fn list_text(sessions: &mut [SessionInfo], width: Option<usize>) -> String {
         if sessions.is_empty() {
             return "No Sessions. Use `loop session new` to create one.\n".into();
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
+        // Within a terminal, the folder and title share what the other
+        // columns leave; a pipe gets them whole.
+        let (folder_max, title_max) = match width {
+            Some(width) => {
+                let id = sessions
+                    .iter()
+                    .map(|s| s.r#ref.key.as_str().chars().count())
+                    .max()
+                    .unwrap_or(2);
+                // ID, BUSY, LAST ACTIVE and PARENT, plus the gaps of six columns.
+                let fixed = id + 4 + 11 + 8 + 5 * 2;
+                let left = width.saturating_sub(fixed).max(20);
+                let folder = (left * 3 / 5).max(10);
+                (Some(folder), (left - folder).clamp(6, 40))
+            }
+            None => (None, 40),
+        };
         let mut rows =
             vec![["ID", "FOLDER", "TITLE", "BUSY", "LAST ACTIVE", "PARENT"].map(String::from)];
         for s in sessions.iter() {
             rows.push([
                 s.r#ref.key.to_string(),
-                s.cwd.display().to_string(),
-                clip(s.name.as_deref().unwrap_or("(untitled)"), 40),
+                folder(&s.cwd, folder_max),
+                clip(s.name.as_deref().unwrap_or("(untitled)"), title_max),
                 if s.busy { "yes" } else { "no" }.into(),
                 ago(now, s.last_active_ms),
                 s.parent
@@ -508,7 +591,8 @@ mod unix {
             0 => anyhow::bail!("No Session matches `{id}`"),
             1 => found.remove(0),
             _ => {
-                terminal.write(&list_text(&mut found))?;
+                found.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+                terminal.write(&list_text(&mut found, terminal.width()))?;
                 anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
             }
         };
@@ -580,34 +664,27 @@ mod unix {
             let header = header("New Session", &session, &cwd);
             (session, header)
         } else {
-            let mut sessions = backend.list().await?;
+            let sessions = backend.list().await?;
             let Some(id) = args.id else {
+                let here = match args.cwd.clone() {
+                    Some(cwd) => cwd,
+                    None => std::env::current_dir()?,
+                };
+                let (mut shown, more) = select(sessions.clone(), &here, args.all);
                 if args.json {
-                    let mut text = serde_json::to_string_pretty(&sessions)?;
+                    let mut text = serde_json::to_string_pretty(&shown)?;
                     text.push('\n');
                     terminal.write(&text)?;
                     client.shutdown().await;
                     return Ok(());
                 }
-                let hidden = if args.all {
-                    0
+                let mut text = if shown.is_empty() && more > 0 {
+                    "No Sessions are loaded or in this folder.\n".to_owned()
                 } else {
-                    let before = sessions.len();
-                    sessions.retain(|s| s.live || s.parent.is_none());
-                    before - sessions.len()
+                    list_text(&mut shown, terminal.width())
                 };
-                let mut text = list_text(&mut sessions);
-                if hidden > 0 {
-                    // Closed covers finished children and ones a cancel or a
-                    // Runtime restart ended; none of them can be prompted.
-                    let (noun, them) = if hidden == 1 {
-                        ("Session", "it")
-                    } else {
-                        ("Sessions", "them")
-                    };
-                    text.push_str(&format!(
-                        "\n{hidden} closed Subagent {noun} not shown (finished, cancelled or interrupted); `loop session list --all` lists {them}.\n"
-                    ));
+                if more > 0 {
+                    text.push_str(&format!("\n{more} more; `loop session list --all`\n"));
                 }
                 terminal.write(&text)?;
                 client.shutdown().await;
@@ -660,7 +737,8 @@ mod unix {
                     }
                 }
                 _ => {
-                    terminal.write(&list_text(&mut found))?;
+                    found.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+                    terminal.write(&list_text(&mut found, terminal.width()))?;
                     client.shutdown().await;
                     anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
                 }

@@ -836,14 +836,12 @@ async fn finished_children_are_hidden_unless_all_and_stay_attachable() {
         let listing = fx.session(&["list"]).finish().await;
         assert_eq!(listed(&listing), 1, "{listing}");
         assert!(
-            listing.contains(
-                "1 closed Subagent Session not shown (finished, cancelled or interrupted)"
-            ),
+            listing.contains("1 more; `loop session list --all`"),
             "{listing}"
         );
         let listing = fx.session(&["list", "--all"]).finish().await;
         assert_eq!(listed(&listing), 2, "{listing}");
-        let listing = fx.session(&["list", "--json"]).finish().await;
+        let listing = fx.session(&["list", "--all", "--json"]).finish().await;
         let all = sessions(&listing);
         assert_eq!(all.len(), 2, "{listing}");
         let root = all.iter().find(|s| s.parent.is_none()).expect("root");

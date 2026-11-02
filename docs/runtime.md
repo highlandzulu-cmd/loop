@@ -81,9 +81,9 @@ its pid may now belong to another program.
 ## Attach a Surface
 
 ```bash
-loop session list               # list Sessions: id, folder, title, busy, last activity, parent
-loop session list --all         # also list finished Subagent Sessions
-loop session list --json        # every Session as JSON, for scripts
+loop session list               # loaded Sessions and this folder's: id, folder, title, busy, last activity, parent
+loop session list --all         # every Session: all folders, closed Subagents too
+loop session list --json        # the same Sessions as JSON, for scripts
 loop session attach 3f2a        # attach to a Session by id or unique id prefix
 loop session new                # create a Session in the current folder and attach
 loop session new --cwd DIR      # create a Session in DIR and attach
@@ -100,11 +100,18 @@ a finished child is closed: it frees its slot and is listed only with
 says how many it left out. It is never loaded again: attaching replays its output, but you
 cannot prompt it.
 
-The table is for people: columns are aligned with spaces, titles are cut
-short and PARENT shows the first 8 characters of the parent id. Scripts should
-use `loop session list --json`. It prints a JSON array with one `SessionInfo` per
-Session, closed Subagents included, with full ids and fields `live`, `busy`,
-`parent`, `created_ms` and `last_active_ms`.
+By default the list shows the Sessions loaded in the Runtime and the Sessions
+of the current folder (or `--cwd`), newest first, at most 20, then a line
+`N more; loop session list --all`. Closed Subagent Sessions are left out.
+`--all` lists every Session of every folder, closed Subagents included.
+
+The table is for people: it fits the terminal width. Folders show `~` for your
+home folder and are cut in the middle, titles are cut short, and PARENT shows
+the first 8 characters of the parent id. Scripts should use
+`loop session list --json` (with `--all` for everything). It prints the same
+Sessions in the same order, as a JSON array with one `SessionInfo` each, with
+full ids and fields `live`, `busy`, `parent`, `created_ms` and
+`last_active_ms`.
 
 `--socket PATH` connects to a Runtime that was started with a custom socket.
 

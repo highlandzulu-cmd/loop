@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 struct Script {
     input: mpsc::UnboundedReceiver<Input>,
     output: Arc<Mutex<String>>,
+    width: Option<usize>,
 }
 #[async_trait::async_trait]
 impl Terminal for Script {
@@ -21,6 +22,9 @@ impl Terminal for Script {
         self.output.lock().unwrap().push_str(text);
         Ok(())
     }
+    fn width(&self) -> Option<usize> {
+        self.width
+    }
 }
 fn script() -> (mpsc::UnboundedSender<Input>, Script, Arc<Mutex<String>>) {
     let (tx, input) = mpsc::unbounded_channel();
@@ -30,6 +34,7 @@ fn script() -> (mpsc::UnboundedSender<Input>, Script, Arc<Mutex<String>>) {
         Script {
             input,
             output: output.clone(),
+            width: None,
         },
         output,
     )
@@ -1521,6 +1526,181 @@ async fn detaching_while_an_approval_is_shown_leaves_it_pending() {
         wait_text(&output, "approved later").await;
         input.send(Input::Eof).unwrap();
         task.await.unwrap().unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// `loop session list` output for `args`, with the terminal `width`.
+async fn listing(rt: &Arc<Runtime>, args: SessionArgs, width: Option<usize>) -> String {
+    let (server, client) = loop_wire::transport::memory();
+    let served = serve(rt.clone(), server);
+    let (backend, events) = connect(client).await.unwrap();
+    let (_tx, mut terminal, output) = script();
+    terminal.width = width;
+    drive(backend, events, args, &mut terminal).await.unwrap();
+    served.done.await.unwrap();
+    let text = output.lock().unwrap().clone();
+    text
+}
+
+/// A Session in `cwd` that is no longer loaded.
+async fn closed_session_in(rt: &Arc<Runtime>, cwd: &std::path::Path, name: &str) -> String {
+    let session = rt
+        .new_session(SessionSpec {
+            cwd: Some(cwd.into()),
+            name: Some(name.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    rt.close(&session.key, false).await.unwrap();
+    session.key.to_string()
+}
+
+#[tokio::test]
+async fn the_default_list_is_loaded_sessions_and_this_folder_newest_first() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let rt = runtime(dir.path()).await;
+        let away = closed_session_in(&rt, &elsewhere, "Away").await;
+        let older = closed_session_in(&rt, &here, "Older").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let newer = closed_session_in(&rt, &here, "Newer").await;
+        let loaded = rt
+            .new_session(SessionSpec {
+                cwd: Some(elsewhere.clone()),
+                name: Some("Loaded".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .key
+            .to_string();
+        let args = || SessionArgs {
+            cwd: Some(here.clone()),
+            ..Default::default()
+        };
+        let text = listing(&rt, args(), None).await;
+        assert!(!text.contains(&away), "another folder, not loaded: {text}");
+        let at = |id: &str| {
+            text.find(id)
+                .unwrap_or_else(|| panic!("{id} missing: {text}"))
+        };
+        assert!(
+            at(&loaded) < at(&newer) && at(&newer) < at(&older),
+            "{text}"
+        );
+        assert!(text.contains("1 more; `loop session list --all`"), "{text}");
+        // --all lists everything; --json uses the same selection and order.
+        let all = listing(
+            &rt,
+            SessionArgs {
+                all: true,
+                ..args()
+            },
+            None,
+        )
+        .await;
+        assert!(all.contains(&away) && !all.contains("more;"), "{all}");
+        let json = listing(
+            &rt,
+            SessionArgs {
+                json: true,
+                ..args()
+            },
+            None,
+        )
+        .await;
+        let listed: Vec<loop_protocol::rpc::SessionInfo> = serde_json::from_str(&json).unwrap();
+        let ids: Vec<String> = listed.iter().map(|s| s.r#ref.key.to_string()).collect();
+        assert_eq!(ids, [loaded.clone(), newer, older]);
+        let json = listing(
+            &rt,
+            SessionArgs {
+                json: true,
+                all: true,
+                ..args()
+            },
+            None,
+        )
+        .await;
+        let listed: Vec<loop_protocol::rpc::SessionInfo> = serde_json::from_str(&json).unwrap();
+        assert_eq!(listed.len(), 4);
+        assert_eq!(listed[0].r#ref.key.to_string(), loaded);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_default_list_shows_at_most_twenty() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        for n in 0..22 {
+            closed_session_in(&rt, dir.path(), &format!("S{n}")).await;
+        }
+        let text = listing(
+            &rt,
+            SessionArgs {
+                cwd: Some(dir.path().into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let rows = text.lines().filter(|l| l.contains(" S")).count();
+        assert_eq!(rows, 20, "{text}");
+        assert!(text.contains("2 more; `loop session list --all`"), "{text}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_list_fits_the_terminal_width() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir
+            .path()
+            .join("a-rather-long-folder-name")
+            .join("and-another-quite-long-one")
+            .join("project");
+        std::fs::create_dir_all(&deep).unwrap();
+        let rt = runtime(dir.path()).await;
+        closed_session_in(
+            &rt,
+            &deep,
+            "A title that is long enough to need clipping here",
+        )
+        .await;
+        let text = listing(
+            &rt,
+            SessionArgs {
+                cwd: Some(deep.clone()),
+                ..Default::default()
+            },
+            Some(100),
+        )
+        .await;
+        for line in text.lines() {
+            assert!(
+                line.chars().count() <= 100,
+                "{} chars: {line:?}",
+                line.chars().count()
+            );
+        }
+        let row = text.lines().nth(1).unwrap();
+        assert!(row.contains('…'), "folder or title shortened: {row}");
+        assert!(row.contains("project"), "the folder keeps its end: {row}");
         rt.shutdown().await;
     })
     .await
