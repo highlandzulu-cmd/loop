@@ -78,6 +78,44 @@ impl SqliteSessionStore {
     }
 }
 
+/// Attempts at starting a write transaction that finds the database busy,
+/// each after the connection's own busy timeout has run out.
+const BEGIN_ATTEMPTS: u32 = 5;
+
+/// Whether SQLite refused for another connection's lock.
+pub(super) fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(e.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
+/// Start an IMMEDIATE (write) transaction. When the database stays busy
+/// past the busy timeout, as under heavy concurrent writing on a slow disk,
+/// try again a few times after a short, jittered pause (20–200 ms).
+pub(super) fn begin_immediate(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
+    let mut attempt = 1;
+    loop {
+        match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+            Err(error) if is_busy(&error) && attempt < BEGIN_ATTEMPTS => {
+                let base = (20u64 << (attempt - 1)).min(200);
+                let jitter = u64::from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .subsec_nanos(),
+                ) % (base / 2 + 1);
+                std::thread::sleep(std::time::Duration::from_millis(
+                    (base / 2 + jitter).clamp(20, 200),
+                ));
+                attempt += 1;
+            }
+            result => return result,
+        }
+    }
+}
+
 pub(super) fn open(path: &Path) -> Result<Connection, SessionError> {
     let conn = Connection::open(path).map_err(|e| SessionError::Storage(e.to_string()))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;")
@@ -528,9 +566,8 @@ impl SqliteSessionStore {
             let path = path.clone();
             let id = id.clone();
             move || {
-                let mut conn = open(&path)?;
-                let tx = conn
-                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                let conn = open(&path)?;
+                let tx = begin_immediate(&conn)
                     .map_err(|e| SessionError::Storage(e.to_string()))?;
                 tx.execute(
                     "INSERT INTO sessions(id, cwd, name, parent_session_id, active_leaf_id, created_at) VALUES (?1,?2,?3,?4,NULL,?5)",
@@ -689,10 +726,8 @@ impl SessionStore for SqliteSessionStore {
         let identity = self.identity.clone();
         let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = open(&path)?;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn).map_err(|e| SessionError::Storage(e.to_string()))?;
             if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
                 return Err(guard.refusal());
             }
@@ -712,10 +747,8 @@ impl SessionStore for SqliteSessionStore {
         let identity = self.identity.clone();
         let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = open(&path)?;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn).map_err(|e| SessionError::Storage(e.to_string()))?;
             if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
                 return Err(guard.refusal());
             }
@@ -744,8 +777,8 @@ impl SessionStore for SqliteSessionStore {
         let through_entry_id = through_entry_id.map(str::to_owned);
         let guard = self.resume_guard.clone();
         let new_id = tokio::task::spawn_blocking(move || {
-            let mut conn = open(&path)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn)
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             let (cwd, leaf): (Option<String>, Option<String>) = tx.query_row(
                 "SELECT cwd, active_leaf_id FROM sessions WHERE id=?1", [&source_id],
@@ -810,6 +843,63 @@ impl SessionStore for SqliteSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hold the write lock on another connection for `hold`.
+    fn hold_write_lock(path: &Path, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
+        let holder = Connection::open(path).unwrap();
+        holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            holder.execute_batch("COMMIT").unwrap();
+        })
+    }
+
+    #[test]
+    fn a_busy_write_transaction_is_retried_until_the_lock_is_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        SqliteSessionStore::open(&path).unwrap();
+        // No busy timeout: SQLite reports BUSY at once, so only the retry waits.
+        let conn = Connection::open(&path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let held = hold_write_lock(&path, std::time::Duration::from_millis(100));
+        let plain = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate);
+        assert!(
+            matches!(&plain, Err(e) if is_busy(e)),
+            "the lock is held: {plain:?}"
+        );
+        drop(plain);
+        let tx = begin_immediate(&conn).unwrap();
+        tx.execute("UPDATE session_sequences SET next_seq = next_seq", [])
+            .unwrap();
+        tx.commit().unwrap();
+        held.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_append_waits_out_another_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let store = SqliteSessionStore::open(&path).unwrap();
+        let id = store
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let held = hold_write_lock(&path, std::time::Duration::from_millis(300));
+        store
+            .append_entry(
+                &id,
+                PendingSessionWrite::Label {
+                    label: "after the lock".into(),
+                },
+            )
+            .await
+            .unwrap();
+        held.join().unwrap();
+    }
 
     #[test]
     fn migrations_apply_in_order() {
