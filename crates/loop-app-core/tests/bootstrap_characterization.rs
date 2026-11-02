@@ -72,14 +72,11 @@ async fn characterization_child() {
         loop_app_core::config::paths::sessions_db_path(&runtime.agent_dir),
     )
     .unwrap();
-    // Resume after the first standalone writer closes and releases its lease.
+    // Resume after the first standalone writer closes and releases its
+    // lease. Its owner releases explicitly, as the CLI does on exit; a Drop
+    // fallback on the blocking pool would race this check.
+    runtime.session_shutdown().run().await.unwrap();
     drop(runtime);
-    for _ in 0..100 {
-        if store.lease(&session_id).await.unwrap().is_none() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
     assert!(store.lease(&session_id).await.unwrap().is_none());
     opts = BootstrapOpts {
         cwd,
