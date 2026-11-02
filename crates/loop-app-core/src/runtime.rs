@@ -119,25 +119,50 @@ pub struct Runtime {
 pub struct SessionShutdown {
     harness: Arc<AgentHarness>,
     store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    grace: std::time::Duration,
 }
 
-/// How long shutdown waits for the current turn to stop writing.
+/// How long shutdown waits for the current turn to stop.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl SessionShutdown {
-    /// Stop admission, cancel the current turn and wait (bounded) for it to
-    /// finish writing, then release this store's leases. Safe to repeat.
+    /// Shut down `harness`, then release the leases `store` holds.
+    pub fn new(
+        harness: Arc<AgentHarness>,
+        store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    ) -> Self {
+        Self {
+            harness,
+            store,
+            grace: SHUTDOWN_GRACE,
+        }
+    }
+
+    /// How long to wait for the current turn to stop (default 5 s).
+    pub fn with_grace(mut self, grace: std::time::Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// Stop admission, cancel the current turn and wait for it to finish:
+    /// its tools, writes and `Settled` hooks. Only then release this store's
+    /// leases. A turn still running after the grace keeps them, and this
+    /// returns an error: the Session is not handed on while work in this
+    /// process may still touch it. Safe to repeat.
     pub async fn run(&self) -> anyhow::Result<()> {
         // Requested once per harness: it clears queued work and runs the
         // `shutdown_requested` hooks, which must not fire again on a repeat.
         if !self.harness.is_shutting_down() {
             self.harness.request_shutdown();
         }
-        if tokio::time::timeout(SHUTDOWN_GRACE, self.harness.wait_for_shutdown())
+        if tokio::time::timeout(self.grace, self.harness.wait_for_settled())
             .await
             .is_err()
         {
-            tracing::warn!("the turn did not stop in time; releasing its Session leases anyway");
+            anyhow::bail!(
+                "the turn did not stop within {} s; its Session lease is kept until this process exits and expires 30 s later",
+                self.grace.as_secs_f32()
+            );
         }
         if let Some(store) = &self.store {
             store
@@ -152,10 +177,7 @@ impl SessionShutdown {
 impl Runtime {
     /// A handle that ends this Surface's Session work and releases its leases.
     pub fn session_shutdown(&self) -> SessionShutdown {
-        SessionShutdown {
-            harness: Arc::clone(&self.harness),
-            store: self.session_store.clone(),
-        }
+        SessionShutdown::new(Arc::clone(&self.harness), self.session_store.clone())
     }
 }
 
