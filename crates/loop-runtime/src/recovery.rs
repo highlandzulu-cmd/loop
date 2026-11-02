@@ -19,6 +19,8 @@ pub struct Recovery {
     pub escalations_withdrawn: usize,
     /// Session leases of the previous Runtime reclaimed and released.
     pub leases_reclaimed: usize,
+    /// Stale lease rows of exited processes removed (the startup sweep).
+    pub leases_swept: usize,
 }
 
 /// An Escalation still open, identified by the generation that raised it.

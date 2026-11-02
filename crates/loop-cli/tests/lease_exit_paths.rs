@@ -445,3 +445,51 @@ async fn a_tui_ended_by_sighup_leaves_no_lease() {
     })
     .await
 }
+
+#[tokio::test]
+async fn a_new_terminal_loop_sweeps_rows_of_exited_processes() {
+    bounded(async {
+        use loop_agent::harness::session::sqlite::{LeaseEnvironment, LeaseIdentity, PidLiveness};
+        struct LongAgo;
+        impl LeaseEnvironment for LongAgo {
+            fn now_ms(&self) -> i64 {
+                1
+            }
+            fn pid_liveness(&self, _: u32) -> PidLiveness {
+                PidLiveness::Unknown
+            }
+        }
+        let fx = Fixture::new(Model::Answer);
+        std::fs::create_dir_all(fx.db().parent().unwrap()).unwrap();
+        let old =
+            SqliteSessionStore::with_environment(fx.db(), std::sync::Arc::new(LongAgo)).unwrap();
+        let mut exited = std::process::Command::new("true").spawn().unwrap();
+        let dead = exited.id();
+        exited.wait().unwrap();
+        let mut seeded = Vec::new();
+        for pid in [dead, std::process::id()] {
+            let id = loop_agent::harness::session::SessionStore::create(&old, None, None)
+                .await
+                .unwrap()
+                .metadata()
+                .id
+                .clone();
+            old.acquire_lease(
+                &id,
+                &LeaseIdentity {
+                    owner: "standalone".into(),
+                    pid,
+                    generation: 1,
+                },
+            )
+            .await
+            .unwrap();
+            seeded.push(id);
+        }
+        let out = output(fx.command(&["--print", "hi"])).await;
+        assert!(out.status.success(), "{out:?}");
+        let left: Vec<_> = fx.leases().await.into_iter().map(|(id, ..)| id).collect();
+        assert_eq!(left, [seeded[1].clone()], "only the live owner's row stays");
+    })
+    .await
+}

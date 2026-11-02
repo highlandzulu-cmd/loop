@@ -280,8 +280,94 @@ impl SqliteSessionStore {
     }
 }
 
+impl SqliteSessionStore {
+    /// Delete lease rows whose owner is gone, and return how many.
+    ///
+    /// A row goes only when its heartbeat is older than
+    /// [`LEASE_STALE_AFTER_MS`] and its pid is proven dead. Unknown liveness,
+    /// a live pid, and any platform without a pid probe keep the row. Rows
+    /// of a Runtime also need `runtime_lock_for` to name this database: the
+    /// caller then holds the Runtime lock of this ownership domain.
+    ///
+    /// Candidates are read, judged and deleted in one IMMEDIATE transaction,
+    /// and each delete names the exact row it judged, so a concurrent renewal
+    /// or a new owner is never removed.
+    pub async fn sweep_stale_leases(
+        &self,
+        runtime_lock_for: Option<&std::path::Path>,
+    ) -> Result<usize, SessionError> {
+        let proof = runtime_lock_for.is_some_and(|held| same_database(held, &self.path));
+        let path = self.path.clone();
+        let env = Arc::clone(&self.environment);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            let now = env.now_ms();
+            let rows: Vec<(String, SessionLease)> = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT session_id, owner, pid, generation, heartbeat_ms FROM session_leases",
+                    )
+                    .map_err(storage)?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            SessionLease {
+                                identity: LeaseIdentity {
+                                    owner: row.get(1)?,
+                                    pid: row.get(2)?,
+                                    generation: row.get(3)?,
+                                },
+                                heartbeat_ms: row.get(4)?,
+                            },
+                        ))
+                    })
+                    .map_err(storage)?;
+                rows.collect::<Result<_, _>>().map_err(storage)?
+            };
+            let mut swept = 0;
+            for (id, lease) in rows {
+                let stale = now.saturating_sub(lease.heartbeat_ms) >= LEASE_STALE_AFTER_MS;
+                if !stale || (lease.identity.owner == "runtime" && !proof) {
+                    continue;
+                }
+                if env.pid_liveness(lease.identity.pid) != PidLiveness::Dead {
+                    continue;
+                }
+                swept += tx
+                    .execute(
+                        "DELETE FROM session_leases WHERE session_id=?1 AND owner=?2 AND pid=?3 AND generation=?4 AND heartbeat_ms=?5",
+                        params![
+                            id,
+                            lease.identity.owner,
+                            lease.identity.pid,
+                            lease.identity.generation,
+                            lease.heartbeat_ms
+                        ],
+                    )
+                    .map_err(storage)?;
+            }
+            tx.commit().map_err(storage)?;
+            Ok(swept)
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))?
+    }
+}
+
+/// Whether two paths name the same database file.
+fn same_database(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => std::path::absolute(a).ok() == std::path::absolute(b).ok(),
+    }
+}
+
 /// Open the standalone bootstrap store and claim its resumed Session, if any.
-/// On Unix, ownership is renewed every 5 s and released when the final store
+/// On Unix, stale rows of dead owners are swept first, and ownership is renewed every 5 s and released when the final store
 /// handle drops. Other platforms retain standalone behavior without leases;
 /// the explicit lease API remains available with injectable process liveness.
 pub async fn create_sqlite_session_store_for_resume(
@@ -291,6 +377,13 @@ pub async fn create_sqlite_session_store_for_resume(
     let store = SqliteSessionStore::open(path)?;
     #[cfg(unix)]
     {
+        // Rows of `loop` processes that died without releasing would block
+        // their Sessions until someone takes them over.
+        match store.sweep_stale_leases(None).await {
+            Ok(0) => {}
+            Ok(swept) => tracing::info!(swept, "removed Session leases of exited processes"),
+            Err(error) => tracing::warn!(%error, "could not sweep stale Session leases"),
+        }
         Ok(Arc::new(match id {
             Some(id) => store.standalone_resume(id).await?,
             None => store.standalone_writer(),

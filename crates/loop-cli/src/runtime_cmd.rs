@@ -147,8 +147,11 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Runtime recovery failed: {e}"))?;
     if recovered != loop_runtime::Recovery::default() {
         eprintln!(
-            "loop runtime: recovered {} interrupted turn(s), withdrew {} Escalation(s), reclaimed {} lease(s)",
-            recovered.turns_ended, recovered.escalations_withdrawn, recovered.leases_reclaimed
+            "loop runtime: recovered {} interrupted turn(s), withdrew {} Escalation(s), reclaimed {} lease(s), removed {} stale lease(s) of exited processes",
+            recovered.turns_ended,
+            recovered.escalations_withdrawn,
+            recovered.leases_reclaimed,
+            recovered.leases_swept
         );
     }
 
@@ -165,6 +168,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         turns_ended = recovered.turns_ended,
         escalations_withdrawn = recovered.escalations_withdrawn,
         leases_reclaimed = recovered.leases_reclaimed,
+        leases_swept = recovered.leases_swept,
         "Runtime listening"
     );
     eprintln!("loop runtime: listening on {}", socket.display());

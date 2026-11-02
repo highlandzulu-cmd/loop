@@ -375,6 +375,19 @@ impl Runtime {
             .await
             .map_err(failed)?;
         let mut leases_reclaimed = 0;
+        let mut leases_swept = 0;
+        if let Some(lock) = lock {
+            // Terminal `loop` processes that died without releasing. A failed
+            // sweep must not keep the Runtime from starting.
+            match self
+                .store
+                .sweep_stale_leases(Some(lock.sessions_db()))
+                .await
+            {
+                Ok(swept) => leases_swept = swept,
+                Err(error) => eprintln!("Runtime recovery: lease sweep: {error}"),
+            }
+        }
         if lock.is_some() {
             for meta in self.store.list(None).await.map_err(failed)? {
                 let Some(lease) = self.store.lease(&meta.id).await.map_err(failed)? else {
@@ -404,6 +417,7 @@ impl Runtime {
             turns_ended: turns.len(),
             escalations_withdrawn: escalations.len(),
             leases_reclaimed,
+            leases_swept,
         })
     }
     /// Bound each step of closing a Session whose turn ignores cancellation.
