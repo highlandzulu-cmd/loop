@@ -228,6 +228,63 @@ pub struct Settings {
     /// commands Loop runs). Entries replace built-in presets with the same id.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agents: Vec<crate::agents::AgentEntry>,
+    /// Limits of `loop runtime start` (global only: one Runtime serves many
+    /// folders). A command-line flag overrides each.
+    #[serde(default, skip_serializing_if = "RuntimeSettings::is_empty")]
+    pub runtime: RuntimeSettings,
+}
+
+/// `runtime` settings. Values are kept as written and checked when the
+/// Runtime starts, so a bad one is reported by its key instead of making
+/// the whole file unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSettings {
+    /// Most Sessions loaded at once (default 16).
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_sessions: Option<serde_json::Value>,
+    /// Most turns running at once (default 8).
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_active_turns: Option<serde_json::Value>,
+}
+
+/// Keep an explicit `null`, so it can be refused rather than ignored.
+fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
+impl RuntimeSettings {
+    fn is_empty(&self) -> bool {
+        self.max_sessions.is_none() && self.max_active_turns.is_none()
+    }
+    /// `runtime.maxSessions`, when set.
+    pub fn max_sessions(&self) -> anyhow::Result<Option<usize>> {
+        limit("maxSessions", self.max_sessions.as_ref())
+    }
+    /// `runtime.maxActiveTurns`, when set.
+    pub fn max_active_turns(&self) -> anyhow::Result<Option<usize>> {
+        limit("maxActiveTurns", self.max_active_turns.as_ref())
+    }
+}
+
+fn limit(key: &str, value: Option<&serde_json::Value>) -> anyhow::Result<Option<usize>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    match value.as_u64().and_then(|n| usize::try_from(n).ok()) {
+        Some(n) if n >= 1 => Ok(Some(n)),
+        _ => anyhow::bail!(
+            "settings.json: `runtime.{key}` must be a whole number of at least 1, not {value}"
+        ),
+    }
 }
 
 fn default_thinking() -> String {
@@ -291,6 +348,7 @@ impl Default for Settings {
             tracing: TracingSettings::default(),
             providers: Vec::new(),
             agents: Vec::new(),
+            runtime: RuntimeSettings::default(),
         }
     }
 }
@@ -551,6 +609,77 @@ pub fn set_skill_disabled(list: &mut Vec<String>, name: &str, enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_limits(json: &str) -> anyhow::Result<(Option<usize>, Option<usize>)> {
+        let settings: Settings = serde_json::from_str(json)?;
+        Ok((
+            settings.runtime.max_sessions()?,
+            settings.runtime.max_active_turns()?,
+        ))
+    }
+
+    #[test]
+    fn runtime_limits_are_read_from_settings() {
+        assert_eq!(runtime_limits("{}").unwrap(), (None, None));
+        assert_eq!(
+            runtime_limits(r#"{"runtime":{"maxSessions":3,"maxActiveTurns":2}}"#).unwrap(),
+            (Some(3), Some(2))
+        );
+        assert_eq!(
+            runtime_limits(r#"{"runtime":{"maxActiveTurns":1}}"#).unwrap(),
+            (None, Some(1))
+        );
+    }
+
+    #[test]
+    fn invalid_runtime_limits_name_their_key() {
+        for (json, key) in [
+            (r#"{"runtime":{"maxSessions":0}}"#, "runtime.maxSessions"),
+            (r#"{"runtime":{"maxSessions":-2}}"#, "runtime.maxSessions"),
+            (r#"{"runtime":{"maxSessions":null}}"#, "runtime.maxSessions"),
+            (r#"{"runtime":{"maxSessions":2.5}}"#, "runtime.maxSessions"),
+            (
+                r#"{"runtime":{"maxActiveTurns":"8"}}"#,
+                "runtime.maxActiveTurns",
+            ),
+            (
+                r#"{"runtime":{"maxActiveTurns":0}}"#,
+                "runtime.maxActiveTurns",
+            ),
+        ] {
+            let error = runtime_limits(json).unwrap_err().to_string();
+            assert!(
+                error.contains(key) && error.contains("at least 1"),
+                "{json}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_limits_survive_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"runtime":{"maxSessions":4,"maxActiveTurns":null}}"#,
+        )
+        .unwrap();
+        Settings::load_file(&path)
+            .unwrap()
+            .save_file(&path)
+            .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["runtime"],
+            serde_json::json!({"maxSessions":4,"maxActiveTurns":null})
+        );
+        // Absent stays absent.
+        Settings::default().save_file(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("runtime").is_none(), "{saved}");
+    }
 
     #[test]
     fn disabled_mcp_servers_round_trip_and_merge() {

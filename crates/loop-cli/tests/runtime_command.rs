@@ -300,3 +300,80 @@ async fn stop_never_signals_the_pid_in_a_stale_pid_file() {
     .await
     .expect("test timed out");
 }
+
+fn write_settings(agent: &Path, json: &str) {
+    std::fs::write(agent.join("settings.json"), json).unwrap();
+}
+
+async fn status_of(agent: &Path) -> loop_protocol::rpc::RuntimeStatus {
+    let output = run(agent, &["runtime", "status", "--json"]).await;
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+#[tokio::test]
+async fn limits_come_from_flags_then_settings_then_defaults() {
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let (_dir, agent) = agent_dir();
+        let socket = agent.join("run/runtime.sock");
+        write_settings(&agent, r#"{"runtime":{"maxSessions":3}}"#);
+        let mut child = serve(&agent, &[]).spawn().unwrap();
+        wait_for(&socket, &mut child).await;
+        let status = status_of(&agent).await;
+        assert_eq!((status.max_sessions, status.max_active_turns), (3, 8));
+        assert_eq!(status.max_sessions_from.as_deref(), Some("settings"));
+        assert_eq!(status.max_active_turns_from.as_deref(), Some("default"));
+        let text = run(&agent, &["runtime", "status"]).await;
+        let text = String::from_utf8_lossy(&text.stdout);
+        assert!(text.contains("0 loaded of 3 (settings)"), "{text}");
+        assert!(text.contains("8 turns at once (default)"), "{text}");
+        signal(&child, "-TERM");
+        child.wait().await.unwrap();
+
+        // A flag wins over settings.
+        write_settings(
+            &agent,
+            r#"{"runtime":{"maxSessions":3,"maxActiveTurns":4}}"#,
+        );
+        let mut child = serve(&agent, &["--max-sessions", "2"]).spawn().unwrap();
+        wait_for(&socket, &mut child).await;
+        let status = status_of(&agent).await;
+        assert_eq!((status.max_sessions, status.max_active_turns), (2, 4));
+        assert_eq!(status.max_sessions_from.as_deref(), Some("flag"));
+        assert_eq!(status.max_active_turns_from.as_deref(), Some("settings"));
+        signal(&child, "-TERM");
+        child.wait().await.unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
+
+#[tokio::test]
+async fn an_invalid_limit_in_settings_stops_startup_and_names_its_key() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_dir, agent) = agent_dir();
+        for (json, key) in [
+            (r#"{"runtime":{"maxSessions":0}}"#, "runtime.maxSessions"),
+            (
+                r#"{"runtime":{"maxActiveTurns":null}}"#,
+                "runtime.maxActiveTurns",
+            ),
+            (
+                r#"{"runtime":{"maxActiveTurns":-1}}"#,
+                "runtime.maxActiveTurns",
+            ),
+        ] {
+            write_settings(&agent, json);
+            let output = tokio::time::timeout(Duration::from_secs(30), serve(&agent, &[]).output())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!output.status.success(), "{json}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(key), "{json}: {stderr}");
+            assert!(!agent.join("run/runtime.sock").exists());
+        }
+    })
+    .await
+    .expect("test timed out");
+}

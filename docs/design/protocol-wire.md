@@ -150,7 +150,7 @@ sets both.
 | `session/close` | c → s | request | `{session, force?}` → `{}`. `force` (default false) cancels a running turn; without it a busy Session returns Busy |
 | `session/attach` | c → s | request | `{session, after_seq?}` → `{latest_seq, generation}`. The cursor defaults to 0 |
 | `session/detach` | c → s | request | `{session}` → `{}`. Stops this connection's updates and approvals for the Session; the turn keeps running |
-| `runtime/status` | c → s | request | `{}` → `RuntimeStatus{pid, socket, generation, loaded, busy, max_sessions, max_active_turns}` |
+| `runtime/status` | c → s | request | `{}` → `RuntimeStatus{pid, socket, generation, loaded, busy, max_sessions, max_active_turns, max_sessions_from?, max_active_turns_from?}`. The `_from` fields say where a limit came from: `flag`, `settings` or `default` |
 | `runtime/stop` | c → s | request | `{}` → `{}`. The Runtime answers, then shuts down as on SIGTERM and closes every connection |
 | `host/interact` | s → c | request | `InteractionRequest` plus optional `session` (a `SessionRef`) → `InteractionOutcome` |
 | `host/interact_withdrawn` | s → c | notification | `{session, id}` |

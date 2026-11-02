@@ -448,6 +448,8 @@ impl Runtime {
             busy: busy as u64,
             max_sessions: self.limits.max_sessions as u64,
             max_active_turns: self.limits.max_active_turns as u64,
+            max_sessions_from: None,
+            max_active_turns_from: None,
         }
     }
     pub fn event_log(&self) -> &Arc<dyn EventLog> {

@@ -14,10 +14,10 @@ pub const STOP_WAIT: Duration = Duration::from_secs(10);
 pub struct StartArgs {
     /// Socket path; default is the agent directory's Runtime socket.
     pub socket: Option<PathBuf>,
-    /// Most Sessions the Runtime holds at once.
-    pub max_sessions: usize,
+    /// `--max-sessions`: most Sessions the Runtime holds at once.
+    pub max_sessions: Option<usize>,
     /// Most turns running at once; the rest queue.
-    pub max_active_turns: usize,
+    pub max_active_turns: Option<usize>,
     /// `--permission-mode`; `full-access` only takes effect through this flag.
     pub permission_mode: Option<String>,
     /// Folder for Sessions that name none.
@@ -67,10 +67,10 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
             );
         }
     }
-    if args.max_sessions == 0 || args.max_active_turns == 0 {
-        anyhow::bail!("--max-sessions and --max-active-turns must be at least 1");
-    }
     let agent_dir = paths::get_agent_dir();
+    let settings = Settings::load_file(&paths::settings_path(&agent_dir)).unwrap_or_default();
+    // Refused before anything starts, naming the flag or settings key.
+    let limits = Limits::resolve(args.max_sessions, args.max_active_turns, &settings.runtime)?;
     paths::ensure_agent_dirs(&agent_dir)?;
     // The Lock is the ownership proof; everything below runs while holding it.
     let lock = RuntimeInstanceLock::acquire(&agent_dir).map_err(|e| {
@@ -104,7 +104,6 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     let sessions_lock = loop_app_core::runtime_instance::SessionDatabaseLock::acquire(&sessions_db)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let settings = Settings::load_file(&paths::settings_path(&agent_dir)).unwrap_or_default();
     let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, true).await?;
     let log = Arc::new(
         SqliteEventLog::open(&agent_dir)
@@ -130,8 +129,8 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         defaults,
         log,
         RuntimeLimits {
-            max_sessions: args.max_sessions,
-            max_active_turns: args.max_active_turns,
+            max_sessions: limits.max_sessions.0,
+            max_active_turns: limits.max_active_turns.0,
         },
     )
     .await
@@ -177,6 +176,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         runtime: runtime.clone(),
         socket: std::path::absolute(&socket).unwrap_or_else(|_| socket.clone()),
         stop: stop.clone(),
+        limits,
     });
 
     let info = PeerInfo {
@@ -239,6 +239,57 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
 #[cfg(unix)]
 use std::sync::Arc;
 
+/// The Runtime's limits and where each came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// Most Sessions loaded at once, and its source.
+    pub max_sessions: (usize, &'static str),
+    /// Most turns running at once, and its source.
+    pub max_active_turns: (usize, &'static str),
+}
+
+impl Limits {
+    /// Default `max_sessions`.
+    pub const MAX_SESSIONS: usize = 16;
+    /// Default `max_active_turns`.
+    pub const MAX_ACTIVE_TURNS: usize = 8;
+
+    /// A flag wins over `settings.json`'s `runtime` key, which wins over the
+    /// defaults. Settings values are checked even when a flag overrides them.
+    pub fn resolve(
+        max_sessions: Option<usize>,
+        max_active_turns: Option<usize>,
+        settings: &crate::config::RuntimeSettings,
+    ) -> anyhow::Result<Self> {
+        let pick = |flag: Option<usize>,
+                    name: &str,
+                    set: Option<usize>,
+                    default: usize|
+         -> anyhow::Result<(usize, &'static str)> {
+            match (flag, set) {
+                (Some(0), _) => anyhow::bail!("--{name} must be at least 1"),
+                (Some(n), _) => Ok((n, "flag")),
+                (None, Some(n)) => Ok((n, "settings")),
+                (None, None) => Ok((default, "default")),
+            }
+        };
+        Ok(Self {
+            max_sessions: pick(
+                max_sessions,
+                "max-sessions",
+                settings.max_sessions()?,
+                Self::MAX_SESSIONS,
+            )?,
+            max_active_turns: pick(
+                max_active_turns,
+                "max-active-turns",
+                settings.max_active_turns()?,
+                Self::MAX_ACTIVE_TURNS,
+            )?,
+        })
+    }
+}
+
 /// The Runtime as one socket serves it: `runtime/status` names this socket
 /// and `runtime/stop` ends the accept loop like a signal does.
 #[cfg(unix)]
@@ -246,6 +297,7 @@ struct Control {
     runtime: Arc<loop_runtime::Runtime>,
     socket: PathBuf,
     stop: tokio_util::sync::CancellationToken,
+    limits: Limits,
 }
 
 #[cfg(unix)]
@@ -313,6 +365,8 @@ impl loop_wire::RuntimeControl for Control {
     async fn status(&self) -> loop_protocol::BackendResult<loop_protocol::rpc::RuntimeStatus> {
         let mut status = self.runtime.status();
         status.socket = self.socket.clone();
+        status.max_sessions_from = Some(self.limits.max_sessions.1.into());
+        status.max_active_turns_from = Some(self.limits.max_active_turns.1.into());
         Ok(status)
     }
     async fn stop(&self) -> loop_protocol::BackendResult<()> {
@@ -434,9 +488,20 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
             status.pid, status.generation
         );
         println!("socket:  {}", status.socket.display());
+        let from = |source: &Option<String>| {
+            source
+                .as_deref()
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default()
+        };
         println!(
-            "Sessions: {} loaded of {}, {} busy; at most {} turns at once",
-            status.loaded, status.max_sessions, status.busy, status.max_active_turns
+            "Sessions: {} loaded of {}{}, {} busy; at most {} turns at once{}",
+            status.loaded,
+            status.max_sessions,
+            from(&status.max_sessions_from),
+            status.busy,
+            status.max_active_turns,
+            from(&status.max_active_turns_from)
         );
     }
     Ok(true)
@@ -485,5 +550,49 @@ mod tests {
         ));
         let failed = Box::pin(std::future::ready(Err(std::io::Error::other("x"))));
         assert!(register(failed).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::Limits;
+    use crate::config::RuntimeSettings;
+
+    fn settings(json: &str) -> RuntimeSettings {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn flags_win_over_settings_which_win_over_defaults() {
+        let none = RuntimeSettings::default();
+        let limits = Limits::resolve(None, None, &none).unwrap();
+        assert_eq!(limits.max_sessions, (16, "default"));
+        assert_eq!(limits.max_active_turns, (8, "default"));
+        let set = settings(r#"{"maxSessions":3,"maxActiveTurns":2}"#);
+        let limits = Limits::resolve(None, None, &set).unwrap();
+        assert_eq!(
+            (limits.max_sessions, limits.max_active_turns),
+            ((3, "settings"), (2, "settings"))
+        );
+        let limits = Limits::resolve(Some(5), None, &set).unwrap();
+        assert_eq!(
+            (limits.max_sessions, limits.max_active_turns),
+            ((5, "flag"), (2, "settings"))
+        );
+    }
+
+    #[test]
+    fn zero_flags_and_bad_settings_are_refused() {
+        let none = RuntimeSettings::default();
+        let error = Limits::resolve(Some(0), None, &none)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("--max-sessions"), "{error}");
+        // A bad settings value is refused even when a flag overrides it.
+        let bad = settings(r#"{"maxActiveTurns":0}"#);
+        let error = Limits::resolve(None, Some(2), &bad)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("runtime.maxActiveTurns"), "{error}");
     }
 }

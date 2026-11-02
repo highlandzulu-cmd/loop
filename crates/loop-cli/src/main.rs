@@ -148,12 +148,14 @@ enum RuntimeCommand {
         /// Socket path (default: `run/runtime.sock` in the agent directory).
         #[arg(long)]
         socket: Option<PathBuf>,
-        /// Most Sessions held at once.
-        #[arg(long, default_value_t = 16)]
-        max_sessions: usize,
-        /// Most turns running at once; further turns queue.
-        #[arg(long, default_value_t = 8)]
-        max_active_turns: usize,
+        /// Most Sessions held at once [default: `runtime.maxSessions` in
+        /// settings.json, else 16].
+        #[arg(long)]
+        max_sessions: Option<usize>,
+        /// Most turns running at once; further turns queue [default:
+        /// `runtime.maxActiveTurns` in settings.json, else 8].
+        #[arg(long)]
+        max_active_turns: Option<usize>,
     },
     /// Ask the running Runtime to stop, through its socket, and wait up to
     /// 10 s for it to go. Never signals a process.
@@ -606,7 +608,7 @@ mod tests {
         else {
             panic!("not runtime start")
         };
-        assert_eq!((socket, max_sessions, max_active_turns), (None, 16, 8));
+        assert_eq!((socket, max_sessions, max_active_turns), (None, None, None));
         let cli = parse(&[
             "loop",
             "runtime",
@@ -633,7 +635,7 @@ mod tests {
             panic!("not runtime start")
         };
         assert_eq!(socket, Some(PathBuf::from("/tmp/x.sock")));
-        assert_eq!((max_sessions, max_active_turns), (3, 2));
+        assert_eq!((max_sessions, max_active_turns), (Some(3), Some(2)));
         let cli = parse(&["loop", "runtime", "stop", "--socket", "/tmp/x.sock"]);
         assert!(matches!(
             cli.command,
