@@ -40,7 +40,7 @@ Common settings in `settings.json`:
 | `providers` | empty | Custom providers added with `/login custom` |
 | `runtime.maxSessions`, `runtime.maxActiveTurns` | `16`, `8` | Limits of `loop runtime start`; see [the Runtime](runtime.md#start-the-runtime). Each must be a whole number of at least 1. A command-line flag overrides it (global only) |
 
-On macOS, use `--permission-mode read-only` or `--permission-mode ask` to control tool permissions. Setting `sandbox.mode` to `local` leaves the sandbox off with a warning on platforms other than Linux.
+On macOS, use `--permission-mode read-only` or `--permission-mode ask` to control tool permissions. On platforms other than Linux, setting `sandbox.mode` to `local` has different startup outcomes: standalone Loop leaves the sandbox off with a warning, while a Runtime started with `loop runtime start` refuses to admit the Session with `required workspace sandbox failed`. Runtime Sessions require the configured sandbox to start successfully.
 
 Environment variables:
 
