@@ -23,10 +23,26 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | Flag | Default | Meaning |
 |---|---|---|
 | `--socket PATH` | `~/.loop/agent/run/runtime.sock` | Where Surfaces connect |
-| `--max-sessions N` | 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
-| `--max-active-turns N` | 8 | Most turns running at once. More turns wait in a queue; they are not refused |
+| `--max-sessions N` | `runtime.maxSessions`, else 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
+| `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits` or `full-access` |
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
+
+The two limits can also be set in the global `~/.loop/agent/settings.json`
+(a project's settings cannot change them, since one Runtime serves many
+folders). A flag wins over the setting, which wins over the default:
+
+```json
+{ "runtime": { "maxSessions": 32, "maxActiveTurns": 12 } }
+```
+
+Each must be a whole number of at least 1. Anything else, including `0`,
+a negative number or `null`, stops `loop runtime start` with an error that
+names the key, for example
+``settings.json: `runtime.maxSessions` must be a whole number of at least 1, not 0``.
+`loop runtime status` shows each limit with where it came from: `flag`,
+`settings` or `default` (`max_sessions_from` and `max_active_turns_from`
+with `--json`).
 
 Only one Runtime can use an agent directory, or a Session database, at a time.
 A second `loop runtime start` exits with `a Runtime is already running (pid N)`, or
@@ -75,7 +91,8 @@ loop session close 3f2a         # unload a Session from the Runtime; its history
 ```
 
 When you attach, the Surface replays the Session's history and then follows it
-live. A Session that is not loaded, for example after the Runtime restarted, is
+live. Prompts show as `› <text>`, whichever Surface sent them; the Surface you
+typed a prompt in does not print it a second time. A Session that is not loaded, for example after the Runtime restarted, is
 loaded when you attach. Child Sessions started by a Subagent are named after
 their task and show their parent in the list. Once the parent has its answer,
 a finished child is closed: it frees its slot and is listed only with
@@ -95,10 +112,10 @@ Session, closed Subagents included, with full ids and fields `live`, `busy`,
 
 | Input | Effect |
 |---|---|
-| A line of text | Starts a turn with it as the prompt. If the Session is busy, you are told |
-| A number, while an approval is shown | Answers the approval with that choice |
+| A line of text | Starts a turn with it as the prompt. While a turn runs it is queued (`queued; sends when the current turn ends`) and sent, in order, when the turn ends. Detaching drops prompts still queued |
+| A number, while an approval is shown | Answers the approval with that choice; an approval always comes before queued prompts |
 | `> ` then text | Always a prompt, even when it starts with a number |
-| Ctrl+C | Cancels the current turn |
+| Ctrl+C | Cancels the current turn and drops prompts still queued, saying how many |
 | Ctrl+C again, or Ctrl+D | Detaches |
 
 Detaching, or losing the connection, never stops the agent. Attach again to

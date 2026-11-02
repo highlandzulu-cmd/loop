@@ -1077,11 +1077,25 @@
           "minimum": 0,
           "type": "integer"
         },
+        "max_active_turns_from": {
+          "description": "Where `max_active_turns` came from: `flag`, `settings` or `default`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "max_sessions": {
           "description": "Most Sessions held at once.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "max_sessions_from": {
+          "description": "Where `max_sessions` came from: `flag`, `settings` or `default`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "pid": {
           "description": "The Runtime's process id.",

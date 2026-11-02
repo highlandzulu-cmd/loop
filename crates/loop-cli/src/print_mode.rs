@@ -325,9 +325,9 @@ pub fn agent_text_chunk(update: &SessionUpdate) -> Option<&str> {
     }
 }
 
-/// Plain-text rendering of a Session's updates for a line terminal: agent
-/// text, one line per tool call and one per finished call, with each message
-/// starting on its own line.
+/// Plain-text rendering of a Session's updates for a line terminal: prompts
+/// as `› text`, agent text, one line per tool call and one per finished call,
+/// with each message starting on its own line.
 #[derive(Debug)]
 pub struct TextRenderer {
     at_line_start: bool,
@@ -375,6 +375,19 @@ impl TextRenderer {
                 }
             }
             SessionUpdate::TurnEnded { .. } => self.break_line(&mut out),
+            // A prompt: its own line, marked, continuation lines indented.
+            SessionUpdate::MessageChunk {
+                role: Role::User,
+                content,
+                ..
+            } => {
+                if let Some(text) = content.as_text().filter(|t| !t.is_empty()) {
+                    self.break_line(&mut out);
+                    out.push_str("› ");
+                    out.push_str(&text.trim_end_matches('\n').replace('\n', "\n  "));
+                    out.push('\n');
+                }
+            }
             _ => {
                 if let Some(text) = agent_text_chunk(update) {
                     out.push_str(text);
@@ -642,6 +655,32 @@ mod tests {
     fn render(updates: &[SessionUpdate]) -> String {
         let mut renderer = TextRenderer::default();
         updates.iter().map(|u| renderer.render(u)).collect()
+    }
+
+    #[test]
+    fn text_renderer_shows_user_messages_on_their_own_line() {
+        let user = |message: &str, text: &str| {
+            [
+                SessionUpdate::MessageStarted {
+                    message_id: loop_protocol::MessageId(message.into()),
+                    role: Role::User,
+                },
+                SessionUpdate::MessageChunk {
+                    message_id: loop_protocol::MessageId(message.into()),
+                    role: Role::User,
+                    content: ContentBlock::text(text),
+                },
+                SessionUpdate::MessageEnded {
+                    message_id: loop_protocol::MessageId(message.into()),
+                },
+            ]
+        };
+        let mut updates = Vec::new();
+        updates.extend(user("u1", "first\nquestion"));
+        updates.push(started("m1"));
+        updates.push(agent_text("m1", "answer"));
+        updates.extend(user("u2", "next"));
+        assert_eq!(render(&updates), "› first\n  question\nanswer\n› next\n");
     }
 
     #[test]

@@ -246,9 +246,27 @@ fn runtime_status_wire() {
             busy: 1,
             max_sessions: 16,
             max_active_turns: 8,
+            max_sessions_from: None,
+            max_active_turns_from: None,
         },
         json!({"pid":42,"socket":"/a/run/runtime.sock","generation":3,"loaded":2,"busy":1,
             "max_sessions":16,"max_active_turns":8}),
+    );
+    roundtrip(
+        &RuntimeStatus {
+            pid: 42,
+            socket: "/s".into(),
+            generation: 3,
+            loaded: 0,
+            busy: 0,
+            max_sessions: 3,
+            max_active_turns: 8,
+            max_sessions_from: Some("settings".into()),
+            max_active_turns_from: Some("default".into()),
+        },
+        json!({"pid":42,"socket":"/s","generation":3,"loaded":0,"busy":0,
+            "max_sessions":3,"max_active_turns":8,
+            "max_sessions_from":"settings","max_active_turns_from":"default"}),
     );
 }
 

@@ -156,6 +156,12 @@ pub struct RuntimeStatus {
     pub max_sessions: u64,
     /// Most turns running at once.
     pub max_active_turns: u64,
+    /// Where `max_sessions` came from: `flag`, `settings` or `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions_from: Option<String>,
+    /// Where `max_active_turns` came from: `flag`, `settings` or `default`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_active_turns_from: Option<String>,
 }
 
 /// `session/close` params. Closing a busy Session requires `force`.
