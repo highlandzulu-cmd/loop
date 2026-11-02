@@ -121,7 +121,7 @@ fn conflict(id: &str, lease: &SessionLease) -> SessionError {
         &lease.identity.owner
     };
     SessionError::Invalid(format!(
-        "Session {id} is in use by {owner} {}. Use `loop attach {id}` instead.",
+        "Session {id} is in use by {owner} {}. Use `loop session attach {id}` instead.",
         lease.identity.pid
     ))
 }
@@ -213,9 +213,16 @@ impl SqliteSessionStore {
         let id = id.to_owned();
         let identity = identity.clone();
         let env = Arc::clone(&self.environment);
+        let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking(move || {
             let mut conn = open(&path)?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+            // Checked inside the transaction: release deletes in its own
+            // IMMEDIATE transaction after closing the writer, so a claim
+            // either commits before that delete or sees the writer closed.
+            if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
+                return Err(guard.refusal());
+            }
             let now = env.now_ms();
             if !tx.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE id=?1)", [&id], |row| row.get::<_, bool>(0)).map_err(storage)? {
                 return Err(SessionError::NotFound(id));
@@ -280,8 +287,94 @@ impl SqliteSessionStore {
     }
 }
 
+impl SqliteSessionStore {
+    /// Delete lease rows whose owner is gone, and return how many.
+    ///
+    /// A row goes only when its heartbeat is older than
+    /// [`LEASE_STALE_AFTER_MS`] and its pid is proven dead. Unknown liveness,
+    /// a live pid, and any platform without a pid probe keep the row. Rows
+    /// of a Runtime also need `runtime_lock_for` to name this database: the
+    /// caller then holds the Runtime lock of this ownership domain.
+    ///
+    /// Candidates are read, judged and deleted in one IMMEDIATE transaction,
+    /// and each delete names the exact row it judged, so a concurrent renewal
+    /// or a new owner is never removed.
+    pub async fn sweep_stale_leases(
+        &self,
+        runtime_lock_for: Option<&std::path::Path>,
+    ) -> Result<usize, SessionError> {
+        let proof = runtime_lock_for.is_some_and(|held| same_database(held, &self.path));
+        let path = self.path.clone();
+        let env = Arc::clone(&self.environment);
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            let now = env.now_ms();
+            let rows: Vec<(String, SessionLease)> = {
+                let mut statement = tx
+                    .prepare(
+                        "SELECT session_id, owner, pid, generation, heartbeat_ms FROM session_leases",
+                    )
+                    .map_err(storage)?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            SessionLease {
+                                identity: LeaseIdentity {
+                                    owner: row.get(1)?,
+                                    pid: row.get(2)?,
+                                    generation: row.get(3)?,
+                                },
+                                heartbeat_ms: row.get(4)?,
+                            },
+                        ))
+                    })
+                    .map_err(storage)?;
+                rows.collect::<Result<_, _>>().map_err(storage)?
+            };
+            let mut swept = 0;
+            for (id, lease) in rows {
+                let stale = now.saturating_sub(lease.heartbeat_ms) >= LEASE_STALE_AFTER_MS;
+                if !stale || (lease.identity.owner == "runtime" && !proof) {
+                    continue;
+                }
+                if env.pid_liveness(lease.identity.pid) != PidLiveness::Dead {
+                    continue;
+                }
+                swept += tx
+                    .execute(
+                        "DELETE FROM session_leases WHERE session_id=?1 AND owner=?2 AND pid=?3 AND generation=?4 AND heartbeat_ms=?5",
+                        params![
+                            id,
+                            lease.identity.owner,
+                            lease.identity.pid,
+                            lease.identity.generation,
+                            lease.heartbeat_ms
+                        ],
+                    )
+                    .map_err(storage)?;
+            }
+            tx.commit().map_err(storage)?;
+            Ok(swept)
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))?
+    }
+}
+
+/// Whether two paths name the same database file.
+fn same_database(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => std::path::absolute(a).ok() == std::path::absolute(b).ok(),
+    }
+}
+
 /// Open the standalone bootstrap store and claim its resumed Session, if any.
-/// On Unix, ownership is renewed every 5 s and released when the final store
+/// On Unix, stale rows of dead owners are swept first, and ownership is renewed every 5 s and released when the final store
 /// handle drops. Other platforms retain standalone behavior without leases;
 /// the explicit lease API remains available with injectable process liveness.
 pub async fn create_sqlite_session_store_for_resume(
@@ -291,6 +384,13 @@ pub async fn create_sqlite_session_store_for_resume(
     let store = SqliteSessionStore::open(path)?;
     #[cfg(unix)]
     {
+        // Rows of `loop` processes that died without releasing would block
+        // their Sessions until someone takes them over.
+        match store.sweep_stale_leases(None).await {
+            Ok(0) => {}
+            Ok(swept) => tracing::info!(swept, "removed Session leases of exited processes"),
+            Err(error) => tracing::warn!(%error, "could not sweep stale Session leases"),
+        }
         Ok(Arc::new(match id {
             Some(id) => store.standalone_resume(id).await?,
             None => store.standalone_writer(),
@@ -308,6 +408,50 @@ pub(super) struct ResumeLeaseGuard {
     ids: parking_lot::Mutex<std::collections::HashSet<String>>,
     identity: LeaseIdentity,
     pub(super) cancellation: tokio_util::sync::CancellationToken,
+    /// Set when release begins: from then on the writer is closed.
+    releasing: std::sync::atomic::AtomicBool,
+    /// Set once the rows are gone; `Drop` then has nothing to do.
+    released: std::sync::atomic::AtomicBool,
+}
+
+/// Every standalone writer of this process, for [`close_standalone_writers`].
+static WRITERS: parking_lot::Mutex<Vec<std::sync::Weak<ResumeLeaseGuard>>> =
+    parking_lot::Mutex::new(Vec::new());
+/// Set by [`close_standalone_writers`]: no writer of this process claims again.
+static WRITERS_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Close every standalone writer of this process and release its leases,
+/// for a process that is about to exit before anyone owns a shutdown
+/// handle (a signal during startup). Terminal for the whole process: any
+/// writer, including one created later, refuses to claim or write.
+pub async fn close_standalone_writers() -> Result<(), SessionError> {
+    WRITERS_CLOSED.store(true, std::sync::atomic::Ordering::Release);
+    let writers: Vec<_> = WRITERS
+        .lock()
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .collect();
+    let mut result = Ok(());
+    for writer in writers {
+        if let Err(error) = writer.release().await {
+            result = Err(error);
+        }
+    }
+    result
+}
+
+/// How long the `Drop` fallback waits for a locked database. Short: it may
+/// run while the process exits, with nobody to retry.
+const DROP_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Delete every lease row of this exact identity, fenced against successors.
+fn delete_identity_rows(conn: &Connection, identity: &LeaseIdentity) -> Result<(), SessionError> {
+    conn.execute(
+        "DELETE FROM session_leases WHERE owner=?1 AND pid=?2 AND generation=?3",
+        params![identity.owner, identity.pid, identity.generation],
+    )
+    .map_err(storage)?;
+    Ok(())
 }
 impl ResumeLeaseGuard {
     pub(super) fn track(&self, id: &str) {
@@ -327,22 +471,70 @@ impl ResumeLeaseGuard {
 
     pub(super) fn failed(&self) -> bool {
         self.cancellation.is_cancelled()
+            || WRITERS_CLOSED.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Why a write through this writer is refused.
+    pub(super) fn refusal(&self) -> SessionError {
+        if self.releasing.load(std::sync::atomic::Ordering::Acquire)
+            || WRITERS_CLOSED.load(std::sync::atomic::Ordering::Acquire)
+        {
+            SessionError::Invalid("Session leases were released; this writer is closed.".into())
+        } else {
+            SessionError::Invalid(
+                "Session lease renewal failed; stop writing and cancel work.".into(),
+            )
+        }
+    }
+
+    /// Close the writer, then delete its lease rows. Writes already inside
+    /// their transaction finish first; any later one is refused.
+    pub(super) async fn release(&self) -> Result<(), SessionError> {
+        self.releasing
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.cancellation.cancel();
+        let path = self.store.path.clone();
+        let identity = self.identity.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut conn = open(&path)?;
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(storage)?;
+            delete_identity_rows(&tx, &identity)?;
+            tx.commit().map_err(storage)
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))??;
+        self.ids.lock().clear();
+        self.released
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 }
 impl Drop for ResumeLeaseGuard {
     fn drop(&mut self) {
-        // Drop cannot await. Release on the blocking pool, fenced against any successor.
+        if self.released.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // A fallback for owners that never called `release`. Drop cannot
+        // await: inside a Tokio runtime, delete on its blocking pool; outside
+        // one, delete now with a short busy timeout.
         let path = self.store.path.clone();
         let identity = self.identity.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn_blocking(move || {
-                if let Ok(conn) = open(&path) {
-                    let _ = conn.execute(
-                        "DELETE FROM session_leases WHERE owner=?1 AND pid=?2 AND generation=?3",
-                        params![identity.owner, identity.pid, identity.generation],
-                    );
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(move || {
+                    if let Ok(conn) = open(&path) {
+                        let _ = delete_identity_rows(&conn, &identity);
+                    }
+                });
+            }
+            Err(_) => {
+                if let Ok(conn) = Connection::open(&path) {
+                    let _ = conn.busy_timeout(DROP_BUSY_TIMEOUT);
+                    let _ = delete_identity_rows(&conn, &identity);
                 }
-            });
+            }
         }
     }
 }
@@ -393,8 +585,15 @@ impl SqliteSessionStore {
             ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
             identity: identity.clone(),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            releasing: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::atomic::AtomicBool::new(false),
         });
         let weak = Arc::downgrade(&guard);
+        {
+            let mut writers = WRITERS.lock();
+            writers.retain(|w| w.strong_count() > 0);
+            writers.push(weak.clone());
+        }
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(

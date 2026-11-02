@@ -564,6 +564,13 @@ impl SessionStore for SqliteSessionStore {
             .map(|guard| guard.cancellation.clone())
     }
 
+    async fn release_leases(&self) -> Result<(), SessionError> {
+        match &self.resume_guard {
+            Some(guard) => guard.release().await,
+            None => Ok(()),
+        }
+    }
+
     async fn create(
         &self,
         cwd: Option<String>,
@@ -575,9 +582,7 @@ impl SessionStore for SqliteSessionStore {
     async fn open_writer(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
         if let Some(guard) = &self.resume_guard {
             if guard.failed() {
-                return Err(SessionError::Invalid(
-                    "Session lease renewal failed; stop writing and cancel work.".into(),
-                ));
+                return Err(guard.refusal());
             }
             self.takeover_lease(
                 id,
@@ -688,10 +693,8 @@ impl SessionStore for SqliteSessionStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
-            if guard.as_ref().is_some_and(|guard| guard.failed()) {
-                return Err(SessionError::Invalid(
-                    "Session lease renewal failed; stop writing and cancel work.".into(),
-                ));
+            if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
+                return Err(guard.refusal());
             }
             super::leases::check_write(&tx, &session_id, identity.as_ref())?;
             let entry = append_entry_tx(&tx, &session_id, pending)?;
@@ -713,10 +716,8 @@ impl SessionStore for SqliteSessionStore {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
-            if guard.as_ref().is_some_and(|guard| guard.failed()) {
-                return Err(SessionError::Invalid(
-                    "Session lease renewal failed; stop writing and cancel work.".into(),
-                ));
+            if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
+                return Err(guard.refusal());
             }
             super::leases::check_write(&tx, &id, identity.as_ref())?;
             delete_session_rows(&tx, &id)?;

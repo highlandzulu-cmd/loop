@@ -312,6 +312,14 @@ pub trait SessionStore: Send + Sync {
         None
     }
 
+    /// Release every Session lease this writer holds. Call it once the
+    /// writer's work has stopped and its writes have finished. It is terminal:
+    /// later writes and claims through this writer fail. Stores without
+    /// leases have nothing to release.
+    async fn release_leases(&self) -> Result<(), SessionError> {
+        Ok(())
+    }
+
     /// Create a session.
     async fn create(
         &self,

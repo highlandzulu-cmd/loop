@@ -4642,6 +4642,7 @@ dependencies = [
  "regex",
  "rhai",
  "rmcp",
+ "rusqlite",
  "rustyline",
  "serde",
  "serde_json",

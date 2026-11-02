@@ -52,7 +52,7 @@ async fn acquire_conflicts_and_renew_release_are_fenced() {
     store.acquire_lease(id, &owner).await.unwrap();
     let error = store.check_resume(id).await.unwrap_err().to_string();
     assert!(error.contains(&format!(
-        "Session {id} is in use by Runtime 42. Use `loop attach {id}` instead."
+        "Session {id} is in use by Runtime 42. Use `loop session attach {id}` instead."
     )));
     assert!(store
         .acquire_lease(id, &identity("standalone", 7, 1))
@@ -487,4 +487,278 @@ async fn repository_open_and_harness_switch_admit_writers_but_readers_do_not() {
             .identity,
         store.lease(&initial_id).await.unwrap().unwrap().identity
     );
+}
+
+fn label(text: &str) -> PendingSessionWrite {
+    PendingSessionWrite::Label { label: text.into() }
+}
+
+#[tokio::test]
+async fn release_leases_is_terminal_idempotent_and_spares_other_owners() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let base = SqliteSessionStore::open(&path).unwrap();
+        let writer = base.standalone_writer();
+        let a = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let b = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        // Another writer's Session keeps its lease.
+        let other = base.standalone_writer();
+        let c = other
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        writer.append_entry(&a, label("before")).await.unwrap();
+
+        writer.release_leases().await.unwrap();
+        assert!(base.lease(&a).await.unwrap().is_none());
+        assert!(base.lease(&b).await.unwrap().is_none());
+        assert!(base.lease(&c).await.unwrap().is_some());
+        // Terminal: nothing more is written or claimed through it.
+        assert!(writer.append_entry(&a, label("after")).await.is_err());
+        assert!(writer.create(None, None).await.is_err());
+        assert!(writer.open_writer(&a).await.is_err());
+        assert!(base.lease(&a).await.unwrap().is_none());
+        // Idempotent.
+        writer.release_leases().await.unwrap();
+        other.append_entry(&c, label("still mine")).await.unwrap();
+        // A store without leases has nothing to release.
+        base.release_leases().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn release_during_an_active_write_is_fenced_and_reports_errors() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let base = SqliteSessionStore::open(&path).unwrap();
+        let writer = Arc::new(base.standalone_writer());
+        let id = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        // Writes race the release; each either lands before it or is refused.
+        let mut writes = tokio::task::JoinSet::new();
+        for n in 0..20 {
+            let (writer, id) = (writer.clone(), id.clone());
+            writes.spawn(async move { writer.append_entry(&id, label(&format!("w{n}"))).await });
+        }
+        writer.release_leases().await.unwrap();
+        while let Some(done) = writes.join_next().await {
+            let _ = done.unwrap();
+        }
+        assert!(base.lease(&id).await.unwrap().is_none());
+        assert!(writer.append_entry(&id, label("late")).await.is_err());
+
+        // A database that stays locked makes the release fail, and says so.
+        let locked = base.standalone_writer();
+        let id = locked
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let holder = rusqlite::Connection::open(&path).unwrap();
+        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let error = locked.release_leases().await.unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error}");
+        holder.execute_batch("ROLLBACK").unwrap();
+        assert!(
+            base.lease(&id).await.unwrap().is_some(),
+            "nothing was released"
+        );
+        locked.release_leases().await.unwrap();
+        assert!(base.lease(&id).await.unwrap().is_none());
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
+fn dropping_the_last_store_without_a_runtime_releases_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (writer, id) = rt.block_on(async {
+        let writer = SqliteSessionStore::open(&path).unwrap().standalone_writer();
+        let id = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        (writer, id)
+    });
+    drop(rt);
+    // No Tokio runtime here: the fallback deletes synchronously.
+    drop(writer);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_leases WHERE session_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+}
+
+/// A store on a fresh database with a fake clock and pid probe.
+fn swept_store(
+    dir: &std::path::Path,
+) -> (SqliteSessionStore, Arc<Environment>, std::path::PathBuf) {
+    let path = dir.join("sessions.db");
+    let env = Arc::new(Environment {
+        now: AtomicI64::new(1_000_000),
+        liveness: AtomicU8::new(0),
+    });
+    let store = SqliteSessionStore::with_environment(&path, env.clone()).unwrap();
+    (store, env, path)
+}
+
+async fn leased(store: &SqliteSessionStore, owner: &LeaseIdentity) -> String {
+    let id = store
+        .create(None, None)
+        .await
+        .unwrap()
+        .metadata()
+        .id
+        .clone();
+    store.acquire_lease(&id, owner).await.unwrap();
+    id
+}
+
+const STALE: i64 = 31_000;
+
+#[tokio::test]
+async fn the_sweep_removes_stale_rows_of_dead_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, env, _) = swept_store(dir.path());
+    // Four rows left by `loop` processes that exited.
+    let mut left = Vec::new();
+    for pid in [77560, 48014, 59908, 60022] {
+        left.push(leased(&store, &identity("standalone", pid, 1)).await);
+    }
+    // Fresh rows are never swept, whatever the pid.
+    assert_eq!(store.sweep_stale_leases(None).await.unwrap(), 0);
+    env.now.fetch_add(STALE, Ordering::SeqCst);
+    assert_eq!(store.sweep_stale_leases(None).await.unwrap(), 4);
+    for id in &left {
+        assert!(store.lease(id).await.unwrap().is_none());
+    }
+    assert_eq!(store.sweep_stale_leases(None).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn the_sweep_keeps_live_and_unknown_owners_and_new_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, env, _) = swept_store(dir.path());
+    let id = leased(&store, &identity("standalone", 4242, 1)).await;
+    env.now.fetch_add(STALE, Ordering::SeqCst);
+    for (liveness, what) in [(1, "alive"), (2, "unknown")] {
+        env.liveness.store(liveness, Ordering::SeqCst);
+        assert_eq!(store.sweep_stale_leases(None).await.unwrap(), 0, "{what}");
+        assert!(store.lease(&id).await.unwrap().is_some(), "{what}");
+    }
+    // Replaced by a new owner: its row is fresh and stays.
+    env.liveness.store(0, Ordering::SeqCst);
+    let successor = identity("standalone", 5151, 2);
+    store.takeover_lease(&id, &successor, false).await.unwrap();
+    assert_eq!(store.sweep_stale_leases(None).await.unwrap(), 0);
+    assert_eq!(store.lease(&id).await.unwrap().unwrap().identity, successor);
+}
+
+#[tokio::test]
+async fn runtime_rows_need_the_lock_of_this_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, env, path) = swept_store(dir.path());
+    let id = leased(&store, &identity("runtime", 3131, 7)).await;
+    env.now.fetch_add(STALE, Ordering::SeqCst);
+    assert_eq!(store.sweep_stale_leases(None).await.unwrap(), 0);
+    let other = dir.path().join("other/sessions.db");
+    assert_eq!(store.sweep_stale_leases(Some(&other)).await.unwrap(), 0);
+    assert!(store.lease(&id).await.unwrap().is_some());
+    assert_eq!(store.sweep_stale_leases(Some(&path)).await.unwrap(), 1);
+    assert!(store.lease(&id).await.unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_racing_the_sweep_is_never_lost_silently() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, env, _) = swept_store(dir.path());
+        let store = Arc::new(store);
+        for round in 0..20 {
+            let owner = identity("standalone", 9000 + round, 1);
+            let id = leased(&store, &owner).await;
+            env.now.fetch_add(STALE, Ordering::SeqCst);
+            let (swept, renewed) = tokio::join!(
+                store.sweep_stale_leases(None),
+                store.renew_lease(&id, &owner)
+            );
+            swept.unwrap();
+            let row = store.lease(&id).await.unwrap();
+            // A renewal that succeeded keeps its row; one that lost the race
+            // is told so, and the owner stops writing.
+            match renewed {
+                Ok(()) => assert_eq!(row.map(|r| r.identity), Some(owner), "round {round}"),
+                Err(_) => assert!(row.is_none(), "round {round}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_acquisition_that_reaches_its_transaction_after_release_is_refused() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let base = SqliteSessionStore::open(&path).unwrap();
+        let writer = base.standalone_writer();
+        let a = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let me = base.lease(&a).await.unwrap().unwrap().identity;
+        // A Session this writer has not claimed yet.
+        let b = base.create(None, None).await.unwrap().metadata().id.clone();
+        writer.release_leases().await.unwrap();
+        // `open_writer` passed its own check before the release; its claim
+        // runs now, in its own transaction.
+        let claimed = writer.takeover_lease(&b, &me, false).await;
+        assert!(claimed.is_err(), "a released writer claimed {b}");
+        assert!(writer.acquire_lease(&b, &me).await.is_err());
+        assert!(base.lease(&b).await.unwrap().is_none());
+        assert!(base.lease(&a).await.unwrap().is_none());
+    })
+    .await
+    .unwrap();
 }

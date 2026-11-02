@@ -286,6 +286,9 @@ pub struct OpenedSession {
     pub selected_model: Option<loop_ai::Model>,
     pub model_note: Option<String>,
     pub startup_notices: Vec<String>,
+    /// The standalone Surface's own Session store, which holds its leases.
+    /// `None` when the Runtime owns ownership (and non-Unix standalone).
+    pub session_store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
 }
 
 impl SessionFactory {
@@ -318,6 +321,24 @@ impl SessionFactory {
         &self,
         workspace: Arc<WorkspaceResources>,
         opts: &BootstrapOpts,
+    ) -> anyhow::Result<OpenedSession> {
+        let mut leased = None;
+        let result = self.open_leased(workspace, opts, &mut leased).await;
+        // A standalone open that fails after taking its lease must not leave
+        // it to a Drop that may never run before the process exits.
+        if let (Err(_), Some(store)) = (&result, leased) {
+            if let Err(error) = store.release_leases().await {
+                tracing::warn!(%error, "could not release the lease of a failed Session open");
+            }
+        }
+        result
+    }
+
+    async fn open_leased(
+        &self,
+        workspace: Arc<WorkspaceResources>,
+        opts: &BootstrapOpts,
+        leased: &mut Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
     ) -> anyhow::Result<OpenedSession> {
         if absolute_workspace(&opts.cwd)? != workspace.cwd {
             bail!("Session cwd does not match workspace");
@@ -360,7 +381,7 @@ impl SessionFactory {
 
         // Unix standalone Surfaces own their writer lease; Runtime callers manage
         // ownership separately before opening through the shared repository.
-        let standalone_repository = if workspace.standalone {
+        let (standalone_repository, session_store) = if workspace.standalone {
             let store =
                 loop_agent::harness::session::sqlite::create_sqlite_session_store_for_resume(
                     &globals.sessions_db,
@@ -368,9 +389,13 @@ impl SessionFactory {
                 )
                 .await
                 .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
-            Some(create_session_repository(store, None))
+            *leased = Some(Arc::clone(&store));
+            (
+                Some(create_session_repository(Arc::clone(&store), None)),
+                Some(store),
+            )
         } else {
-            None
+            (None, None)
         };
         let repository = standalone_repository
             .as_ref()
@@ -542,6 +567,7 @@ impl SessionFactory {
             selected_model: model,
             model_note,
             startup_notices,
+            session_store,
         })
     }
 }
@@ -549,6 +575,42 @@ impl SessionFactory {
 #[cfg(all(test, unix))]
 mod lease_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_standalone_open_releases_the_lease_it_took() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = Arc::new(Models::create(Default::default()));
+        let globals =
+            Arc::new(GlobalResources::with_models(dir.path().join("agent"), models).unwrap());
+        let opts = BootstrapOpts {
+            cwd: dir.path().to_path_buf(),
+            provider: None,
+            model: None,
+            theme: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            no_context_files: true,
+            interactive: false,
+            session_id: None,
+            no_web: true,
+            // Refused only after the Session was created and leased.
+            permission_mode: Some("invalid".into()),
+            agent: None,
+        };
+        let workspace = Arc::new(
+            WorkspaceResources::load_resolved(&globals, &opts, false, Settings::default(), true)
+                .await
+                .unwrap(),
+        );
+        let factory = SessionFactory::new(Arc::clone(&globals));
+        assert!(factory.open(workspace, &opts).await.is_err());
+        let store =
+            loop_agent::harness::session::sqlite::SqliteSessionStore::open(&globals.sessions_db)
+                .unwrap();
+        for meta in globals.repository.list(None).await.unwrap() {
+            assert_eq!(store.lease(&meta.id).await.unwrap(), None, "{}", meta.id);
+        }
+    }
 
     #[tokio::test]
     async fn standalone_factory_refuses_runtime_lease_before_opening_session() {
@@ -598,7 +660,7 @@ mod lease_tests {
         };
         assert!(
             error.contains(&format!(
-                "Session {id} is in use by Runtime {}. Use `loop attach {id}` instead.",
+                "Session {id} is in use by Runtime {}. Use `loop session attach {id}` instead.",
                 std::process::id()
             )),
             "{error}"

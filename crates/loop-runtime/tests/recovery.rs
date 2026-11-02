@@ -201,6 +201,7 @@ async fn recovery_ends_open_turns_withdraws_parked_escalations_and_reclaims_leas
                 turns_ended: 1,
                 escalations_withdrawn: 1,
                 leases_reclaimed: 1,
+                leases_swept: 0,
             }
         );
 
@@ -603,6 +604,64 @@ async fn clean_shutdown_mid_turn_leaves_no_turn_for_recovery() {
 
         let rt = runtime(dir.path(), log.clone()).await;
         assert_eq!(rt.recover(None).await.unwrap(), Recovery::default());
+        rt.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A pid that belonged to a process that has exited.
+#[cfg(unix)]
+fn dead_pid() -> u32 {
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    pid
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn runtime_start_sweeps_stale_rows_of_exited_terminal_processes() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_agent::harness::session::sqlite::{LeaseEnvironment, PidLiveness};
+        struct LongAgo;
+        impl LeaseEnvironment for LongAgo {
+            fn now_ms(&self) -> i64 {
+                1
+            }
+            fn pid_liveness(&self, _: u32) -> PidLiveness {
+                PidLiveness::Unknown
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let log: Arc<dyn EventLog> = Arc::new(
+            SqliteEventLog::open(&dir.path().join("agent"))
+                .await
+                .unwrap(),
+        );
+        let rt = runtime(dir.path(), log.clone()).await;
+        // Rows written long ago by terminal `loop` processes: one exited,
+        // one (this test) still running.
+        let path = dir.path().join("agent/sessions.db");
+        let old = SqliteSessionStore::with_environment(&path, Arc::new(LongAgo)).unwrap();
+        let mut ids = Vec::new();
+        for pid in [dead_pid(), std::process::id()] {
+            let id = old.create(None, None).await.unwrap().metadata().id.clone();
+            let owner = LeaseIdentity {
+                owner: "standalone".into(),
+                pid,
+                generation: 1,
+            };
+            old.acquire_lease(&id, &owner).await.unwrap();
+            ids.push(id);
+        }
+        let store = SqliteSessionStore::open(&path).unwrap();
+        // Without the lock (not `loop runtime start`) nothing is swept.
+        assert_eq!(rt.recover(None).await.unwrap().leases_swept, 0);
+        let report = rt.recover(Some(&lock(dir.path()))).await.unwrap();
+        assert_eq!(report.leases_swept, 1);
+        assert!(store.lease(&ids[0]).await.unwrap().is_none());
+        assert!(store.lease(&ids[1]).await.unwrap().is_some());
         rt.shutdown().await;
     })
     .await

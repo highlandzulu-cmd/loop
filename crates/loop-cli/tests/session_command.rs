@@ -1,5 +1,5 @@
 #![cfg(unix)]
-use loop_cli::attach_cmd::{connect, drive, AttachArgs, Input, Terminal};
+use loop_cli::session_cmd::{connect, drive, Input, SessionArgs, Terminal};
 use loop_protocol::{rpc::PeerInfo, AgentBackend, ContentBlock, SessionSpec};
 use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};
 use std::{
@@ -63,6 +63,14 @@ async fn runtime_with_script(
     log: Arc<dyn loop_runtime::log::EventLog>,
     responses: loop_ai::providers::FauxScript,
 ) -> Arc<Runtime> {
+    runtime_with_limits(dir, log, responses, RuntimeLimits::default()).await
+}
+async fn runtime_with_limits(
+    dir: &std::path::Path,
+    log: Arc<dyn loop_runtime::log::EventLog>,
+    responses: loop_ai::providers::FauxScript,
+    limits: RuntimeLimits,
+) -> Arc<Runtime> {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
     models.set_provider(loop_ai::providers::faux_provider(responses));
     let globals =
@@ -81,11 +89,7 @@ async fn runtime_with_script(
         permission_mode: Some("ask".into()),
         agent: None,
     };
-    Arc::new(
-        Runtime::new(globals, opts, log, RuntimeLimits::default())
-            .await
-            .unwrap(),
-    )
+    Arc::new(Runtime::new(globals, opts, log, limits).await.unwrap())
 }
 fn serve(
     rt: Arc<Runtime>,
@@ -133,7 +137,7 @@ async fn list_and_ambiguous_prefix_show_session_details_newest_first() {
             let result = drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: id.clone(),
                     ..Default::default()
                 },
@@ -192,7 +196,7 @@ async fn attach_renders_replay_then_live_and_typed_line_becomes_prompt() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key[..8].into()),
                     ..Default::default()
                 },
@@ -244,7 +248,7 @@ async fn new_session_uses_cwd_and_eof_only_detaches() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 new: true,
                 cwd: Some(dir.path().into()),
                 ..Default::default()
@@ -292,7 +296,7 @@ async fn no_runtime_explains_how_to_start_one_without_bootstrap() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let dir = tempfile::tempdir().unwrap();
         let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_loop"))
-            .args(["attach", "--socket"])
+            .args(["session", "list", "--socket"])
             .arg(dir.path().join("missing.sock"))
             .env("LOOP_CODING_AGENT_DIR", dir.path().join("agent"))
             .stdin(std::process::Stdio::null())
@@ -301,7 +305,7 @@ async fn no_runtime_explains_how_to_start_one_without_bootstrap() {
             .await
             .unwrap();
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("loop serve"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("loop runtime start"));
         assert!(!dir.path().join("agent").exists());
     })
     .await
@@ -328,7 +332,7 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
         let served = serve(rt.clone(), loop_wire::transport::Transport { incoming, outgoing: server.outgoing });
         let (backend, events) = connect(client).await.unwrap(); let (tx, mut terminal, output) = script();
         let key = session.key.to_string();
-        let task = tokio::spawn(async move { drive(backend, events, AttachArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
+        let task = tokio::spawn(async move { drive(backend, events, SessionArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
         wait_text(&output, "replayed").await;
         let request = |rpc_id: u64, id: &str| serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
             "session":session, "kind":"permission", "id":id,
@@ -387,7 +391,7 @@ async fn immediate_eof_renders_the_complete_replay_before_detaching() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -479,7 +483,7 @@ async fn eof_detaches_without_stopping_a_running_turn() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -540,7 +544,7 @@ async fn connection_loss_reports_error_and_leaves_the_session_running() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(id),
                     ..Default::default()
                 },
@@ -599,7 +603,7 @@ async fn buffered_withdrawn_answer_never_answers_the_next_request_or_becomes_a_p
             let (backend, events) = connect(client).await.unwrap(); let (tx, script, output) = script();
             let (enable, enabled) = tokio::sync::watch::channel(false); let mut terminal = PausedInput { script, enabled };
             let key = session.key.to_string();
-            let task = tokio::spawn(async move { drive(backend, events, AttachArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
+            let task = tokio::spawn(async move { drive(backend, events, SessionArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
             let approval = |rpc_id: u64, id: &str| serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
                 "session": session, "kind":"permission", "id":id,
                 "options":[{"native_id":"allow", "label":id, "kind_hint":"allow_once"}]
@@ -658,7 +662,7 @@ async fn runtime_loss_after_detach_request_closes_locally_without_a_shutdown_rpc
         let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: server_incoming, outgoing: server.outgoing });
         let (backend, events) = connect(loop_wire::transport::Transport { incoming, outgoing: client.outgoing }).await.unwrap();
         let (tx, mut terminal, _) = script(); tx.send(Input::Eof).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), drive(backend, events, AttachArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
+        let result = tokio::time::timeout(Duration::from_secs(3), drive(backend, events, SessionArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
         assert!(result.is_err());
         tokio::time::timeout(Duration::from_secs(1), closed.notified()).await.expect("local transport stayed open");
         assert!(!messages.lock().unwrap().iter().any(|m| m["method"] == "shutdown"));
@@ -719,7 +723,7 @@ async fn interrupts_cancel_and_detach_before_gated_replay_finishes() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key),
                     ..Default::default()
                 },
@@ -776,7 +780,7 @@ async fn attaching_to_a_session_held_by_another_loop_says_what_to_do() {
         let error = drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -786,7 +790,7 @@ async fn attaching_to_a_session_held_by_another_loop_says_what_to_do() {
         .unwrap_err()
         .to_string();
         assert!(error.contains("in use"), "{error}");
-        assert!(!error.contains("loop attach"), "circular hint: {error}");
+        assert!(!error.contains("session attach"), "circular hint: {error}");
         assert!(error.contains("Close it there"), "{error}");
         served.done.await.unwrap();
         rt.shutdown().await;
@@ -829,7 +833,7 @@ async fn attach_shows_tool_calls_and_starts_each_message_on_its_own_line() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 id: Some(session.key.to_string()),
                 ..Default::default()
             },
@@ -892,7 +896,7 @@ async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key),
                     ..Default::default()
                 },
@@ -1003,7 +1007,7 @@ async fn a_slow_session_list_never_delays_a_subagents_escalation() {
             drive(
                 backend,
                 events,
-                AttachArgs {
+                SessionArgs {
                     id: Some(key),
                     ..Default::default()
                 },
@@ -1068,7 +1072,7 @@ async fn json_listing_prints_every_session_as_session_info() {
         drive(
             backend,
             events,
-            AttachArgs {
+            SessionArgs {
                 json: true,
                 ..Default::default()
             },
@@ -1083,6 +1087,216 @@ async fn json_listing_prints_every_session_as_session_info() {
         assert_eq!(list[0].r#ref, session);
         assert_eq!(list[0].name.as_deref(), Some("two  spaces"));
         served.done.await.unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Run `loop session close <id>` against `rt` over an in-memory wire.
+async fn close_via_cli(rt: &Arc<Runtime>, id: &str, force: bool) -> (anyhow::Result<()>, String) {
+    let (server, client) = loop_wire::transport::memory();
+    let served = serve(rt.clone(), server);
+    let (backend, events) = connect(client).await.unwrap();
+    let (_tx, mut terminal, output) = script();
+    let result = drive(
+        backend,
+        events,
+        SessionArgs {
+            id: Some(id.into()),
+            close: true,
+            force,
+            ..Default::default()
+        },
+        &mut terminal,
+    )
+    .await;
+    served.done.await.unwrap();
+    let text = output.lock().unwrap().clone();
+    (result, text)
+}
+
+#[tokio::test]
+async fn close_unloads_an_idle_session_releases_its_lease_and_reload_continues_seq() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        use loop_agent::harness::session::sqlite::SqliteSessionStore;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime_with_log(dir.path(), log.clone()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.prompt(&session, vec![ContentBlock::text("one")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        let store = SqliteSessionStore::open(dir.path().join("agent/sessions.db")).unwrap();
+        assert!(store.lease(&session.native_id).await.unwrap().is_some());
+        let (result, text) = close_via_cli(&rt, &session.key.as_str()[..8], false).await;
+        result.unwrap();
+        assert!(text.contains("Closed Session"), "{text}");
+        assert!(!rt.list().await.unwrap()[0].live);
+        assert!(store.lease(&session.native_id).await.unwrap().is_none());
+        assert_eq!(rt.status().loaded, 0);
+        // Not loaded any more: say so and succeed.
+        let (result, text) = close_via_cli(&rt, session.key.as_str(), false).await;
+        result.unwrap();
+        assert!(text.contains("is not loaded"), "{text}");
+        // Data is kept: loading again continues the Session's sequence.
+        let before = loop_runtime::log::EventLog::latest_seq(log.as_ref(), &session.key)
+            .await
+            .unwrap();
+        assert!(before > 0);
+        let mut updates = rt.subscribe();
+        let reloaded = rt
+            .load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        rt.prompt(&reloaded, vec![ContentBlock::text("two")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        let first = updates.recv().await.unwrap();
+        assert_eq!(first.seq, before + 1);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn close_refuses_a_busy_session_unless_forced() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        // `ask` mode parks this call on an approval no Surface answers.
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "park".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo parked"}),
+                thought_signature: None,
+            },
+        ]));
+        let rt = runtime_with_script(dir.path(), Arc::new(MemoryEventLog::new()), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let mut updates = rt.subscribe();
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("park")])
+            .await
+            .unwrap();
+        while !matches!(
+            updates.recv().await.unwrap().update,
+            loop_protocol::SessionUpdate::ToolCall(_)
+        ) {}
+        let (result, _) = close_via_cli(&rt, session.key.as_str(), false).await;
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("busy") && error.contains("--force"),
+            "{error}"
+        );
+        assert!(rt.list().await.unwrap()[0].live);
+        let (result, text) = close_via_cli(&rt, session.key.as_str(), true).await;
+        result.unwrap();
+        assert!(text.contains("Closed Session"), "{text}");
+        assert!(!rt.list().await.unwrap()[0].live);
+        assert_eq!(turn.outcome().await, loop_protocol::TurnOutcome::Cancelled);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn close_with_an_ambiguous_or_unknown_id_closes_nothing() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.new_session(SessionSpec::default()).await.unwrap();
+        let (result, text) = close_via_cli(&rt, "", false).await;
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("Ambiguous"), "{error}");
+        assert!(text.contains("ID"), "lists the candidates: {text}");
+        let (result, _) = close_via_cli(&rt, "zzzz-no-such", false).await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No Session matches"));
+        assert_eq!(rt.status().loaded, 2);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_full_runtime_says_its_limit_and_how_to_make_room() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime_with_limits(
+            dir.path(),
+            Arc::new(MemoryEventLog::new()),
+            loop_ai::providers::FauxScript::new(),
+            RuntimeLimits {
+                max_sessions: 2,
+                max_active_turns: 1,
+            },
+        )
+        .await;
+        // Two Sessions, each watched by its own Surface, fill the Runtime.
+        let mut surfaces = Vec::new();
+        for _ in 0..2 {
+            let (server, client) = loop_wire::transport::memory();
+            let served = serve(rt.clone(), server);
+            let (backend, events) = connect(client).await.unwrap();
+            let (tx, mut terminal, output) = script();
+            let task = tokio::spawn(async move {
+                drive(
+                    backend,
+                    events,
+                    SessionArgs {
+                        new: true,
+                        cwd: Some(std::env::temp_dir()),
+                        ..Default::default()
+                    },
+                    &mut terminal,
+                )
+                .await
+            });
+            wait_text(&output, "New Session").await;
+            surfaces.push((tx, task, served));
+        }
+        // Registration follows the reply; wait until both are watched.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (server, client) = loop_wire::transport::memory();
+        let served = serve(rt.clone(), server);
+        let (backend, events) = connect(client).await.unwrap();
+        let (_tx, mut terminal, _) = script();
+        let error = drive(
+            backend,
+            events,
+            SessionArgs {
+                new: true,
+                cwd: Some(std::env::temp_dir()),
+                ..Default::default()
+            },
+            &mut terminal,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("all 2 loaded Sessions are busy or watched (limit 2)"),
+            "{error}"
+        );
+        assert!(error.contains("loop session close <id>"), "{error}");
+        served.done.await.unwrap();
+        for (tx, task, served) in surfaces {
+            tx.send(Input::Eof).unwrap();
+            task.await.unwrap().unwrap();
+            served.done.await.unwrap();
+        }
         rt.shutdown().await;
     })
     .await

@@ -129,6 +129,10 @@ pub struct AgentHarness {
     hooks: HookRegistry,
     shutting_down: AtomicBool,
     shutdown_notify: Notify,
+    /// Turns in flight, counted from the phase change to after their
+    /// writes and `Settled` hooks.
+    turns_in_flight: std::sync::atomic::AtomicUsize,
+    settled: Notify,
     compaction_settings: RwLock<CompactionSettings>,
     tool_execution: Mutex<ToolExecutionMode>,
     before_tool_call: Mutex<Option<BeforeToolHook>>,
@@ -175,6 +179,8 @@ impl AgentHarness {
             hooks: HookRegistry::default(),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
+            turns_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            settled: Notify::new(),
             compaction_settings: RwLock::new(CompactionSettings::default()),
             tool_execution: Mutex::new(ToolExecutionMode::Parallel),
             before_tool_call: Mutex::new(None),
@@ -1114,6 +1120,21 @@ impl AgentHarness {
         });
     }
 
+    /// Wait until no turn is in flight: its tools, writes and `Settled`
+    /// hooks have all finished. Unlike [`Self::wait_for_idle`], which ends
+    /// when the phase turns Idle, before those hooks run.
+    pub async fn wait_for_settled(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.turns_in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Wait until shutdown was requested and the harness is idle.
     pub async fn wait_for_shutdown(&self) {
         loop {
@@ -1265,6 +1286,9 @@ impl AgentHarness {
             }
             *phase = AgentHarnessPhase::Turn;
         }
+        // Counted until this whole function ends, also if its future is
+        // dropped: phase turns Idle before the `Settled` hooks run.
+        let _in_flight = InFlight::enter(self);
 
         let token = lease_cancellation
             .map(|token| token.child_token())
@@ -1738,4 +1762,20 @@ fn first_kept_entry_id_for_cut(entries: &[SessionTreeEntry], cut_index: usize) -
         }
     }
     producer_ids.get(cut_index).map(|s| s.to_string())
+}
+
+/// Counts one turn in flight for [`AgentHarness::wait_for_settled`].
+struct InFlight<'a>(&'a AgentHarness);
+impl<'a> InFlight<'a> {
+    fn enter(harness: &'a AgentHarness) -> Self {
+        harness.turns_in_flight.fetch_add(1, Ordering::AcqRel);
+        Self(harness)
+    }
+}
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if self.0.turns_in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.settled.notify_waiters();
+        }
+    }
 }

@@ -4,7 +4,7 @@ Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model c
 
 Goal: `loop-protocol` runs over a real connection. This is S1, the first step
 of the spine: the Runtime (S2) and the TUI as a Runtime client (S3) build on
-it. This lane adds no `loop serve` and no `--connect`. Its only user-facing
+it. This lane adds no Runtime command and no `--connect`. Its only user-facing
 part is `--print --output-format`.
 
 ## 1. What exists today
@@ -44,7 +44,7 @@ A transport sends and receives whole messages (`Stream<Item = String>` + `Sink<S
 
 Security, carried over from `mcp serve`:
 - **Unix socket:** created with mode 0600, under `~/.loop/run/`.
-- **WebSocket:** binds to loopback by default and always needs a bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. It refuses to bind to a non-loopback address without `--token`. This lane only adds the transport; the flags come with `loop serve` in S2.
+- **WebSocket:** binds to loopback by default and always needs a bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. It refuses to bind to a non-loopback address without `--token`. This lane only adds the transport; the flags come with `loop runtime start` in S2.
 
 ## 4. Methods
 
@@ -136,7 +136,7 @@ Exit codes:
 
 ## 11. Runtime methods (S2)
 
-S2 adds the shared Runtime (`loop serve`, user guide in [`../runtime.md`](../runtime.md),
+S2 adds the shared Runtime (`loop runtime` and `loop session`, user guide in [`../runtime.md`](../runtime.md),
 design in [`runtime.md`](runtime.md)). All additions keep `PROTOCOL_VERSION` at 1:
 an older peer ignores the new fields, and an unknown method still returns `-32601`.
 
@@ -150,9 +150,15 @@ sets both.
 | `session/close` | c → s | request | `{session, force?}` → `{}`. `force` (default false) cancels a running turn; without it a busy Session returns Busy |
 | `session/attach` | c → s | request | `{session, after_seq?}` → `{latest_seq, generation}`. The cursor defaults to 0 |
 | `session/detach` | c → s | request | `{session}` → `{}`. Stops this connection's updates and approvals for the Session; the turn keeps running |
+| `runtime/status` | c → s | request | `{}` → `RuntimeStatus{pid, socket, generation, loaded, busy, max_sessions, max_active_turns}` |
+| `runtime/stop` | c → s | request | `{}` → `{}`. The Runtime answers, then shuts down as on SIGTERM and closes every connection |
 | `host/interact` | s → c | request | `InteractionRequest` plus optional `session` (a `SessionRef`) → `InteractionOutcome` |
 | `host/interact_withdrawn` | s → c | notification | `{session, id}` |
 
+- **Runtime control.** `runtime/status` and `runtime/stop` are served only on
+  a Runtime's socket, which is mode 0600, so only the same user reaches them.
+  `loop runtime status` and `loop runtime stop` use them instead of the pid
+  file. A server without them returns an error.
 - **Session references.** `session` is always a full `SessionRef`
   (`instance`, `key`, `native_id`), never a title.
 - **List.** `session/list` returns every stored Session, closed ones

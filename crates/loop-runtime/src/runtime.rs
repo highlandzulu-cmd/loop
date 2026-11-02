@@ -57,6 +57,8 @@ impl Default for RuntimeLimits {
 mod subagent;
 #[cfg(test)]
 mod subagent_tests;
+#[cfg(test)]
+mod unload_tests;
 
 /// One Runtime owns all live native Sessions and their durable update streams.
 pub struct Runtime {
@@ -82,6 +84,12 @@ pub struct Runtime {
     subagent_depth: u32,
     /// Sessions the Runtime opened as Subagents, read from the Event Log once.
     subagents: AsyncMutex<Option<HashSet<SessionKey>>>,
+    /// Sessions unloaded to make room and not loaded since. A prompt or an
+    /// attach for one loads it again instead of failing.
+    unloaded: Mutex<HashSet<SessionKey>>,
+    /// Connections attached to each Session, whether or not they answer
+    /// Escalations. A watched Session is never unloaded.
+    watchers: Mutex<HashMap<SessionKey, HashSet<u64>>>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -165,6 +173,10 @@ struct WorkspaceState {
     sandbox: Option<Arc<dyn Sandbox>>,
 }
 struct LiveSession {
+    /// Serializes the decisions that change who may use this Session:
+    /// unloading, closing, prompt admission and attaching. Whoever holds it
+    /// sees `busy`, `closing` and the attached Surfaces settled.
+    lifecycle: AsyncMutex<()>,
     opened: OpenedSession,
     escalations: crate::EscalationHost,
     reference: SessionRef,
@@ -272,6 +284,8 @@ impl Runtime {
             me: OnceLock::new(),
             subagent_depth: subagent::DEFAULT_DEPTH,
             subagents: AsyncMutex::new(None),
+            unloaded: Mutex::new(HashSet::new()),
+            watchers: Mutex::new(HashMap::new()),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -365,6 +379,19 @@ impl Runtime {
             .await
             .map_err(failed)?;
         let mut leases_reclaimed = 0;
+        let mut leases_swept = 0;
+        if let Some(lock) = lock {
+            // Terminal `loop` processes that died without releasing. A failed
+            // sweep must not keep the Runtime from starting.
+            match self
+                .store
+                .sweep_stale_leases(Some(lock.sessions_db()))
+                .await
+            {
+                Ok(swept) => leases_swept = swept,
+                Err(error) => eprintln!("Runtime recovery: lease sweep: {error}"),
+            }
+        }
         if lock.is_some() {
             for meta in self.store.list(None).await.map_err(failed)? {
                 let Some(lease) = self.store.lease(&meta.id).await.map_err(failed)? else {
@@ -394,6 +421,7 @@ impl Runtime {
             turns_ended: turns.len(),
             escalations_withdrawn: escalations.len(),
             leases_reclaimed,
+            leases_swept,
         })
     }
     /// Bound each step of closing a Session whose turn ignores cancellation.
@@ -403,6 +431,24 @@ impl Runtime {
     }
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+    /// This process, its limits and how many Sessions are loaded and busy.
+    /// `socket` is empty: the process serving the Runtime fills it in.
+    pub fn status(&self) -> loop_protocol::rpc::RuntimeStatus {
+        let sessions = self.sessions.lock().unwrap();
+        let busy = sessions
+            .values()
+            .filter(|s| s.busy.load(Ordering::Acquire))
+            .count();
+        loop_protocol::rpc::RuntimeStatus {
+            pid: std::process::id(),
+            socket: PathBuf::new(),
+            generation: self.generation,
+            loaded: sessions.len() as u64,
+            busy: busy as u64,
+            max_sessions: self.limits.max_sessions as u64,
+            max_active_turns: self.limits.max_active_turns as u64,
+        }
     }
     pub fn event_log(&self) -> &Arc<dyn EventLog> {
         &self.log
@@ -424,30 +470,40 @@ impl Runtime {
         spec: SessionSpec,
         child: Option<subagent::ChildOpen>,
     ) -> BackendResult<SessionRef> {
-        let _admission = self.admission.lock().await;
-        if self.stopped.load(Ordering::Acquire) {
-            return Err(failed("Runtime stopped"));
-        }
-        if let Some(session) = existing {
+        let _admission = loop {
+            let admission = self.admission.lock().await;
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(failed("Runtime stopped"));
+            }
+            let Some(session) = existing else {
+                break admission;
+            };
             if session.instance != self.instance || session.key.0 != session.native_id {
                 return Err(BackendError::SessionNotFound(session.key.clone()));
             }
-            if let Ok(live) = self.route(session) {
-                if live.closing.load(Ordering::Acquire) {
-                    return Err(BackendError::Busy);
+            match self.route(session) {
+                // Being closed or unloaded: load it again once that is done,
+                // without holding up other admissions meanwhile.
+                Ok(live) if live.closing.load(Ordering::Acquire) => {
+                    drop(admission);
+                    self.wait_removed(&live).await;
                 }
-                return Ok(live.reference.clone());
+                Ok(live) => return Ok(live.reference.clone()),
+                Err(_) => break admission,
             }
+        };
+        if let Some(session) = existing {
             if let Some(parent) = self.subagent_parent(session).await? {
                 // Reopened alone it would lose its parent's ceiling and depth.
                 return Err(failed(format!(
                     "Session {} is a Subagent of Session {parent}; a Subagent runs only for its \
-                     parent and cannot be reopened. Its Event Log stays readable with `loop attach`.",
+                     parent and cannot be reopened. Its Event Log stays readable with `loop session attach`.",
                     session.native_id
                 )));
             }
         }
-        if self.sessions.lock().unwrap().len() >= self.limits.max_sessions {
+        let full = || self.sessions.lock().unwrap().len() >= self.limits.max_sessions;
+        if full() && (!self.unload_one().await || full()) {
             return Err(BackendError::Busy);
         }
         let d = &self.defaults;
@@ -600,6 +656,7 @@ impl Runtime {
                 }
             }
             let live = Arc::new(LiveSession {
+                lifecycle: AsyncMutex::new(()),
                 opened,
                 escalations,
                 reference: reference.clone(),
@@ -649,6 +706,7 @@ impl Runtime {
                 .lock()
                 .unwrap()
                 .insert(reference.key.clone(), live.clone());
+            self.unloaded.lock().unwrap().remove(&reference.key);
             lease.armed = false;
             Ok(reference)
         }
@@ -814,16 +872,128 @@ impl Runtime {
             .get(key)
             .cloned()
             .ok_or_else(|| BackendError::SessionNotFound(key.clone()))?;
-        if !force && live.busy.load(Ordering::Acquire) {
-            return Err(BackendError::Busy);
-        }
-        if live.closing.swap(true, Ordering::AcqRel) {
-            // Another close owns the teardown; wait for it instead of repeating it.
-            while self.sessions.lock().unwrap().contains_key(key) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        {
+            // Decided under the lifecycle lock, so no prompt is admitted
+            // between the busy check and `closing`.
+            let _lifecycle = live.lifecycle.lock().await;
+            if !force && live.busy.load(Ordering::Acquire) {
+                return Err(BackendError::Busy);
             }
-            return Ok(());
+            if live.closing.swap(true, Ordering::AcqRel) {
+                drop(_lifecycle);
+                // Another close owns the teardown; wait for it instead of repeating it.
+                self.wait_removed(&live).await;
+                return Ok(());
+            }
         }
+        let reason = if self.stopped.load(Ordering::Acquire) {
+            "shutdown"
+        } else {
+            "closed"
+        };
+        self.teardown(key, live, force, reason).await
+    }
+    /// Wait until `live` is no longer the loaded instance of its Session.
+    async fn wait_removed(&self, live: &Arc<LiveSession>) {
+        while self
+            .sessions
+            .lock()
+            .unwrap()
+            .get(&live.reference.key)
+            .is_some_and(|current| Arc::ptr_eq(current, live))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+    fn was_unloaded(&self, key: &SessionKey) -> bool {
+        self.unloaded.lock().unwrap().contains(key)
+    }
+    /// Whether nothing needs `live` loaded: no turn, no parked Escalation, no
+    /// attached Surface, no running Subagent below it, and not itself a
+    /// Subagent (its `subagent` call closes it). Call under its lifecycle lock.
+    async fn unloadable(&self, live: &LiveSession) -> bool {
+        let key = &live.reference.key;
+        if live.busy.load(Ordering::Acquire)
+            || live.closing.load(Ordering::Acquire)
+            || live.child.is_some()
+            || live.parent.is_some()
+            || *live.waiting.lock().await > 0
+            || live.escalations.has_pending().await
+        {
+            return false;
+        }
+        if self
+            .watchers
+            .lock()
+            .unwrap()
+            .get(key)
+            .is_some_and(|watching| !watching.is_empty())
+            || self
+                .recipients
+                .lock()
+                .await
+                .get(key)
+                .is_some_and(|attached| !attached.is_empty())
+        {
+            return false;
+        }
+        !self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .any(|s| s.parent.as_ref() == Some(key))
+    }
+    /// Unload the least recently active Session nothing needs, to make room.
+    /// Runs under admission. Returns whether one was unloaded.
+    async fn unload_one(&self) -> bool {
+        let mut candidates: Vec<(i64, Arc<LiveSession>)> = {
+            let activity = self.activity.lock().unwrap();
+            self.sessions
+                .lock()
+                .unwrap()
+                .values()
+                .map(|live| {
+                    let ts = activity.get(&live.reference.key).copied().unwrap_or(0);
+                    (ts, live.clone())
+                })
+                .collect()
+        };
+        candidates.sort_by_key(|(ts, _)| *ts);
+        for (_, live) in candidates {
+            let lifecycle = live.lifecycle.lock().await;
+            if !self.unloadable(&live).await {
+                continue;
+            }
+            let key = live.reference.key.clone();
+            live.closing.store(true, Ordering::Release);
+            self.unloaded.lock().unwrap().insert(key.clone());
+            drop(lifecycle);
+            eprintln!(
+                "Runtime: unloading idle Session {} (least recently active) to make room",
+                key.0
+            );
+            if let Err(error) = self.teardown(&key, live, false, "unloaded").await {
+                eprintln!("Runtime: unloading Session {}: {error}", key.0);
+            }
+            return true;
+        }
+        false
+    }
+    /// Load a Session that was unloaded to make room, for a prompt or attach.
+    async fn reload(&self, session: &SessionRef) -> BackendResult<()> {
+        self.open(Some(session), SessionSpec::default(), None)
+            .await
+            .map(|_| ())
+    }
+    /// Close a Session whose `closing` the caller set. Always removes it.
+    async fn teardown(
+        &self,
+        key: &SessionKey,
+        live: Arc<LiveSession>,
+        force: bool,
+        reason: &str,
+    ) -> BackendResult<()> {
         if force {
             live.cancel.send_modify(|n| *n += 1);
             live.opened.native.cancel(&live.reference);
@@ -893,7 +1063,7 @@ impl Runtime {
                 turn: None,
                 ts_ms,
                 kind: EventKind::SessionClosed(
-                    json!({"force": force, "aborted": !settled || !stopped}),
+                    json!({"force": force, "aborted": !settled || !stopped, "reason": reason}),
                 ),
             }]),
         )
@@ -968,17 +1138,20 @@ impl Runtime {
         }
     }
 }
-#[async_trait]
-impl loop_wire::RuntimeControl for Runtime {
-    async fn recipient(
+impl Runtime {
+    /// Record whether `connection` watches `session`, and its Escalation
+    /// recipient when it answers them. Any watched Session stays loaded.
+    async fn register_watch(
         &self,
         session: &SessionRef,
         connection: u64,
+        attached: bool,
         recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
     ) -> BackendResult<()> {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
+        self.set_watch(session, connection, attached).await;
         let mut recipients = self.recipients.lock().await;
         match &recipient {
             Some(recipient) => {
@@ -1012,7 +1185,61 @@ impl loop_wire::RuntimeControl for Runtime {
         }
         Ok(())
     }
-    async fn disconnected(&self, connection: u64) {
+    /// Add or remove `connection` as a watcher of `session`, under its
+    /// lifecycle lock when it is loaded: an unload either sees the watcher
+    /// and keeps the Session, or has already begun. Returns whether the
+    /// registry changed.
+    async fn set_watch(&self, session: &SessionRef, connection: u64, attached: bool) -> bool {
+        let target = self.route(session).ok();
+        let _lifecycle = match (&target, attached) {
+            (Some(live), true) => Some(live.lifecycle.lock().await),
+            _ => None,
+        };
+        let mut watchers = self.watchers.lock().unwrap();
+        if attached {
+            watchers
+                .entry(session.key.clone())
+                .or_default()
+                .insert(connection)
+        } else {
+            let removed = watchers
+                .get_mut(&session.key)
+                .is_some_and(|watching| watching.remove(&connection));
+            if watchers.get(&session.key).is_some_and(HashSet::is_empty) {
+                watchers.remove(&session.key);
+            }
+            removed
+        }
+    }
+    /// `session/attach` for `connection`: protect the Session from unloading
+    /// before taking the snapshot, and load it again first if it was
+    /// unloaded to make room. If it cannot be loaded, the attach fails.
+    async fn attach_watched(
+        &self,
+        connection: u64,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<loop_wire::Attachment> {
+        if session.instance != self.instance || session.key.0 != session.native_id {
+            return Err(BackendError::SessionNotFound(session.key.clone()));
+        }
+        let added = self.set_watch(session, connection, true).await;
+        let result = async {
+            let unloading = self
+                .route(session)
+                .map_or(true, |live| live.closing.load(Ordering::Acquire));
+            if unloading && self.was_unloaded(&session.key) {
+                self.reload(session).await?;
+            }
+            loop_wire::RuntimeControl::attach(self, session, after_seq).await
+        }
+        .await;
+        if result.is_err() && added {
+            self.set_watch(session, connection, false).await;
+        }
+        result
+    }
+    async fn disconnect_recipients(&self, connection: u64) {
         let mut recipients = self.recipients.lock().await;
         recipients.retain(|_, attached| {
             attached.remove(&connection);
@@ -1023,9 +1250,50 @@ impl loop_wire::RuntimeControl for Runtime {
             live.escalations.detach(connection).await;
         }
     }
+}
+#[async_trait]
+impl loop_wire::RuntimeControl for Runtime {
+    async fn recipient(
+        &self,
+        session: &SessionRef,
+        connection: u64,
+        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
+    ) -> BackendResult<()> {
+        let attached = recipient.is_some();
+        self.register_watch(session, connection, attached, recipient)
+            .await
+    }
+    async fn register(
+        &self,
+        session: &SessionRef,
+        connection: u64,
+        attached: bool,
+        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
+    ) -> BackendResult<()> {
+        self.register_watch(session, connection, attached, recipient)
+            .await
+    }
+    async fn attach_watching(
+        &self,
+        connection: u64,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<loop_wire::Attachment> {
+        self.attach_watched(connection, session, after_seq).await
+    }
+    async fn disconnected(&self, connection: u64) {
+        self.watchers.lock().unwrap().retain(|_, watching| {
+            watching.remove(&connection);
+            !watching.is_empty()
+        });
+        self.disconnect_recipients(connection).await;
+    }
 
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         Runtime::list(self).await
+    }
+    async fn status(&self) -> BackendResult<loop_protocol::rpc::RuntimeStatus> {
+        Ok(Runtime::status(self))
     }
     async fn close(&self, session: &SessionRef, force: bool) -> BackendResult<()> {
         if session.instance != self.instance || session.key.0 != session.native_id {
@@ -1114,20 +1382,49 @@ impl AgentBackend for Runtime {
         session: &SessionRef,
         input: Vec<ContentBlock>,
     ) -> BackendResult<TurnHandle> {
-        let live = self.route(session)?;
-        if self.stopped.load(Ordering::Acquire) || live.closing.load(Ordering::Acquire) {
-            return Err(failed("Session closing"));
-        }
-        if let Some(error) = live.failure.lock().unwrap().clone() {
-            return Err(failed(error));
-        }
-        if live
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return Err(BackendError::Busy);
-        }
+        let mut reloads = 0;
+        let live = loop {
+            let live = match self.route(session) {
+                Ok(live) => live,
+                // Unloaded to make room: load it again rather than refuse.
+                Err(BackendError::SessionNotFound(key))
+                    if self.was_unloaded(&key) && reloads < 3 =>
+                {
+                    reloads += 1;
+                    self.reload(session).await?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // Admission is decided under the lifecycle lock, so an unload
+            // either sees this turn or has already begun.
+            let lifecycle = live.lifecycle.lock().await;
+            if live.closing.load(Ordering::Acquire) {
+                drop(lifecycle);
+                if self.was_unloaded(&session.key) && reloads < 3 {
+                    reloads += 1;
+                    self.wait_removed(&live).await;
+                    self.reload(session).await?;
+                    continue;
+                }
+                return Err(failed("Session closing"));
+            }
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(failed("Session closing"));
+            }
+            if let Some(error) = live.failure.lock().unwrap().clone() {
+                return Err(failed(error));
+            }
+            if live
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return Err(BackendError::Busy);
+            }
+            drop(lifecycle);
+            break live;
+        };
         let (done, handle) = TurnHandle::channel();
         let log = self.log.clone();
         let generation = self.generation;

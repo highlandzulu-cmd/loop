@@ -109,6 +109,76 @@ pub struct Runtime {
     /// Process telemetry, when the host application installed it.
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<loop_telemetry::TelemetryHandle>,
+    /// This Surface's Session store, which holds its Session leases.
+    pub session_store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+}
+
+/// Ends a standalone Surface's Session work and releases its leases. Take it
+/// before the [`Runtime`] is moved, so every exit path can still run it.
+#[derive(Clone)]
+pub struct SessionShutdown {
+    harness: Arc<AgentHarness>,
+    store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    grace: std::time::Duration,
+}
+
+/// How long shutdown waits for the current turn to stop.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl SessionShutdown {
+    /// Shut down `harness`, then release the leases `store` holds.
+    pub fn new(
+        harness: Arc<AgentHarness>,
+        store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    ) -> Self {
+        Self {
+            harness,
+            store,
+            grace: SHUTDOWN_GRACE,
+        }
+    }
+
+    /// How long to wait for the current turn to stop (default 5 s).
+    pub fn with_grace(mut self, grace: std::time::Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// Stop admission, cancel the current turn and wait for it to finish:
+    /// its tools, writes and `Settled` hooks. Only then release this store's
+    /// leases. A turn still running after the grace keeps them, and this
+    /// returns an error: the Session is not handed on while work in this
+    /// process may still touch it. Safe to repeat.
+    pub async fn run(&self) -> anyhow::Result<()> {
+        // Requested once per harness: it clears queued work and runs the
+        // `shutdown_requested` hooks, which must not fire again on a repeat.
+        if !self.harness.is_shutting_down() {
+            self.harness.request_shutdown();
+        }
+        if tokio::time::timeout(self.grace, self.harness.wait_for_settled())
+            .await
+            .is_err()
+        {
+            anyhow::bail!(
+                "the turn did not stop within {} s; its Session lease is kept until this process exits and expires 30 s later",
+                self.grace.as_secs_f32()
+            );
+        }
+        if let Some(store) = &self.store {
+            store
+                .release_leases()
+                .await
+                .map_err(|e| anyhow::anyhow!("could not release Session leases: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Runtime {
+    /// A handle that ends this Surface's Session work and releases its leases.
+    pub fn session_shutdown(&self) -> SessionShutdown {
+        SessionShutdown::new(Arc::clone(&self.harness), self.session_store.clone())
+    }
 }
 
 impl Runtime {
@@ -1352,6 +1422,7 @@ pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         selected_model,
         model_note,
         startup_notices,
+        session_store,
         ..
     } = opened;
     // Standalone Surfaces install their own approval transport, as before.
@@ -1406,6 +1477,7 @@ pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         web_disabled_for_run: opts.no_web,
         #[cfg(feature = "telemetry")]
         telemetry: None,
+        session_store,
     })
 }
 

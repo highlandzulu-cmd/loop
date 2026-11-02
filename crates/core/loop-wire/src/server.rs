@@ -305,6 +305,12 @@ async fn handle(
         methods::SESSION_LIST if runtime.is_some() => {
             runtime.unwrap().list().await.map(|l| to_value(&l))
         }
+        methods::RUNTIME_STATUS if runtime.is_some() => {
+            runtime.unwrap().status().await.map(|s| to_value(&s))
+        }
+        methods::RUNTIME_STOP if runtime.is_some() => {
+            runtime.unwrap().stop().await.map(|()| json!({}))
+        }
         methods::SESSION_CLOSE if runtime.is_some() => match parse::<CloseParams>(params) {
             Ok(CloseParams { session, force }) => runtime
                 .unwrap()
@@ -322,7 +328,10 @@ async fn handle(
                     key: session.key.clone(),
                     op,
                 });
-                let result = runtime.unwrap().attach(&session, after_seq).await;
+                let result = runtime
+                    .unwrap()
+                    .attach_watching(host.id, &session, after_seq)
+                    .await;
                 let _ = control.send(Control::Attached {
                     id,
                     key: session.key.clone(),
@@ -785,7 +794,10 @@ async fn register_recipient(
         } else {
             None
         };
-        if let Err(error) = runtime.recipient(session, host.id, recipient).await {
+        if let Err(error) = runtime
+            .register(session, host.id, attached, recipient)
+            .await
+        {
             tracing::debug!(%error, "could not register Escalation recipient");
         }
     }

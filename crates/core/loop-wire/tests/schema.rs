@@ -126,6 +126,8 @@ fn runtime_methods_and_messages_are_in_the_schema() {
         methods::SESSION_CLOSE,
         methods::SESSION_ATTACH,
         methods::SESSION_DETACH,
+        methods::RUNTIME_STATUS,
+        methods::RUNTIME_STOP,
     ] {
         assert_eq!(schema["methods"][method]["direction"], "client_to_server");
         assert_eq!(schema["methods"][method]["kind"], "request");
@@ -146,6 +148,10 @@ fn runtime_methods_and_messages_are_in_the_schema() {
             json!({"ref":session,"cwd":"/work","name":null,"parent":null,"live":true,"busy":false,"created_ms":1,"last_active_ms":2}),
         ),
         ("CloseParams", json!({"session":session})),
+        (
+            "RuntimeStatus",
+            json!({"pid":42,"socket":"/a/run/runtime.sock","generation":3,"loaded":2,"busy":1,"max_sessions":16,"max_active_turns":8}),
+        ),
         ("AttachParams", json!({"session":session})),
         ("AttachResult", json!({"latest_seq":42,"generation":3})),
         (
@@ -167,6 +173,7 @@ fn runtime_methods_and_messages_are_in_the_schema() {
             "{definition}: {message}"
         );
     }
+    assert!(!validator("RuntimeStatus").is_valid(&json!({"pid":42,"loaded":-1})));
     assert!(!validator("AttachParams").is_valid(&json!({"session":session,"after_seq":-1})));
     assert!(!validator("InteractParams")
         .is_valid(&json!({"kind":"permission","id":"p1","session":7,"options":[]})));
