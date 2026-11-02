@@ -8,28 +8,56 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+/// Scripted keyboard: each input carries the time it was "typed".
+#[derive(Clone)]
+struct Keys(mpsc::UnboundedSender<(std::time::Instant, Input)>);
+impl Keys {
+    fn send(
+        &self,
+        input: Input,
+    ) -> Result<(), mpsc::error::SendError<(std::time::Instant, Input)>> {
+        self.0.send((std::time::Instant::now(), input))
+    }
+}
 struct Script {
-    input: mpsc::UnboundedReceiver<Input>,
+    input: mpsc::UnboundedReceiver<(std::time::Instant, Input)>,
     output: Arc<Mutex<String>>,
+    width: Option<usize>,
+    typed: Option<std::time::Instant>,
 }
 #[async_trait::async_trait]
 impl Terminal for Script {
     async fn read(&mut self) -> anyhow::Result<Input> {
-        Ok(self.input.recv().await.unwrap_or(Input::Eof))
+        Ok(match self.input.recv().await {
+            Some((typed, input)) => {
+                self.typed = Some(typed);
+                input
+            }
+            None => Input::Eof,
+        })
+    }
+    fn typed_at(&self) -> Option<std::time::Instant> {
+        self.typed
     }
     fn write(&mut self, text: &str) -> anyhow::Result<()> {
         self.output.lock().unwrap().push_str(text);
         Ok(())
     }
+    fn width(&self) -> Option<usize> {
+        self.width
+    }
 }
-fn script() -> (mpsc::UnboundedSender<Input>, Script, Arc<Mutex<String>>) {
+fn script() -> (Keys, Script, Arc<Mutex<String>>) {
     let (tx, input) = mpsc::unbounded_channel();
+    let tx = Keys(tx);
     let output = Arc::new(Mutex::new(String::new()));
     (
         tx,
         Script {
             input,
             output: output.clone(),
+            width: None,
+            typed: None,
         },
         output,
     )
@@ -350,7 +378,8 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
         }).await.expect("approval response missing");
         output.lock().unwrap().clear();
         inject.send(request(9002, "approve-2")).unwrap();
-        wait_text(&output, "3. Allow once").await;
+        // Each approval is numbered from 1 again.
+        wait_text(&output, "1. Allow once").await;
         inject.send(serde_json::json!({"jsonrpc":"2.0", "method":"host/interact_withdrawn", "params":{"session":session,"id":"approve-2"}}).to_string()).unwrap();
         wait_text(&output, "Another client answered").await;
         // Release the injection sender so server shutdown closes the transport.
@@ -582,6 +611,9 @@ impl Terminal for PausedInput {
     }
     fn write(&mut self, text: &str) -> anyhow::Result<()> {
         self.script.write(text)
+    }
+    fn typed_at(&self) -> Option<std::time::Instant> {
+        self.script.typed_at()
     }
 }
 
@@ -927,7 +959,8 @@ async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
             )
             .unwrap();
         wait_text(&output, "Escalation: ls parent").await;
-        tx.send(Input::Line("2".into())).unwrap();
+        // Numbered from 1 again, not after the withdrawn child's choices.
+        tx.send(Input::Line("1".into())).unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if messages
@@ -1308,7 +1341,7 @@ async fn surface(
     rt: &Arc<Runtime>,
     session: &loop_protocol::SessionRef,
 ) -> (
-    mpsc::UnboundedSender<Input>,
+    Keys,
     Arc<Mutex<String>>,
     tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
@@ -1470,6 +1503,323 @@ async fn ctrl_c_cancels_the_turn_and_drops_queued_prompts() {
         assert_eq!(prompts, 1, "{}", output.lock().unwrap());
         input.send(Input::Eof).unwrap();
         task.await.unwrap().unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn detaching_while_an_approval_is_shown_leaves_it_pending() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo approved"}),
+                thought_signature: None,
+            },
+        ]));
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "approved later".into(),
+        ));
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime_with_script(dir.path(), log.clone(), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (input, output, task) = surface(&rt, &session).await;
+        wait_text(&output, "Attached").await;
+        input.send(Input::Line("start".into())).unwrap();
+        wait_text(&output, "Escalation").await;
+        // Ctrl+D while the approval is shown.
+        input.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rt.is_busy(&session), "detaching answered the approval");
+        use loop_runtime::log::EventLog;
+        assert!(!log
+            .read_runtime_after(0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(
+                e.event.kind,
+                loop_runtime::log::EventKind::EscalationAnswered(_)
+            )));
+        // Attaching again shows it, and it can still be answered.
+        let (input, output, task) = surface(&rt, &session).await;
+        wait_text(&output, "Escalation").await;
+        input.send(Input::Line("1".into())).unwrap();
+        wait_text(&output, "approved later").await;
+        input.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// `loop session list` output for `args`, with the terminal `width`.
+async fn listing(rt: &Arc<Runtime>, args: SessionArgs, width: Option<usize>) -> String {
+    let (server, client) = loop_wire::transport::memory();
+    let served = serve(rt.clone(), server);
+    let (backend, events) = connect(client).await.unwrap();
+    let (_tx, mut terminal, output) = script();
+    terminal.width = width;
+    drive(backend, events, args, &mut terminal).await.unwrap();
+    served.done.await.unwrap();
+    let text = output.lock().unwrap().clone();
+    text
+}
+
+/// A Session in `cwd` that is no longer loaded.
+async fn closed_session_in(rt: &Arc<Runtime>, cwd: &std::path::Path, name: &str) -> String {
+    let session = rt
+        .new_session(SessionSpec {
+            cwd: Some(cwd.into()),
+            name: Some(name.into()),
+        })
+        .await
+        .unwrap();
+    rt.close(&session.key, false).await.unwrap();
+    session.key.to_string()
+}
+
+#[tokio::test]
+async fn the_default_list_is_loaded_sessions_and_this_folder_newest_first() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let here = dir.path().join("here");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&here).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let rt = runtime(dir.path()).await;
+        let away = closed_session_in(&rt, &elsewhere, "Away").await;
+        let older = closed_session_in(&rt, &here, "Older").await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let newer = closed_session_in(&rt, &here, "Newer").await;
+        let loaded = rt
+            .new_session(SessionSpec {
+                cwd: Some(elsewhere.clone()),
+                name: Some("Loaded".into()),
+            })
+            .await
+            .unwrap()
+            .key
+            .to_string();
+        let args = || SessionArgs {
+            cwd: Some(here.clone()),
+            ..Default::default()
+        };
+        let text = listing(&rt, args(), None).await;
+        assert!(!text.contains(&away), "another folder, not loaded: {text}");
+        let at = |id: &str| {
+            text.find(id)
+                .unwrap_or_else(|| panic!("{id} missing: {text}"))
+        };
+        assert!(
+            at(&loaded) < at(&newer) && at(&newer) < at(&older),
+            "{text}"
+        );
+        assert!(text.contains("1 more; `loop session list --all`"), "{text}");
+        // --all lists everything; --json uses the same selection and order.
+        let all = listing(
+            &rt,
+            SessionArgs {
+                all: true,
+                ..args()
+            },
+            None,
+        )
+        .await;
+        assert!(all.contains(&away) && !all.contains("more;"), "{all}");
+        let json = listing(
+            &rt,
+            SessionArgs {
+                json: true,
+                ..args()
+            },
+            None,
+        )
+        .await;
+        let listed: Vec<loop_protocol::rpc::SessionInfo> = serde_json::from_str(&json).unwrap();
+        let ids: Vec<String> = listed.iter().map(|s| s.r#ref.key.to_string()).collect();
+        assert_eq!(ids, [loaded.clone(), newer, older]);
+        let json = listing(
+            &rt,
+            SessionArgs {
+                json: true,
+                all: true,
+                ..args()
+            },
+            None,
+        )
+        .await;
+        let listed: Vec<loop_protocol::rpc::SessionInfo> = serde_json::from_str(&json).unwrap();
+        assert_eq!(listed.len(), 4);
+        assert_eq!(listed[0].r#ref.key.to_string(), loaded);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_default_list_shows_at_most_twenty() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        for n in 0..22 {
+            closed_session_in(&rt, dir.path(), &format!("S{n}")).await;
+        }
+        let text = listing(
+            &rt,
+            SessionArgs {
+                cwd: Some(dir.path().into()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await;
+        let rows = text.lines().filter(|l| l.contains(" S")).count();
+        assert_eq!(rows, 20, "{text}");
+        assert!(text.contains("2 more; `loop session list --all`"), "{text}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_list_fits_the_terminal_width() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir
+            .path()
+            .join("a-rather-long-folder-name")
+            .join("and-another-quite-long-one")
+            .join("project");
+        std::fs::create_dir_all(&deep).unwrap();
+        let rt = runtime(dir.path()).await;
+        closed_session_in(
+            &rt,
+            &deep,
+            "A title that is long enough to need clipping here",
+        )
+        .await;
+        let text = listing(
+            &rt,
+            SessionArgs {
+                cwd: Some(deep.clone()),
+                ..Default::default()
+            },
+            Some(100),
+        )
+        .await;
+        for line in text.lines() {
+            assert!(
+                line.chars().count() <= 100,
+                "{} chars: {line:?}",
+                line.chars().count()
+            );
+        }
+        let row = text.lines().nth(1).unwrap();
+        assert!(row.contains('…'), "folder or title shortened: {row}");
+        assert!(row.contains("project"), "the folder keeps its end: {row}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn each_approval_is_numbered_from_one_and_ignores_earlier_typing() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (mut server, client) = loop_wire::transport::memory();
+        let inject = server.outgoing.clone();
+        let messages = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured = messages.clone();
+        let (forward, incoming) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(raw) = server.incoming.recv().await {
+                captured.lock().unwrap().push(serde_json::from_str(&raw).unwrap());
+                if forward.send(raw).is_err() {
+                    break;
+                }
+            }
+        });
+        let served = serve(
+            rt.clone(),
+            loop_wire::transport::Transport {
+                incoming,
+                outgoing: server.outgoing,
+            },
+        );
+        let (backend, events) = connect(client).await.unwrap();
+        let (tx, script, output) = script();
+        let (enable, enabled) = tokio::sync::watch::channel(true);
+        let mut terminal = PausedInput { script, enabled };
+        let key = session.key.to_string();
+        let task = tokio::spawn(async move {
+            drive(
+                backend,
+                events,
+                SessionArgs {
+                    id: Some(key),
+                    ..Default::default()
+                },
+                &mut terminal,
+            )
+            .await
+        });
+        let request = |rpc_id: u64, id: &str| serde_json::json!({"jsonrpc":"2.0", "id":rpc_id, "method":"host/interact", "params":{
+            "session":session, "kind":"permission", "id":id,
+            "options":[{"native_id":"allow-once", "label":"Allow once", "kind_hint":"allow_once"}, {"native_id":"reject", "label":"Reject", "kind_hint":"reject_once"}]
+        }}).to_string();
+        let answered = |id: u64, choice: &'static str| {
+            let messages = messages.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if messages.lock().unwrap().iter().any(|v| v["id"] == id && v["result"]["native_id"] == choice) {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| panic!("{id} was not answered with {choice}"));
+            }
+        };
+        while !messages.lock().unwrap().iter().any(|m| m["method"] == "session/attach") {
+            tokio::task::yield_now().await;
+        }
+        inject.send(request(9001, "first")).unwrap();
+        wait_text(&output, "1. Allow once").await;
+        tx.send(Input::Line("2".into())).unwrap();
+        answered(9001, "reject").await;
+        // Typed while nothing is shown, read only after the next appears.
+        enable.send(false).unwrap();
+        tx.send(Input::Line("1".into())).unwrap();
+        output.lock().unwrap().clear();
+        inject.send(request(9002, "second")).unwrap();
+        wait_text(&output, "1. Allow once").await;
+        assert!(!output.lock().unwrap().contains("3."), "numbering continued");
+        enable.send(true).unwrap();
+        wait_text(&output, "Choice no longer active").await;
+        assert!(!messages.lock().unwrap().iter().any(|v| v["id"] == 9002 && v.get("result").is_some()),
+            "a line typed before the approval answered it");
+        // Typed after it was shown: answers it.
+        tx.send(Input::Line("1".into())).unwrap();
+        answered(9002, "allow-once").await;
+        drop(inject);
+        tx.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        served.done.await.unwrap();
         rt.shutdown().await;
     })
     .await

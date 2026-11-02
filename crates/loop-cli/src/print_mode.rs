@@ -332,6 +332,9 @@ pub fn agent_text_chunk(update: &SessionUpdate) -> Option<&str> {
 pub struct TextRenderer {
     at_line_start: bool,
     tools: std::collections::HashMap<loop_protocol::ToolCallId, String>,
+    /// The call whose line was the last thing written: its result can
+    /// follow without repeating its name.
+    last_call: Option<loop_protocol::ToolCallId>,
 }
 
 impl Default for TextRenderer {
@@ -339,6 +342,7 @@ impl Default for TextRenderer {
         Self {
             at_line_start: true,
             tools: Default::default(),
+            last_call: None,
         }
     }
 }
@@ -348,6 +352,7 @@ impl TextRenderer {
     pub fn render(&mut self, update: &SessionUpdate) -> String {
         use loop_protocol::ToolCallStatus;
         let mut out = String::new();
+        let mut last_call = None;
         match update {
             SessionUpdate::MessageStarted {
                 role: Role::Agent, ..
@@ -362,16 +367,25 @@ impl TextRenderer {
                 };
                 out.push_str(&format!("• {label}\n"));
                 self.tools.insert(call.id.clone(), label);
-                if let Some(status) = finished(call.status) {
-                    out.push_str(status);
-                    self.tools.remove(&call.id);
+                match finished(call.status) {
+                    Some(status) => {
+                        out.push_str(&format!("  └ {status}\n"));
+                        self.tools.remove(&call.id);
+                    }
+                    None => last_call = Some(call.id.clone()),
                 }
             }
             SessionUpdate::ToolCallUpdate(update) => {
-                let status = update.status.and_then(finished);
-                if let Some(status) = status.filter(|_| self.tools.remove(&update.id).is_some()) {
-                    self.break_line(&mut out);
-                    out.push_str(status);
+                if let Some(status) = update.status.and_then(finished) {
+                    if let Some(label) = self.tools.remove(&update.id) {
+                        self.break_line(&mut out);
+                        // Name the call unless its line is right above.
+                        if self.last_call.as_ref() == Some(&update.id) {
+                            out.push_str(&format!("  └ {status}\n"));
+                        } else {
+                            out.push_str(&format!("  └ {label} {status}\n"));
+                        }
+                    }
                 }
             }
             SessionUpdate::TurnEnded { .. } => self.break_line(&mut out),
@@ -396,13 +410,14 @@ impl TextRenderer {
         }
         if !out.is_empty() {
             self.at_line_start = out.ends_with('\n');
+            self.last_call = last_call;
         }
         return out;
 
         fn finished(status: ToolCallStatus) -> Option<&'static str> {
             match status {
-                ToolCallStatus::Completed => Some("  └ done\n"),
-                ToolCallStatus::Failed => Some("  └ failed\n"),
+                ToolCallStatus::Completed => Some("done"),
+                ToolCallStatus::Failed => Some("failed"),
                 ToolCallStatus::Pending | ToolCallStatus::InProgress => None,
             }
         }
@@ -655,6 +670,41 @@ mod tests {
     fn render(updates: &[SessionUpdate]) -> String {
         let mut renderer = TextRenderer::default();
         updates.iter().map(|u| renderer.render(u)).collect()
+    }
+
+    #[test]
+    fn parallel_tool_results_name_their_call() {
+        let call = |id: &str, name: &str, title: &str| {
+            SessionUpdate::ToolCall(loop_protocol::ToolCall {
+                id: id.into(),
+                name: Some(name.into()),
+                title: title.into(),
+                kind: loop_protocol::ToolKind::Read,
+                status: loop_protocol::ToolCallStatus::InProgress,
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input: None,
+            })
+        };
+        let end = |id: &str, status| {
+            let mut update = loop_protocol::ToolCallUpdate::new(id.into());
+            update.status = Some(status);
+            SessionUpdate::ToolCallUpdate(update)
+        };
+        use loop_protocol::ToolCallStatus::{Completed, Failed};
+        let text = render(&[
+            call("a", "ls", "ls ."),
+            call("b", "read", "read notes.txt"),
+            end("a", Completed),
+            end("b", Failed),
+            // A call ending right after it started needs no name.
+            call("c", "ls", "ls src"),
+            end("c", Completed),
+        ]);
+        assert_eq!(
+            text,
+            "• ls .\n• read notes.txt\n  └ ls . done\n  └ read notes.txt failed\n• ls src\n  └ done\n"
+        );
     }
 
     #[test]

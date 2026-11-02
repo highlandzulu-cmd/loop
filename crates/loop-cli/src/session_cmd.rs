@@ -75,12 +75,22 @@ mod unix {
     pub trait Terminal: Send {
         async fn read(&mut self) -> anyhow::Result<Input>;
         fn write(&mut self, text: &str) -> anyhow::Result<()>;
+        /// Columns available for a line, when output is a terminal.
+        fn width(&self) -> Option<usize> {
+            None
+        }
+        /// When the line [`Self::read`] last returned was typed, if known.
+        /// A line typed before an approval appeared never answers it.
+        fn typed_at(&self) -> Option<std::time::Instant> {
+            None
+        }
     }
 
     pub struct StdioTerminal {
-        lines: mpsc::UnboundedReceiver<std::io::Result<String>>,
+        lines: mpsc::UnboundedReceiver<(std::time::Instant, std::io::Result<String>)>,
         interrupt: tokio::signal::unix::Signal,
         stdin_ended: bool,
+        typed: Option<std::time::Instant>,
     }
     impl StdioTerminal {
         pub fn new() -> anyhow::Result<Self> {
@@ -90,7 +100,7 @@ mod unix {
             // A detached OS thread avoids Tokio's blocking-stdin shutdown wait.
             std::thread::spawn(move || {
                 for line in std::io::stdin().lock().lines() {
-                    if tx.send(line).is_err() {
+                    if tx.send((std::time::Instant::now(), line)).is_err() {
                         break;
                     }
                 }
@@ -99,6 +109,7 @@ mod unix {
                 lines,
                 interrupt,
                 stdin_ended: false,
+                typed: None,
             })
         }
     }
@@ -108,10 +119,21 @@ mod unix {
             tokio::select! {
                 _ = self.interrupt.recv() => Ok(Input::Interrupt),
                 line = self.lines.recv(), if !self.stdin_ended => match line {
-                    Some(line) => Ok(Input::Line(line?)),
+                    Some((typed, line)) => { self.typed = Some(typed); Ok(Input::Line(line?)) },
                     None => { self.stdin_ended = true; Ok(Input::Eof) },
                 }
             }
+        }
+        fn typed_at(&self) -> Option<std::time::Instant> {
+            self.typed
+        }
+        fn width(&self) -> Option<usize> {
+            use std::io::IsTerminal;
+            std::io::stdout()
+                .is_terminal()
+                .then(|| crossterm::terminal::size().ok())
+                .flatten()
+                .map(|(columns, _)| usize::from(columns))
         }
         fn write(&mut self, text: &str) -> anyhow::Result<()> {
             let mut out = std::io::stdout().lock();
@@ -142,9 +164,15 @@ mod unix {
                 .send(HostEvent::Request(Box::new(request), tx))
                 .is_err()
             {
-                return InteractionOutcome::Cancelled;
+                return std::future::pending().await;
             }
-            rx.await.unwrap_or(InteractionOutcome::Cancelled)
+            // No answer when this Surface detaches or exits with the request
+            // still shown: replying would answer it for everyone. The
+            // Runtime keeps it pending for the other Surfaces.
+            match rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => std::future::pending().await,
+            }
         }
     }
 
@@ -242,21 +270,92 @@ mod unix {
         Ok((AttachClient { backend, closed }, events))
     }
 
-    fn list_text(sessions: &mut [SessionInfo]) -> String {
+    /// Most Sessions the default listing shows.
+    const DEFAULT_LIST: usize = 20;
+
+    /// What `loop session list` shows, newest first, and how many it leaves
+    /// out. By default: loaded Sessions and those in `here` (not closed
+    /// Subagents), at most [`DEFAULT_LIST`]. With `all`: every Session.
+    pub(super) fn select(
+        mut sessions: Vec<SessionInfo>,
+        here: &std::path::Path,
+        all: bool,
+    ) -> (Vec<SessionInfo>, usize) {
         sessions.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+        if all {
+            return (sessions, 0);
+        }
+        let total = sessions.len();
+        let here = std::fs::canonicalize(here).unwrap_or_else(|_| here.to_path_buf());
+        let in_here = |cwd: &std::path::Path| {
+            std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()) == here
+        };
+        let mut shown: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| s.live || (s.parent.is_none() && in_here(&s.cwd)))
+            .collect();
+        shown.truncate(DEFAULT_LIST);
+        let more = total - shown.len();
+        (shown, more)
+    }
+
+    /// `path` with the home folder as `~`, cut in the middle to `max` characters.
+    fn folder(path: &std::path::Path, max: Option<usize>) -> String {
+        let mut text = path.display().to_string();
+        if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+            if let Ok(rest) = path.strip_prefix(&home) {
+                text = if rest.as_os_str().is_empty() {
+                    "~".into()
+                } else {
+                    format!("~/{}", rest.display())
+                };
+            }
+        }
+        match max {
+            Some(max) if text.chars().count() > max && max > 1 => {
+                let chars: Vec<char> = text.chars().collect();
+                let tail = (max - 1) / 2 + (max - 1) % 2;
+                let head = max - 1 - tail;
+                let mut cut: String = chars[..head].iter().collect();
+                cut.push('…');
+                cut.extend(&chars[chars.len() - tail..]);
+                cut
+            }
+            _ => text,
+        }
+    }
+
+    fn list_text(sessions: &mut [SessionInfo], width: Option<usize>) -> String {
         if sessions.is_empty() {
             return "No Sessions. Use `loop session new` to create one.\n".into();
         }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis() as u64);
+        // Within a terminal, the folder and title share what the other
+        // columns leave; a pipe gets them whole.
+        let (folder_max, title_max) = match width {
+            Some(width) => {
+                let id = sessions
+                    .iter()
+                    .map(|s| s.r#ref.key.as_str().chars().count())
+                    .max()
+                    .unwrap_or(2);
+                // ID, BUSY, LAST ACTIVE and PARENT, plus the gaps of six columns.
+                let fixed = id + 4 + 11 + 8 + 5 * 2;
+                let left = width.saturating_sub(fixed).max(20);
+                let folder = (left * 3 / 5).max(10);
+                (Some(folder), (left - folder).clamp(6, 40))
+            }
+            None => (None, 40),
+        };
         let mut rows =
             vec![["ID", "FOLDER", "TITLE", "BUSY", "LAST ACTIVE", "PARENT"].map(String::from)];
         for s in sessions.iter() {
             rows.push([
                 s.r#ref.key.to_string(),
-                s.cwd.display().to_string(),
-                clip(s.name.as_deref().unwrap_or("(untitled)"), 40),
+                folder(&s.cwd, folder_max),
+                clip(s.name.as_deref().unwrap_or("(untitled)"), title_max),
                 if s.busy { "yes" } else { "no" }.into(),
                 ago(now, s.last_active_ms),
                 s.parent
@@ -330,14 +429,25 @@ mod unix {
     struct Pending {
         request: InteractionRequest,
         reply: oneshot::Sender<InteractionOutcome>,
-        first_choice: usize,
         session: SessionKey,
         /// Set when the request comes from a Subagent of the attached Session.
         from: Option<String>,
+        /// When its choices were put on screen.
+        shown: Option<std::time::Instant>,
     }
     impl Pending {
-        fn show(&self) -> String {
-            show(&self.request, self.first_choice, self.from.as_deref())
+        /// Its choices, numbered from 1; remembers when they were shown.
+        fn show(&mut self) -> String {
+            self.shown = Some(std::time::Instant::now());
+            show(&self.request, 1, self.from.as_deref())
+        }
+        /// Whether a line typed at `typed` was meant for this request: it
+        /// must have been typed after the request was shown.
+        fn typed_for(&self, typed: Option<std::time::Instant>) -> bool {
+            match (typed, self.shown) {
+                (Some(typed), Some(shown)) => typed >= shown,
+                _ => true,
+            }
         }
     }
     fn show(request: &InteractionRequest, first_choice: usize, from: Option<&str>) -> String {
@@ -502,7 +612,8 @@ mod unix {
             0 => anyhow::bail!("No Session matches `{id}`"),
             1 => found.remove(0),
             _ => {
-                terminal.write(&list_text(&mut found))?;
+                found.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+                terminal.write(&list_text(&mut found, terminal.width()))?;
                 anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
             }
         };
@@ -574,34 +685,27 @@ mod unix {
             let header = header("New Session", &session, &cwd);
             (session, header)
         } else {
-            let mut sessions = backend.list().await?;
+            let sessions = backend.list().await?;
             let Some(id) = args.id else {
+                let here = match args.cwd.clone() {
+                    Some(cwd) => cwd,
+                    None => std::env::current_dir()?,
+                };
+                let (mut shown, more) = select(sessions.clone(), &here, args.all);
                 if args.json {
-                    let mut text = serde_json::to_string_pretty(&sessions)?;
+                    let mut text = serde_json::to_string_pretty(&shown)?;
                     text.push('\n');
                     terminal.write(&text)?;
                     client.shutdown().await;
                     return Ok(());
                 }
-                let hidden = if args.all {
-                    0
+                let mut text = if shown.is_empty() && more > 0 {
+                    "No Sessions are loaded or in this folder.\n".to_owned()
                 } else {
-                    let before = sessions.len();
-                    sessions.retain(|s| s.live || s.parent.is_none());
-                    before - sessions.len()
+                    list_text(&mut shown, terminal.width())
                 };
-                let mut text = list_text(&mut sessions);
-                if hidden > 0 {
-                    // Closed covers finished children and ones a cancel or a
-                    // Runtime restart ended; none of them can be prompted.
-                    let (noun, them) = if hidden == 1 {
-                        ("Session", "it")
-                    } else {
-                        ("Sessions", "them")
-                    };
-                    text.push_str(&format!(
-                        "\n{hidden} closed Subagent {noun} not shown (finished, cancelled or interrupted); `loop session list --all` lists {them}.\n"
-                    ));
+                if more > 0 {
+                    text.push_str(&format!("\n{more} more; `loop session list --all`\n"));
                 }
                 terminal.write(&text)?;
                 client.shutdown().await;
@@ -654,7 +758,8 @@ mod unix {
                     }
                 }
                 _ => {
-                    terminal.write(&list_text(&mut found))?;
+                    found.sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+                    terminal.write(&list_text(&mut found, terminal.width()))?;
                     client.shutdown().await;
                     anyhow::bail!("Ambiguous Session prefix `{id}`; use a longer id");
                 }
@@ -705,10 +810,9 @@ mod unix {
         let mut last_seq = 0;
         let mut deferred = VecDeque::new();
         let mut pending: Vec<Pending> = Vec::new();
-        // Numbers are request identities, never reused by this Surface. A
-        // buffered answer remains tied to its original Escalation even if a
-        // withdrawal wins the race with terminal input.
-        let mut next_choice = 1;
+        // Each approval is numbered from 1. A line typed before an approval
+        // was shown (buffered while another was withdrawn) never answers it.
+        let mut approvals_shown = false;
         let mut withdrawn: Recent<(SessionKey, loop_protocol::InteractionId)> = Recent::default();
         // Origins of requests not yet received, in arrival order.
         let mut origins: Recent<(loop_protocol::InteractionId, SessionRef)> = Recent::default();
@@ -739,12 +843,7 @@ mod unix {
                         if !matches!(request, InteractionRequest::Permission {..} | InteractionRequest::Question {..}) {
                             let _ = reply.send(InteractionOutcome::Rejected { reason: "loop session attach supports choices and text questions".into() }); continue;
                         }
-                        let first_choice = next_choice;
-                        next_choice += match &request {
-                            InteractionRequest::Permission { options, .. } => options.len().max(1),
-                            InteractionRequest::Question { choices, .. } => choices.as_ref().map_or(1, |c| c.len().max(1)),
-                            _ => 1,
-                        };
+                        approvals_shown = true;
                         let label = if from.key == session.key {
                             None
                         } else {
@@ -755,7 +854,7 @@ mod unix {
                             }
                             labels.get(&from.key).cloned()
                         };
-                        let item = Pending { request, reply, first_choice, session: from.key, from: label };
+                        let mut item = Pending { request, reply, session: from.key, from: label, shown: None };
                         if pending.is_empty() { terminal.write(&item.show())?; }
                         pending.push(item);
                     }
@@ -771,7 +870,7 @@ mod unix {
                         }
                         if held.is_some() || key.0 == session.key {
                             terminal.write("\r\x1b[2KAnother client answered; Escalation withdrawn.\n")?;
-                            if let Some(next) = pending.first() { terminal.write(&next.show())?; }
+                            if let Some(next) = pending.first_mut() { terminal.write(&next.show())?; }
                         }
                     }
                     HostEvent::Disconnected => return Err(LostContact.into()),
@@ -833,11 +932,12 @@ mod unix {
                     if last_seq >= replay_until {
                         if let Some(input) = deferred.pop_front() { return Ok(input); }
                     }
-                    terminal.read().await
+                    let input = terminal.read().await?;
+                    Ok::<_, anyhow::Error>((terminal.typed_at(), input))
                 } => {
-                    let input = input?;
+                    let (typed, input) = input?;
                     if last_seq < replay_until && !matches!(input, Input::Interrupt) {
-                        deferred.push_back(input);
+                        deferred.push_back((typed, input));
                         continue;
                     }
                     match input {
@@ -865,13 +965,15 @@ mod unix {
                     Input::Line(line) => {
                         let explicit_prompt = line.starts_with("> ");
                         let line = line.strip_prefix("> ").unwrap_or(&line).to_owned();
-                        if let Some(item) = pending.first().filter(|_| !explicit_prompt) {
-                            if let Some(outcome) = answer(&item.request, &line, item.first_choice) {
+                        if pending.first().is_some_and(|item| !explicit_prompt && !item.typed_for(typed)) {
+                            terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
+                        } else if let Some(item) = pending.first().filter(|_| !explicit_prompt) {
+                            if let Some(outcome) = answer(&item.request, &line, 1) {
                                 let item = pending.remove(0);
                                 let _ = item.reply.send(outcome);
-                                if let Some(next) = pending.first() { terminal.write(&next.show())?; }
+                                if let Some(next) = pending.first_mut() { terminal.write(&next.show())?; }
                             } else { terminal.write("Enter one of the numbered choices.\n")?; }
-                        } else if !explicit_prompt && next_choice > 1 && line.trim().parse::<usize>().is_ok() {
+                        } else if !explicit_prompt && approvals_shown && line.trim().parse::<usize>().is_ok() {
                             terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
                         } else if !line.trim().is_empty() {
                             interrupted = false;

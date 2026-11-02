@@ -81,9 +81,9 @@ its pid may now belong to another program.
 ## Attach a Surface
 
 ```bash
-loop session list               # list Sessions: id, folder, title, busy, last activity, parent
-loop session list --all         # also list finished Subagent Sessions
-loop session list --json        # every Session as JSON, for scripts
+loop session list               # loaded Sessions and this folder's: id, folder, title, busy, last activity, parent
+loop session list --all         # every Session: all folders, closed Subagents too
+loop session list --json        # the same Sessions as JSON, for scripts
 loop session attach 3f2a        # attach to a Session by id or unique id prefix
 loop session new                # create a Session in the current folder and attach
 loop session new --cwd DIR      # create a Session in DIR and attach
@@ -100,11 +100,18 @@ a finished child is closed: it frees its slot and is listed only with
 says how many it left out. It is never loaded again: attaching replays its output, but you
 cannot prompt it.
 
-The table is for people: columns are aligned with spaces, titles are cut
-short and PARENT shows the first 8 characters of the parent id. Scripts should
-use `loop session list --json`. It prints a JSON array with one `SessionInfo` per
-Session, closed Subagents included, with full ids and fields `live`, `busy`,
-`parent`, `created_ms` and `last_active_ms`.
+By default the list shows the Sessions loaded in the Runtime and the Sessions
+of the current folder (or `--cwd`), newest first, at most 20, then a line
+`N more; loop session list --all`. Closed Subagent Sessions are left out.
+`--all` lists every Session of every folder, closed Subagents included.
+
+The table is for people: it fits the terminal width. Folders show `~` for your
+home folder and are cut in the middle, titles are cut short, and PARENT shows
+the first 8 characters of the parent id. Scripts should use
+`loop session list --json` (with `--all` for everything). It prints the same
+Sessions in the same order, as a JSON array with one `SessionInfo` each, with
+full ids and fields `live`, `busy`, `parent`, `created_ms` and
+`last_active_ms`.
 
 `--socket PATH` connects to a Runtime that was started with a custom socket.
 
@@ -113,7 +120,7 @@ Session, closed Subagents included, with full ids and fields `live`, `busy`,
 | Input | Effect |
 |---|---|
 | A line of text | Starts a turn with it as the prompt. While a turn runs it is queued (`queued; sends when the current turn ends`) and sent, in order, when the turn ends. Detaching drops prompts still queued |
-| A number, while an approval is shown | Answers the approval with that choice; an approval always comes before queued prompts |
+| A number, while an approval is shown | Answers the approval with that choice. Each approval is numbered from 1; a line typed before it appeared is ignored (`Choice no longer active`). An approval always comes before queued prompts |
 | `> ` then text | Always a prompt, even when it starts with a number |
 | Ctrl+C | Cancels the current turn and drops prompts still queued, saying how many |
 | Ctrl+C again, or Ctrl+D | Detaches |
@@ -162,6 +169,8 @@ An approval is an Escalation: a tool that needs your decision before it runs.
   `Another client answered; Escalation withdrawn.`
 - If no Surface is attached, the request waits, with no timeout. The next
   Surface to attach sees it.
+- Detaching or quitting while an approval is shown never answers it: it stays
+  pending for the other Surfaces, or waits for the next one.
 - **File edits are applied before you answer.** In `ask` mode a file edit
   (`write`, `edit`) is written first and reverted if you reject it. While its
   approval is parked, the change is already on disk; rejecting it, or
