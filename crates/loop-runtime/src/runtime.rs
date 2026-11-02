@@ -87,6 +87,9 @@ pub struct Runtime {
     /// Sessions unloaded to make room and not loaded since. A prompt or an
     /// attach for one loads it again instead of failing.
     unloaded: Mutex<HashSet<SessionKey>>,
+    /// Connections attached to each Session, whether or not they answer
+    /// Escalations. A watched Session is never unloaded.
+    watchers: Mutex<HashMap<SessionKey, HashSet<u64>>>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -282,6 +285,7 @@ impl Runtime {
             subagent_depth: subagent::DEFAULT_DEPTH,
             subagents: AsyncMutex::new(None),
             unloaded: Mutex::new(HashSet::new()),
+            watchers: Mutex::new(HashMap::new()),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -919,11 +923,17 @@ impl Runtime {
             return false;
         }
         if self
-            .recipients
+            .watchers
             .lock()
-            .await
+            .unwrap()
             .get(key)
-            .is_some_and(|attached| !attached.is_empty())
+            .is_some_and(|watching| !watching.is_empty())
+            || self
+                .recipients
+                .lock()
+                .await
+                .get(key)
+                .is_some_and(|attached| !attached.is_empty())
         {
             return false;
         }
@@ -1128,26 +1138,42 @@ impl Runtime {
         }
     }
 }
-#[async_trait]
-impl loop_wire::RuntimeControl for Runtime {
-    async fn recipient(
+impl Runtime {
+    /// Record whether `connection` watches `session`, and its Escalation
+    /// recipient when it answers them. Any watched Session stays loaded.
+    async fn register_watch(
         &self,
         session: &SessionRef,
         connection: u64,
+        attached: bool,
         recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
     ) -> BackendResult<()> {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
         // Registering under the lifecycle lock: an unload either sees this
-        // Surface and keeps the Session, or has already begun, and then the
+        // watcher and keeps the Session, or has already begun, and then the
         // Session is loaded again below.
         let target = self.route(session).ok();
-        let _lifecycle = match (&target, &recipient) {
-            (Some(live), Some(_)) => Some(live.lifecycle.lock().await),
+        let _lifecycle = match (&target, attached) {
+            (Some(live), true) => Some(live.lifecycle.lock().await),
             _ => None,
         };
-        let reload = recipient.is_some()
+        {
+            let mut watchers = self.watchers.lock().unwrap();
+            if attached {
+                watchers
+                    .entry(session.key.clone())
+                    .or_default()
+                    .insert(connection);
+            } else if let Some(watching) = watchers.get_mut(&session.key) {
+                watching.remove(&connection);
+                if watching.is_empty() {
+                    watchers.remove(&session.key);
+                }
+            }
+        }
+        let reload = attached
             && self.was_unloaded(&session.key)
             && target
                 .as_ref()
@@ -1200,7 +1226,7 @@ impl loop_wire::RuntimeControl for Runtime {
         }
         Ok(())
     }
-    async fn disconnected(&self, connection: u64) {
+    async fn disconnect_recipients(&self, connection: u64) {
         let mut recipients = self.recipients.lock().await;
         recipients.retain(|_, attached| {
             attached.remove(&connection);
@@ -1210,6 +1236,36 @@ impl loop_wire::RuntimeControl for Runtime {
         for live in sessions {
             live.escalations.detach(connection).await;
         }
+    }
+}
+#[async_trait]
+impl loop_wire::RuntimeControl for Runtime {
+    async fn recipient(
+        &self,
+        session: &SessionRef,
+        connection: u64,
+        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
+    ) -> BackendResult<()> {
+        let attached = recipient.is_some();
+        self.register_watch(session, connection, attached, recipient)
+            .await
+    }
+    async fn register(
+        &self,
+        session: &SessionRef,
+        connection: u64,
+        attached: bool,
+        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
+    ) -> BackendResult<()> {
+        self.register_watch(session, connection, attached, recipient)
+            .await
+    }
+    async fn disconnected(&self, connection: u64) {
+        self.watchers.lock().unwrap().retain(|_, watching| {
+            watching.remove(&connection);
+            !watching.is_empty()
+        });
+        self.disconnect_recipients(connection).await;
     }
 
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {

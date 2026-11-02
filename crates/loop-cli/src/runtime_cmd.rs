@@ -260,6 +260,22 @@ impl loop_wire::RuntimeControl for Control {
         loop_wire::RuntimeControl::recipient(self.runtime.as_ref(), session, connection, recipient)
             .await
     }
+    async fn register(
+        &self,
+        session: &loop_protocol::SessionRef,
+        connection: u64,
+        attached: bool,
+        recipient: Option<Arc<dyn loop_wire::control::EscalationRecipient>>,
+    ) -> loop_protocol::BackendResult<()> {
+        loop_wire::RuntimeControl::register(
+            self.runtime.as_ref(),
+            session,
+            connection,
+            attached,
+            recipient,
+        )
+        .await
+    }
     async fn disconnected(&self, connection: u64) {
         loop_wire::RuntimeControl::disconnected(self.runtime.as_ref(), connection).await
     }

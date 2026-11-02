@@ -28,6 +28,19 @@ pub trait RuntimeControl: Send + Sync {
     ) -> BackendResult<()> {
         Ok(())
     }
+    /// Record whether `connection` is attached to `session` (watching it,
+    /// whether or not it answers Escalations), with its Escalation
+    /// `recipient` when it answers them. A Runtime keeps watched Sessions
+    /// loaded. The default only registers the recipient.
+    async fn register(
+        &self,
+        session: &SessionRef,
+        connection: u64,
+        _attached: bool,
+        recipient: Option<std::sync::Arc<dyn EscalationRecipient>>,
+    ) -> BackendResult<()> {
+        self.recipient(session, connection, recipient).await
+    }
     /// Remove a disconnected connection from every Session.
     async fn disconnected(&self, _connection: u64) {}
     /// Every known Session, live or not. Does not subscribe to any of them.

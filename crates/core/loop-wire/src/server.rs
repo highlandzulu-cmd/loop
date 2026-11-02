@@ -791,7 +791,10 @@ async fn register_recipient(
         } else {
             None
         };
-        if let Err(error) = runtime.recipient(session, host.id, recipient).await {
+        if let Err(error) = runtime
+            .register(session, host.id, attached, recipient)
+            .await
+        {
             tracing::debug!(%error, "could not register Escalation recipient");
         }
     }
