@@ -140,9 +140,17 @@ async fn loaded(rt: &Runtime) -> Vec<SessionKey> {
         .collect()
 }
 
-/// Registration follows the reply on the connection's output task.
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(100)).await;
+/// Wait until `key` has `watching` watchers. A connection registers the
+/// Sessions it creates, and forgets a disconnected one, on its own task.
+/// Attach and detach register before they reply and need no wait.
+async fn watched(rt: &Runtime, key: &SessionKey, watching: usize) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while rt.watcher_count(key) != watching {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{key:?} never had {watching} watcher(s)"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -153,13 +161,12 @@ async fn an_observer_keeps_its_session_loaded() {
         let observer = Client::connect(&rt, false).await;
         let a = observer.new_session().await.unwrap();
         observer.attach(&a).await.unwrap();
-        settle().await;
         let other = Client::connect(&rt, true).await;
         assert_eq!(other.new_session().await, Err(BackendError::Busy));
         assert_eq!(loaded(&rt).await, std::slice::from_ref(&a.key));
         // Once it detaches, A can make room.
         observer.detach(&a).await;
-        settle().await;
+        assert_eq!(rt.watcher_count(&a.key), 0);
         let b = other.new_session().await.unwrap();
         assert_eq!(loaded(&rt).await, [b.key]);
         rt.shutdown().await;
@@ -175,9 +182,9 @@ async fn a_disconnected_observer_no_longer_keeps_its_session() {
         let rt = runtime(dir.path(), Arc::new(MemoryEventLog::new())).await;
         let observer = Client::connect(&rt, false).await;
         let a = observer.new_session().await.unwrap();
-        settle().await;
+        watched(&rt, &a.key, 1).await;
         observer.conn.close();
-        settle().await;
+        watched(&rt, &a.key, 0).await;
         let other = Client::connect(&rt, true).await;
         let b = other.new_session().await.unwrap();
         assert_eq!(loaded(&rt).await, [b.key]);
@@ -243,7 +250,6 @@ async fn an_attach_protects_its_session_before_its_snapshot() {
         let maker = Client::connect(&rt, true).await;
         let a = maker.new_session().await.unwrap();
         maker.detach(&a).await;
-        settle().await;
         // A's attach is paused in its snapshot...
         let watcher = Arc::new(Client::connect(&rt, true).await);
         log.held.store(true, Ordering::Release);
@@ -272,18 +278,16 @@ async fn an_attach_that_cannot_load_its_unloaded_session_fails() {
         let maker = Client::connect(&rt, true).await;
         let a = maker.new_session().await.unwrap();
         maker.detach(&a).await;
-        settle().await;
         // B unloads A and stays watched by its maker.
         let other = Client::connect(&rt, true).await;
         let b = other.new_session().await.unwrap();
-        settle().await;
+        watched(&rt, &b.key, 1).await;
         assert_eq!(loaded(&rt).await, std::slice::from_ref(&b.key));
         // A cannot come back while B is watched: the attach says so.
         let watcher = Client::connect(&rt, true).await;
         assert_eq!(watcher.attach(&a).await, Err(BackendError::Busy));
         // With room again, the same attach loads A.
         other.detach(&b).await;
-        settle().await;
         watcher.attach(&a).await.unwrap();
         assert_eq!(loaded(&rt).await, std::slice::from_ref(&a.key));
         rt.shutdown().await;

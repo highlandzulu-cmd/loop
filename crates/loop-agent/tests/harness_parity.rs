@@ -229,12 +229,13 @@ async fn abort_during_tool_ends_turn_and_persists_nothing() {
 
     let harness = Arc::clone(&fx.harness);
     let running = tokio::spawn(async move { harness.prompt("wait").await });
-    for _ in 0..200 {
-        if fx.event_names().contains(&"tool_execution_start") {
-            break;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !fx.event_names().contains(&"tool_execution_start") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    })
+    .await
+    .expect("the tool never started");
     fx.harness.abort();
     tokio::time::timeout(Duration::from_secs(5), running)
         .await

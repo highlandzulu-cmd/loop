@@ -211,19 +211,34 @@ async fn each_client_sees_only_its_own_sessions_body() {
     let a = one.new_session(SessionSpec::default()).await.unwrap();
     let b = two.new_session(SessionSpec::default()).await.unwrap();
     tokio::join!(say(&one, &a, "a"), say(&two, &b, "b"));
-    // The Runtime has finished both; give the forwarders a moment.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let seen = |rx: &mut Receiver<UpdateEnvelope>| {
+    // Read each client's stream up to its own turn's end; anything of the
+    // other Session would be among it or still queued behind it.
+    async fn seen(
+        rx: &mut Receiver<UpdateEnvelope>,
+    ) -> (std::collections::HashSet<SessionKey>, usize) {
         let mut keys = std::collections::HashSet::new();
         let mut count = 0;
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let e = rx.recv().await.unwrap();
+                let ended = matches!(e.update, loop_protocol::SessionUpdate::TurnEnded { .. });
+                keys.insert(e.session);
+                count += 1;
+                if ended {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("no turn end delivered");
         while let Ok(e) = rx.try_recv() {
             keys.insert(e.session);
             count += 1;
         }
         (keys, count)
-    };
-    let (k1, n1) = seen(&mut rx1);
-    let (k2, n2) = seen(&mut rx2);
+    }
+    let (k1, n1) = seen(&mut rx1).await;
+    let (k2, n2) = seen(&mut rx2).await;
     assert!(n1 > 0 && n2 > 0);
     assert_eq!(k1, [a.key.clone()].into());
     assert_eq!(k2, [b.key.clone()].into());

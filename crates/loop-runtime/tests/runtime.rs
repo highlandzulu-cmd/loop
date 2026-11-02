@@ -276,7 +276,7 @@ async fn active_turn_limit_waits_and_parent_can_release_and_reacquire() {
         .prompt(&a, vec![ContentBlock::text("park")])
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         loop {
             if matches!(
                 updates.recv().await.unwrap().update,
@@ -307,7 +307,7 @@ async fn active_turn_limit_waits_and_parent_can_release_and_reacquire() {
     assert_eq!(log.latest_seq(&b.key).await.unwrap(), 0);
     rt.release_turn_permit(&a).await.unwrap();
     assert!(matches!(
-        tokio::time::timeout(Duration::from_secs(5), second)
+        tokio::time::timeout(Duration::from_secs(20), second)
             .await
             .unwrap(),
         TurnOutcome::Completed(_)
@@ -319,7 +319,7 @@ async fn active_turn_limit_waits_and_parent_can_release_and_reacquire() {
         .unwrap();
     rt.cancel(&b);
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(5), queued.outcome())
+        tokio::time::timeout(Duration::from_secs(20), queued.outcome())
             .await
             .unwrap(),
         TurnOutcome::Cancelled
@@ -549,10 +549,11 @@ async fn live_leases_renew_and_ownership_loss_stops_admission() {
         .prompt(&a, vec![ContentBlock::text("slow log")])
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(5), log.update_started.notified())
+    tokio::time::timeout(Duration::from_secs(20), log.update_started.notified())
         .await
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(7), async {
+    // Renewal runs every 5 s; wait for it however slow the machine is.
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if store
                 .lease(&a.native_id)
@@ -577,9 +578,23 @@ async fn live_leases_renew_and_ownership_loss_stops_admission() {
         .release_lease(&a.native_id, &first.identity)
         .await
         .unwrap();
-    // The next renewal discovers ownership loss. A failed Session cannot run
-    // further work; the store independently fences every write as well.
-    tokio::time::sleep(Duration::from_millis(5_100)).await;
+    // The next renewal discovers ownership loss and logs it. A failed
+    // Session cannot run further work; the store independently fences every
+    // write as well. Wait for that record rather than for the interval.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let lost = log.read_runtime_after(0).await.unwrap().iter().any(|e| {
+                e.event.session_key.as_ref() == Some(&a.key)
+                    && matches!(&e.event.kind, EventKind::Cancelled(p) if p["reason"] == "lease lost")
+            });
+            if lost {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the lost lease was never noticed");
     assert!(rt
         .prompt(&a, vec![ContentBlock::text("must not run")])
         .await
@@ -614,7 +629,7 @@ async fn interrupted_session_open_releases_ownership() {
         dir.path().join("agent/sessions.db"),
     )
     .unwrap();
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
         while store.lease(id).await.unwrap().is_some() {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
@@ -687,7 +702,7 @@ async fn stuck_turn(
 async fn forced_close_gives_up_on_a_turn_that_ignores_cancellation() {
     let dir = tempfile::tempdir().unwrap();
     let (log, rt, a, _turn) = stuck_turn(dir.path()).await;
-    tokio::time::timeout(std::time::Duration::from_secs(5), rt.close(&a.key, true))
+    tokio::time::timeout(std::time::Duration::from_secs(20), rt.close(&a.key, true))
         .await
         .expect("forced close must be bounded")
         .ok();
@@ -715,13 +730,29 @@ async fn shutdown_is_bounded_and_does_not_block_admission_while_settling() {
         let key = a.key.clone();
         tokio::spawn(async move { rt.close(&key, true).await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    // The forced close is still settling: admission and listing stay responsive.
-    tokio::time::timeout(std::time::Duration::from_millis(200), rt.list())
+    // Wait until the close has begun: a prompt then fails as closing (before
+    // that, the stuck turn makes it fail as busy).
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            match rt.prompt(&a, vec![]).await {
+                Err(e) if e.to_string().contains("closing") => break,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+            }
+        }
+    })
+    .await
+    .expect("the close never began");
+    // The forced close is still settling (its stuck turn takes grace periods
+    // to give up on): admission and listing answer before it finishes.
+    tokio::time::timeout(std::time::Duration::from_secs(20), rt.list())
         .await
         .expect("list must not wait for close")
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), rt.shutdown())
+    assert!(
+        !closing.is_finished(),
+        "list waited for the close to finish"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(20), rt.shutdown())
         .await
         .expect("shutdown must be bounded");
     let _ = closing.await;

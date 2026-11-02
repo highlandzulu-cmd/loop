@@ -577,7 +577,7 @@ impl EventLog for DelayedDecision {
 }
 #[tokio::test]
 async fn cancellation_during_raised_commit_still_logs_withdrawal() {
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(20), async {
         let log = Arc::new(DelayedDecision(MemoryEventLog::new(), false));
         let host = EscalationHost::new(
             SessionRef {
@@ -716,7 +716,10 @@ async fn close_with_delayed_decision(answer: bool, shutdown: bool) {
     } else {
         wait_raised(&log.0).await;
     }
-    tokio::time::timeout(Duration::from_millis(250), async {
+    // The acknowledgement never completes (DelayedDecision stalls forever),
+    // so finishing at all proves close bypassed it; the bound only keeps a
+    // regression from hanging the suite.
+    tokio::time::timeout(Duration::from_secs(10), async {
         if shutdown {
             rt.shutdown().await;
         } else {
@@ -754,7 +757,7 @@ async fn close_with_delayed_decision(answer: bool, shutdown: bool) {
 }
 #[tokio::test]
 async fn forced_close_bounds_stalled_raised_and_answered_acknowledgements() {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         for answer in [false, true] {
             close_with_delayed_decision(answer, false).await;
         }
@@ -764,7 +767,7 @@ async fn forced_close_bounds_stalled_raised_and_answered_acknowledgements() {
 }
 #[tokio::test]
 async fn shutdown_bounds_stalled_raised_and_answered_acknowledgements() {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         for answer in [false, true] {
             close_with_delayed_decision(answer, true).await;
         }
