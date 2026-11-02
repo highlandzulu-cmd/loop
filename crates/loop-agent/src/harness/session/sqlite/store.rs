@@ -69,11 +69,13 @@ impl SqliteSessionStore {
         }
         let mut conn = open(&path)?;
         apply_migrations(&mut conn)?;
+        let gate = WriteGate::for_path(&path);
         Ok(Self {
             path,
             environment,
             identity: None,
             resume_guard: None,
+            gate,
         })
     }
 }
@@ -83,6 +85,87 @@ impl SqliteSessionStore {
 pub(super) const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Most time starting one write transaction may take, busy waits and
 /// retries together.
+/// Serializes this process's write transactions on one database file.
+///
+/// Many writers in one process (Runtime Sessions writing at once) would
+/// otherwise all fight over SQLite's file lock, which on Windows is slow
+/// and unfair. Reads never take it.
+pub(super) struct WriteGate {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    busy_ms: std::sync::atomic::AtomicU64,
+    busy_seen: std::sync::atomic::AtomicUsize,
+}
+
+impl WriteGate {
+    /// The gate of the database at `path`, shared by every store on it.
+    pub(super) fn for_path(path: &Path) -> Arc<Self> {
+        static GATES: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<WriteGate>>>,
+        > = std::sync::OnceLock::new();
+        let key = std::fs::canonicalize(path)
+            .or_else(|_| std::path::absolute(path))
+            .unwrap_or_else(|_| path.to_path_buf());
+        let mut gates = GATES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(&key).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(WriteGate {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            busy_ms: std::sync::atomic::AtomicU64::new(BUSY_TIMEOUT.as_millis() as u64),
+            busy_seen: std::sync::atomic::AtomicUsize::new(0),
+        });
+        gates.insert(key, Arc::downgrade(&gate));
+        gate
+    }
+
+    /// Wait for this process's turn to write.
+    pub(super) async fn enter(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        Arc::clone(&self.lock).lock_owned().await
+    }
+
+    /// [`Self::enter`], giving up after `limit`.
+    pub(super) async fn enter_within(
+        &self,
+        limit: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, SessionError> {
+        tokio::time::timeout(limit, self.enter())
+            .await
+            .map_err(|_| {
+                SessionError::Storage(
+                    "database is locked: another write in this process is still running".into(),
+                )
+            })
+    }
+
+    /// How long a write waits for another process's lock before BUSY.
+    pub(super) fn busy_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.busy_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_busy_timeout(&self, timeout: std::time::Duration) {
+        self.busy_ms.store(
+            timeout.as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    fn saw_busy(&self) {
+        self.busy_seen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many write starts met BUSY.
+    #[cfg(test)]
+    pub(super) fn busy_seen(&self) -> usize {
+        self.busy_seen.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 const BEGIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(6);
 /// Most attempts at starting one write transaction.
 const BEGIN_ATTEMPTS: u32 = 5;
@@ -100,22 +183,33 @@ pub(super) fn is_busy(error: &rusqlite::Error) -> bool {
 /// all for another connection's lock. Under heavy concurrent writing (a
 /// slow disk) SQLite can report BUSY before that; it is then tried again
 /// after a short, jittered pause (20–200 ms), within the same deadline.
-pub(super) fn begin_immediate(conn: &Connection) -> rusqlite::Result<Transaction<'_>> {
-    begin_immediate_within(conn, BEGIN_DEADLINE)
+///
+/// Callers in this process hold the database's [`WriteGate`] around the
+/// whole transaction, so the busy wait only meets other processes.
+pub(super) fn begin_immediate<'c>(
+    conn: &'c Connection,
+    gate: &WriteGate,
+) -> rusqlite::Result<Transaction<'c>> {
+    begin_immediate_within(conn, BEGIN_DEADLINE, gate)
 }
 
 /// [`begin_immediate`] with an explicit overall deadline.
-pub(super) fn begin_immediate_within(
-    conn: &Connection,
+pub(super) fn begin_immediate_within<'c>(
+    conn: &'c Connection,
     limit: std::time::Duration,
-) -> rusqlite::Result<Transaction<'_>> {
+    gate: &WriteGate,
+) -> rusqlite::Result<Transaction<'c>> {
     let deadline = std::time::Instant::now() + limit;
     let mut attempt = 1;
     let result = loop {
         // Each attempt's busy wait only spends what is left of the deadline.
         let left = deadline.saturating_duration_since(std::time::Instant::now());
-        conn.busy_timeout(left.min(BUSY_TIMEOUT))?;
-        match Transaction::new_unchecked(conn, TransactionBehavior::Immediate) {
+        conn.busy_timeout(left.min(gate.busy_timeout()))?;
+        let begun = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
+        if begun.as_ref().err().is_some_and(is_busy) {
+            gate.saw_busy();
+        }
+        match begun {
             Err(error) if is_busy(&error) && attempt < BEGIN_ATTEMPTS => {
                 let base = (20u64 << (attempt - 1)).min(200);
                 let jitter = u64::from(
@@ -198,6 +292,8 @@ pub struct SqliteSessionStore {
     pub(super) environment: Arc<dyn super::leases::LeaseEnvironment>,
     pub(super) identity: Option<super::leases::LeaseIdentity>,
     pub(super) resume_guard: Option<Arc<super::leases::ResumeLeaseGuard>>,
+    /// This process's write gate for the database file.
+    pub(super) gate: Arc<WriteGate>,
 }
 
 struct SqliteReader {
@@ -586,12 +682,17 @@ impl SqliteSessionStore {
             path: None,
         };
         let guard = self.resume_guard.clone();
+        let gate = Arc::clone(&self.gate);
+        // One writer of this process at a time; other processes meet
+        // SQLite's busy timeout and the bounded retry.
+        let permit = gate.enter().await;
         tokio::task::spawn_blocking({
             let path = path.clone();
             let id = id.clone();
             move || {
+                let _permit = permit;
                 let conn = open(&path)?;
-                let tx = begin_immediate(&conn)
+                let tx = begin_immediate(&conn, &gate)
                     .map_err(|e| SessionError::Storage(e.to_string()))?;
                 tx.execute(
                     "INSERT INTO sessions(id, cwd, name, parent_session_id, active_leaf_id, created_at) VALUES (?1,?2,?3,?4,NULL,?5)",
@@ -749,9 +850,15 @@ impl SessionStore for SqliteSessionStore {
         let session_id = session_id.to_string();
         let identity = self.identity.clone();
         let guard = self.resume_guard.clone();
+        let gate = Arc::clone(&self.gate);
+        // One writer of this process at a time; other processes meet
+        // SQLite's busy timeout and the bounded retry.
+        let permit = gate.enter().await;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn).map_err(|e| SessionError::Storage(e.to_string()))?;
+            let tx =
+                begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
             if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
                 return Err(guard.refusal());
             }
@@ -770,9 +877,15 @@ impl SessionStore for SqliteSessionStore {
         let id = id.to_string();
         let identity = self.identity.clone();
         let guard = self.resume_guard.clone();
+        let gate = Arc::clone(&self.gate);
+        // One writer of this process at a time; other processes meet
+        // SQLite's busy timeout and the bounded retry.
+        let permit = gate.enter().await;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn).map_err(|e| SessionError::Storage(e.to_string()))?;
+            let tx =
+                begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
             if let Some(guard) = guard.as_ref().filter(|guard| guard.failed()) {
                 return Err(guard.refusal());
             }
@@ -800,9 +913,14 @@ impl SessionStore for SqliteSessionStore {
         let source_id = source_id.to_string();
         let through_entry_id = through_entry_id.map(str::to_owned);
         let guard = self.resume_guard.clone();
+        let gate = Arc::clone(&self.gate);
+        // One writer of this process at a time; other processes meet
+        // SQLite's busy timeout and the bounded retry.
+        let permit = gate.enter().await;
         let new_id = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn)
+            let tx = begin_immediate(&conn, &gate)
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             let (cwd, leaf): (Option<String>, Option<String>) = tx.query_row(
                 "SELECT cwd, active_leaf_id FROM sessions WHERE id=?1", [&source_id],
@@ -893,7 +1011,8 @@ mod tests {
             "the lock is held: {plain:?}"
         );
         drop(plain);
-        let tx = begin_immediate(&conn).unwrap();
+        let gate = WriteGate::for_path(&path);
+        let tx = begin_immediate(&conn, &gate).unwrap();
         tx.execute("UPDATE session_sequences SET next_seq = next_seq", [])
             .unwrap();
         tx.commit().unwrap();
@@ -908,7 +1027,11 @@ mod tests {
         let conn = open(&path).unwrap();
         let held = hold_write_lock(&path, std::time::Duration::from_secs(3));
         let started = std::time::Instant::now();
-        let result = begin_immediate_within(&conn, std::time::Duration::from_millis(400));
+        let result = begin_immediate_within(
+            &conn,
+            std::time::Duration::from_millis(400),
+            &WriteGate::for_path(&path),
+        );
         let took = started.elapsed();
         assert!(matches!(&result, Err(e) if is_busy(e)), "{result:?}");
         // The busy timeout and the retries share one deadline.
@@ -918,6 +1041,85 @@ mod tests {
         );
         drop(result);
         held.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_writers_in_one_process_never_see_busy() {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sessions.db");
+            let store = Arc::new(SqliteSessionStore::open(&path).unwrap());
+            // No busy waiting at all: any contention would surface as BUSY.
+            store.gate.set_busy_timeout(std::time::Duration::ZERO);
+            let id = store
+                .create(None, None)
+                .await
+                .unwrap()
+                .metadata()
+                .id
+                .clone();
+            let mut writers = tokio::task::JoinSet::new();
+            for n in 0..64 {
+                let (store, id) = (store.clone(), id.clone());
+                writers.spawn(async move {
+                    match n % 4 {
+                        0 => store.create(None, None).await.map(|_| ()),
+                        _ => store
+                            .append_entry(
+                                &id,
+                                PendingSessionWrite::Label {
+                                    label: format!("w{n}"),
+                                },
+                            )
+                            .await
+                            .map(|_| ()),
+                    }
+                });
+            }
+            while let Some(done) = writers.join_next().await {
+                done.unwrap().unwrap();
+            }
+            assert_eq!(
+                store.gate.busy_seen(),
+                0,
+                "a writer in this process met BUSY"
+            );
+            // Reads do not wait for the gate.
+            let held = store.gate.enter().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), store.list(None))
+                .await
+                .expect("a read waited for the write gate")
+                .unwrap();
+            drop(held);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn release_waits_only_briefly_for_a_write_in_this_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = SqliteSessionStore::open(dir.path().join("sessions.db")).unwrap();
+        let writer = base.standalone_writer();
+        let id = writer
+            .create(None, None)
+            .await
+            .unwrap()
+            .metadata()
+            .id
+            .clone();
+        let held = base.gate.enter().await;
+        let started = std::time::Instant::now();
+        let error = writer.release_leases().await.unwrap_err().to_string();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(error.contains("locked"), "{error}");
+        drop(held);
+        writer.release_leases().await.unwrap();
+        assert!(base.lease(&id).await.unwrap().is_none());
     }
 
     #[tokio::test]
