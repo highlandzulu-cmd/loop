@@ -142,9 +142,15 @@ mod unix {
                 .send(HostEvent::Request(Box::new(request), tx))
                 .is_err()
             {
-                return InteractionOutcome::Cancelled;
+                return std::future::pending().await;
             }
-            rx.await.unwrap_or(InteractionOutcome::Cancelled)
+            // No answer when this Surface detaches or exits with the request
+            // still shown: replying would answer it for everyone. The
+            // Runtime keeps it pending for the other Surfaces.
+            match rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => std::future::pending().await,
+            }
         }
     }
 

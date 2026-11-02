@@ -772,3 +772,54 @@ async fn shutdown_bounds_stalled_raised_and_answered_acknowledgements() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn a_cancelled_reply_is_a_recipient_leaving_not_an_answer() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        use loop_protocol::{AgentBackend, ContentBlock, SessionSpec, TurnOutcome};
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime_with_approval(dir.path(), log.clone()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let mut leaving = peer(&rt, true).await;
+        attach(&mut leaving, &session).await;
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("run")])
+            .await
+            .unwrap();
+        let asked = interaction(&mut leaving).await;
+        // What an exiting client used to send.
+        leaving
+            .outgoing
+            .send(
+                serde_json::json!({"jsonrpc":"2.0", "id":asked["id"],
+                    "result":InteractionOutcome::Cancelled})
+                .to_string(),
+            )
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rt.is_busy(&session), "the turn must still wait");
+        let answered = log
+            .read_runtime_after(0)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e.event.kind, EventKind::EscalationAnswered(_)))
+            .count();
+        assert_eq!(answered, 0, "a leaving Surface answered the Escalation");
+        // The Escalation is still there for the next Surface.
+        let mut next = peer(&rt, true).await;
+        attach(&mut next, &session).await;
+        let asked = interaction(&mut next).await;
+        next.outgoing
+            .send(
+                serde_json::json!({"jsonrpc":"2.0", "id":asked["id"], "result":selected("accept")})
+                    .to_string(),
+            )
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

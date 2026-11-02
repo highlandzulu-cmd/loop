@@ -174,10 +174,30 @@ impl EscalationHost {
         };
         let host = self.clone();
         tokio::spawn(async move {
-            if let Ok(answer) = recipient.interact(params, rx).await {
-                host.answer(ticket, connection, token, answer).await;
+            match recipient.interact(params, rx).await {
+                // A Surface that leaves (detach or exit) may still reply
+                // Cancelled; that is the recipient going, not an answer.
+                Ok(InteractionOutcome::Cancelled) => {
+                    host.recipient_gone(ticket, connection, token).await
+                }
+                Ok(answer) => host.answer(ticket, connection, token, answer).await,
+                Err(()) => {}
             }
         });
+    }
+    /// Forget this delivery only; the request stays pending for the other
+    /// recipients, or parked for the next Surface.
+    async fn recipient_gone(&self, ticket: u64, connection: u64, token: u64) {
+        let mut state = self.0.state.lock().await;
+        if let Some(pending) = state.pending.get_mut(&ticket) {
+            if pending
+                .deliveries
+                .get(&connection)
+                .is_some_and(|d| d.token == token)
+            {
+                pending.deliveries.remove(&connection);
+            }
+        }
     }
     async fn answer(&self, ticket: u64, connection: u64, token: u64, answer: InteractionOutcome) {
         let mut state = self.0.state.lock().await;

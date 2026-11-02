@@ -1475,3 +1475,54 @@ async fn ctrl_c_cancels_the_turn_and_drops_queued_prompts() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn detaching_while_an_approval_is_shown_leaves_it_pending() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo approved"}),
+                thought_signature: None,
+            },
+        ]));
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "approved later".into(),
+        ));
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime_with_script(dir.path(), log.clone(), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (input, output, task) = surface(&rt, &session).await;
+        wait_text(&output, "Attached").await;
+        input.send(Input::Line("start".into())).unwrap();
+        wait_text(&output, "Escalation").await;
+        // Ctrl+D while the approval is shown.
+        input.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rt.is_busy(&session), "detaching answered the approval");
+        use loop_runtime::log::EventLog;
+        assert!(!log
+            .read_runtime_after(0)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| matches!(
+                e.event.kind,
+                loop_runtime::log::EventKind::EscalationAnswered(_)
+            )));
+        // Attaching again shows it, and it can still be answered.
+        let (input, output, task) = surface(&rt, &session).await;
+        wait_text(&output, "Escalation").await;
+        input.send(Input::Line("1".into())).unwrap();
+        wait_text(&output, "approved later").await;
+        input.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
