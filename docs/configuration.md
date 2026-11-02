@@ -22,6 +22,28 @@ In `models.json`, custom provider `models` can be string ids (listed with metada
 }
 ```
 
+Custom providers added with `/login custom` can also save per-model thinking metadata in the global `settings.json`:
+
+```json
+{
+  "providers": [{
+    "id": "my-gateway",
+    "name": "My Gateway",
+    "baseUrl": "https://gateway.example/v1",
+    "models": [
+      { "id": "glm-5.3", "reasoning": true, "thinkingFormat": "zai" },
+      { "id": "another-model", "reasoning": true, "thinkingFormat": "openai" }
+    ]
+  }]
+}
+```
+
+`models` is optional, so existing provider settings still work. Each entry pins an exact model id and its capabilities. `reasoning` defaults to `false`; `thinkingFormat` is optional and otherwise uses automatic compatibility detection. `openai` sends `reasoning_effort` for each enabled effort level and omits it for off. `zai` sends `thinking: {"type": "enabled"}` for every enabled level and `thinking: {"type": "disabled"}` for off. Zai does not distinguish the enabled effort levels.
+
+After the name, URL and key, `/login custom` asks which model ids support thinking and which format they use (default `openai`). Enter comma-separated ids, or leave the answer blank to keep saved metadata on reconnect and use server defaults on first login. Enter `none` to clear saved metadata. For mixed capabilities or formats, edit individual entries in settings. Reconnect, restart and catalog refresh retain the metadata.
+
+Precedence for a matching model id, from highest to lowest: a `models.json` entry, a saved provider `models` entry, server-published metadata (including `supported_parameters`), then built-in defaults. Entries are pinned as complete model specifications; unspecified context and output limits use the custom-provider defaults (128,000 and 16,384 tokens). Other models remain discoverable from `/models`. `models.json` overrides also accept `thinkingFormat` (or `thinking_format`) alongside the existing model fields; its provider URL and key environment settings take precedence when that provider id appears in both files. These overrides apply consistently during login and at startup.
+
 A project can add `.loop/settings.json` in its root. Project values override global values. Arrays replace, they do not merge.
 
 Common settings in `settings.json`:

@@ -817,6 +817,13 @@ fn apply_reasoning(
     compat: &ResolvedOpenAICompletionsCompat,
     reasoning: Option<ThinkingLevel>,
 ) {
+    if reasoning.is_none()
+        && model.reasoning
+        && compat.thinking_format == ThinkingFormat::Zai
+        && !reasoning_rejected(model)
+    {
+        payload["thinking"] = json!({ "type": "disabled" });
+    }
     let Some(level) = reasoning else { return };
     if !model.reasoning && !compat.supports_reasoning_effort {
         return;

@@ -5,7 +5,7 @@
 
 use loop_agent::harness::{web_search_backend, WebSearchBackendInfo, WEB_SEARCH_BACKENDS};
 use loop_ai::providers::{provider_preset, ProviderPreset, PROVIDER_PRESETS};
-use loop_app_core::config::providers::slugify;
+use loop_app_core::config::providers::{slugify, CustomProviderModel};
 use loop_app_core::config::{validate_http_url, ProviderLoginRequest};
 
 use crate::wizard::{wrap_selection, WizardView};
@@ -61,6 +61,8 @@ pub enum LoginTarget {
         name: String,
         /// Base URL.
         base_url: String,
+        /// Saved metadata retained when retrying a rejected key.
+        models: Option<Vec<CustomProviderModel>>,
     },
 }
 
@@ -70,12 +72,17 @@ impl PartialEq for LoginTarget {
             (Self::Preset(a), Self::Preset(b)) => a.id == b.id,
             (Self::WebSearch(a), Self::WebSearch(b)) => a.id == b.id,
             (
-                Self::Custom { name, base_url },
+                Self::Custom {
+                    name,
+                    base_url,
+                    models,
+                },
                 Self::Custom {
                     name: other_name,
                     base_url: other_url,
+                    models: other_models,
                 },
-            ) => name == other_name && base_url == other_url,
+            ) => name == other_name && base_url == other_url && models == other_models,
             _ => false,
         }
     }
@@ -121,6 +128,18 @@ pub enum ProviderSetup {
     CustomBaseUrl {
         /// Entered name.
         name: String,
+    },
+    /// Model ids that support thinking, or an empty answer to keep defaults.
+    CustomModels {
+        /// Pending custom provider login, including the masked key.
+        request: ProviderLoginRequest,
+    },
+    /// Request format for the entered model ids.
+    CustomFormat {
+        /// Pending custom provider login.
+        request: ProviderLoginRequest,
+        /// Exact ids whose thinking capability is being configured.
+        ids: Vec<String>,
     },
     /// API key (masked).
     ApiKey {
@@ -195,9 +214,15 @@ impl ProviderSetup {
                     }
                 }
             },
-            ProviderLoginRequest::Custom { name, base_url, .. } => LoginTarget::Custom {
+            ProviderLoginRequest::Custom {
+                name,
+                base_url,
+                models,
+                ..
+            } => LoginTarget::Custom {
                 name: name.clone(),
                 base_url: base_url.clone(),
+                models: models.clone(),
             },
         };
         Self::ApiKey { target }
@@ -258,6 +283,7 @@ impl ProviderSetup {
                         target: LoginTarget::Custom {
                             name,
                             base_url: value,
+                            models: None,
                         },
                     },
                     prefill: String::new(),
@@ -289,12 +315,67 @@ impl ProviderSetup {
                 api_key: value,
             })),
             Self::ApiKey {
-                target: LoginTarget::Custom { name, base_url },
-            } => Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Custom {
-                name,
-                base_url,
-                api_key: (!value.is_empty()).then_some(value),
-            })),
+                target:
+                    LoginTarget::Custom {
+                        name,
+                        base_url,
+                        models,
+                    },
+            } => Transition::Next {
+                step: Self::CustomModels {
+                    request: ProviderLoginRequest::Custom {
+                        name,
+                        base_url,
+                        models,
+                        api_key: (!value.is_empty()).then_some(value),
+                    },
+                },
+                prefill: String::new(),
+            },
+            Self::CustomModels { mut request } => {
+                if value.is_empty() {
+                    Transition::Done(LoginChoice::Provider(request))
+                } else if value.eq_ignore_ascii_case("none") {
+                    if let ProviderLoginRequest::Custom { models, .. } = &mut request {
+                        *models = Some(Vec::new());
+                    }
+                    Transition::Done(LoginChoice::Provider(request))
+                } else {
+                    let ids: Vec<String> = value
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if ids.is_empty() {
+                        Self::CustomModels { request }.retry("enter model ids separated by commas")
+                    } else {
+                        Transition::Next {
+                            step: Self::CustomFormat { request, ids },
+                            prefill: String::new(),
+                        }
+                    }
+                }
+            }
+            Self::CustomFormat { mut request, ids } => {
+                let format = match value.to_ascii_lowercase().as_str() {
+                    "" | "openai" => loop_ai::ThinkingFormat::Openai,
+                    "zai" => loop_ai::ThinkingFormat::Zai,
+                    _ => return Self::CustomFormat { request, ids }.retry("enter openai or zai"),
+                };
+                if let ProviderLoginRequest::Custom { models, .. } = &mut request {
+                    *models = Some(
+                        ids.into_iter()
+                            .map(|id| CustomProviderModel {
+                                id,
+                                reasoning: true,
+                                thinking_format: Some(format),
+                            })
+                            .collect(),
+                    );
+                }
+                Transition::Done(LoginChoice::Provider(request))
+            }
         }
     }
 
@@ -321,9 +402,11 @@ pub fn login_usage(agents: &[AgentRow]) -> String {
 impl WizardView for ProviderSetup {
     fn title(&self) -> String {
         match self {
+            Self::CustomModels { .. } => "Custom provider thinking · step 4 of 5".into(),
+            Self::CustomFormat { .. } => "Custom provider thinking format · step 5 of 5".into(),
             Self::Choose { .. } => "Connect a model provider, subscription or web search".into(),
-            Self::CustomName => "Connect a custom provider · step 1 of 3".into(),
-            Self::CustomBaseUrl { .. } => "Connect a custom provider · step 2 of 3".into(),
+            Self::CustomName => "Connect a custom provider · step 1 of 5".into(),
+            Self::CustomBaseUrl { .. } => "Connect a custom provider · step 2 of 5".into(),
             Self::ApiKey {
                 target: LoginTarget::Preset(preset),
             } => format!("Connect {}", preset.name),
@@ -332,12 +415,14 @@ impl WizardView for ProviderSetup {
             } => format!("Connect {}", info.display_name),
             Self::ApiKey {
                 target: LoginTarget::Custom { name, .. },
-            } => format!("Connect {name} · step 3 of 3"),
+            } => format!("Connect {name} · step 3 of 5"),
         }
     }
 
     fn instructions(&self) -> String {
         match self {
+            Self::CustomModels { .. } => "Do any models support thinking? Enter their exact ids, separated by commas. Enter to keep saved metadata or server defaults; none to clear saved metadata.".into(),
+            Self::CustomFormat { .. } => "Request format: openai sends reasoning_effort; zai sends thinking: {type}. Enter defaults to openai.".into(),
             Self::Choose { .. } => {
                 "Choose where Loop sends model requests (or add web search)".into()
             }
@@ -368,6 +453,8 @@ impl WizardView for ProviderSetup {
 
     fn placeholder(&self) -> &'static str {
         match self {
+            Self::CustomModels { .. } => " e.g. glm-5.3, another-model (optional)",
+            Self::CustomFormat { .. } => " openai or zai (default: openai)",
             Self::Choose { .. } => " ↑↓ to choose, enter to continue",
             Self::CustomName => " e.g. Together",
             Self::CustomBaseUrl { .. } => {
@@ -554,15 +641,66 @@ mod tests {
         assert!(retry_error(url.clone().submit("localhost:1234")).contains("http://"));
         let key = next(url.submit("http://localhost:1234/v1"));
         assert!(key.masked());
-        assert_eq!(key.title(), "Connect LM Studio · step 3 of 3");
+        assert_eq!(key.title(), "Connect LM Studio · step 3 of 5");
         assert_eq!(
-            key.submit(""),
+            next(key.submit("")).submit(""),
             Transition::Done(LoginChoice::Provider(ProviderLoginRequest::Custom {
                 name: "LM Studio".into(),
                 base_url: "http://localhost:1234/v1".into(),
                 api_key: None,
+                models: None,
             }))
         );
+    }
+
+    #[test]
+    fn custom_thinking_can_clear_saved_metadata() {
+        let request = ProviderLoginRequest::Custom {
+            name: "Gateway".into(),
+            base_url: "http://localhost/v1".into(),
+            api_key: None,
+            models: None,
+        };
+        let Transition::Done(LoginChoice::Provider(request)) =
+            (ProviderSetup::CustomModels { request }).submit("none")
+        else {
+            panic!("expected completed login")
+        };
+        assert_eq!(request.custom_entry().unwrap().models, Some(Vec::new()));
+    }
+
+    #[test]
+    fn custom_thinking_collects_model_ids_and_format() {
+        for (answer, format) in [
+            ("", loop_ai::ThinkingFormat::Openai),
+            ("zai", loop_ai::ThinkingFormat::Zai),
+        ] {
+            let request = ProviderLoginRequest::Custom {
+                name: "Gateway".into(),
+                base_url: "http://localhost/v1".into(),
+                api_key: None,
+                models: None,
+            };
+            let format_step = next(ProviderSetup::CustomModels { request }.submit("glm, other"));
+            assert!(retry_error(format_step.clone().submit("invalid")).contains("openai or zai"));
+            let Transition::Done(LoginChoice::Provider(request)) = format_step.submit(answer)
+            else {
+                panic!("expected completed login")
+            };
+            let models = request.custom_entry().unwrap().models.unwrap();
+            assert_eq!(
+                models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+                ["glm", "other"]
+            );
+            assert!(models
+                .iter()
+                .all(|m| m.reasoning && m.thinking_format == Some(format)));
+            let retry = next(ProviderSetup::retry_key(&request).submit("new-key"));
+            let Transition::Done(LoginChoice::Provider(retried)) = retry.submit("") else {
+                panic!("expected completed retry")
+            };
+            assert_eq!(retried.custom_entry(), request.custom_entry());
+        }
     }
 
     #[test]
@@ -589,6 +727,7 @@ mod tests {
             name: "G".into(),
             base_url: "http://g/v1".into(),
             api_key: None,
+            models: None,
         };
         assert!(matches!(
             ProviderSetup::retry_key(&custom),

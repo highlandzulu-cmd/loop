@@ -6,7 +6,8 @@
 
 use loop_ai::auth::{Credential, CredentialStore};
 use loop_ai::providers::{
-    custom_provider, provider_preset, CustomProviderConfig, ProviderPreset, PROVIDER_PRESETS,
+    custom_provider, provider_preset, CustomModelSpec, CustomProviderConfig, ProviderPreset,
+    PROVIDER_PRESETS,
 };
 use loop_ai::{Models, Provider};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,36 @@ pub struct CustomProviderEntry {
     pub name: String,
     /// Base URL including the version path, e.g. `http://localhost:11434/v1`.
     pub base_url: String,
+    /// Pinned model metadata. Omitted entries use the server's metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<CustomProviderModel>>,
+}
+
+/// Explicit capabilities for one custom model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomProviderModel {
+    /// Exact model id from the provider.
+    pub id: String,
+    /// Whether the model supports thinking.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Request format; omitted uses automatic compatibility detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_format: Option<loop_ai::ThinkingFormat>,
+}
+
+impl CustomProviderModel {
+    pub(crate) fn spec(&self) -> CustomModelSpec {
+        let mut spec = CustomModelSpec::new(&self.id).with_reasoning(self.reasoning);
+        if let Some(format) = self.thinking_format {
+            spec = spec.with_compat(loop_ai::OpenAICompletionsCompat {
+                thinking_format: Some(format),
+                ..Default::default()
+            });
+        }
+        spec
+    }
 }
 
 impl CustomProviderEntry {
@@ -33,7 +64,12 @@ impl CustomProviderEntry {
             name: Some(self.name.clone()),
             base_url: self.base_url.clone(),
             api_key_env: vec![],
-            models: vec![],
+            models: self
+                .models
+                .iter()
+                .flatten()
+                .map(CustomProviderModel::spec)
+                .collect(),
             headers: None,
         })
     }
@@ -57,6 +93,8 @@ pub enum ProviderLoginRequest {
         base_url: String,
         /// API key; `None` for keyless local servers.
         api_key: Option<String>,
+        /// Model capabilities; omitted preserves saved metadata on reconnect.
+        models: Option<Vec<CustomProviderModel>>,
     },
     /// A web-search backend (`tavily`, `brave`) for the `web_search` tool.
     WebSearch {
@@ -128,10 +166,13 @@ impl ProviderLoginRequest {
     /// The settings entry to save (custom providers only).
     pub fn custom_entry(&self) -> Option<CustomProviderEntry> {
         match self {
-            Self::Custom { base_url, .. } => Some(CustomProviderEntry {
+            Self::Custom {
+                base_url, models, ..
+            } => Some(CustomProviderEntry {
                 id: self.provider_id(),
                 name: self.display_name(),
                 base_url: base_url.trim().trim_end_matches('/').to_string(),
+                models: models.clone(),
             }),
             Self::Preset { .. } | Self::WebSearch { .. } => None,
         }
@@ -285,6 +326,7 @@ mod tests {
             name: name.into(),
             base_url: base_url.into(),
             api_key: key.map(Into::into),
+            models: None,
         }
     }
 
@@ -293,6 +335,22 @@ mod tests {
             id: id.into(),
             api_key: key.into(),
         }
+    }
+
+    #[test]
+    fn saved_custom_model_metadata_registers_reasoning() {
+        let entry: CustomProviderEntry = serde_json::from_value(serde_json::json!({
+            "id": "g", "name": "Gateway", "baseUrl": "http://localhost/v1",
+            "models": [{"id": "glm", "reasoning": true, "thinkingFormat": "zai"}]
+        }))
+        .unwrap();
+        let models = entry.provider().get_models();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].reasoning);
+        assert_eq!(
+            models[0].compat.as_ref().unwrap().thinking_format,
+            Some(loop_ai::ThinkingFormat::Zai)
+        );
     }
 
     #[test]
@@ -322,6 +380,7 @@ mod tests {
                 id: "lm-studio".into(),
                 name: "LM Studio".into(),
                 base_url: "http://localhost:1234/v1".into(),
+                models: None,
             }
         );
         assert!(custom("???", "http://x", None).validate().is_err());
@@ -351,6 +410,7 @@ mod tests {
             id: "lm-studio".into(),
             name: "LM Studio".into(),
             base_url: "http://localhost:1234/v1".into(),
+            models: None,
         }];
         assert_eq!(
             connected_providers(&store, &customs, |_| None),
@@ -414,6 +474,7 @@ mod tests {
             id: "g".into(),
             name: "G".into(),
             base_url: url.into(),
+            models: None,
         };
         upsert_custom_provider(&mut entries, entry("http://a"));
         upsert_custom_provider(&mut entries, entry("http://b"));
@@ -429,6 +490,7 @@ mod tests {
                 id: "g".into(),
                 name: "G".into(),
                 base_url: "http://localhost:1/v1".into(),
+                models: None,
             }],
         );
         for id in ["soket", "openrouter", "openai", "anthropic", "gemini", "g"] {
