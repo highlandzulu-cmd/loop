@@ -719,7 +719,12 @@ mod unix {
         // Prompts this Surface sent: their terminal already shows them, so
         // their rendered copy is skipped once.
         let mut sent: VecDeque<String> = VecDeque::new();
-        let mut prompts = tokio::task::JoinSet::new();
+        let mut prompts: Prompts = tokio::task::JoinSet::new();
+        // Prompts typed while a turn runs; the first goes when it ends.
+        let mut queued: VecDeque<String> = VecDeque::new();
+        // When to try the queue again: a turn's end reaches Surfaces just
+        // before the Runtime takes new prompts.
+        let mut retry: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 Some(event) = events.recv() => match event {
@@ -788,6 +793,7 @@ mod unix {
                             terminal.write("Turn ended uncertain — Runtime restarted. Its tools may or may not have run; nothing was retried.\n")?;
                         }
                         if let Some(error) = error { terminal.write(&format!("loop: {}\n", error.message))?; }
+                        if !queued.is_empty() { retry = Some(tokio::time::Instant::now() + QUEUE_RETRY); }
                     }
                 },
                 Some(named) = naming.join_next(), if !naming.is_empty() => {
@@ -803,7 +809,23 @@ mod unix {
                     }
                 },
                 Some(result) = prompts.join_next(), if !prompts.is_empty() => {
-                    if let Err(error) = result? { terminal.write(&format!("loop: {error}\n"))?; }
+                    let (line, result) = result?;
+                    match result {
+                        // The Runtime was still ending the last turn: wait.
+                        Err(error) if error.to_string() == loop_protocol::BackendError::Busy.to_string() => {
+                            if let Some(at) = sent.iter().rposition(|mine| *mine == line) { sent.remove(at); }
+                            queued.push_front(line);
+                            retry = Some(tokio::time::Instant::now() + QUEUE_RETRY);
+                        }
+                        Err(error) => terminal.write(&format!("loop: {error}\n"))?,
+                        Ok(()) => { send_queued(backend, session, &mut queued, &mut sent, &mut prompts, terminal).await?; }
+                    }
+                },
+                _ = async { if let Some(at) = retry { tokio::time::sleep_until(at).await } }, if retry.is_some() => {
+                    retry = None;
+                    if !send_queued(backend, session, &mut queued, &mut sent, &mut prompts, terminal).await? && !queued.is_empty() && prompts.is_empty() {
+                        retry = Some(tokio::time::Instant::now() + QUEUE_RETRY);
+                    }
                 },
                 // Lines and piped EOF wait for the snapshot, but controls must
                 // stay responsive even while history is still being delivered.
@@ -819,7 +841,12 @@ mod unix {
                         continue;
                     }
                     match input {
-                    Input::Eof => return Ok(()),
+                    Input::Eof => {
+                        if !queued.is_empty() {
+                            terminal.write(&format!("Detaching; {} queued prompt(s) not sent.\n", queued.len()))?;
+                        }
+                        return Ok(());
+                    }
                     Input::Interrupt if interrupted => return Ok(()),
                     Input::Interrupt => {
                         interrupted = true;
@@ -839,20 +866,70 @@ mod unix {
                             terminal.write("Choice no longer active; ignored. Start a numeric prompt with `> `.\n")?;
                         } else if !line.trim().is_empty() {
                             interrupted = false;
-                            match backend.prompt(session, vec![ContentBlock::text(line.clone())]).await {
-                                Ok(turn) => { sent.push_back(line); prompts.spawn(async move {
-                                    match turn.outcome().await {
-                                        loop_protocol::TurnOutcome::Failed(error) => Err(loop_protocol::BackendError::Failed(error)),
-                                        loop_protocol::TurnOutcome::Uncertain => Err(loop_protocol::BackendError::failed(loop_protocol::ErrorCategory::Network, "Lost contact with Runtime")),
-                                        _ => Ok(()),
-                                    }
-                                }); }
-                                Err(error) => terminal.write(&format!("loop: {error}\n"))?,
+                            // Behind a running turn, or behind earlier queued
+                            // prompts: wait, keeping their order.
+                            queued.push_back(line);
+                            if !send_queued(backend, session, &mut queued, &mut sent, &mut prompts, terminal).await? {
+                                terminal.write("queued; sends when the current turn ends\n")?;
                             }
                         }
                     }
                     }
                 }
+            }
+        }
+    }
+
+    /// Prompts this Surface sent, each with its line and how its turn ended.
+    type Prompts = tokio::task::JoinSet<(String, Result<(), loop_protocol::BackendError>)>;
+    /// Pause before trying a queued prompt again.
+    const QUEUE_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// Send the oldest queued prompt unless a turn is running. Returns
+    /// whether one was sent.
+    async fn send_queued(
+        backend: &Arc<RemoteBackend>,
+        session: &SessionRef,
+        queued: &mut VecDeque<String>,
+        sent: &mut VecDeque<String>,
+        prompts: &mut Prompts,
+        terminal: &mut dyn Terminal,
+    ) -> anyhow::Result<bool> {
+        if queued.is_empty() || backend.is_busy(session) {
+            return Ok(false);
+        }
+        let line = queued.pop_front().unwrap_or_default();
+        match backend
+            .prompt(session, vec![ContentBlock::text(line.clone())])
+            .await
+        {
+            Ok(turn) => {
+                sent.push_back(line.clone());
+                prompts.spawn(async move {
+                    let result = match turn.outcome().await {
+                        loop_protocol::TurnOutcome::Failed(error) => {
+                            Err(loop_protocol::BackendError::Failed(error))
+                        }
+                        loop_protocol::TurnOutcome::Uncertain => {
+                            Err(loop_protocol::BackendError::failed(
+                                loop_protocol::ErrorCategory::Network,
+                                "Lost contact with Runtime",
+                            ))
+                        }
+                        _ => Ok(()),
+                    };
+                    (line, result)
+                });
+                Ok(true)
+            }
+            // Another Surface started a turn first: keep waiting.
+            Err(loop_protocol::BackendError::Busy) => {
+                queued.push_front(line);
+                Ok(false)
+            }
+            Err(error) => {
+                terminal.write(&format!("loop: {error}\n"))?;
+                Ok(false)
             }
         }
     }

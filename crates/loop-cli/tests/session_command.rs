@@ -1373,3 +1373,48 @@ async fn user_messages_are_shown_in_replay_and_live_but_not_twice_to_their_sende
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn a_line_typed_during_a_turn_is_queued_and_sent_when_it_ends() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let responses = loop_ai::providers::FauxScript::new();
+        // `ask` mode: the call waits for this Surface's approval.
+        responses.push(loop_ai::providers::FauxResponse::ToolCalls(vec![
+            loop_ai::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command":"echo approved"}),
+                thought_signature: None,
+            },
+        ]));
+        responses.push(loop_ai::providers::FauxResponse::Text("first done".into()));
+        responses.push(loop_ai::providers::FauxResponse::Text(
+            "queued answer".into(),
+        ));
+        let rt = runtime_with_script(dir.path(), Arc::new(MemoryEventLog::new()), responses).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let (input, output, task) = surface(&rt, &session).await;
+        wait_text(&output, "Attached").await;
+        input.send(Input::Line("start".into())).unwrap();
+        wait_text(&output, "Escalation").await;
+        // A prompt while the turn runs waits instead of failing.
+        input.send(Input::Line("> later".into())).unwrap();
+        wait_text(&output, "queued; sends when the current turn ends").await;
+        // The pending approval still takes the next answer.
+        input.send(Input::Line("1".into())).unwrap();
+        wait_text(&output, "first done").await;
+        wait_text(&output, "queued answer").await;
+        let text = output.lock().unwrap().clone();
+        assert!(!text.contains("already running"), "{text}");
+        assert!(
+            text.find("first done").unwrap() < text.find("queued answer").unwrap(),
+            "{text}"
+        );
+        input.send(Input::Eof).unwrap();
+        task.await.unwrap().unwrap();
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

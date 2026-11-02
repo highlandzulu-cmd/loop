@@ -112,8 +112,8 @@ Session, closed Subagents included, with full ids and fields `live`, `busy`,
 
 | Input | Effect |
 |---|---|
-| A line of text | Starts a turn with it as the prompt. If the Session is busy, you are told |
-| A number, while an approval is shown | Answers the approval with that choice |
+| A line of text | Starts a turn with it as the prompt. While a turn runs it is queued (`queued; sends when the current turn ends`) and sent, in order, when the turn ends. Detaching drops prompts still queued |
+| A number, while an approval is shown | Answers the approval with that choice; an approval always comes before queued prompts |
 | `> ` then text | Always a prompt, even when it starts with a number |
 | Ctrl+C | Cancels the current turn |
 | Ctrl+C again, or Ctrl+D | Detaches |
