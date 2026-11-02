@@ -331,7 +331,8 @@ impl Pty {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                // A raw pointer: Linux takes `*const winsize`, macOS `*mut`.
+                &raw mut size,
             )
         };
         assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());

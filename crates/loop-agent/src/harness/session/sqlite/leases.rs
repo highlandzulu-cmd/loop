@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension};
 
-use super::store::{open, SqliteSessionStore};
+use super::store::{begin_immediate, open, SqliteSessionStore};
 use crate::harness::types::SessionError;
 
 /// Owners should renew a live Session lease at this interval.
@@ -215,8 +215,8 @@ impl SqliteSessionStore {
         let env = Arc::clone(&self.environment);
         let guard = self.resume_guard.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = open(&path)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn).map_err(storage)?;
             // Checked inside the transaction: release deletes in its own
             // IMMEDIATE transaction after closing the writer, so a claim
             // either commits before that delete or sees the writer closed.
@@ -272,8 +272,8 @@ impl SqliteSessionStore {
         let identity = identity.clone();
         let env = Arc::clone(&self.environment);
         tokio::task::spawn_blocking(move || {
-            let mut conn = open(&path)?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(storage)?;
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn).map_err(storage)?;
             let changed = if release {
                 tx.execute("DELETE FROM session_leases WHERE session_id=?1 AND owner=?2 AND pid=?3 AND generation=?4",
                     params![id, identity.owner, identity.pid, identity.generation]).map_err(storage)?
@@ -307,9 +307,8 @@ impl SqliteSessionStore {
         let path = self.path.clone();
         let env = Arc::clone(&self.environment);
         tokio::task::spawn_blocking(move || {
-            let mut conn = open(&path)?;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn)
                 .map_err(storage)?;
             let now = env.now_ms();
             let rows: Vec<(String, SessionLease)> = {
@@ -496,10 +495,8 @@ impl ResumeLeaseGuard {
         let path = self.store.path.clone();
         let identity = self.identity.clone();
         tokio::task::spawn_blocking(move || {
-            let mut conn = open(&path)?;
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(storage)?;
+            let conn = open(&path)?;
+            let tx = begin_immediate(&conn).map_err(storage)?;
             delete_identity_rows(&tx, &identity)?;
             tx.commit().map_err(storage)
         })
