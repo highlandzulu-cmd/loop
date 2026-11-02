@@ -307,11 +307,19 @@ impl fmt::Display for SandboxBuildError {
                  and remove sandbox.isolation from settings.json if it is set to \"full\" there.",
                 os = platform.name(),
             ),
-            Self::Unavailable { platform } => write!(
-                f,
-                "the local sandbox is not available on {} yet; tools run on the host (/sandbox off)",
-                platform.name()
-            ),
+            Self::Unavailable { platform } => {
+                write!(
+                    f,
+                    "the local sandbox is not available on {} yet; tools run on the host (/sandbox off).",
+                    platform.name()
+                )?;
+                if *platform == SandboxPlatform::MacOs {
+                    f.write_str(
+                        " Use `--permission-mode read-only` or `--permission-mode ask` to control tool permissions.",
+                    )?;
+                }
+                Ok(())
+            }
             Self::Start(message) => f.write_str(message),
         }
     }
