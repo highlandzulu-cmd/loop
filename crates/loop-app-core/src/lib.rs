@@ -12,6 +12,7 @@ pub mod permissions;
 pub mod resources;
 pub mod runtime;
 pub mod runtime_instance;
+pub mod sandbox_builder;
 pub mod sessions;
 pub mod system_prompt;
 pub mod theme;

@@ -9,8 +9,7 @@ use loop_agent::harness::{
     create_bash_tool_with, create_edit_tool, create_exit_plan_tool, create_read_tool,
     create_session_repository, create_sqlite_session_store, create_todo_tool, create_write_tool,
     search_tools_with_filter, verify_web_search_key, AgentHarness, AgentHarnessOptions,
-    AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox, LocalSandboxRuntime,
-    Sandbox, SandboxMode, WebSearchConfig,
+    AgentHarnessResources, HostExecutionEnv, SandboxMode, WebSearchConfig,
 };
 use loop_agent::types::{AgentThinkingLevel, AgentTool};
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};

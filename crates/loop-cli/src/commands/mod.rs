@@ -279,61 +279,7 @@ pub fn parse_command(line: &str) -> Option<ParsedCommand> {
     Some(ParsedCommand { name, args })
 }
 
-/// Parse flags after `/sandbox local` (`--full|--partial`, `--crun|--runc|--runsc|--krun`).
-///
-/// Defaults: `--full` and `--runc`. Positional `full`/`partial`/`runc`/… are accepted too.
-pub fn parse_local_sandbox_flags(
-    args: &[&str],
-) -> Result<
-    (
-        loop_agent::harness::KrunIsolation,
-        loop_agent::harness::LocalSandboxRuntime,
-    ),
-    String,
-> {
-    use loop_agent::harness::{KrunIsolation, LocalSandboxRuntime};
-
-    let mut isolation: Option<KrunIsolation> = None;
-    let mut runtime: Option<LocalSandboxRuntime> = None;
-
-    for tok in args {
-        let raw = tok.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let key = raw.trim_start_matches('-').to_ascii_lowercase();
-        match key.as_str() {
-            "full" => {
-                if isolation.is_some() {
-                    return Err("specify only one of --full / --partial".into());
-                }
-                isolation = Some(KrunIsolation::Full);
-            }
-            "partial" => {
-                if isolation.is_some() {
-                    return Err("specify only one of --full / --partial".into());
-                }
-                isolation = Some(KrunIsolation::Partial);
-            }
-            "crun" | "runc" | "runsc" | "gvisor" | "krun" => {
-                if runtime.is_some() {
-                    return Err("specify only one runtime (--crun|--runc|--runsc|--krun)".into());
-                }
-                runtime = LocalSandboxRuntime::parse(&key);
-            }
-            other => {
-                return Err(format!(
-                    "unknown sandbox option '{other}' (use --full|--partial and --crun|--runc|--runsc|--krun)"
-                ));
-            }
-        }
-    }
-
-    Ok((
-        isolation.unwrap_or(KrunIsolation::Full),
-        runtime.unwrap_or(LocalSandboxRuntime::Runc),
-    ))
-}
+pub use loop_app_core::sandbox_builder::parse_local_sandbox_flags;
 
 /// Shared command side-effect messages for the UI.
 #[derive(Debug, Clone)]
