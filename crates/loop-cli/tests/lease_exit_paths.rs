@@ -1,0 +1,432 @@
+#![cfg(unix)]
+//! Every way a terminal `loop` process ends must leave no Session lease row
+//! behind in `sessions.db`. Each test runs the real binary against a fake
+//! OpenAI-compatible model with an isolated agent directory.
+
+use loop_agent::harness::session::sqlite::SqliteSessionStore;
+use loop_test_support::{FakeHttpServer, FakeResponse, RecordedRequest};
+use serde_json::{json, Value};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
+
+const WAIT: Duration = Duration::from_secs(30);
+const PROVIDER_ENV: &[&str] = &[
+    "SOKET_API_KEY",
+    "TENSORSTUDIO_API_KEY",
+    "LOOP_API_KEY",
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
+
+fn sse(chunks: &[Value]) -> String {
+    let mut body = String::new();
+    for chunk in chunks {
+        body += &format!(
+            "data: {}\n\n",
+            json!({"id":"r","object":"chat.completion.chunk","choices":[chunk]})
+        );
+    }
+    body + "data: [DONE]\n\n"
+}
+fn text_reply(text: &str) -> FakeResponse {
+    FakeResponse::new(
+        200,
+        "text/event-stream",
+        sse(&[
+            json!({"index":0,"delta":{"role":"assistant","content":text},"finish_reason":null}),
+            json!({"index":0,"delta":{},"finish_reason":"stop"}),
+        ]),
+    )
+}
+
+/// How the fake model answers a chat request.
+#[derive(Clone, Copy)]
+enum Model {
+    Answer,
+    Fail,
+    /// Never finishes within the test.
+    Hang,
+}
+
+struct Fixture {
+    _dir: tempfile::TempDir,
+    agent: PathBuf,
+    work: PathBuf,
+    home: PathBuf,
+    model: FakeHttpServer,
+}
+impl Fixture {
+    fn new(reply: Model) -> Self {
+        let dir = tempfile::Builder::new()
+            .prefix("lle")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let agent = dir.path().join("agent");
+        let work = dir.path().join("work");
+        let home = dir.path().join("home");
+        for d in [&agent, &work, &home] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let model = FakeHttpServer::start(move |r: &RecordedRequest| {
+            match (r.method.as_str(), r.path.as_str()) {
+                ("GET", "/v1/models") => FakeResponse::json(r#"{"data":[{"id":"fake-model"}]}"#),
+                ("POST", "/v1/chat/completions") => match reply {
+                    Model::Answer => text_reply("hello"),
+                    Model::Fail => FakeResponse::new(
+                        400,
+                        "application/json",
+                        r#"{"error":{"message":"bad request"}}"#,
+                    ),
+                    Model::Hang => text_reply("late").with_body_delay(Duration::from_secs(120)),
+                },
+                _ => FakeResponse::new(404, "text/plain", "not found"),
+            }
+        });
+        std::fs::write(
+            agent.join("models.json"),
+            json!({"providers":[{"id":"fake","baseUrl":format!("{}/v1", model.base_url()),
+                "models":["fake-model"]}]})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            json!({"defaultProvider":"fake","defaultModel":"fake-model",
+                "defaultProjectTrust":"always",
+                "providers":[{"id":"fake","name":"Fake",
+                    "baseUrl":format!("{}/v1", model.base_url())}]})
+            .to_string(),
+        )
+        .unwrap();
+        Self {
+            _dir: dir,
+            agent,
+            work,
+            home,
+            model,
+        }
+    }
+    fn command(&self, args: &[&str]) -> std::process::Command {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_loop"));
+        cmd.args(args)
+            .env("LOOP_CODING_AGENT_DIR", &self.agent)
+            .env("LOOP_CODING_AGENT_SESSION_DIR", self.agent.join("sessions"))
+            .env("HOME", &self.home)
+            .env("TERM", "xterm-256color")
+            .env_remove("LOOP_DEBUG")
+            .env_remove("RUST_LOG")
+            .current_dir(&self.work);
+        for key in PROVIDER_ENV {
+            cmd.env_remove(key);
+        }
+        cmd
+    }
+    fn db(&self) -> PathBuf {
+        self.agent.join("sessions/sessions.db")
+    }
+    /// `(session, owner, pid)` of every lease row.
+    async fn leases(&self) -> Vec<(String, String, u32)> {
+        leases(&self.db()).await
+    }
+    /// Wait until the process has written its Session's lease.
+    async fn wait_for_lease(&self) {
+        let found = tokio::time::timeout(WAIT, async {
+            while self.leases().await.is_empty() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(found.is_ok(), "the process never took a lease");
+    }
+    async fn wait_for_model_call(&self) {
+        let called = tokio::time::timeout(WAIT, async {
+            while !self
+                .model
+                .requests()
+                .iter()
+                .any(|r| r.path == "/v1/chat/completions")
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(called.is_ok(), "the model was never called");
+    }
+}
+
+async fn leases(db: &Path) -> Vec<(String, String, u32)> {
+    if !db.exists() {
+        return Vec::new();
+    }
+    let store = SqliteSessionStore::open(db).unwrap();
+    let mut rows = Vec::new();
+    for meta in loop_agent::harness::session::SessionStore::list(&store, None)
+        .await
+        .unwrap()
+    {
+        if let Some(lease) = store.lease(&meta.id).await.unwrap() {
+            rows.push((meta.id, lease.identity.owner, lease.identity.pid));
+        }
+    }
+    rows
+}
+
+async fn output(mut cmd: std::process::Command) -> std::process::Output {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = tokio::process::Command::from(cmd)
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(WAIT, child)
+        .await
+        .expect("loop did not exit")
+        .unwrap()
+}
+
+fn signal(pid: u32, name: &str) {
+    assert!(std::process::Command::new("kill")
+        .args([name, &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+}
+
+async fn bounded(test: impl std::future::Future<Output = ()>) {
+    tokio::time::timeout(Duration::from_secs(90), test)
+        .await
+        .expect("test timed out");
+}
+
+#[tokio::test]
+async fn print_that_succeeds_leaves_no_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let out = output(fx.command(&["--print", "hi"])).await;
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
+        assert_eq!(fx.leases().await, [], "{out:?}");
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "leaks until B1: --print exits non-zero with process::exit before the store is released"]
+async fn print_that_fails_leaves_no_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Fail);
+        let out = output(fx.command(&["--print", "hi"])).await;
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(!fx.model.requests().is_empty());
+        assert_eq!(fx.leases().await, [], "{out:?}");
+    })
+    .await
+}
+
+#[tokio::test]
+async fn an_error_after_startup_leaves_no_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        // Refused only after the Session was opened.
+        let out = output(fx.command(&["--serve-mcp", "--mcp-host", "0.0.0.0"])).await;
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--mcp-token"));
+        assert!(fx.db().exists(), "the Session was opened");
+        assert_eq!(fx.leases().await, [], "{out:?}");
+    })
+    .await
+}
+
+async fn print_ended_by(name: &str) {
+    let fx = Fixture::new(Model::Hang);
+    let mut cmd = fx.command(&["--print", "hi"]);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = tokio::process::Command::from(cmd)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    fx.wait_for_lease().await;
+    fx.wait_for_model_call().await;
+    signal(child.id().unwrap(), name);
+    let status = tokio::time::timeout(WAIT, child.wait())
+        .await
+        .expect("loop ignored the signal")
+        .unwrap();
+    assert!(!status.success(), "{name}: {status}");
+    assert_eq!(fx.leases().await, [], "{name}: {status}");
+}
+
+#[tokio::test]
+#[ignore = "leaks until B1: SIGTERM kills --print with no release"]
+async fn print_ended_by_sigterm_leaves_no_lease() {
+    bounded(print_ended_by("-TERM")).await
+}
+
+#[tokio::test]
+#[ignore = "leaks until B1: SIGHUP kills --print with no release"]
+async fn print_ended_by_sighup_leaves_no_lease() {
+    bounded(print_ended_by("-HUP")).await
+}
+
+/// A pseudo-terminal for the TUI: the child gets the slave side as its
+/// controlling terminal; the test writes keys to and drains the master.
+struct Pty {
+    master: std::fs::File,
+    slave: std::os::fd::OwnedFd,
+}
+impl Pty {
+    fn open() -> Self {
+        use std::os::fd::FromRawFd;
+        let (mut master, mut slave) = (-1, -1);
+        let mut size = libc::winsize {
+            ws_row: 40,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty writes two descriptors it opened; we own them after.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut size,
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // SAFETY: both descriptors are open and owned by nothing else.
+        unsafe {
+            Self {
+                master: std::fs::File::from_raw_fd(master),
+                slave: std::os::fd::OwnedFd::from_raw_fd(slave),
+            }
+        }
+    }
+    fn attach(&self, cmd: &mut std::process::Command) {
+        use std::os::unix::process::CommandExt;
+        for (i, stream) in [0, 1, 2].into_iter().enumerate() {
+            let fd = self.slave.try_clone().unwrap();
+            match i {
+                0 => cmd.stdin(Stdio::from(fd)),
+                1 => cmd.stdout(Stdio::from(fd)),
+                _ => cmd.stderr(Stdio::from(fd)),
+            };
+            let _ = stream;
+        }
+        // SAFETY: only async-signal-safe calls between fork and exec.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+                Ok(())
+            });
+        }
+    }
+    /// Copy everything the TUI draws into a buffer, so it never blocks, and
+    /// answer its cursor position queries like a terminal would.
+    fn drain(&self) -> std::sync::Arc<std::sync::Mutex<Vec<u8>>> {
+        use std::io::{Read, Write};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut master = self.master.try_clone().unwrap();
+        let mut reply = self.master.try_clone().unwrap();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = master.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let chunk = &buf[..n];
+                for _ in 0..chunk.windows(4).filter(|w| w == b"\x1b[6n").count() {
+                    let _ = reply.write_all(b"\x1b[1;1R");
+                }
+                sink.lock().unwrap().extend_from_slice(chunk);
+            }
+        });
+        seen
+    }
+    fn keys(&self, bytes: &[u8]) {
+        use std::io::Write;
+        (&self.master).write_all(bytes).unwrap();
+        (&self.master).flush().unwrap();
+    }
+}
+
+#[tokio::test]
+#[ignore = "leaks until B1: the TUI exits 0 without releasing its lease"]
+async fn quitting_the_tui_leaves_no_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let pty = Pty::open();
+        let mut cmd = fx.command(&[]);
+        pty.attach(&mut cmd);
+        let mut child = tokio::process::Command::from(cmd)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let screen = pty.drain();
+        fx.wait_for_lease().await;
+        // Let the TUI take the terminal before sending keys.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let status = tokio::time::timeout(WAIT, async {
+            loop {
+                pty.keys(b"\x03");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                pty.keys(b"\x03");
+                if let Ok(Ok(status)) =
+                    tokio::time::timeout(Duration::from_secs(2), child.wait()).await
+                {
+                    return status;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the TUI did not quit on Ctrl+C twice:\n{}",
+                String::from_utf8_lossy(&screen.lock().unwrap())
+            )
+        });
+        let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        assert!(status.success(), "{status}\n{shown}");
+        assert_eq!(fx.leases().await, []);
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "leaks until B1: SIGHUP kills the TUI with no release"]
+async fn a_tui_ended_by_sighup_leaves_no_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let pty = Pty::open();
+        let mut cmd = fx.command(&[]);
+        pty.attach(&mut cmd);
+        let mut child = tokio::process::Command::from(cmd)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let _screen = pty.drain();
+        fx.wait_for_lease().await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        signal(child.id().unwrap(), "-HUP");
+        tokio::time::timeout(WAIT, child.wait())
+            .await
+            .expect("the TUI ignored SIGHUP")
+            .unwrap();
+        assert_eq!(fx.leases().await, []);
+    })
+    .await
+}
