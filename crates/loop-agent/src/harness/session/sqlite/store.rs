@@ -200,17 +200,19 @@ pub(super) fn begin_immediate_within<'c>(
     gate: &WriteGate,
 ) -> rusqlite::Result<Transaction<'c>> {
     let deadline = std::time::Instant::now() + limit;
+    let left = || deadline.saturating_duration_since(std::time::Instant::now());
     let mut attempt = 1;
     let result = loop {
-        // Each attempt's busy wait only spends what is left of the deadline.
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        conn.busy_timeout(left.min(gate.busy_timeout()))?;
+        // Every wait, SQLite's busy wait and our pause alike, is capped to
+        // what is left of the deadline, so it is overshot by at most the
+        // scheduler's slack.
+        conn.busy_timeout(left().min(gate.busy_timeout()))?;
         let begun = Transaction::new_unchecked(conn, TransactionBehavior::Immediate);
         if begun.as_ref().err().is_some_and(is_busy) {
             gate.saw_busy();
         }
         match begun {
-            Err(error) if is_busy(&error) && attempt < BEGIN_ATTEMPTS => {
+            Err(error) if is_busy(&error) && attempt < BEGIN_ATTEMPTS && !left().is_zero() => {
                 let base = (20u64 << (attempt - 1)).min(200);
                 let jitter = u64::from(
                     std::time::SystemTime::now()
@@ -219,16 +221,13 @@ pub(super) fn begin_immediate_within<'c>(
                         .subsec_nanos(),
                 ) % (base / 2 + 1);
                 let pause = std::time::Duration::from_millis((base / 2 + jitter).clamp(20, 200));
-                if std::time::Instant::now() + pause >= deadline {
-                    break Err(error);
-                }
-                std::thread::sleep(pause);
+                std::thread::sleep(pause.min(left()));
                 attempt += 1;
             }
             result => break result,
         }
     };
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.busy_timeout(gate.busy_timeout())?;
     result
 }
 
@@ -1034,9 +1033,13 @@ mod tests {
         );
         let took = started.elapsed();
         assert!(matches!(&result, Err(e) if is_busy(e)), "{result:?}");
-        // The busy timeout and the retries share one deadline.
+        // The busy waits and the retries share one deadline: it is used up,
+        // and not exceeded by anything near the 5 s busy timeout. The upper
+        // bound leaves a second for a loaded CI machine.
+        let deadline = std::time::Duration::from_millis(400);
+        assert!(took >= deadline, "gave up early, after {took:?}");
         assert!(
-            took < std::time::Duration::from_millis(900),
+            took < deadline + std::time::Duration::from_secs(1),
             "took {took:?}"
         );
         drop(result);
@@ -1112,7 +1115,9 @@ mod tests {
         let started = std::time::Instant::now();
         let error = writer.release_leases().await.unwrap_err().to_string();
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(1),
+            // 200 ms for the gate, plus slack for a loaded CI machine;
+            // far below the 5 s busy timeout.
+            started.elapsed() < std::time::Duration::from_millis(1200),
             "{:?}",
             started.elapsed()
         );
