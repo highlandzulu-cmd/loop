@@ -615,9 +615,26 @@ impl Runtime {
                 .await
                 .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
         }
-        let entry = request.custom_entry();
+        let mut entry = request.custom_entry();
+        if let Some(entry) = &mut entry {
+            if entry.models.is_none() {
+                entry.models = self
+                    .settings
+                    .providers
+                    .iter()
+                    .find(|saved| saved.id == entry.id)
+                    .and_then(|saved| saved.models.clone());
+            }
+        }
         let provider = match &entry {
-            Some(entry) => Arc::new(entry.provider()),
+            Some(entry) => {
+                let candidate = Models::new();
+                candidate.set_provider(entry.provider());
+                load_custom_models_json(&self.agent_dir, &candidate, std::slice::from_ref(entry))?;
+                candidate
+                    .get_provider(&id)
+                    .expect("registered custom provider")
+            }
             None => self
                 .models
                 .get_provider(&id)
@@ -658,7 +675,38 @@ impl Runtime {
             }
             return Err(error.context("could not save login"));
         }
+        for model in provider.get_models() {
+            let previous = self.models.get_model(&id, &model.id);
+            if previous.as_ref().is_none_or(|previous| {
+                previous.base_url != model.base_url
+                    || loop_ai::resolve_compat(&previous.base_url, previous.compat.as_ref())
+                        .thinking_format
+                        != loop_ai::resolve_compat(&model.base_url, model.compat.as_ref())
+                            .thinking_format
+            }) {
+                loop_ai::clear_reasoning_rejection(&model);
+            }
+        }
         self.models.set_provider(provider);
+        if let Some(model_id) = self
+            .selected_model
+            .as_ref()
+            .filter(|model| model.provider == id)
+            .map(|model| model.id.clone())
+        {
+            if let Some(model) = self.models.get_model(&id, &model_id) {
+                self.harness.set_model(model.clone()).await;
+                self.selected_model = Some(model);
+            } else {
+                self.harness.clear_model().await;
+                self.selected_model = None;
+                self.model_note = Some(format!(
+                    "{id}/{model_id} is no longer available; select a model with /model"
+                ));
+                self.settings.clear_selected_model();
+                self.save_settings()?;
+            }
+        }
         self.needs_provider_setup = false;
         if id == loop_ai::providers::SOKET_PROVIDER_ID {
             // The Soket key also powers the default web search and fetch.
@@ -1189,11 +1237,15 @@ pub fn build_models(
         models_store: Some(store),
     }));
     crate::config::providers::register_providers(&models, custom);
-    load_custom_models_json(agent_dir, &models)?;
+    load_custom_models_json(agent_dir, &models, custom)?;
     Ok(models)
 }
 
-fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<()> {
+fn load_custom_models_json(
+    agent_dir: &Path,
+    models: &Models,
+    custom: &[crate::config::CustomProviderEntry],
+) -> anyhow::Result<()> {
     let path = models_json_path(agent_dir);
     if !path.exists() {
         return Ok(());
@@ -1222,7 +1274,7 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let model_specs = p
+            let mut model_specs = p
                 .get("models")
                 .and_then(|v| v.as_array())
                 .map(|a| {
@@ -1239,6 +1291,13 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
                 .unwrap_or_default();
             if model_specs.is_empty() {
                 continue;
+            }
+            if let Some(entry) = custom.iter().find(|entry| entry.id == id) {
+                for saved in entry.models.iter().flatten() {
+                    if !model_specs.iter().any(|spec| spec.id == saved.id) {
+                        model_specs.push(saved.spec());
+                    }
+                }
             }
             models.set_provider(custom_provider(CustomProviderConfig {
                 id: id.into(),
@@ -1264,7 +1323,7 @@ fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
             .or_else(|| m.get(snake))
             .and_then(|v| v.as_u64())
     };
-    CustomModelSpec::new(id)
+    let mut spec = CustomModelSpec::new(id)
         .with_reasoning(
             m.get("reasoning")
                 .and_then(|v| v.as_bool())
@@ -1272,7 +1331,18 @@ fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
         )
         .with_name(m.get("name").and_then(|v| v.as_str()))
         .with_context_window(field("contextWindow", "context_window"))
-        .with_max_tokens(field("maxTokens", "max_tokens"))
+        .with_max_tokens(field("maxTokens", "max_tokens"));
+    if let Some(format) = m
+        .get("thinkingFormat")
+        .or_else(|| m.get("thinking_format"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        spec = spec.with_compat(loop_ai::OpenAICompletionsCompat {
+            thinking_format: Some(format),
+            ..Default::default()
+        });
+    }
+    spec
 }
 
 /// Resolve project trust (ask interactively when needed).
@@ -1587,7 +1657,7 @@ mod tests {
             credentials: None,
             models_store: None,
         });
-        load_custom_models_json(dir.path(), &models).unwrap();
+        load_custom_models_json(dir.path(), &models, &[]).unwrap();
 
         let pinned = models.get_model("zai", "glm-5.3-flash").unwrap();
         assert_eq!(pinned.context_window, 1_000_000);
@@ -1611,6 +1681,38 @@ mod tests {
         // String entries keep the listing defaults.
         let plain = models.get_model("zai", "plain-model").unwrap();
         assert_eq!(plain.context_window, 128_000);
+    }
+
+    #[test]
+    fn models_json_overrides_matching_settings_models_and_keeps_other_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            models_json_path(dir.path()),
+            serde_json::json!({
+                "providers": [{"id": "gateway", "baseUrl": "http://localhost/v1",
+                    "models": [{"id": "override", "reasoning": false}]}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let entry: crate::config::CustomProviderEntry = serde_json::from_value(serde_json::json!({
+            "id": "gateway", "name": "Gateway", "baseUrl": "http://localhost/v1",
+            "models": [
+                {"id": "override", "reasoning": true, "thinkingFormat": "zai"},
+                {"id": "keep", "reasoning": true, "thinkingFormat": "zai"}
+            ]
+        }))
+        .unwrap();
+        let models = Models::new();
+        models.set_provider(entry.provider());
+        load_custom_models_json(dir.path(), &models, &[entry]).unwrap();
+        assert!(!models.get_model("gateway", "override").unwrap().reasoning);
+        let kept = models.get_model("gateway", "keep").unwrap();
+        assert!(kept.reasoning);
+        assert_eq!(
+            kept.compat.unwrap().thinking_format,
+            Some(loop_ai::ThinkingFormat::Zai)
+        );
     }
 
     #[test]
