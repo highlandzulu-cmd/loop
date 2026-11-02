@@ -1,6 +1,7 @@
 //! `/login` / `/logout` persistence against local fake providers (separate test binary:
 //! it mutates process env).
 
+use futures::StreamExt;
 use loop_cli::config::paths::{auth_path, settings_path, ENV_AGENT_DIR, ENV_SESSION_DIR};
 use loop_cli::config::ProviderLoginRequest;
 use loop_cli::{bootstrap_cli, BootstrapOpts, CliRuntime};
@@ -293,7 +294,151 @@ async fn connect_reject_restart_and_disconnect() {
         assert!(!read(auth_path(agent_dir.path())).contains("k-secret"));
         assert!(!read(settings_path(agent_dir.path())).contains("gateway"));
         assert!(runtime.disconnect_provider("gateway").await.is_err());
+        removed_pin_clears_selection(&mut runtime).await;
+        corrected_reconnect_restores_thinking(&mut runtime).await;
     })
     .await
     .expect("provider lifecycle completed");
+}
+
+const ANSWER: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+
+async fn thinking_reply(runtime: &CliRuntime) {
+    let model = runtime.harness.model().await.unwrap();
+    let context = loop_ai::Context {
+        messages: vec![loop_ai::Message::user_text("hi")],
+        ..Default::default()
+    };
+    let mut stream = runtime.models.stream_simple(
+        &model,
+        &context,
+        loop_ai::SimpleStreamOptions::with_reasoning(loop_ai::ThinkingLevel::High),
+    );
+    while let Some(event) = stream.next().await {
+        assert!(
+            !matches!(event, loop_ai::AssistantMessageEvent::Error { .. }),
+            "{event:?}"
+        );
+    }
+}
+
+async fn corrected_reconnect_restores_thinking(runtime: &mut CliRuntime) {
+    let server = FakeHttpServer::start(|request| match request.path.as_str() {
+        "/v1/models" => FakeResponse::json(MODELS),
+        _ => {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body.get("reasoning_effort").is_some() {
+                FakeResponse::new(
+                    400,
+                    "application/json",
+                    r#"{"error":{"message":"unsupported parameter: reasoning_effort"}}"#,
+                )
+            } else {
+                FakeResponse::new(200, "text/event-stream", ANSWER)
+            }
+        }
+    });
+    let request = |url: &str, format| ProviderLoginRequest::Custom {
+        name: "Recovery".into(),
+        base_url: format!("{url}/v1"),
+        api_key: None,
+        models: Some(vec![
+            loop_app_core::config::providers::CustomProviderModel {
+                id: "m-two".into(),
+                reasoning: true,
+                thinking_format: Some(format),
+            },
+        ]),
+    };
+    runtime
+        .connect_provider(&request(server.base_url(), loop_ai::ThinkingFormat::Openai))
+        .await
+        .unwrap();
+    runtime.select_model("recovery", "m-two").await.unwrap();
+    thinking_reply(runtime).await;
+    assert_eq!(runtime.efforts().await.unwrap().0, ["off"]);
+    // Unchanged reconnects retain the learned rejection.
+    runtime
+        .connect_provider(&request(server.base_url(), loop_ai::ThinkingFormat::Openai))
+        .await
+        .unwrap();
+    assert_eq!(runtime.efforts().await.unwrap().0, ["off"]);
+    runtime
+        .connect_provider(&request(server.base_url(), loop_ai::ThinkingFormat::Zai))
+        .await
+        .unwrap();
+    assert!(runtime
+        .efforts()
+        .await
+        .unwrap()
+        .0
+        .contains(&"high".to_string()));
+    thinking_reply(runtime).await;
+    let body: serde_json::Value =
+        serde_json::from_slice(&server.requests().last().unwrap().body).unwrap();
+    assert_eq!(body["thinking"], serde_json::json!({"type": "enabled"}));
+    // A different endpoint must also get another chance with the same format.
+    runtime
+        .connect_provider(&request(server.base_url(), loop_ai::ThinkingFormat::Openai))
+        .await
+        .unwrap();
+    thinking_reply(runtime).await;
+    assert_eq!(runtime.efforts().await.unwrap().0, ["off"]);
+    let corrected = FakeHttpServer::start(|request| match request.path.as_str() {
+        "/v1/models" => FakeResponse::json(MODELS),
+        _ => FakeResponse::new(200, "text/event-stream", ANSWER),
+    });
+    runtime
+        .connect_provider(&request(
+            corrected.base_url(),
+            loop_ai::ThinkingFormat::Openai,
+        ))
+        .await
+        .unwrap();
+    assert!(runtime
+        .efforts()
+        .await
+        .unwrap()
+        .0
+        .contains(&"high".to_string()));
+    thinking_reply(runtime).await;
+    let body: serde_json::Value =
+        serde_json::from_slice(&corrected.requests().last().unwrap().body).unwrap();
+    assert_eq!(body["reasoning_effort"], "high");
+    runtime.disconnect_provider("recovery").await.unwrap();
+}
+
+async fn removed_pin_clears_selection(runtime: &mut CliRuntime) {
+    let server = models_server();
+    let mut request = ProviderLoginRequest::Custom {
+        name: "Pins".into(),
+        base_url: format!("{}/v1", server.base_url()),
+        api_key: None,
+        models: Some(vec![
+            loop_app_core::config::providers::CustomProviderModel {
+                id: "removed".into(),
+                reasoning: true,
+                thinking_format: Some(loop_ai::ThinkingFormat::Zai),
+            },
+        ]),
+    };
+    runtime.connect_provider(&request).await.unwrap();
+    runtime.select_model("pins", "removed").await.unwrap();
+    if let ProviderLoginRequest::Custom { models, .. } = &mut request {
+        *models = Some(vec![]);
+    }
+    runtime.connect_provider(&request).await.unwrap();
+    assert!(runtime.models.get_model("pins", "removed").is_none());
+    assert!(runtime.selected_model.is_none());
+    assert!(runtime.harness.model().await.is_none());
+    assert!(runtime.settings.default_model.is_none());
+    assert!(runtime.settings.default_provider.is_none());
+    let saved: serde_json::Value =
+        serde_json::from_str(&read(settings_path(&runtime.agent_dir))).unwrap();
+    assert!(saved
+        .get("defaultModel")
+        .is_none_or(|value| value.is_null()));
+    assert!(saved
+        .get("defaultProvider")
+        .is_none_or(|value| value.is_null()));
 }

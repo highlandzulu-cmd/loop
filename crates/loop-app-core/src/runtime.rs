@@ -676,6 +676,18 @@ impl Runtime {
             }
             return Err(error.context("could not save login"));
         }
+        for model in provider.get_models() {
+            let previous = self.models.get_model(&id, &model.id);
+            if previous.as_ref().is_none_or(|previous| {
+                previous.base_url != model.base_url
+                    || loop_ai::resolve_compat(&previous.base_url, previous.compat.as_ref())
+                        .thinking_format
+                        != loop_ai::resolve_compat(&model.base_url, model.compat.as_ref())
+                            .thinking_format
+            }) {
+                loop_ai::clear_reasoning_rejection(&model);
+            }
+        }
         self.models.set_provider(provider);
         if let Some(model_id) = self
             .selected_model
@@ -686,6 +698,14 @@ impl Runtime {
             if let Some(model) = self.models.get_model(&id, &model_id) {
                 self.harness.set_model(model.clone()).await;
                 self.selected_model = Some(model);
+            } else {
+                self.harness.clear_model().await;
+                self.selected_model = None;
+                self.model_note = Some(format!(
+                    "{id}/{model_id} is no longer available; select a model with /model"
+                ));
+                self.settings.clear_selected_model();
+                self.save_settings()?;
             }
         }
         self.needs_provider_setup = false;

@@ -68,3 +68,60 @@ async fn rejected_reasoning_is_dropped_and_remembered() {
     assert_eq!(all.len(), 3);
     assert!(!String::from_utf8_lossy(&all[2].body).contains("reasoning_effort"));
 }
+
+#[tokio::test]
+async fn rejected_zai_off_retries_without_thinking() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let server = FakeHttpServer::start(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            if body.get("thinking").is_some() {
+                FakeResponse::new(
+                    422,
+                    "application/json",
+                    r#"{"error":{"message":"unsupported parameter: thinking"}}"#,
+                )
+            } else {
+                FakeResponse::new(200, "text/event-stream", ANSWER)
+            }
+        });
+        let models = Models::new();
+        models.set_provider(custom_provider(CustomProviderConfig {
+            id: "zai-off-fallback".into(),
+            name: None,
+            base_url: server.base_url().into(),
+            api_key_env: vec![],
+            headers: None,
+            models: vec![CustomModelSpec::new("m").with_reasoning(true).with_compat(
+                loop_ai::OpenAICompletionsCompat {
+                    thinking_format: Some(loop_ai::ThinkingFormat::Zai),
+                    ..Default::default()
+                },
+            )],
+        }));
+        let model = models.get_model("zai-off-fallback", "m").unwrap();
+        let context = Context {
+            messages: vec![Message::user_text("hi")],
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let mut stream = models.stream_simple(&model, &context, SimpleStreamOptions::default());
+            while let Some(event) = stream.next().await {
+                assert!(
+                    !matches!(event, AssistantMessageEvent::Error { .. }),
+                    "{event:?}"
+                );
+            }
+        }
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(first["thinking"], serde_json::json!({"type": "disabled"}));
+        for request in &requests[1..] {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(body.get("thinking").is_none());
+        }
+        assert!(loop_ai::reasoning_rejected(&model));
+    })
+    .await
+    .expect("off fallback completed");
+}
