@@ -131,6 +131,8 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens. Change wi
 
 ## Sandbox
 
+Local sandbox: **Linux only (macOS support is planned)**. On macOS, use `--permission-mode read-only` or `--permission-mode ask` to control tool permissions.
+
 `/sandbox` / `/sandbox status` — boxed status (on/off, kind, runtime; not sent to the model)  
 `/sandbox off` — host tools  
 `/sandbox local` — same as `--full --runc` (rootless Podman + runc)  

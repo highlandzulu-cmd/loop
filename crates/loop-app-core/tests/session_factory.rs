@@ -312,3 +312,36 @@ async fn gate_uses_the_session_workspace_for_relative_paths() {
         Decision::Ask
     );
 }
+
+#[cfg(not(target_os = "linux"))]
+#[tokio::test]
+async fn runtime_refuses_local_sandbox_with_platform_guidance() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        let mut settings = Settings::default();
+        settings.sandbox.mode = "local".into();
+        settings.save_file(&settings_path(&agent)).unwrap();
+        let factory = factory(&agent);
+        let opts = opts(dir.path());
+        let workspace = factory.workspace(&opts).await.unwrap();
+        let error = match factory.open(workspace, &opts).await {
+            Ok(_) => panic!("Runtime admitted a Session without its required sandbox"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.starts_with(
+                "required workspace sandbox failed: local sandbox is Linux-only on this platform"
+            ),
+            "{error}"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(error.contains("--permission-mode read-only"), "{error}");
+            assert!(error.contains("--permission-mode ask"), "{error}");
+        }
+    })
+    .await
+    .expect("sandbox admission timed out");
+}

@@ -242,8 +242,13 @@ impl WorkspaceResources {
                                 }
                                 Err(e) => {
                                     if !self.standalone {
+                                        let platform = if cfg!(target_os = "linux") {
+                                            ""
+                                        } else {
+                                            "local sandbox is Linux-only on this platform. "
+                                        };
                                         return Err(anyhow::anyhow!(
-                                            "required workspace sandbox failed: {e}"
+                                            "required workspace sandbox failed: {platform}{e}"
                                         ));
                                     }
                                     tracing::warn!("local sandbox disabled at startup: {e}");
