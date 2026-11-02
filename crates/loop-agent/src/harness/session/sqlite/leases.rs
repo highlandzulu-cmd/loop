@@ -153,6 +153,7 @@ impl SqliteSessionStore {
             environment: Arc::clone(&self.environment),
             identity: Some(identity),
             resume_guard: None,
+            gate: Arc::clone(&self.gate),
         }
     }
 
@@ -214,9 +215,14 @@ impl SqliteSessionStore {
         let identity = identity.clone();
         let env = Arc::clone(&self.environment);
         let guard = self.resume_guard.clone();
+        let gate = Arc::clone(&self.gate);
+        // One writer of this process at a time; other processes meet
+        // SQLite's busy timeout and the bounded retry.
+        let permit = gate.enter().await;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn).map_err(storage)?;
+            let tx = begin_immediate(&conn, &gate).map_err(storage)?;
             // Checked inside the transaction: release deletes in its own
             // IMMEDIATE transaction after closing the writer, so a claim
             // either commits before that delete or sees the writer closed.
@@ -271,9 +277,14 @@ impl SqliteSessionStore {
         let id = id.to_owned();
         let identity = identity.clone();
         let env = Arc::clone(&self.environment);
+        let gate = Arc::clone(&self.gate);
+        // One writer of this process at a time; other processes meet
+        // SQLite's busy timeout and the bounded retry.
+        let permit = gate.enter().await;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn).map_err(storage)?;
+            let tx = begin_immediate(&conn, &gate).map_err(storage)?;
             let changed = if release {
                 tx.execute("DELETE FROM session_leases WHERE session_id=?1 AND owner=?2 AND pid=?3 AND generation=?4",
                     params![id, identity.owner, identity.pid, identity.generation]).map_err(storage)?
@@ -306,9 +317,14 @@ impl SqliteSessionStore {
         let proof = runtime_lock_for.is_some_and(|held| same_database(held, &self.path));
         let path = self.path.clone();
         let env = Arc::clone(&self.environment);
+        let gate = Arc::clone(&self.gate);
+        // One writer of this process at a time; other processes meet
+        // SQLite's busy timeout and the bounded retry.
+        let permit = gate.enter().await;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn)
+            let tx = begin_immediate(&conn, &gate)
                 .map_err(storage)?;
             let now = env.now_ms();
             let rows: Vec<(String, SessionLease)> = {
@@ -498,7 +514,10 @@ impl ResumeLeaseGuard {
         self.cancellation.cancel();
         let path = self.store.path.clone();
         let identity = self.identity.clone();
+        // Wait only briefly for this process's other writes too.
+        let permit = self.store.gate.enter_within(RELEASE_BUSY_TIMEOUT).await?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             // One short attempt, no retries: this runs on the way out, and a
             // locked database must not hold up exit. The writer is closed
             // already; a row left behind expires and the startup sweep
@@ -591,6 +610,7 @@ impl SqliteSessionStore {
                 environment: self.environment.clone(),
                 identity: None,
                 resume_guard: None,
+                gate: Arc::clone(&self.gate),
             },
             ids: parking_lot::Mutex::new(std::collections::HashSet::new()),
             identity: identity.clone(),
