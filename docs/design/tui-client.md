@@ -1,6 +1,6 @@
 # S3 · The TUI as a Runtime client: design
 
-Status: Draft for approval
+Status: Approved 2026-11-03 (answers to the open questions are recorded in section 10).
 
 Current-code references were checked at
 `dc98af089ab23240a901a140f8f143df6cc232a4` on `s3/design-doc`.
@@ -640,6 +640,17 @@ No Cargo checks are required for this documentation-only slice.
 
 ## 10. Open questions for approval
 
+Answered 2026-11-03:
+
+- After a model or effort change, the TUI shows a one-line hint to also save the
+  value as the default for new Sessions. The Session change always applies.
+- Host usage history stays hidden over WebSocket. Remote Surfaces see the live
+  Session panel and the Runtime panel only.
+- The remaining questions take the defaults proposed in this document.
+
+Original questions:
+
+
 - Should the TUI offer “save for new Sessions” after each model/effort change,
   or expose it in a settings action? Session setters and default writes remain
   separate in either case.
@@ -662,7 +673,7 @@ No Cargo checks are required for this documentation-only slice.
 
 ## Decision record
 
-Proposed; awaiting maintainer approval. The TUI will use one SurfaceClient code
+Approved by the maintainer on 2026-11-03. The TUI will use one SurfaceClient code
 path. The facade first adapts the current NativeBackend and then RemoteBackend.
 An embedded Runtime becomes the default only after ACP, host trust and embedded
 ownership/recovery pass their gates. This sequence keeps existing subscription
