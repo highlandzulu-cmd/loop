@@ -75,6 +75,33 @@ pub enum Origin {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionUpdate {
+    /// Replace the transcript with an immutable branch view.
+    BranchReset {
+        /// Committed transcript revision.
+        branch_revision: u64,
+        /// Immutable transcript view id; expires explicitly.
+        view_id: String,
+        /// Why the transcript was replaced.
+        reason: String,
+    },
+    /// Replace the public Session metadata and configuration.
+    ConfigChanged {
+        /// Committed control revision.
+        revision: u64,
+        /// Complete public Session metadata.
+        metadata: crate::rpc::SessionMetadataView,
+        /// Desired public Session configuration.
+        config: serde_json::Value,
+        /// Public configuration effective for the current turn.
+        effective: serde_json::Value,
+        /// Desired state waiting for the next turn.
+        pending: serde_json::Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Turn after which pending state takes effect.
+        applies_after_turn: Option<String>,
+        /// Revision of the workspace configuration.
+        workspace_revision: u64,
+    },
     /// A turn began.
     TurnStarted {
         /// Turn id.

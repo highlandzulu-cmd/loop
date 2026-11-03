@@ -109,6 +109,7 @@ fn start(
     let host = Arc::new(ClientHost {
         conn: Arc::clone(&conn),
         interact: Arc::clone(&interact),
+        branch_reset: AtomicBool::new(false),
         id: NEXT_TICKET.fetch_add(1, Ordering::Relaxed),
     });
     let done = tokio::spawn(run(
@@ -151,7 +152,7 @@ enum Control {
         key: SessionKey,
         op: u64,
         after_seq: u64,
-        result: BackendResult<Attachment>,
+        result: Box<BackendResult<Attachment>>,
         session: loop_protocol::SessionRef,
     },
     /// Stop forwarding `key`, then answer `id`.
@@ -199,6 +200,8 @@ async fn run(
                         Ok(params) => {
                             host.interact
                                 .store(params.client_capabilities.interact, Ordering::Release);
+                            host.branch_reset
+                                .store(params.client_capabilities.branch_reset, Ordering::Release);
                             let mut capabilities = backend.capabilities();
                             // Advertise only what this connection can serve.
                             capabilities.multi_session = runtime.is_some();
@@ -302,6 +305,118 @@ async fn handle(
             }
             Err(error) => return conn.respond(id, Err(error)),
         },
+        // Session-tree dispatch stays grouped for parallel protocol additions.
+        methods::SESSION_TREE if runtime.is_some() => {
+            if !backend.capabilities().session_tree {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::TreeParams>(params) {
+                    Ok(params) => runtime
+                        .unwrap()
+                        .tree(params)
+                        .await
+                        .map(|result| to_value(&result)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_VIEW if runtime.is_some() => {
+            if !backend.capabilities().branch_snapshot {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::ViewParams>(params) {
+                    Ok(params) => runtime
+                        .unwrap()
+                        .view(params)
+                        .await
+                        .map(|result| to_value(&result)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_NAVIGATE if runtime.is_some() => {
+            if !backend.capabilities().session_tree {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::NavigateParams>(params) {
+                    Ok(params) => runtime
+                        .unwrap()
+                        .navigate(params)
+                        .await
+                        .map(|result| to_value(&result)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_RENAME if runtime.is_some() => {
+            if !backend.capabilities().session_rename {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::RenameParams>(params) {
+                    Ok(params) => runtime
+                        .unwrap()
+                        .rename(params)
+                        .await
+                        .map(|result| to_value(&result)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_FORK if runtime.is_some() => {
+            if !backend.capabilities().session_fork {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::ForkParams>(params) {
+                    Ok(params) => runtime
+                        .unwrap()
+                        .fork(params)
+                        .await
+                        .map(|result| to_value(&result)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_CLONE if runtime.is_some() => {
+            if !backend.capabilities().session_fork {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::CloneParams>(params) {
+                    Ok(params) => runtime
+                        .unwrap()
+                        .clone_session(params)
+                        .await
+                        .map(|result| to_value(&result)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_EXPORT if runtime.is_some() => {
+            if !backend.capabilities().session_transfer {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::SessionParams>(params) {
+                    Ok(params) => runtime.unwrap().export(params).await.and_then(|result| {
+                        export_response_fits(&id, &result)?;
+                        Ok(to_value(&result))
+                    }),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_IMPORT if runtime.is_some() => {
+            if !backend.capabilities().session_transfer {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse::<loop_protocol::rpc::ImportParams>(params) {
+                    Ok(params) => runtime
+                        .unwrap()
+                        .import(params)
+                        .await
+                        .map(|result| to_value(&result)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
         methods::SESSION_LIST if runtime.is_some() => {
             runtime.unwrap().list().await.map(|l| to_value(&l))
         }
@@ -328,17 +443,24 @@ async fn handle(
                     key: session.key.clone(),
                     op,
                 });
-                let result = runtime
-                    .unwrap()
-                    .attach_watching(host.id, &session, after_seq)
-                    .await;
+                let result = if host.branch_reset.load(Ordering::Acquire) {
+                    runtime
+                        .unwrap()
+                        .attach_snapshot_watching(host.id, &session, after_seq)
+                        .await
+                } else {
+                    runtime
+                        .unwrap()
+                        .attach_watching(host.id, &session, after_seq)
+                        .await
+                };
                 let _ = control.send(Control::Attached {
                     id,
                     key: session.key.clone(),
                     session,
                     op,
                     after_seq,
-                    result,
+                    result: Box::new(result),
                 });
                 return;
             }
@@ -430,7 +552,7 @@ async fn forward(
             // must be seen before that turn's updates.
             biased;
             command = control.recv() => match command {
-                Some(Control::Start) => started = true,
+                Some(Control::Start) => { started = true; feeds.branch_reset = host.branch_reset.load(Ordering::Acquire); },
                 Some(Control::Rejected { ticket }) => waiting.retain(|w| w.ticket != ticket),
                 Some(Control::RegisterBegin) => feeds.registering += 1,
                 Some(Control::RegisterEnd) => {
@@ -460,10 +582,10 @@ async fn forward(
                 Some(Control::Attaching { key, op }) => feeds.start_attach(key, op),
                 Some(Control::Attached { id, key, op, after_seq, result, session }) => {
                     let attached = result.is_ok() && matches!(feeds.map.get(&key), Some(Feed::Attaching { op: current, .. }) if *current == op);
-                    if feeds.finish_attach(&conn, id, key, op, after_seq, result).is_err() {
+                    if feeds.finish_attach(&conn, id, key, op, after_seq, *result).is_err() {
                         return;
                     }
-                    if attached { register_recipient(runtime.as_deref(), &host, &session, true).await; }
+                    if attached && feeds.map.contains_key(&session.key) { register_recipient(runtime.as_deref(), &host, &session, true).await; }
                 }
                 Some(Control::Detach { id, session }) => {
                     register_recipient(runtime.as_deref(), &host, &session, false).await;
@@ -547,6 +669,9 @@ async fn forward(
                 }
             }
         }
+        for session in std::mem::take(&mut feeds.detached) {
+            register_recipient(runtime.as_deref(), &host, &session, false).await;
+        }
         for turn in feeds.ended.drain(..) {
             for w in waiting
                 .iter_mut()
@@ -594,6 +719,8 @@ struct Feeds {
     dropped: u64,
     /// Turns whose `turn_ended` reached the client (or needs no sending).
     ended: Vec<TurnId>,
+    branch_reset: bool,
+    detached: Vec<loop_protocol::SessionRef>,
 }
 
 /// Most updates held for a Session that is still being created or loaded.
@@ -614,11 +741,28 @@ impl Feeds {
             pending_limit,
             dropped: 0,
             ended: Vec::new(),
+            branch_reset: false,
+            detached: Vec::new(),
         }
     }
 
     /// Send an update to the client, noting a `turn_ended`.
     fn send(&mut self, conn: &Connection, envelope: &UpdateEnvelope) -> Result<(), RpcError> {
+        if matches!(envelope.update, SessionUpdate::BranchReset { .. }) && !self.branch_reset {
+            self.map.remove(&envelope.session);
+            self.detached.push(loop_protocol::SessionRef {
+                instance: envelope.instance.clone(),
+                key: envelope.session.clone(),
+                native_id: envelope.session.to_string(),
+            });
+            let mut notice = envelope.clone();
+            notice.update = SessionUpdate::Notice {
+                level: NoticeLevel::Warning,
+                text: "this Session changed branch; attach again".into(),
+            };
+            conn.notify(methods::SESSION_UPDATE, to_value(&notice))?;
+            return Ok(());
+        }
         conn.notify(methods::SESSION_UPDATE, to_value(envelope))?;
         if let SessionUpdate::TurnEnded { turn_id, .. } = &envelope.update {
             self.ended.push(turn_id.clone());
@@ -715,6 +859,7 @@ impl Feeds {
                 conn.respond(
                     id,
                     Ok(to_value(&AttachResult {
+                        snapshot: attachment.snapshot,
                         latest_seq: attachment.latest_seq,
                         generation: attachment.generation,
                     })),
@@ -729,6 +874,9 @@ impl Feeds {
                     envelope.origin = Origin::Replay;
                     envelope.generation = attachment.generation;
                     self.send(conn, &envelope)?;
+                    if !self.detached.is_empty() {
+                        return Ok(());
+                    }
                 }
                 (last, buffer)
             }
@@ -780,6 +928,7 @@ struct ClientHost {
     conn: Arc<Connection>,
     /// Whether the client declared `interact` at `initialize`.
     interact: Arc<AtomicBool>,
+    branch_reset: AtomicBool,
 }
 
 async fn register_recipient(
@@ -851,6 +1000,43 @@ impl HostServices for ClientHost {
     }
 }
 
+/// Include framing and the caller's actual request id in the export bound.
+fn export_response_fits(id: &PeerRequestId, result: &impl serde::Serialize) -> BackendResult<()> {
+    #[derive(serde::Serialize)]
+    struct Response<'a, T> {
+        jsonrpc: &'static str,
+        id: &'a PeerRequestId,
+        result: &'a T,
+    }
+    struct Bounded(usize);
+    impl std::io::Write for Bounded {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_sub(bytes.len())
+                .ok_or_else(|| std::io::Error::other("encoded Session export exceeds 16 MiB"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(
+        Bounded(loop_protocol::rpc::SESSION_RESPONSE_LIMIT),
+        &Response {
+            jsonrpc: "2.0",
+            id,
+            result,
+        },
+    )
+    .map_err(|error| {
+        loop_protocol::BackendError::failed(
+            loop_protocol::ErrorCategory::Protocol,
+            error.to_string(),
+        )
+    })
+}
+
 fn parse<T: DeserializeOwned>(params: Value) -> Result<T, (i64, String)> {
     serde_json::from_value(params).map_err(|e| (codes::INVALID_PARAMS, e.to_string()))
 }
@@ -886,6 +1072,66 @@ mod tests {
         )
     }
 
+    #[test]
+    fn export_response_bound_includes_json_escaping_and_request_id() {
+        let id = json!("x".repeat(loop_protocol::rpc::SESSION_RESPONSE_LIMIT));
+        assert!(export_response_fits(&id, &json!({})).is_err());
+        assert!(export_response_fits(&json!(1), &json!({"jsonl":"small"})).is_ok());
+    }
+
+    #[tokio::test]
+    async fn reset_replay_detaches_legacy_before_buffered_replacement_updates() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for branch_reset in [false, true] {
+                let (transport, _peer) = memory();
+                let (conn, _incoming) = Connection::new(transport);
+                let mut feeds = Feeds {
+                    branch_reset,
+                    ..Default::default()
+                };
+                feeds.own("other".into());
+                let key = SessionKey("s".into());
+                feeds.start_attach(key.clone(), 1);
+                feeds.route(&conn, update("s", 3)).unwrap();
+                let mut reset = update("s", 2);
+                reset.update = SessionUpdate::BranchReset {
+                    branch_revision: 1,
+                    view_id: "view".into(),
+                    reason: "navigate".into(),
+                };
+                feeds
+                    .finish_attach(
+                        &conn,
+                        json!(1),
+                        key.clone(),
+                        1,
+                        0,
+                        Ok(Attachment {
+                            snapshot: None,
+                            latest_seq: 2,
+                            generation: 1,
+                            replay: Box::new(vec![update("s", 1), reset].into_iter()),
+                        }),
+                    )
+                    .unwrap();
+                assert!(feeds.map.contains_key(&SessionKey("other".into())));
+                if branch_reset {
+                    assert!(matches!(
+                        feeds.map.get(&key),
+                        Some(Feed::Live { last_sent: 3 })
+                    ));
+                    assert!(feeds.detached.is_empty());
+                } else {
+                    assert!(!feeds.map.contains_key(&key));
+                    assert_eq!(feeds.detached.len(), 1);
+                    assert_eq!(feeds.detached[0].key, key);
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn registration_overflow_is_counted_not_silently_skipped() {
         let (conn, _peer) = memory();
@@ -909,6 +1155,7 @@ mod tests {
         feeds.start_attach(key.clone(), 2);
         let empty = || {
             Ok(Attachment {
+                snapshot: None,
                 latest_seq: 0,
                 generation: 1,
                 replay: Box::new(std::iter::empty()),

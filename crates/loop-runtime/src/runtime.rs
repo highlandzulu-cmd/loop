@@ -60,6 +60,8 @@ mod subagent_tests;
 #[cfg(test)]
 mod unload_tests;
 
+mod tree;
+
 /// One Runtime owns all live native Sessions and their durable update streams.
 pub struct Runtime {
     instance: BackendInstanceId,
@@ -90,6 +92,8 @@ pub struct Runtime {
     /// Connections attached to each Session, whether or not they answer
     /// Escalations. A watched Session is never unloaded.
     watchers: Mutex<HashMap<SessionKey, HashSet<u64>>>,
+    views: Mutex<HashMap<String, tree::BranchView>>,
+    destinations: AsyncMutex<()>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -177,6 +181,8 @@ struct LiveSession {
     /// unloading, closing, prompt admission and attaching. Whoever holds it
     /// sees `busy`, `closing` and the attached Surfaces settled.
     lifecycle: AsyncMutex<()>,
+    committed: AsyncMutex<Option<loop_agent::harness::session::SessionFile>>,
+    turn_start_seq: std::sync::atomic::AtomicU64,
     opened: OpenedSession,
     escalations: crate::EscalationHost,
     reference: SessionRef,
@@ -205,6 +211,7 @@ struct LiveSession {
 }
 enum Command {
     Cancel,
+    Publish(Box<SessionUpdate>, oneshot::Sender<BackendResult<()>>),
     Barrier(oneshot::Sender<()>),
     Stop(oneshot::Sender<()>),
 }
@@ -286,6 +293,8 @@ impl Runtime {
             subagents: AsyncMutex::new(None),
             unloaded: Mutex::new(HashSet::new()),
             watchers: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
+            destinations: AsyncMutex::new(()),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -659,6 +668,8 @@ impl Runtime {
             }
             let live = Arc::new(LiveSession {
                 lifecycle: AsyncMutex::new(()),
+                committed: AsyncMutex::new(None),
+                turn_start_seq: std::sync::atomic::AtomicU64::new(0),
                 opened,
                 escalations,
                 reference: reference.clone(),
@@ -794,6 +805,20 @@ impl Runtime {
             .map_err(failed)?;
         // Forks also record a parent; only Subagents report one here.
         let subagents = self.subagent_keys().await?;
+        let mut summaries = HashMap::new();
+        let mut owners = HashMap::new();
+        for meta in &known {
+            let reader = self.store.load(&meta.id).await.map_err(failed)?;
+            let entries = reader.read_entries(None).await.map_err(failed)?;
+            summaries.insert(
+                meta.id.clone(),
+                loop_agent::harness::session::summarize_session(meta, &entries),
+            );
+            owners.insert(
+                meta.id.clone(),
+                self.store.lease(&meta.id).await.map_err(failed)?,
+            );
+        }
         let activity = self.activity.lock().unwrap().clone();
         let sessions = self.sessions.lock().unwrap();
         Ok(known
@@ -807,10 +832,41 @@ impl Runtime {
                     .copied()
                     .unwrap_or(meta.created_at)
                     .max(0) as u64;
+                let summary = summaries.remove(&meta.id).unwrap();
+                let owner = owners.remove(&meta.id).flatten();
+                let foreign = owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.identity != self.identity);
                 SessionInfo {
+                    summary: loop_protocol::rpc::SessionListSummary {
+                        workspace_id: meta
+                            .cwd
+                            .as_ref()
+                            .map(|cwd| tree::workspace_id(std::path::Path::new(cwd))),
+                        backend: Some("native".into()),
+                        first_prompt: summary.title,
+                        message_count: Some(summary.message_count as u64),
+                        selected_model: summary.model,
+                        owner_kind: owner.map(|owner| owner.identity.owner),
+                        availability: Some(
+                            if foreign {
+                                "owned_elsewhere"
+                            } else if live.is_some() {
+                                "loaded"
+                            } else {
+                                "loadable"
+                            }
+                            .into(),
+                        ),
+                        fork_source: meta
+                            .parent_session_id
+                            .as_ref()
+                            .filter(|_| !subagent)
+                            .map(|id| reference(id)),
+                    },
                     r#ref: r,
                     cwd: meta.cwd.map(PathBuf::from).unwrap_or_default(),
-                    name: meta.name,
+                    name: summary.name,
                     parent: meta
                         .parent_session_id
                         .filter(|_| subagent)
@@ -973,7 +1029,9 @@ impl Runtime {
         };
         candidates.sort_by_key(|(ts, _)| *ts);
         for (_, live) in candidates {
-            let lifecycle = live.lifecycle.lock().await;
+            let Ok(lifecycle) = live.lifecycle.try_lock() else {
+                continue;
+            };
             if !self.unloadable(&live).await {
                 continue;
             }
@@ -1049,6 +1107,7 @@ impl Runtime {
                 turn.abort();
             }
             live.permit.lock().await.take();
+            let _lifecycle = live.lifecycle.lock().await;
             live.busy.store(false, Ordering::Release);
         }
         let _ = tokio::time::timeout(grace, live.opened.native.shutdown()).await;
@@ -1231,6 +1290,7 @@ impl Runtime {
         connection: u64,
         session: &SessionRef,
         after_seq: u64,
+        snapshot: bool,
     ) -> BackendResult<loop_wire::Attachment> {
         if session.instance != self.instance || session.key.0 != session.native_id {
             return Err(BackendError::SessionNotFound(session.key.clone()));
@@ -1240,10 +1300,26 @@ impl Runtime {
             let unloading = self
                 .route(session)
                 .map_or(true, |live| live.closing.load(Ordering::Acquire));
-            if unloading && self.was_unloaded(&session.key) {
+            if unloading && (snapshot || self.was_unloaded(&session.key)) {
+                // Finished Subagents have an audit stream but cannot be reopened
+                // without their parent's policy and cancellation lineage.
+                if self.route(session).is_err() && self.subagent_parent(session).await?.is_some() {
+                    return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
+                }
                 self.reload(session).await?;
             }
-            loop_wire::RuntimeControl::attach(self, session, after_seq).await
+            if !snapshot {
+                return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
+            }
+            let live = self.route(session)?;
+            let _lifecycle = live.lifecycle.lock().await;
+            self.check_tree_live(&live)?;
+            barrier(&live).await?;
+            self.announce_control(&live).await?;
+            let mut attachment =
+                loop_wire::RuntimeControl::attach(self, session, after_seq).await?;
+            attachment.snapshot = Some(self.snapshot_locked(&live, attachment.latest_seq).await?);
+            Ok(attachment)
         }
         .await;
         if result.is_err() && added {
@@ -1265,6 +1341,54 @@ impl Runtime {
 }
 #[async_trait]
 impl loop_wire::RuntimeControl for Runtime {
+    async fn tree(
+        &self,
+        params: loop_protocol::rpc::TreeParams,
+    ) -> BackendResult<loop_protocol::rpc::TreeResult> {
+        Runtime::tree(self, params).await
+    }
+    async fn view(
+        &self,
+        params: loop_protocol::rpc::ViewParams,
+    ) -> BackendResult<loop_protocol::rpc::ViewResult> {
+        Runtime::view(self, params).await
+    }
+    async fn navigate(
+        &self,
+        params: loop_protocol::rpc::NavigateParams,
+    ) -> BackendResult<loop_protocol::rpc::NavigateResult> {
+        Runtime::navigate(self, params).await
+    }
+    async fn rename(
+        &self,
+        params: loop_protocol::rpc::RenameParams,
+    ) -> BackendResult<loop_protocol::rpc::MutationResult> {
+        Runtime::rename(self, params).await
+    }
+    async fn fork(
+        &self,
+        params: loop_protocol::rpc::ForkParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        Runtime::fork(self, params).await
+    }
+    async fn clone_session(
+        &self,
+        params: loop_protocol::rpc::CloneParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        Runtime::clone_session(self, params).await
+    }
+    async fn export(
+        &self,
+        params: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::ExportResult> {
+        Runtime::export(self, &params.session).await
+    }
+    async fn import(
+        &self,
+        params: loop_protocol::rpc::ImportParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        Runtime::import(self, params).await
+    }
     async fn recipient(
         &self,
         session: &SessionRef,
@@ -1291,7 +1415,17 @@ impl loop_wire::RuntimeControl for Runtime {
         session: &SessionRef,
         after_seq: u64,
     ) -> BackendResult<loop_wire::Attachment> {
-        self.attach_watched(connection, session, after_seq).await
+        self.attach_watched(connection, session, after_seq, false)
+            .await
+    }
+    async fn attach_snapshot_watching(
+        &self,
+        connection: u64,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<loop_wire::Attachment> {
+        self.attach_watched(connection, session, after_seq, true)
+            .await
     }
     async fn disconnected(&self, connection: u64) {
         self.watchers.lock().unwrap().retain(|_, watching| {
@@ -1334,8 +1468,7 @@ impl loop_wire::RuntimeControl for Runtime {
                 return Err(BackendError::SessionNotFound(session.key.clone()));
             }
         }
-        // The caller already listens for live updates, so anything committed
-        // after this read is delivered live; the caller removes the overlap.
+        // Plain Event Log replay stays read-only, including closed Sessions.
         let records = self
             .log
             .read_after(&session.key, after_seq)
@@ -1352,6 +1485,7 @@ impl loop_wire::RuntimeControl for Runtime {
             None => self.log.latest_seq(&session.key).await.map_err(failed)?,
         };
         Ok(loop_wire::Attachment {
+            snapshot: None,
             latest_seq,
             generation: self.generation,
             replay: Box::new(replay.into_iter()),
@@ -1366,6 +1500,12 @@ impl AgentBackend for Runtime {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            session_tree: true,
+            session_rename: true,
+            session_fork: true,
+            session_transfer: true,
+            branch_snapshot: true,
+            attach_snapshot: true,
             multi_session: true,
             attach: true,
             load_session: true,
@@ -1426,6 +1566,19 @@ impl AgentBackend for Runtime {
             }
             if let Some(error) = live.failure.lock().unwrap().clone() {
                 return Err(failed(error));
+            }
+            if !live.busy.load(Ordering::Acquire) {
+                self.announce_control(&live).await?;
+                barrier(&live).await?;
+                live.turn_start_seq.store(
+                    self.log
+                        .latest_seq(&live.reference.key)
+                        .await
+                        .map_err(failed)?,
+                    Ordering::Release,
+                );
+                *live.committed.lock().await =
+                    Some(live.opened.harness.export_session().await.map_err(failed)?);
             }
             if live
                 .busy
@@ -1651,6 +1804,12 @@ async fn pump(
             command = commands.recv() => {
                 let stop = matches!(&command, Some(Command::Stop(_)));
                 match command {
+                    Some(Command::Publish(update, tx)) => {
+                        let envelope = UpdateEnvelope::live(live.reference.instance.clone(), generation, live.reference.key.clone(), None, 0, *update);
+                        let result = publish(&live,envelope,log.as_ref(),generation,&updates).await;
+                        let _ = tx.send(result.clone());
+                        result
+                    }
                     Some(Command::Cancel) => {
                         let result = log.append_batch(vec![Event { generation, session_key: Some(live.reference.key.clone()), turn: None, ts_ms: now(), kind: EventKind::Cancelled(json!({})) }]).await.map_err(failed);
                         live.cancel.send_modify(|n| *n += 1);

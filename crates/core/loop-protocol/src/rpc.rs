@@ -17,6 +17,23 @@ use crate::update::StopReason;
 
 /// Method names.
 pub mod methods {
+    // Session-tree operations.
+    /// Session-tree RPC method.
+    pub const SESSION_TREE: &str = "session/tree";
+    /// Session-tree RPC method.
+    pub const SESSION_VIEW: &str = "session/view";
+    /// Session-tree RPC method.
+    pub const SESSION_NAVIGATE: &str = "session/navigate";
+    /// Session-tree RPC method.
+    pub const SESSION_RENAME: &str = "session/rename";
+    /// Session-tree RPC method.
+    pub const SESSION_FORK: &str = "session/fork";
+    /// Session-tree RPC method.
+    pub const SESSION_CLONE: &str = "session/clone";
+    /// Session-tree RPC method.
+    pub const SESSION_EXPORT: &str = "session/export";
+    /// Session-tree RPC method.
+    pub const SESSION_IMPORT: &str = "session/import";
     /// Client → server request: agree on a version. [`super::InitializeParams`]
     /// → [`super::InitializeResult`].
     pub const INITIALIZE: &str = "initialize";
@@ -76,6 +93,9 @@ pub struct PeerInfo {
 pub struct ClientCapabilities {
     /// Answers `host/interact` (permission prompts, questions).
     pub interact: bool,
+    /// Replaces its transcript when a branch reset arrives.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub branch_reset: bool,
 }
 
 /// `initialize` params.
@@ -136,6 +156,9 @@ pub struct SessionInfo {
     pub created_ms: u64,
     /// Last activity time in milliseconds since the Unix epoch.
     pub last_active_ms: u64,
+    /// Public picker summary, read without writer admission.
+    #[serde(default, flatten)]
+    pub summary: SessionListSummary,
 }
 
 /// `runtime/status` result: the Runtime process and its Session counts.
@@ -191,9 +214,12 @@ fn is_zero(value: &u64) -> bool {
 }
 
 /// `session/attach` result, sent before replay and live updates.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachResult {
+    /// Immutable public state; absent on legacy servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SessionSnapshot>,
     /// Last update sequence in the replay snapshot, not an audit cursor.
     pub latest_seq: u64,
     /// Runtime generation of the snapshot.
@@ -307,6 +333,8 @@ impl From<PromptResult> for TurnOutcome {
 pub mod error_codes {
     /// [`crate::BackendError::Busy`].
     pub const BUSY: i64 = -32001;
+    /// A control setter used an outdated revision.
+    pub const CONFLICT: i64 = -32005;
     /// [`crate::BackendError::Unsupported`].
     pub const UNSUPPORTED: i64 = -32002;
     /// [`crate::BackendError::SessionNotFound`].
@@ -331,6 +359,10 @@ pub struct RpcErrorBody {
 impl From<&BackendError> for RpcErrorBody {
     fn from(error: &BackendError) -> Self {
         let (code, data) = match error {
+            BackendError::Conflict { revision } => (
+                error_codes::CONFLICT,
+                Some(serde_json::json!({"revision":revision})),
+            ),
             BackendError::Busy => (error_codes::BUSY, None),
             BackendError::Unsupported(what) => {
                 (error_codes::UNSUPPORTED, Some(Value::from(what.as_str())))
@@ -356,6 +388,9 @@ impl RpcErrorBody {
     pub fn into_backend_error(self) -> BackendError {
         let data = self.data.unwrap_or(Value::Null);
         match self.code {
+            error_codes::CONFLICT => BackendError::Conflict {
+                revision: data["revision"].as_u64().unwrap_or_default(),
+            },
             error_codes::BUSY => BackendError::Busy,
             error_codes::UNSUPPORTED => {
                 BackendError::Unsupported(data.as_str().unwrap_or(&self.message).to_owned())
@@ -411,6 +446,19 @@ pub fn json_schema() -> Value {
     let interaction = reference(generator.subschema_for::<InteractParams>());
     let interaction_outcome = reference(generator.subschema_for::<InteractionOutcome>());
     let error = reference(generator.subschema_for::<RpcErrorBody>());
+    let tree_params = reference(generator.subschema_for::<TreeParams>());
+    let tree_result = reference(generator.subschema_for::<TreeResult>());
+    let view_params = reference(generator.subschema_for::<ViewParams>());
+    let view_result = reference(generator.subschema_for::<ViewResult>());
+    let navigate_params = reference(generator.subschema_for::<NavigateParams>());
+    let navigate_result = reference(generator.subschema_for::<NavigateResult>());
+    let rename_params = reference(generator.subschema_for::<RenameParams>());
+    let mutation_result = reference(generator.subschema_for::<MutationResult>());
+    let fork_params = reference(generator.subschema_for::<ForkParams>());
+    let clone_params = reference(generator.subschema_for::<CloneParams>());
+    let destination = reference(generator.subschema_for::<DestinationResult>());
+    let export = reference(generator.subschema_for::<ExportResult>());
+    let import = reference(generator.subschema_for::<ImportParams>());
     let empty = serde_json::json!({"type": "object"});
     let method = |direction: &str, kind: &str, params: &Value, result: Option<&Value>| {
         let mut method = serde_json::json!({
@@ -430,9 +478,18 @@ pub fn json_schema() -> Value {
         "title": "loop-protocol",
         "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
         "protocol_version": PROTOCOL_VERSION,
+        "limits": {"session_transfer_bytes":SESSION_TRANSFER_LIMIT,"encoded_response_bytes":SESSION_RESPONSE_LIMIT,"page_default":100,"page_max":1000},
         "methods": {
             methods::INITIALIZE: method(up, "request", &initialize_params, Some(&initialize_result)),
             methods::SESSION_NEW: method(up, "request", &spec, Some(&session)),
+            methods::SESSION_TREE: method(up, "request", &tree_params, Some(&tree_result)),
+            methods::SESSION_VIEW: method(up, "request", &view_params, Some(&view_result)),
+            methods::SESSION_NAVIGATE: method(up, "request", &navigate_params, Some(&navigate_result)),
+            methods::SESSION_RENAME: method(up, "request", &rename_params, Some(&mutation_result)),
+            methods::SESSION_FORK: method(up, "request", &fork_params, Some(&destination)),
+            methods::SESSION_CLONE: method(up, "request", &clone_params, Some(&destination)),
+            methods::SESSION_EXPORT: method(up, "request", &session_params, Some(&export)),
+            methods::SESSION_IMPORT: method(up, "request", &import, Some(&destination)),
             methods::SESSION_LIST: method(up, "request", &empty, Some(&session_list)),
             methods::SESSION_CLOSE: method(up, "request", &close, Some(&empty)),
             methods::SESSION_ATTACH: method(up, "request", &attach, Some(&attached)),
@@ -451,4 +508,289 @@ pub fn json_schema() -> Value {
         "error": error,
         "$defs": generator.definitions(),
     })
+}
+
+/// Maximum UTF-8 JSONL transfer size, in bytes.
+pub const SESSION_TRANSFER_LIMIT: usize = 8 * 1024 * 1024;
+/// Maximum encoded transfer response size, in bytes.
+pub const SESSION_RESPONSE_LIMIT: usize = 16 * 1024 * 1024;
+
+/// Optional picker data added to v1 Session listings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionListSummary {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Opaque host workspace identity.
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Backend kind.
+    pub backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// First user prompt preview.
+    pub first_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Number of user and assistant messages.
+    pub message_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Selected provider/model id.
+    pub selected_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Current lease owner kind, when leased.
+    pub owner_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Loaded, loadable or owned_elsewhere.
+    pub availability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Source Session for a fork or clone.
+    pub fork_source: Option<SessionRef>,
+}
+
+/// A page of tree entries; cursors are offsets within the captured tree revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TreeParams {
+    /// Session reference.
+    pub session: SessionRef,
+    #[serde(default)]
+    /// Opaque continuation cursor.
+    pub cursor: Option<String>,
+    #[serde(default)]
+    /// Page size: defaults to 100, at most 1000.
+    pub limit: Option<u32>,
+}
+/// An immutable transcript page request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ViewParams {
+    /// Session reference.
+    pub session: SessionRef,
+    /// Immutable transcript view id; expires explicitly.
+    pub view_id: String,
+    #[serde(default)]
+    /// Opaque continuation cursor.
+    pub cursor: Option<String>,
+    #[serde(default)]
+    /// Page size: defaults to 100, at most 1000.
+    pub limit: Option<u32>,
+}
+/// Tree rows and fork points use the native tree's versioned JSON entry format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TreeResult {
+    /// Tree rows in display order.
+    pub entries: Vec<TreeEntry>,
+    /// User-message fork points.
+    pub fork_points: Vec<ForkPoint>,
+    /// Related Session references.
+    pub family: Vec<SessionRef>,
+    /// Committed transcript revision.
+    pub branch_revision: u64,
+    /// Continuation cursor, absent at the end.
+    pub next_cursor: Option<String>,
+}
+/// A page from an immutable transcript view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ViewResult {
+    /// Transcript projection for this page.
+    pub updates: Vec<crate::SessionUpdate>,
+    /// Continuation cursor, absent at the end.
+    pub next_cursor: Option<String>,
+    /// Committed transcript revision.
+    pub branch_revision: u64,
+    /// Event Log high-water mark at capture.
+    pub at_seq: u64,
+}
+/// Move the active branch. None means before its first entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct NavigateParams {
+    /// Session reference.
+    pub session: SessionRef,
+    #[serde(default)]
+    /// Destination entry, or None for the root.
+    pub target_entry_id: Option<String>,
+    #[serde(default)]
+    /// Add a summary of the previous branch.
+    pub summarize: bool,
+    #[serde(default)]
+    /// Reject if the current control revision differs.
+    pub expected_revision: Option<u64>,
+}
+/// Ordered branch mutation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct NavigateResult {
+    /// Committed transcript revision.
+    pub branch_revision: u64,
+    /// Committed update sequence.
+    pub seq: u64,
+}
+/// Change only the Session display name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RenameParams {
+    /// Session reference.
+    pub session: SessionRef,
+    /// Session display name.
+    pub name: String,
+    #[serde(default)]
+    /// Reject if the current control revision differs.
+    pub expected_revision: Option<u64>,
+}
+/// A committed metadata/config mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationResult {
+    /// Committed control revision.
+    pub revision: u64,
+    /// Committed update sequence.
+    pub seq: u64,
+    /// Desired state waiting for the next turn.
+    pub pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Turn after which pending state takes effect.
+    pub applies_after_turn: Option<String>,
+}
+/// Create a new Session before a user message on the source branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ForkParams {
+    /// Session reference.
+    pub session: SessionRef,
+    /// User message excluded from the destination branch.
+    pub before_entry_id: String,
+    #[serde(default)]
+    /// Session display name.
+    pub name: Option<String>,
+    /// Stable retry id; reuse only for identical parameters.
+    pub request_id: String,
+}
+/// Copy a whole committed active branch into a new Session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CloneParams {
+    /// Session reference.
+    pub session: SessionRef,
+    #[serde(default)]
+    /// Session display name.
+    pub name: Option<String>,
+    /// Stable retry id; reuse only for identical parameters.
+    pub request_id: String,
+}
+/// A newly admitted destination; source subscriptions are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DestinationResult {
+    /// Session reference.
+    pub session: SessionRef,
+    /// Opaque host workspace identity.
+    pub workspace_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Source revision captured by a copy.
+    pub source_branch_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Excluded user message to restore in the initiating composer.
+    pub draft: Option<String>,
+}
+/// Bounded payloads written to files by the Surface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ExportResult {
+    /// Session JSONL format version.
+    pub format_version: u32,
+    /// Readable branch transcript.
+    pub markdown: String,
+    /// UTF-8 versioned Session payload.
+    pub jsonl: String,
+    /// Committed transcript revision.
+    pub branch_revision: u64,
+}
+/// Import bytes into a known host workspace, never a supplied host path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ImportParams {
+    /// Opaque host workspace identity.
+    pub workspace_id: String,
+    /// UTF-8 versioned Session payload.
+    pub jsonl: String,
+    /// Stable retry id; reuse only for identical parameters.
+    pub request_id: String,
+}
+
+/// Public Session metadata; never changes the transcript revision.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionMetadataView {
+    /// Session display name.
+    pub name: Option<String>,
+}
+
+/// Consistent public Session state and an immutable transcript captured at at_seq.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionSnapshot {
+    /// Session reference.
+    pub session: SessionRef,
+    /// Host workspace identity.
+    pub workspace_id: String,
+    /// Captured Event Log high-water mark.
+    pub at_seq: u64,
+    /// Control revision.
+    pub revision: u64,
+    /// Branch revision.
+    pub branch_revision: u64,
+    /// Immutable transcript view.
+    pub view_id: String,
+    /// Public metadata.
+    pub metadata: SessionMetadataView,
+    /// Desired public configuration.
+    pub config: Value,
+    /// Effective public configuration.
+    pub effective: Value,
+    /// Pending configuration changes.
+    pub pending: Value,
+    /// Services supported by this Session.
+    pub capabilities: Capabilities,
+    /// Idle, busy or parked.
+    pub turn_state: String,
+    /// Public stats; unknown values are omitted.
+    pub stats: Value,
+    /// Workspace configuration revision.
+    pub workspace_revision: u64,
+}
+
+/// One tree row, including its branch membership and editable user text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TreeEntry {
+    /// Persisted entry id.
+    pub entry_id: String,
+    /// Parent entry, or the root.
+    pub parent_id: Option<String>,
+    /// Indentation level.
+    pub depth: usize,
+    /// User, assistant or summary.
+    pub kind: String,
+    /// Short display text.
+    pub preview: String,
+    /// Full editable prompt, for user rows.
+    pub text: Option<String>,
+    /// Whether this row is on the active branch.
+    pub on_branch: bool,
+    /// Whether this is the current position.
+    pub current: bool,
+}
+/// A user-message fork point returned with its tree page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ForkPoint {
+    /// Persisted user-message entry id.
+    pub entry_id: String,
+    /// One-based user-message index.
+    pub index: usize,
+    /// Full draft text.
+    pub text: String,
+    /// Short display text.
+    pub preview: String,
 }

@@ -7,6 +7,8 @@ use loop_protocol::{BackendError, BackendResult, ErrorCategory, SessionRef, Upda
 
 /// A consistent view of one Session's Event Log, for `session/attach`.
 pub struct Attachment {
+    /// Public Session state captured at the high-water mark.
+    pub snapshot: Option<loop_protocol::rpc::SessionSnapshot>,
     /// Last update `session_seq` in `replay`'s range (the high-water mark).
     pub latest_seq: u64,
     /// Generation to report and to stamp on replayed updates.
@@ -19,6 +21,62 @@ pub struct Attachment {
 /// Session management for a Runtime shared by many connections.
 #[async_trait]
 pub trait RuntimeControl: Send + Sync {
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn tree(
+        &self,
+        _params: loop_protocol::rpc::TreeParams,
+    ) -> BackendResult<loop_protocol::rpc::TreeResult> {
+        Err(BackendError::Unsupported("session/tree".into()))
+    }
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn view(
+        &self,
+        _params: loop_protocol::rpc::ViewParams,
+    ) -> BackendResult<loop_protocol::rpc::ViewResult> {
+        Err(BackendError::Unsupported("session/view".into()))
+    }
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn navigate(
+        &self,
+        _params: loop_protocol::rpc::NavigateParams,
+    ) -> BackendResult<loop_protocol::rpc::NavigateResult> {
+        Err(BackendError::Unsupported("session/navigate".into()))
+    }
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn rename(
+        &self,
+        _params: loop_protocol::rpc::RenameParams,
+    ) -> BackendResult<loop_protocol::rpc::MutationResult> {
+        Err(BackendError::Unsupported("session/rename".into()))
+    }
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn fork(
+        &self,
+        _params: loop_protocol::rpc::ForkParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        Err(BackendError::Unsupported("session/fork".into()))
+    }
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn clone_session(
+        &self,
+        _params: loop_protocol::rpc::CloneParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        Err(BackendError::Unsupported("session/clone_session".into()))
+    }
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn export(
+        &self,
+        _params: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::ExportResult> {
+        Err(BackendError::Unsupported("session/export".into()))
+    }
+    /// Session-tree service; unsupported unless advertised by the backend.
+    async fn import(
+        &self,
+        _params: loop_protocol::rpc::ImportParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        Err(BackendError::Unsupported("session/import".into()))
+    }
     /// Register an interactive connection after replay setup, or remove it on detach.
     async fn recipient(
         &self,
@@ -64,6 +122,15 @@ pub trait RuntimeControl: Send + Sync {
         after_seq: u64,
     ) -> BackendResult<Attachment> {
         self.attach(session, after_seq).await
+    }
+    /// Extended attach for Surfaces that understand immutable transcript views.
+    async fn attach_snapshot_watching(
+        &self,
+        connection: u64,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<Attachment> {
+        self.attach_watching(connection, session, after_seq).await
     }
     /// The Runtime process and its Session counts (`runtime/status`).
     async fn status(&self) -> BackendResult<RuntimeStatus> {

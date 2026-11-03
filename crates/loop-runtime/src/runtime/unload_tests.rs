@@ -374,3 +374,275 @@ async fn an_escalation_raised_while_evicting_keeps_its_session() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn session_tree_transfer_keeps_source_watchable() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 8).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        run(&rt, &source, "original").await;
+        rt.register_watch(&source, 77, true, None).await.unwrap();
+        let exported = rt.export(&source).await.unwrap();
+        let copied = rt
+            .clone_session(loop_protocol::rpc::CloneParams {
+                session: source.clone(),
+                name: None,
+                request_id: "clone-once".into(),
+            })
+            .await
+            .unwrap();
+        assert_ne!(source, copied.session);
+        assert_eq!(rt.watcher_count(&source.key), 1);
+        assert_eq!(
+            copied,
+            rt.clone_session(loop_protocol::rpc::CloneParams {
+                session: source.clone(),
+                name: None,
+                request_id: "clone-once".into(),
+            })
+            .await
+            .unwrap()
+        );
+        run(&rt, &source, "still usable").await;
+        let imported = rt
+            .import(loop_protocol::rpc::ImportParams {
+                workspace_id: copied.workspace_id,
+                jsonl: exported.jsonl.clone(),
+                request_id: "import-once".into(),
+            })
+            .await
+            .unwrap();
+        let restored = rt.export(&imported.session).await.unwrap();
+        let original =
+            loop_agent::harness::session::SessionFile::from_jsonl(&exported.jsonl).unwrap();
+        let restored =
+            loop_agent::harness::session::SessionFile::from_jsonl(&restored.jsonl).unwrap();
+        assert_eq!(original.entries.len(), restored.entries.len());
+        let oversized = loop_protocol::rpc::ImportParams {
+            workspace_id: imported.workspace_id,
+            jsonl: "x".repeat(loop_protocol::rpc::SESSION_TRANSFER_LIMIT + 1),
+            request_id: "too-large".into(),
+        };
+        assert!(rt.import(oversized).await.is_err());
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tree_capacity_retry_and_import_validation_are_side_effect_free() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_protocol::rpc::*;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 2).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.register_watch(&source, 1, true, None).await.unwrap();
+        run(&rt, &source, "one").await;
+        let params = CloneParams {
+            session: source.clone(),
+            name: None,
+            request_id: "capacity-retry".into(),
+        };
+        let destination = rt.clone_session(params.clone()).await.unwrap();
+        rt.register_watch(&destination.session, 2, true, None)
+            .await
+            .unwrap();
+        assert_eq!(rt.clone_session(params.clone()).await.unwrap(), destination);
+        let mut conflict = params.clone();
+        conflict.name = Some("different".into());
+        assert!(rt.clone_session(conflict).await.is_err());
+        let mut full = params;
+        full.request_id = "no-room".into();
+        assert_eq!(
+            rt.clone_session(full).await.unwrap_err(),
+            BackendError::Busy
+        );
+        assert_eq!(rt.list().await.unwrap().len(), 2);
+        run(&rt, &source, "still running").await;
+        let export = rt.export(&source).await.unwrap();
+        let mut lines: Vec<serde_json::Value> = export
+            .jsonl
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        lines[0]["cwd"] = json!("/untrusted/imported/path");
+        lines[1]["parent_id"] = json!("missing-parent");
+        let invalid = lines
+            .into_iter()
+            .map(|line| line.to_string() + "\n")
+            .collect();
+        assert!(rt
+            .import(ImportParams {
+                workspace_id: destination.workspace_id.clone(),
+                jsonl: invalid,
+                request_id: "bad-parent".into()
+            })
+            .await
+            .is_err());
+        assert!(rt
+            .import(ImportParams {
+                workspace_id: "/tmp/not-an-id".into(),
+                jsonl: export.jsonl,
+                request_id: "bad-workspace".into()
+            })
+            .await
+            .is_err());
+        assert_eq!(rt.list().await.unwrap().len(), 2);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn export_rejects_oversized_committed_context_without_truncation() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 2).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        let store = rt.factory.globals.repository.store();
+        store
+            .append_entry(
+                &source.native_id,
+                loop_agent::harness::session::PendingSessionWrite::Message {
+                    message: loop_agent::types::AgentMessage::user_text(
+                        "x".repeat(loop_protocol::rpc::SESSION_TRANSFER_LIMIT),
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(rt
+            .export(&source)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("size limit"));
+        let entries = store
+            .load(&source.native_id)
+            .await
+            .unwrap()
+            .read_entries(None)
+            .await
+            .unwrap();
+        assert!(entries.iter().any(|entry| matches!(
+            entry,
+            loop_agent::harness::session::SessionTreeEntry::Message { .. }
+        )));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn abandoned_destination_releases_its_own_lease_and_receipt() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 2).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        let file = rt
+            .route(&source)
+            .unwrap()
+            .opened
+            .harness
+            .export_session()
+            .await
+            .unwrap();
+        let created = rt
+            .store
+            .create_destination(
+                file,
+                dir.path().to_string_lossy().into_owned(),
+                Some(source.native_id.clone()),
+                "cancelled-copy".into(),
+                "fingerprint".into(),
+                "{}".into(),
+                rt.identity.clone(),
+            )
+            .await
+            .unwrap();
+        let destination = created.id.clone();
+        assert!(rt.store.lease(&destination).await.unwrap().is_some());
+        drop(created);
+        while rt.store.list(None).await.unwrap().len() != 1 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rt.store.lease(&destination).await.unwrap().is_none());
+        assert!(rt
+            .store
+            .destination_receipt("cancelled-copy", "fingerprint")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(rt.store.lease(&source.native_id).await.unwrap().is_some());
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn busy_attach_view_contains_already_committed_current_turn_updates() {
+    tokio::time::timeout(LIMIT,async {
+        use loop_protocol::rpc::ViewParams;
+        use loop_wire::RuntimeControl;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt,_) = runtime(dir.path(),2).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt.prompt(&source,vec![ContentBlock::text("park snapshot")]).await.unwrap();
+        parked(&rt,&source).await;
+        let attachment = rt.attach_snapshot_watching(90,&source,0).await.unwrap();
+        let snapshot = attachment.snapshot.unwrap();
+        let view = rt.view(ViewParams { session:source.clone(),view_id:snapshot.view_id,cursor:None,limit:None }).await.unwrap();
+        assert_eq!(view.at_seq,attachment.latest_seq);
+        assert!(view.updates.iter().any(|update| matches!(update,SessionUpdate::MessageChunk { content,.. } if content.as_text() == Some("park snapshot"))));
+        rt.cancel(&source);
+        turn.outcome().await;
+        rt.shutdown().await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn export_limits_the_whole_encoded_response() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_agent::harness::session::PendingSessionWrite;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 2).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.factory
+            .globals
+            .repository
+            .store()
+            .append_entry(
+                &source.native_id,
+                PendingSessionWrite::Message {
+                    message: loop_agent::types::AgentMessage::user_text("\0".repeat(1_300_000)),
+                },
+            )
+            .await
+            .unwrap();
+        let file = rt
+            .route(&source)
+            .unwrap()
+            .opened
+            .harness
+            .export_session()
+            .await
+            .unwrap();
+        assert!(file
+            .to_jsonl_bounded(loop_protocol::rpc::SESSION_TRANSFER_LIMIT)
+            .is_ok());
+        assert!(rt
+            .export(&source)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("16 MiB"));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

@@ -4566,7 +4566,9 @@ fn handle_update(
         SessionUpdate::Plan { entries } => *live_plan = Some(entries),
         // Approvals arrive through HostServices, not the update stream;
         // unknown updates come from newer backends.
-        SessionUpdate::InteractionRequested { .. }
+        SessionUpdate::BranchReset { .. }
+        | SessionUpdate::ConfigChanged { .. }
+        | SessionUpdate::InteractionRequested { .. }
         | SessionUpdate::InteractionResolved { .. }
         | SessionUpdate::Unknown(_) => {}
     }

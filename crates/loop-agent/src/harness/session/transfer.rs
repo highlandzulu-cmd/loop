@@ -61,11 +61,14 @@ impl SessionFile {
         let meta = reader.metadata();
         let head = reader.read_head().await?;
         let all = reader.read_entries(None).await?;
-        let entries: Vec<SessionTreeEntry> =
+        let entries: Vec<SessionTreeEntry> = if head.is_none() {
+            Vec::new()
+        } else {
             read_session_entries_for_fork(&all, head.as_deref(), SessionForkSelection::All, None)?
-                .into_iter()
-                .filter(|entry| !matches!(entry, SessionTreeEntry::Leaf { .. }))
-                .collect();
+        }
+        .into_iter()
+        .filter(|entry| !matches!(entry, SessionTreeEntry::Leaf { .. }))
+        .collect();
         let name = entries
             .iter()
             .rev()
@@ -102,6 +105,48 @@ impl SessionFile {
         out
     }
 
+    /// Serialize UTF-8 JSONL without allocating beyond the transfer limit.
+    pub fn to_jsonl_bounded(&self, limit: usize) -> Result<String, String> {
+        use std::io::Write;
+        struct Bounded {
+            bytes: Vec<u8>,
+            limit: usize,
+        }
+        impl Write for Bounded {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+                    return Err(std::io::Error::other(
+                        "Session transfer exceeds its size limit",
+                    ));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Bounded {
+            bytes: Vec::new(),
+            limit,
+        };
+        let header = Header {
+            kind: HEADER_TYPE.into(),
+            version: SESSION_FILE_VERSION,
+            id: self.id.clone(),
+            name: self.name.clone(),
+            cwd: self.cwd.clone(),
+            created_at: self.created_at,
+        };
+        serde_json::to_writer(&mut writer, &header).map_err(|error| error.to_string())?;
+        writer.write_all(b"\n").map_err(|error| error.to_string())?;
+        for entry in &self.entries {
+            serde_json::to_writer(&mut writer, entry).map_err(|error| error.to_string())?;
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+        }
+        String::from_utf8(writer.bytes).map_err(|error| error.to_string())
+    }
+
     /// Parse a session file's text.
     pub fn from_jsonl(text: &str) -> Result<Self, String> {
         let mut lines = text.lines().filter(|line| !line.trim().is_empty());
@@ -110,6 +155,9 @@ impl SessionFile {
             .ok()
             .filter(|h: &Header| h.kind == HEADER_TYPE)
             .ok_or("not a Loop session file (export one with /export)")?;
+        if header.version == 0 {
+            return Err("Session file version 0 is unsupported".into());
+        }
         if header.version > SESSION_FILE_VERSION {
             return Err(format!(
                 "session file version {} is newer than this Loop reads ({SESSION_FILE_VERSION}); \
@@ -482,5 +530,24 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("line 2"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_jsonl_accepts_the_exact_utf8_limit_and_rejects_one_byte_less() {
+        let file = SessionFile {
+            id: "id".into(),
+            name: Some("名字".into()),
+            cwd: None,
+            created_at: 0,
+            entries: Vec::new(),
+        };
+        let expected = file.to_jsonl();
+        assert_eq!(file.to_jsonl_bounded(expected.len()).unwrap(), expected);
+        assert!(file.to_jsonl_bounded(expected.len() - 1).is_err());
     }
 }

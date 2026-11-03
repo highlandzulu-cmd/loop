@@ -641,3 +641,61 @@ async fn detaching_mid_turn_clears_observed_busy() {
     .await
     .expect("test timed out");
 }
+
+#[tokio::test]
+async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::*;
+        use loop_protocol::SessionUpdate;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log.clone()).await;
+        let (legacy, _legacy_server) = connect(&rt).await;
+        let source = legacy.new_session(SessionSpec::default()).await.unwrap();
+        let other = legacy.new_session(SessionSpec::default()).await.unwrap();
+        say(&legacy, &source, "source prompt").await;
+        let (server, client) = memory();
+        let _capable_server = serve_with_control(rt.clone(), rt.clone(), server, info(), ServeOptions { owns_backend:false });
+        let capable = RemoteBackend::connect_with_capabilities(client,info(),Arc::new(Reject),ClientCapabilities { interact:true,branch_reset:true }).await.unwrap();
+        let mut capable_rx = capable.subscribe();
+        let attached = capable.attach(&source,log.latest_seq(&source.key).await.unwrap()).await.unwrap();
+        let snapshot = attached.snapshot.unwrap();
+        let original_view = snapshot.view_id.clone();
+        let mut legacy_rx = legacy.subscribe();
+        let renamed = capable.rename(RenameParams { session:source.clone(),name:"  renamed  ".into(),expected_revision:Some(snapshot.revision) }).await.unwrap();
+        for receiver in [&mut capable_rx,&mut legacy_rx] {
+            let events = collect(receiver,&source.key,renamed.seq).await;
+            assert!(matches!(events.last().unwrap().update,SessionUpdate::ConfigChanged { ref metadata, .. } if metadata.name.as_deref() == Some("renamed")));
+            assert!(!events.iter().any(|event| matches!(event.update,SessionUpdate::BranchReset { .. })));
+        }
+        let tree = capable.tree(TreeParams { session:source.clone(),cursor:None,limit:Some(1) }).await.unwrap();
+        let point = tree.fork_points[0].entry_id.as_str();
+        let fork = capable.fork(ForkParams { session:source.clone(),before_entry_id:point.into(),name:None,request_id:"wire-fork".into() }).await.unwrap();
+        assert_ne!(fork.session,source);
+        assert_eq!(fork.draft.as_deref(),Some("source prompt"));
+        assert_eq!(rt.watcher_count(&source.key),2);
+        let reset = capable.navigate(NavigateParams { session:source.clone(),target_entry_id:None,summarize:false,expected_revision:Some(renamed.revision) }).await.unwrap();
+        let events = collect(&mut capable_rx,&source.key,reset.seq).await;
+        let view_id = match &events.last().unwrap().update {
+            SessionUpdate::BranchReset { view_id,.. } => view_id.clone(),
+            other => panic!("expected reset, got {other:?}"),
+        };
+        let events = collect(&mut legacy_rx,&source.key,reset.seq).await;
+        assert!(matches!(&events.last().unwrap().update,SessionUpdate::Notice { text,.. } if text == "this Session changed branch; attach again"));
+        assert!(!events.iter().any(|event| matches!(event.update,SessionUpdate::BranchReset { .. })));
+        while rt.watcher_count(&source.key) != 1 { tokio::task::yield_now().await; }
+        assert_eq!(rt.watcher_count(&other.key),1);
+        let reset_view = capable.view(ViewParams { session:source.clone(),view_id,cursor:None,limit:None }).await.unwrap();
+        assert!(reset_view.updates.is_empty());
+        let old_view = capable.view(ViewParams { session:source.clone(),view_id:original_view,cursor:None,limit:None }).await.unwrap();
+        assert!(!old_view.updates.is_empty(),"old snapshot must stay immutable");
+        legacy.attach(&source,reset.seq).await.unwrap();
+        say(&capable,&source,"after reset").await;
+        let end = log.latest_seq(&source.key).await.unwrap();
+        assert!(!collect(&mut legacy_rx,&source.key,end).await.is_empty());
+        let payload = capable.export(SessionParams { session:source.clone() }).await.unwrap();
+        let imported = capable.import(ImportParams { workspace_id:fork.workspace_id,jsonl:payload.jsonl,request_id:"wire-import".into() }).await.unwrap();
+        assert_ne!(imported.session,source);
+        rt.shutdown().await;
+    }).await.unwrap();
+}

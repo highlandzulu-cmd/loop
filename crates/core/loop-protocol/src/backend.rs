@@ -35,6 +35,11 @@ pub enum BackendError {
     Unsupported(String),
     /// The session does not exist or belongs to another backend.
     SessionNotFound(SessionKey),
+    /// A setter used an outdated control revision.
+    Conflict {
+        /// Current committed control revision.
+        revision: u64,
+    },
     /// The operation failed.
     Failed(ErrorInfo),
 }
@@ -49,6 +54,9 @@ impl BackendError {
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Conflict { revision } => {
+                write!(f, "revision conflict: current revision is {revision}")
+            }
             Self::Busy => f.write_str("a turn is already running"),
             Self::Unsupported(what) => write!(f, "not supported by this agent: {what}"),
             Self::SessionNotFound(key) => write!(f, "session not found: {key}"),

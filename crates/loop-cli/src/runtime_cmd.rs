@@ -303,6 +303,69 @@ struct Control {
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_wire::RuntimeControl for Control {
+    async fn attach_snapshot_watching(
+        &self,
+        connection: u64,
+        session: &loop_protocol::SessionRef,
+        after_seq: u64,
+    ) -> loop_protocol::BackendResult<loop_wire::Attachment> {
+        loop_wire::RuntimeControl::attach_snapshot_watching(
+            self.runtime.as_ref(),
+            connection,
+            session,
+            after_seq,
+        )
+        .await
+    }
+    // Session-tree services are forwarded as one additive group.
+    async fn tree(
+        &self,
+        params: loop_protocol::rpc::TreeParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::TreeResult> {
+        loop_wire::RuntimeControl::tree(self.runtime.as_ref(), params).await
+    }
+    async fn view(
+        &self,
+        params: loop_protocol::rpc::ViewParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::ViewResult> {
+        loop_wire::RuntimeControl::view(self.runtime.as_ref(), params).await
+    }
+    async fn navigate(
+        &self,
+        params: loop_protocol::rpc::NavigateParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::NavigateResult> {
+        loop_wire::RuntimeControl::navigate(self.runtime.as_ref(), params).await
+    }
+    async fn rename(
+        &self,
+        params: loop_protocol::rpc::RenameParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::MutationResult> {
+        loop_wire::RuntimeControl::rename(self.runtime.as_ref(), params).await
+    }
+    async fn fork(
+        &self,
+        params: loop_protocol::rpc::ForkParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::DestinationResult> {
+        loop_wire::RuntimeControl::fork(self.runtime.as_ref(), params).await
+    }
+    async fn clone_session(
+        &self,
+        params: loop_protocol::rpc::CloneParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::DestinationResult> {
+        loop_wire::RuntimeControl::clone_session(self.runtime.as_ref(), params).await
+    }
+    async fn export(
+        &self,
+        params: loop_protocol::rpc::SessionParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::ExportResult> {
+        loop_wire::RuntimeControl::export(self.runtime.as_ref(), params).await
+    }
+    async fn import(
+        &self,
+        params: loop_protocol::rpc::ImportParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::DestinationResult> {
+        loop_wire::RuntimeControl::import(self.runtime.as_ref(), params).await
+    }
     async fn recipient(
         &self,
         session: &loop_protocol::SessionRef,

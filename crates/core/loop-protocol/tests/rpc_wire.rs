@@ -169,6 +169,7 @@ fn session_list_info_wire() {
     use loop_protocol::rpc::SessionInfo;
     roundtrip(
         &vec![SessionInfo {
+            summary: Default::default(),
             r#ref: session(),
             cwd: "/work/repo".into(),
             name: Some("Review".into()),
@@ -223,6 +224,7 @@ fn session_control_wire_and_defaults() {
     roundtrip(&attach, json!({"session":reference}));
     roundtrip(
         &AttachResult {
+            snapshot: None,
             latest_seq: 42,
             generation: 3,
         },
@@ -329,4 +331,58 @@ fn interactions_route_to_a_session_and_withdraw_by_native_id() {
         },
         json!({"session":{"instance":"native","key":"s1","native_id":"n1"},"id":"p1"}),
     );
+}
+
+#[test]
+fn session_tree_v1_capabilities_and_event_goldens() {
+    use loop_protocol::rpc::*;
+    use loop_protocol::SessionUpdate;
+    let legacy: ClientCapabilities = serde_json::from_value(json!({"interact":true})).unwrap();
+    assert!(!legacy.branch_reset);
+    let capabilities: Capabilities = serde_json::from_value(json!({})).unwrap();
+    assert!(
+        !capabilities.session_tree
+            && !capabilities.branch_snapshot
+            && !capabilities.session_transfer
+    );
+    roundtrip(
+        &NavigateParams {
+            session: session(),
+            target_entry_id: None,
+            summarize: false,
+            expected_revision: Some(2),
+        },
+        json!({"session":session(),"target_entry_id":null,"summarize":false,"expected_revision":2}),
+    );
+    roundtrip(
+        &SessionUpdate::BranchReset {
+            branch_revision: 3,
+            view_id: "view-1".into(),
+            reason: "navigate".into(),
+        },
+        json!({"type":"branch_reset","branch_revision":3,"view_id":"view-1","reason":"navigate"}),
+    );
+    roundtrip(
+        &SessionUpdate::ConfigChanged {
+            revision: 2,
+            metadata: SessionMetadataView {
+                name: Some("name".into()),
+            },
+            config: json!({}),
+            effective: json!({}),
+            pending: json!({}),
+            applies_after_turn: None,
+            workspace_revision: 0,
+        },
+        json!({"type":"config_changed","revision":2,"metadata":{"name":"name"},"config":{},"effective":{},"pending":{},"workspace_revision":0}),
+    );
+}
+
+#[test]
+fn revision_conflicts_preserve_the_current_revision_over_the_wire() {
+    let error = loop_protocol::BackendError::Conflict { revision: 7 };
+    let body = loop_protocol::rpc::RpcErrorBody::from(&error);
+    assert_eq!(body.code, loop_protocol::rpc::error_codes::CONFLICT);
+    assert_eq!(body.data, Some(json!({"revision":7})));
+    assert_eq!(body.into_backend_error(), error);
 }
