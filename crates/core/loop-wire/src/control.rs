@@ -15,7 +15,8 @@ pub struct Attachment {
     pub generation: u64,
     /// The current branch's transcript, stamped at its high-water mark, for a
     /// client that cannot replace its transcript on BranchReset. Sent whole,
-    /// before `replay`, whatever the client's cursor.
+    /// before `replay`, whatever the client's cursor; earlier updates keep
+    /// the client's cursor and only the last one advances it to the stamp.
     pub baseline: Vec<UpdateEnvelope>,
     /// Committed updates after the client's cursor through `latest_seq`, in
     /// contiguous order.

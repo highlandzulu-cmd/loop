@@ -866,9 +866,15 @@ impl Feeds {
                 );
                 // A cursor ahead of the log would hide new updates.
                 let mut last = after_seq.min(attachment.latest_seq);
-                // A fresh branch transcript; it leaves the cursor at its stamp.
-                for mut envelope in attachment.baseline {
-                    last = last.max(envelope.seq);
+                // A fresh branch transcript. Only its last update carries its
+                // stamp, so a client's cursor reaches it once the whole
+                // transcript has arrived.
+                let count = attachment.baseline.len();
+                for (index, mut envelope) in attachment.baseline.into_iter().enumerate() {
+                    if index + 1 == count {
+                        last = last.max(envelope.seq);
+                    }
+                    envelope.seq = last;
                     envelope.origin = Origin::Replay;
                     envelope.generation = attachment.generation;
                     self.send(conn, &envelope)?;
@@ -1151,6 +1157,48 @@ mod tests {
         }
         assert_eq!(feeds.pending.len(), 4);
         assert_eq!(feeds.dropped, 6, "overflow must be recorded");
+    }
+
+    #[tokio::test]
+    async fn a_baseline_advances_the_cursor_only_with_its_last_update() {
+        let (transport, mut peer) = memory();
+        let (conn, _incoming) = Connection::new(transport);
+        let mut feeds = Feeds::default();
+        let key = SessionKey("s".into());
+        feeds.start_attach(key.clone(), 1);
+        feeds
+            .finish_attach(
+                &conn,
+                json!(1),
+                key.clone(),
+                1,
+                5,
+                Ok(Attachment {
+                    snapshot: None,
+                    latest_seq: 9,
+                    generation: 1,
+                    baseline: vec![update("s", 9), update("s", 9), update("s", 9)],
+                    // Superseded by the baseline: never sent.
+                    replay: Box::new(vec![update("s", 9)].into_iter()),
+                }),
+            )
+            .unwrap();
+        assert!(matches!(
+            feeds.map.get(&key),
+            Some(Feed::Live { last_sent: 9 })
+        ));
+        let mut seqs = Vec::new();
+        while seqs.len() < 3 {
+            let message = tokio::time::timeout(Duration::from_secs(10), peer.incoming.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let message: Value = serde_json::from_str(&message).unwrap();
+            if message["method"] == methods::SESSION_UPDATE {
+                seqs.push(message["params"]["seq"].as_u64().unwrap());
+            }
+        }
+        assert_eq!(seqs, [5, 5, 9]);
     }
 
     #[tokio::test]

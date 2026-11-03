@@ -1315,7 +1315,14 @@ impl Runtime {
                 if self.route(session).is_err() && self.subagent_parent(session).await?.is_some() {
                     return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
                 }
-                self.reload(session).await?;
+                if let Err(error) = self.reload(session).await {
+                    // A Session that cannot be loaded here (for example, owned
+                    // elsewhere) keeps read-only replay; it detaches at the reset.
+                    if snapshot || self.was_unloaded(&session.key) {
+                        return Err(error);
+                    }
+                    return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
+                }
             }
             if !fresh {
                 return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
