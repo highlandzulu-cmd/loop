@@ -1167,6 +1167,7 @@ async fn workflow_success_streams_the_plan_tasks_and_output_in_order() {
         let dir = tempfile::tempdir().unwrap();
         let runtime = fixture(dir.path()).await;
         test_support::plan_shell_task(&runtime);
+        test_support::set_workflow_environment(&runtime);
         let mut updates = runtime.backend().subscribe();
         let result = runtime.workflow("inspect", Some(1)).await.unwrap();
         let mut states = vec![];
@@ -1179,7 +1180,11 @@ async fn workflow_success_streams_the_plan_tasks_and_output_in_order() {
                     let completed = progress.completion.unwrap();
                     assert!(completed.success);
                     assert_eq!(completed.completed_count, 1);
-                    assert!(completed.output.contains("workflow-output"));
+                    assert!(
+                        completed.output.contains("workflow-output:caller"),
+                        "{}",
+                        completed.output
+                    );
                     break;
                 }
             }

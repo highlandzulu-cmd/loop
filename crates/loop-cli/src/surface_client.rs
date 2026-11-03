@@ -10,7 +10,9 @@ mod native_sessions;
 use crate::theme::Theme;
 use crate::{keybindings, CliRuntime, PendingAgent, StartupSessions, ToolApprovalBridge};
 mod native_host;
+mod remote;
 use native_host::NativeHost;
+pub use remote::{connect, RemoteHost};
 
 /// A Surface's client services and local terminal state.
 ///
@@ -35,6 +37,16 @@ use native_host::NativeHost;
 /// ```
 pub struct SurfaceClient {
     host: NativeHost,
+    remote: Option<Arc<loop_wire::RemoteBackend>>,
+    remote_host: Option<Arc<RemoteHost>>,
+    remote_snapshot: Option<SessionSnapshot>,
+    remote_resources: Option<ResourceView>,
+    remote_mcp: Option<loop_protocol::admin::McpResult>,
+    remote_updates:
+        std::sync::Mutex<Option<tokio::sync::broadcast::Receiver<loop_protocol::UpdateEnvelope>>>,
+    remote_cursor: u64,
+    remote_view: Option<String>,
+    remote_redraw: bool,
     /// Tests start their own sandboxes instead of a platform one.
     #[cfg(test)]
     pub(crate) sandbox_starter: Option<native_admin::SandboxStarter>,
@@ -131,6 +143,15 @@ impl From<CliRuntime> for SurfaceClient {
             native_backend: native,
             workspace_id,
             host: NativeHost { inner },
+            remote: None,
+            remote_host: None,
+            remote_snapshot: None,
+            remote_resources: None,
+            remote_mcp: None,
+            remote_updates: Default::default(),
+            remote_cursor: 0,
+            remote_view: None,
+            remote_redraw: false,
             #[cfg(test)]
             sandbox_starter: None,
             confirm_timeout_default: None,
@@ -223,12 +244,22 @@ impl SurfaceClient {
         self.host.inner.active_model_label()
     }
     pub fn native_effort(&self) -> String {
-        self.host.inner.native_effort()
+        self.remote_snapshot
+            .as_ref()
+            .and_then(|s| s.config.effort.clone())
+            .unwrap_or_else(|| self.host.inner.native_effort())
     }
     pub fn selected_model_spec(&self) -> Option<String> {
         self.host.inner.selected_model_spec()
     }
     pub fn session_ref(&self) -> loop_protocol::SessionRef {
+        if let Some(remote) = &self.remote {
+            return SessionRef {
+                instance: remote.instance().clone(),
+                key: self.session_id().clone().into(),
+                native_id: self.session_id().clone(),
+            };
+        }
         self.host.inner.session_ref()
     }
     pub fn note_prompt(&self, prompt: &str) {
@@ -247,6 +278,10 @@ impl SurfaceClient {
         self.host.inner.sync_agent_effort().await
     }
     pub async fn use_native(&mut self) {
+        if self.is_remote() {
+            let _ = self.refresh_remote().await;
+            return;
+        }
         self.host.inner.use_native().await
     }
     /// The model catalog, for tests that compare the picker with it.
@@ -296,6 +331,11 @@ impl SurfaceClient {
             key: id.into(),
             native_id: id.into(),
         };
+        if self.is_remote() {
+            self.attach_remote(session).await?;
+            self.host.inner.resumed = true;
+            return Ok(());
+        }
         self.native_backend
             .load_session(&session, SessionSpec::default())
             .await?;
@@ -319,12 +359,26 @@ impl SurfaceClient {
     }
 
     pub async fn new_session(&mut self) -> anyhow::Result<()> {
-        if self.is_native() {
+        if self.is_remote() {
+            let session = self
+                .native_backend
+                .new_session(SessionSpec {
+                    cwd: Some(self.cwd().clone()),
+                    env: Some(crate::runtime_launch::session_environment(
+                        self.remote.as_ref().unwrap(),
+                        self.agent_dir(),
+                    )?),
+                    ..Default::default()
+                })
+                .await?;
+            self.attach_remote(session).await?;
+        } else if self.is_native() {
             let session = self
                 .native_backend
                 .new_session(SessionSpec {
                     cwd: Some(self.cwd().clone()),
                     name: None,
+                    ..Default::default()
                 })
                 .await?;
             self.host.inner.session_id = session.native_id;
@@ -411,7 +465,11 @@ impl SurfaceClient {
                 expected_revision: None,
             })
             .await?;
-        self.refresh_native_model();
+        if self.is_remote() {
+            self.refresh_remote().await?;
+        } else {
+            self.refresh_native_model();
+        }
         Ok(())
     }
 
@@ -452,6 +510,9 @@ impl SurfaceClient {
             .open_native_session(&destination.session.native_id)
             .await
         {
+            if self.is_remote() {
+                return Err(error);
+            }
             self.native_sessions
                 .discard_destination(&destination.session)
                 .await
@@ -500,14 +561,17 @@ impl SurfaceClient {
 
     /// The native Session's model choices, in picker order.
     pub async fn available_models(&self) -> anyhow::Result<Vec<loop_ai::Model>> {
-        let session = self.host.inner.native.current_session().await;
+        let session = self.session_ref();
         let choices = self.native_control()?.models(&session).await?;
         let models = choices
             .models
             .into_iter()
             .filter_map(|choice| {
                 let (provider, id) = choice.id.split_once('/')?;
-                self.host.inner.models.get_model(provider, id)
+                self.host.inner.models.get_model(provider, id).or_else(|| {
+                    self.is_remote()
+                        .then(|| remote::model_view(&choice.id, &choice.name))
+                })
             })
             .collect();
         Ok(crate::config::providers::sort_models_for_picker(models))
@@ -530,6 +594,19 @@ impl SurfaceClient {
     }
 
     pub async fn resolve_model(&self, spec: &str) -> anyhow::Result<loop_ai::Model> {
+        if self.is_remote() {
+            let matches: Vec<_> = self
+                .available_models()
+                .await?
+                .into_iter()
+                .filter(|m| spec == m.id || spec == format!("{}/{}", m.provider, m.id))
+                .collect();
+            return match matches.as_slice() {
+                [model] => Ok(model.clone()),
+                [] => anyhow::bail!("unknown model `{spec}`"),
+                _ => anyhow::bail!("ambiguous model `{spec}`; use provider/model"),
+            };
+        }
         // Preserve bare ids, provider/model ids and the existing ambiguity help.
         loop_app_core::model_selection::resolve_model_spec(&self.host.inner.models, spec)
     }
@@ -539,11 +616,16 @@ impl SurfaceClient {
         provider: &str,
         id: &str,
     ) -> anyhow::Result<(loop_ai::Model, bool)> {
-        if loop_ai::CredentialStore::is_logged_out(self.host.inner.credentials.as_ref(), provider) {
+        if !self.is_remote()
+            && loop_ai::CredentialStore::is_logged_out(
+                self.host.inner.credentials.as_ref(),
+                provider,
+            )
+        {
             anyhow::bail!("{provider} is logged out; run /login {provider}");
         }
         let model = self.resolve_model(&format!("{provider}/{id}")).await?;
-        let session = self.host.inner.native.current_session().await;
+        let session = self.session_ref();
         let changed = self
             .native_control()?
             .set_model(&session, &format!("{provider}/{id}"), None)
@@ -1101,13 +1183,20 @@ impl SurfaceClient {
     /// S3.4 admin request service for the native owner. The borrow prevents the
     /// UI from changing host state during an administrative operation.
     pub fn admin(&mut self) -> impl loop_wire::RuntimeAdmin + '_ {
-        native_admin::NativeAdmin(tokio::sync::Mutex::new(&mut self.host.inner))
+        native_admin::NativeAdmin(
+            tokio::sync::Mutex::new(&mut self.host.inner),
+            self.remote.as_deref(),
+        )
     }
     pub fn workspace_id(&self) -> &str {
         &self.workspace_id
     }
     pub fn permission_mode(&self) -> loop_app_core::permissions::PermissionMode {
-        self.host.inner.permission_mode()
+        self.remote_snapshot
+            .as_ref()
+            .and_then(|s| s.config.mode.as_deref())
+            .and_then(loop_app_core::permissions::PermissionMode::parse)
+            .unwrap_or_else(|| self.host.inner.permission_mode())
     }
     pub async fn set_permission_mode(
         &mut self,
@@ -1136,6 +1225,9 @@ impl SurfaceClient {
             expected_revision: None,
         };
         self.admin().trust(params).await?;
+        if self.is_remote() {
+            self.host.inner.project_trusted = trusted;
+        }
         Ok(())
     }
     pub fn supports_sandbox(&self) -> bool {
@@ -1145,6 +1237,9 @@ impl SurfaceClient {
         self.backend().capabilities().session_ttfb && self.backend().model_control().is_some()
     }
     pub fn sandbox_service(&self) -> Arc<dyn loop_wire::RuntimeAdmin> {
+        if let Some(remote) = &self.remote {
+            return remote.clone();
+        }
         Arc::new(self.native_sandbox())
     }
     fn native_sandbox(&self) -> native_admin::NativeSandbox {
@@ -1184,6 +1279,10 @@ impl SurfaceClient {
         &mut self,
         host: loop_app_core::interaction::InteractionQueue,
     ) -> anyhow::Result<()> {
+        if let Some(remote) = &self.remote_host {
+            remote.install(host);
+            return Ok(());
+        }
         let r = &mut self.host.inner;
         let env = r.harness.tool_env().await?;
         let grants = r
@@ -1221,9 +1320,19 @@ impl SurfaceClient {
             .unwrap_or_default()
     }
     pub fn mcp_configured(&self) -> bool {
+        if let Some(mcp) = &self.remote_mcp {
+            return !mcp.servers.is_empty();
+        }
         !self.host.inner.settings.mcp_servers.is_empty()
     }
     pub fn mcp_enabled(&self, name: &str) -> Option<bool> {
+        if let Some(mcp) = &self.remote_mcp {
+            return mcp
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| s.enabled);
+        }
         self.host
             .inner
             .settings
@@ -1240,6 +1349,13 @@ impl SurfaceClient {
             })
     }
     pub fn mcp_choices(&self) -> Vec<(String, String)> {
+        if let Some(mcp) = &self.remote_mcp {
+            return mcp
+                .servers
+                .iter()
+                .map(|s| (s.name.clone(), format!("{} tools", s.tools)))
+                .collect();
+        }
         self.host
             .inner
             .settings
@@ -1273,7 +1389,11 @@ impl SurfaceClient {
             name,
             expected_revision: None,
         };
-        Ok(self.admin().mcp(params).await?)
+        let result = self.admin().mcp(params).await?;
+        if self.is_remote() {
+            self.remote_mcp = Some(result.clone());
+        }
+        Ok(result)
     }
     pub async fn mcp_tools(&self) -> Vec<(String, Vec<String>)> {
         self.host.inner.mcp_client.list_connection_tools().await
@@ -1294,6 +1414,9 @@ impl SurfaceClient {
     ) -> anyhow::Result<
         futures::future::BoxFuture<'static, Result<loop_mcp::OAuthLoginOutcome, String>>,
     > {
+        if self.is_remote() {
+            anyhow::bail!("run MCP login on the Runtime host");
+        }
         let r = &self.host.inner;
         let cfg = r
             .settings
@@ -1317,6 +1440,9 @@ impl SurfaceClient {
         }))
     }
     pub async fn finish_mcp_login(&self, name: &str) -> anyhow::Result<Option<usize>> {
+        if self.is_remote() {
+            anyhow::bail!("run MCP login on the Runtime host");
+        }
         let r = &self.host.inner;
         if self.mcp_enabled(name) == Some(false) {
             return Ok(None);
@@ -1342,6 +1468,9 @@ impl SurfaceClient {
         Ok(Some(count))
     }
     pub async fn mcp_logout(&self, name: &str) -> anyhow::Result<bool> {
+        if self.is_remote() {
+            anyhow::bail!("run MCP logout on the Runtime host");
+        }
         let r = &self.host.inner;
         if self.mcp_enabled(name).is_none() {
             anyhow::bail!("mcp server not found: {name} (see /mcp list)");
@@ -1381,7 +1510,7 @@ impl SurfaceClient {
 }
 
 /// Immutable workspace definitions for local pickers and autocomplete.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ResourceView {
     pub skills: Vec<loop_protocol::admin::SkillStatus>,
     pub templates: Vec<loop_protocol::admin::TemplateInfo>,
@@ -1391,6 +1520,9 @@ pub struct ResourceView {
 }
 impl SurfaceClient {
     pub fn resource_view(&self) -> ResourceView {
+        if let Some(view) = &self.remote_resources {
+            return view.clone();
+        }
         let r = &self.host.inner;
         ResourceView {
             skills: r
@@ -1436,7 +1568,10 @@ impl SurfaceClient {
             name: Some(name.into()),
             expected_revision: None,
         };
-        self.admin().skills(params).await?;
+        let result = self.admin().skills(params).await?;
+        if let Some(view) = &mut self.remote_resources {
+            view.skills = result.skills;
+        }
         Ok(true)
     }
     pub async fn render_template(
@@ -1481,7 +1616,7 @@ impl SurfaceClient {
         }
         self.sessions
             .skill(SkillParams {
-                session: self.host.inner.native.current_session().await,
+                session: self.session_ref(),
                 name: name.into(),
                 active: true,
                 expected_revision: None,
@@ -1541,7 +1676,7 @@ impl SurfaceClient {
         Ok(self
             .sessions
             .config(SessionParams {
-                session: self.host.inner.native.current_session().await,
+                session: self.session_ref(),
             })
             .await?)
     }

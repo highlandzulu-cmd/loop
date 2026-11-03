@@ -1,5 +1,5 @@
-//! Every way a terminal `loop` process ends must leave no Session lease row
-//! behind in `sessions.db`. Each test runs the real binary against a fake
+//! In-process exits release their leases; default TUI exits leave the Runtime
+//! owning its Session until it stops. Each test runs the real binary against a fake
 //! OpenAI-compatible model with an isolated agent directory.
 
 use loop_agent::harness::session::sqlite::SqliteSessionStore;
@@ -136,6 +136,15 @@ impl Fixture {
     async fn leases(&self) -> Vec<(String, String, u32)> {
         leases(&self.db()).await
     }
+    async fn assert_runtime_lease_survives_detach(&self, surface_pid: u32) {
+        let leases = self.leases().await;
+        assert_eq!(leases.len(), 1, "{leases:?}");
+        assert_eq!(leases[0].1, "runtime");
+        assert_ne!(leases[0].2, surface_pid);
+        let stopped = output(self.command(&["runtime", "stop"])).await;
+        assert!(stopped.status.success(), "{stopped:?}");
+        assert_eq!(self.leases().await, []);
+    }
     /// Wait until the process has written its Session's lease.
     async fn wait_for_lease(&self) {
         let found = tokio::time::timeout(WAIT, async {
@@ -229,6 +238,10 @@ async fn print_that_succeeds_leaves_no_lease() {
         assert!(out.status.success(), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
         assert_eq!(fx.leases().await, [], "{out:?}");
+        assert!(
+            !fx.agent.join("run/runtime.sock").exists(),
+            "--print must stay in-process"
+        );
         // The shutdown barrier ran before release: the turn is stored.
         use loop_agent::harness::session::SessionStore;
         let store = SqliteSessionStore::open(fx.db()).unwrap();
@@ -395,7 +408,7 @@ impl Pty {
 
 #[tokio::test]
 
-async fn quitting_the_tui_leaves_no_lease() {
+async fn quitting_the_tui_keeps_the_runtime_lease_until_the_owner_stops() {
     bounded(async {
         let fx = Fixture::new(Model::Answer);
         let pty = Pty::open();
@@ -405,6 +418,7 @@ async fn quitting_the_tui_leaves_no_lease() {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let surface_pid = child.id().unwrap();
         let screen = pty.drain();
         fx.wait_for_lease().await;
         // Let the TUI take the terminal before sending keys.
@@ -430,14 +444,14 @@ async fn quitting_the_tui_leaves_no_lease() {
         });
         let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
         assert!(status.success(), "{status}\n{shown}");
-        assert_eq!(fx.leases().await, []);
+        fx.assert_runtime_lease_survives_detach(surface_pid).await;
     })
     .await
 }
 
 #[tokio::test]
 
-async fn a_tui_ended_by_sighup_leaves_no_lease() {
+async fn a_tui_ended_by_sighup_keeps_the_runtime_lease_until_the_owner_stops() {
     bounded(async {
         let fx = Fixture::new(Model::Answer);
         let pty = Pty::open();
@@ -447,6 +461,7 @@ async fn a_tui_ended_by_sighup_leaves_no_lease() {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let surface_pid = child.id().unwrap();
         let _screen = pty.drain();
         fx.wait_for_lease().await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -455,9 +470,48 @@ async fn a_tui_ended_by_sighup_leaves_no_lease() {
             .await
             .expect("the TUI ignored SIGHUP")
             .unwrap();
-        assert_eq!(fx.leases().await, []);
+        fx.assert_runtime_lease_survives_detach(surface_pid).await;
     })
     .await
+}
+
+#[tokio::test]
+async fn a_failed_runtime_connection_falls_back_and_releases_the_native_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let pty = Pty::open();
+        let mut cmd = fx.command(&["--connect", "/does/not/exist/runtime.sock"]);
+        pty.attach(&mut cmd);
+        let mut child = tokio::process::Command::from(cmd)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let screen = pty.drain();
+        fx.wait_for_lease().await;
+        let leases = fx.leases().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].1, "standalone");
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if String::from_utf8_lossy(&screen.lock().unwrap()).contains("/help for commands") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fallback TUI did not become ready");
+        pty.keys(b"\x04");
+        assert!(tokio::time::timeout(WAIT, child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+        assert_eq!(fx.leases().await, []);
+        assert!(String::from_utf8_lossy(&screen.lock().unwrap())
+            .contains("using in-process mode for this run"));
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -560,4 +614,232 @@ async fn a_signal_during_startup_leaves_no_lease() {
         }
     })
     .await
+}
+
+#[tokio::test]
+async fn a_stopped_or_incompatible_explicit_owner_falls_back_instead_of_exiting() {
+    for (version, loaded) in [(env!("CARGO_PKG_VERSION"), 0), ("0.0.1", 0), ("0.0.1", 1)] {
+        bounded(async {
+            use loop_wire::connection::{Connection, Incoming};
+            let fx = Fixture::new(Model::Answer);
+            let socket = fx.agent.join("run/other.sock");
+            loop_cli::config::paths::run_dir(&fx.agent).unwrap();
+            let listener = loop_wire::socket::unix_listen(&socket).unwrap();
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (connection, mut incoming) = Connection::new(loop_wire::socket::unix(stream));
+                while let Some(message) = incoming.recv().await {
+                    if let Incoming::Request { id, method, .. } = message {
+                        if method == "initialize" {
+                            connection.respond(id, Ok(json!({"protocol_version":1,"server_info":{"name":"loop","version":version},"instance":"native","capabilities":{"session_environment":true}})));
+                        } else if method == "runtime/status" {
+                            connection.respond(id, Ok(json!({"pid":1,"socket":"other.sock","generation":1,"loaded":loaded,"busy":0,"max_sessions":16,"max_active_turns":8,"auto_started":false})));
+                            break;
+                        } else {
+                            connection.respond(id, Err((-32603, "Runtime stopped".into())));
+                            break;
+                        }
+                    }
+                }
+            });
+            let pty = Pty::open();
+            let mut cmd = fx.command(&["--connect", socket.to_str().unwrap()]);
+            pty.attach(&mut cmd);
+            let mut child = tokio::process::Command::from(cmd).kill_on_drop(true).spawn().unwrap();
+            let screen = pty.drain();
+            tokio::select! {
+                _ = fx.wait_for_lease() => {},
+                status = child.wait() => panic!("CLI exited instead of falling back: {status:?}"),
+            }
+            assert_eq!(fx.leases().await[0].1, "standalone");
+            tokio::time::timeout(WAIT, async {
+                while !String::from_utf8_lossy(&screen.lock().unwrap()).contains("/help for commands") { tokio::time::sleep(Duration::from_millis(20)).await; }
+            }).await.unwrap();
+            pty.keys(b"\x04");
+            assert!(tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap().success());
+            peer.await.unwrap();
+            assert_eq!(fx.leases().await, []);
+        }).await;
+    }
+}
+
+#[tokio::test]
+async fn explicit_foreign_socket_never_records_trust_in_the_surface_agent_dir() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let other = fx._dir.path().join("other-agent");
+        std::fs::create_dir_all(&other).unwrap();
+        for file in ["settings.json", "models.json"] {
+            std::fs::copy(fx.agent.join(file), other.join(file)).unwrap();
+        }
+        let socket = other.join("run/runtime.sock");
+        let mut command = fx.command(&["runtime", "start"]);
+        command
+            .env("LOOP_CODING_AGENT_DIR", &other)
+            .env("LOOP_CODING_AGENT_SESSION_DIR", other.join("sessions"));
+        let mut owner = tokio::process::Command::from(command)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        tokio::time::timeout(WAIT, async {
+            while tokio::net::UnixStream::connect(&socket).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let pty = Pty::open();
+        let mut command = fx.command(&["--connect", socket.to_str().unwrap()]);
+        pty.attach(&mut command);
+        let mut surface = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let screen = pty.drain();
+        tokio::time::timeout(WAIT, async {
+            while !String::from_utf8_lossy(&screen.lock().unwrap()).contains("/help for commands") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !fx.agent.join("trust.json").exists(),
+            "foreign connection wrote Surface trust"
+        );
+        assert!(
+            !other.join("trust.json").exists(),
+            "Runtime silently trusted the project"
+        );
+        pty.keys(b"\x04");
+        assert!(tokio::time::timeout(WAIT, surface.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+        let stopped =
+            output(fx.command(&["runtime", "stop", "--socket", socket.to_str().unwrap()])).await;
+        assert!(stopped.status.success(), "{stopped:?}");
+        assert!(tokio::time::timeout(WAIT, owner.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_exited_owner_shows_a_recovery_banner_and_the_tui_still_quits_cleanly() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let mut owner_command = fx.command(&["runtime", "start"]);
+        owner_command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut owner = tokio::process::Command::from(owner_command)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let socket = fx.agent.join("run/runtime.sock");
+        tokio::time::timeout(WAIT, async {
+            while tokio::net::UnixStream::connect(&socket).await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let pty = Pty::open();
+        let mut command = fx.command(&[]);
+        pty.attach(&mut command);
+        let mut surface = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let screen = pty.drain();
+        fx.wait_for_lease().await;
+        tokio::time::timeout(WAIT, async {
+            while !String::from_utf8_lossy(&screen.lock().unwrap()).contains("/help for commands") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        owner.kill().await.unwrap();
+        owner.wait().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !String::from_utf8_lossy(&screen.lock().unwrap())
+                .contains("Runtime connection lost")
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("no Runtime recovery banner appeared");
+        pty.keys(b"\x04");
+        assert!(tokio::time::timeout(WAIT, surface.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_and_saved_subscription_agents_stay_in_process_while_signed_out() {
+    bounded(async {
+        for saved in [false, true] {
+            let fx = Fixture::new(Model::Answer);
+            if saved {
+                let path = fx.agent.join("settings.json");
+                let mut settings: Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                settings["defaultProvider"] = json!("chatgpt");
+                settings["defaultModel"] = json!("test-model");
+                std::fs::write(path, serde_json::to_vec(&settings).unwrap()).unwrap();
+            }
+            let args: &[&str] = if saved {
+                &[]
+            } else {
+                &["--provider", "chatgpt", "--model", "test-model"]
+            };
+            let pty = Pty::open();
+            let mut command = fx.command(args);
+            command.env("CODEX_HOME", fx.home.join(".codex"));
+            pty.attach(&mut command);
+            let mut surface = tokio::process::Command::from(command)
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let screen = pty.drain();
+            tokio::select! {
+                _ = fx.wait_for_lease() => {},
+                status = surface.wait() => panic!("subscription startup exited: {status:?}"),
+            }
+            tokio::time::timeout(WAIT, async {
+                while !String::from_utf8_lossy(&screen.lock().unwrap())
+                    .contains("sign in to chatgpt")
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!fx.agent.join("run/runtime.sock").exists());
+            assert_eq!(fx.leases().await[0].1, "standalone");
+            signal(surface.id().unwrap(), "-TERM");
+            assert!(!tokio::time::timeout(WAIT, surface.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success());
+            assert_eq!(fx.leases().await, []);
+        }
+    })
+    .await;
 }

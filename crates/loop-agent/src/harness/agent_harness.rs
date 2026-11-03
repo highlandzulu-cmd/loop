@@ -103,6 +103,7 @@ pub struct AgentHarness {
     stream_fn: StreamFn,
     session: Arc<tokio::sync::Mutex<Session>>,
     host_env: Arc<dyn ExecutionEnv>,
+    session_environment: parking_lot::RwLock<Option<std::collections::BTreeMap<String, String>>>,
     model: RwLock<Option<Model>>,
     thinking_level: RwLock<AgentThinkingLevel>,
     /// Synchronous lock: `tools_snapshot` runs inside the MCP server factory on a
@@ -157,6 +158,7 @@ impl AgentHarness {
             stream_fn,
             session: Arc::new(tokio::sync::Mutex::new(options.session)),
             host_env: options.host_env,
+            session_environment: parking_lot::RwLock::new(None),
             model: RwLock::new(options.model),
             thinking_level: RwLock::new(AgentThinkingLevel::Off),
             tools: parking_lot::RwLock::new(options.tools),
@@ -1564,12 +1566,26 @@ impl AgentHarness {
         }
     }
 
+    /// The environment inherited by child Sessions and copies.
+    pub fn session_environment(&self) -> Option<std::collections::BTreeMap<String, String>> {
+        self.session_environment.read().clone()
+    }
+
+    /// Bind tools and user commands to the opening Surface's environment.
+    pub fn set_session_environment(&self, env: Option<std::collections::BTreeMap<String, String>>) {
+        *self.session_environment.write() = env;
+    }
+
     /// Tool env that the current sandbox/host would provide (for rebuilding tools).
     /// Starts the sandbox if needed; needs no model.
     pub async fn tool_env(&self) -> Result<Arc<dyn ExecutionEnv>, AgentHarnessError> {
-        Ok(match self.ensure_sandbox_ready().await? {
+        let env = match self.ensure_sandbox_ready().await? {
             Some(sandbox) => sandbox.env(),
             None => Arc::clone(&self.host_env),
+        };
+        Ok(match self.session_environment.read().as_ref() {
+            Some(values) => super::SessionExecutionEnv::wrap(env, values),
+            None => env,
         })
     }
 
@@ -1651,7 +1667,7 @@ impl AgentHarness {
         if let Some(filter) = self.tool_filter.read().clone() {
             tools.retain(|t| filter(&t.name));
         }
-        let host_env = Arc::clone(&self.host_env);
+        let host_env = self.tool_env().await?;
         // Workflow tasks get the same tool checks as the chat.
         let hooks = WorkflowToolHooks {
             before: self.before_tool_call.lock().clone(),

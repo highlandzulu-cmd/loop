@@ -21,9 +21,7 @@ use tokio::sync::mpsc;
 
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, Usage};
-use loop_app_core::interaction::{
-    approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
-};
+use loop_app_core::interaction::{approval_kind, ApprovalReply, PendingInteraction};
 use loop_protocol::rpc::{ForkPoint, TreeEntry};
 use loop_protocol::{
     AgentBackend, ContentBlock, InteractionOutcome, InteractionRequest, NoticeLevel, Origin,
@@ -61,6 +59,7 @@ use crate::{PendingAgent, StartupSessions, SurfaceClient};
 use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
+    RuntimeLost,
     UpdateAvailable(String),
     /// `/changelog` loaded the running version's release notes (or failed).
     Changelog(Result<String, String>),
@@ -341,7 +340,7 @@ pub async fn run(mut runtime: SurfaceClient) -> anyhow::Result<()> {
     terminal.show_cursor()?;
     // End the native owner’s work and release the Session
     // leases before the process exits; nothing after this does it reliably.
-    if let Err(error) = runtime.shutdown().run().await {
+    if let Err(error) = runtime.finish().await {
         eprintln!("loop: {error:#}");
     }
 
@@ -385,12 +384,19 @@ async fn run_loop(
             }
         });
     }
+    if let Some(closed) = runtime.connection_closed() {
+        let closed_tx = tx.clone();
+        tokio::spawn(async move {
+            closed.await;
+            let _ = closed_tx.send(UiEvent::RuntimeLost);
+        });
+    }
     ensure_forwarding(runtime, runtime.backend().as_ref(), &tx);
 
-    let (host, mut review_rx) = InteractionQueue::new();
+    let (host, mut review_rx) = runtime.interaction_queue();
     runtime.install_interactions(host).await?;
 
-    let mut chat: Vec<ChatItem> = match runtime.backend().transcript(&runtime.session_ref()).await {
+    let mut chat: Vec<ChatItem> = match runtime.transcript().await {
         Ok(updates) => chat_from_agent_transcript(updates, active_agent_name(runtime)),
         Err(e) => {
             tracing::warn!("failed to restore session transcript: {e}");
@@ -476,7 +482,7 @@ async fn run_loop(
     let mut ac_selected: usize = 0;
     let mut last_ac_filter = String::new();
     let mut file_index: Option<Vec<FileEntry>> = None;
-    let mut working = false;
+    let mut working = runtime.backend().is_busy(&runtime.session_ref());
     let mut turn_step = String::new();
     let mut message_queue: VecDeque<QueuedMessage> = VecDeque::new();
     let mut spinner_frame: usize = 0;
@@ -541,6 +547,20 @@ async fn run_loop(
     let mut dashboard: Option<dashboard::Screen> = None;
 
     while !should_quit {
+        if runtime.take_transcript_redraw() {
+            reset_and_redraw(
+                terminal,
+                runtime,
+                version,
+                &chat,
+                &mut flushed,
+                &mut live_frozen,
+                streaming_assistant,
+                streaming_thinking,
+                expand_details,
+                hide_thinking,
+            )?;
+        }
         #[cfg(feature = "usage")]
         {
             if std::mem::take(&mut runtime.usage_requested) && dashboard.is_none() {
@@ -1510,6 +1530,15 @@ async fn drain_ui_events(
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
+            UiEvent::RuntimeLost => {
+                *working = false;
+                turn_step.clear();
+                *status = "Runtime disconnected".into();
+                push_before_queued(
+                    chat,
+                    sys("Runtime connection lost; run `loop --continue` to reattach"),
+                );
+            }
             UiEvent::UpdateAvailable(message) => {
                 push_before_queued(chat, sys(message));
             }
@@ -1528,7 +1557,9 @@ async fn drain_ui_events(
             UiEvent::Update(envelope) => {
                 // Updates for another session (for example one just left with
                 // /new or a fork) must not leak into this transcript.
-                if envelope.session.as_str() != runtime.session_id() {
+                if envelope.session.as_str() != runtime.session_id()
+                    || !runtime.accept_update(envelope.seq)
+                {
                     continue;
                 }
                 // An approval the backend withdrew (for example on cancel)
@@ -1548,6 +1579,29 @@ async fn drain_ui_events(
                     {
                         pending_setup.take();
                         input.clear();
+                    }
+                }
+                if runtime.is_remote()
+                    && matches!(
+                        envelope.update,
+                        SessionUpdate::ConfigChanged(_) | SessionUpdate::BranchReset { .. }
+                    )
+                {
+                    if let Err(error) = runtime.refresh_remote().await {
+                        push_before_queued(chat, error_item(error.to_string()));
+                    }
+                    if let SessionUpdate::BranchReset { view_id, .. } = &envelope.update {
+                        match runtime.reset_transcript(view_id).await {
+                            Ok(updates) => {
+                                *chat =
+                                    chat_from_agent_transcript(updates, active_agent_name(runtime));
+                                *streaming_assistant = None;
+                                *streaming_thinking = None;
+                            }
+                            Err(error) => {
+                                push_before_queued(chat, error_item(error.to_string()));
+                            }
+                        }
                     }
                 }
                 let UpdateEnvelope { update, origin, .. } = *envelope;
@@ -1801,7 +1855,11 @@ fn ensure_forwarding(
         .insert(backend.instance().to_string());
     if fresh {
         forward_updates(
-            backend.subscribe(),
+            if runtime.is_remote() {
+                runtime.subscribe()
+            } else {
+                backend.subscribe()
+            },
             tx.clone(),
             runtime.debug_log_path.clone(),
         );
@@ -2413,6 +2471,31 @@ async fn handle_key(
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
 ) -> anyhow::Result<()> {
+    // Detach keys take priority over modal approval input. Dropping the
+    // remote reply leaves the Runtime's Escalation unanswered.
+    if runtime.is_remote() {
+        match runtime.keybindings.resolve(key) {
+            Some(Action::Exit) if input.is_empty() || active_approval.is_some() => {
+                *should_quit = true;
+                return Ok(());
+            }
+            Some(Action::Clear) if active_approval.is_some() => {
+                if last_clear.elapsed() < Duration::from_secs(2) {
+                    *clear_presses += 1;
+                } else {
+                    *clear_presses = 1;
+                }
+                *last_clear = Instant::now();
+                if *clear_presses >= 2 {
+                    *should_quit = true;
+                } else {
+                    *status = "ctrl+c again to detach".into();
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     if let Some(review) = active_approval.as_mut() {
         match key.code {
             KeyCode::Esc => {
@@ -3514,7 +3597,7 @@ async fn resume_session(
         }
         None => match runtime.open_native_session(&choice.id).await {
             Ok(()) => {
-                *chat = match runtime.backend().transcript(&runtime.session_ref()).await {
+                *chat = match runtime.transcript().await {
                     Ok(updates) => chat_from_transcript(updates),
                     Err(e) => {
                         tracing::warn!("failed to load the session transcript: {e}");
@@ -4062,7 +4145,7 @@ async fn adopt_forked_session(
             *streaming_assistant = None;
             *streaming_thinking = None;
             *working = false;
-            *chat = match runtime.backend().transcript(&runtime.session_ref()).await {
+            *chat = match runtime.transcript().await {
                 Ok(updates) => chat_from_transcript(updates),
                 Err(e) => {
                     tracing::warn!("failed to load forked session transcript: {e}");

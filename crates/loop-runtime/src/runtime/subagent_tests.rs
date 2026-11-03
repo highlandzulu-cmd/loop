@@ -534,7 +534,49 @@ fn payload<'a>(events: &'a [LoggedEvent], key: &SessionKey, kind: &str) -> Optio
 }
 
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
+async fn a_running_subagent_prevents_idle_shutdown_until_the_tree_ends() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let script: Script = Arc::new(|turn: Turn| match (turn.task.as_str(), turn.call) {
+            ("root", 1) => ready(calls(vec![spawn("leaf")])),
+            ("leaf", 1) => ready(calls(vec![("bash", json!({"command": "sleep 30"}))])),
+            _ => ready(text("done")),
+        });
+        let (rt, log, _seen) =
+            runtime(dir.path(), "full-access", RuntimeLimits::default(), script).await;
+        let root = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&root, vec![ContentBlock::text("root")])
+            .await
+            .unwrap();
+        let r = root.clone();
+        let leaf = logged(
+            &log,
+            move |list| Some(children(list, &r).pop()?.r#ref.key),
+            &rt,
+            "sleep 30",
+        )
+        .await;
+        let leaf_ref = children(&rt.list().await.unwrap(), &root)
+            .pop()
+            .unwrap()
+            .r#ref;
+        assert_eq!(leaf_ref.key, leaf);
+        assert!(rt.is_busy(&leaf_ref), "the child holds the busy flag");
+        assert!(rt.is_busy(&root), "the parent waits on the child");
+        assert!(!rt.is_idle().await);
+        assert!(!rt.shutdown_if_idle().await);
+        rt.cancel(&root);
+        let _ = turn.outcome().await;
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn cancelling_the_parent_cancels_its_descendants() {
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
@@ -573,6 +615,14 @@ async fn cancelling_the_parent_cancels_its_descendants() {
             "sleep 30",
         )
         .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            !rt.is_idle().await,
+            "running descendants and their bash tool prevent idle shutdown"
+        );
+        assert!(!rt.shutdown_if_idle().await);
+        tokio::time::resume();
         let list = rt.list().await.unwrap();
         let middle = children(&list, &root).pop().unwrap().r#ref.key;
 

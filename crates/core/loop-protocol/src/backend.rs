@@ -77,10 +77,16 @@ impl fmt::Display for BackendError {
 impl std::error::Error for BackendError {}
 
 /// How to open a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct SessionSpec {
+    /// Per-run startup choices; ignored by legacy backends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<SessionOptions>,
+    /// Caller environment for tools; omitted means use the host defaults.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
     /// Absolute working directory for the session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
@@ -529,4 +535,35 @@ pub trait LocalShell: Send + Sync {
         command: &str,
         timeout_ms: Option<u64>,
     ) -> BackendResult<ShellResult>;
+}
+
+impl std::fmt::Debug for SessionSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSpec")
+            .field("cwd", &self.cwd)
+            .field("name", &self.name)
+            .field("env_keys", &self.env.as_ref().map(|env| env.len()))
+            .finish()
+    }
+}
+
+/// Startup overrides for a native Runtime Session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct SessionOptions {
+    /// Provider override.
+    pub provider: Option<String>,
+    /// Model override.
+    pub model: Option<String>,
+    /// Replace the system prompt.
+    pub system_prompt: Option<String>,
+    /// Append to the system prompt.
+    pub append_system_prompt: Option<String>,
+    /// Skip context discovery.
+    pub no_context_files: bool,
+    /// Disable web tools for this Session.
+    pub no_web: bool,
+    /// Explicit permission mode.
+    pub permission_mode: Option<String>,
 }

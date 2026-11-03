@@ -14,6 +14,23 @@ pub struct RuntimeInstanceLock {
 }
 
 impl RuntimeInstanceLock {
+    /// Probe the owner lock without publishing or removing a diagnostic pid.
+    pub fn is_held(agent_dir: &Path) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        crate::config::paths::run_dir(agent_dir)?;
+        let file = private_file(&crate::config::paths::runtime_lock_path(agent_dir))?;
+        // SAFETY: the descriptor is valid and the nonblocking probe retains no fd.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(true)
+        } else {
+            Err(error)
+        }
+    }
+
     /// Acquire without waiting and publish this process's diagnostic pid.
     pub fn acquire(agent_dir: &Path) -> io::Result<Self> {
         use crate::config::paths::{run_dir, runtime_lock_path, runtime_pid_path};

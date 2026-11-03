@@ -694,6 +694,357 @@ async fn defaults_writes_are_serialized_with_each_other_and_workspace_changes() 
     .unwrap();
 }
 
+async fn refuses_idle_shutdown_after_time_passes(rt: &Runtime) {
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(!rt.is_idle().await);
+    assert!(!rt.shutdown_if_idle().await);
+    tokio::time::resume();
+}
+
+#[tokio::test]
+async fn attached_surface_prevents_idle_shutdown() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        loop_wire::RuntimeControl::attach_snapshot_watching(rt.as_ref(), 41, &session, 0)
+            .await
+            .unwrap();
+        refuses_idle_shutdown_after_time_passes(&rt).await;
+        rt.register_watch(&session, 41, false, None).await.unwrap();
+        assert!(rt.shutdown_if_idle().await);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn busy_turn_prevents_idle_shutdown() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("park")])
+            .await
+            .unwrap();
+        refuses_idle_shutdown_after_time_passes(&rt).await;
+        rt.cancel(&session);
+        let _ = turn.outcome().await;
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn parked_approval_prevents_idle_shutdown() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, log) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = park(&rt, &log, &session).await;
+        assert!(rt.route(&session).unwrap().escalations.has_pending().await);
+        refuses_idle_shutdown_after_time_passes(&rt).await;
+        rt.cancel(&session);
+        let _ = turn.outcome().await;
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn session_environment_reaches_shell_without_changing_other_sessions() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        rt.factory.globals.models.set_provider(faux_provider_fn(Arc::new(|context: &Context| {
+            let answered = context.messages.iter().any(|m| matches!(m, Message::Assistant(_)));
+            let response = if answered { FauxResponse::Text("finished".into()) } else {
+                FauxResponse::ToolCalls(vec![ToolCall {
+                    id: "env-tool".into(), name: "bash".into(),
+                    arguments: json!({"command": "printf '%s' \"$LOOP_SESSION_TEST\" > env-result"}),
+                    thought_signature: None,
+                }])
+            };
+            Box::pin(std::future::ready(response))
+        })));
+        let session = rt
+            .new_session(SessionSpec {
+                options: Some(loop_protocol::SessionOptions { provider: Some("faux".into()), model: Some("faux-model".into()), permission_mode: Some("full-access".into()), no_context_files: true, no_web: true, ..Default::default() }),
+                env: Some(std::collections::BTreeMap::from([(
+                    "LOOP_SESSION_TEST".into(),
+                    "caller value".into(),
+                )])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let result = rt
+            .route(&session)
+            .unwrap()
+            .opened
+            .harness
+            .tool_env()
+            .await
+            .unwrap()
+            .exec(
+                "printf '%s:%s' \"$LOOP_SESSION_TEST\" \"$PWD\"",
+                Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.stdout,
+            format!(
+                "caller value:{}",
+                dir.path().canonicalize().unwrap().display()
+            )
+        );
+        let turn = rt.prompt(&session, vec![ContentBlock::text("check environment")]).await.unwrap();
+        let outcome = turn.outcome().await;
+        assert!(matches!(outcome, TurnOutcome::Completed(_)), "{outcome:?}");
+        assert_eq!(std::fs::read_to_string(dir.path().join("env-result")).unwrap(), "caller value");
+        let second = rt.new_session(SessionSpec::default()).await.unwrap();
+        let result = rt
+            .route(&second)
+            .unwrap()
+            .opened
+            .harness
+            .tool_env()
+            .await
+            .unwrap()
+            .exec("printf '%s' \"$LOOP_SESSION_TEST\"", Default::default())
+            .await
+            .unwrap();
+        assert_eq!(result.stdout, "");
+        let shell = LocalShell::run(
+            rt.as_ref(),
+            &session,
+            "printf '%s' \"$LOOP_SESSION_TEST\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shell.stdout, "caller value");
+        rt.close(&session.key, false).await.unwrap();
+        rt.load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        let shell = LocalShell::run(
+            rt.as_ref(),
+            &session,
+            "printf '%s' \"$LOOP_SESSION_TEST\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(shell.stdout, "caller value");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn automatic_shutdown_refuses_watchers_and_fences_later_admissions() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        loop_wire::RuntimeControl::attach_snapshot_watching(rt.as_ref(), 41, &session, 0)
+            .await
+            .unwrap();
+        assert!(!rt.shutdown_if_idle().await);
+        rt.register_watch(&session, 41, false, None).await.unwrap();
+        assert!(rt.shutdown_if_idle().await);
+        assert!(rt.new_session(SessionSpec::default()).await.is_err());
+        assert!(
+            loop_wire::RuntimeControl::attach_snapshot_watching(rt.as_ref(), 42, &session, 0)
+                .await
+                .is_err()
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn version_replacement_refuses_even_an_idle_loaded_session() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        assert!(!rt.shutdown_if_empty().await);
+        rt.close(&session.key, false).await.unwrap();
+        assert!(rt.shutdown_if_empty().await);
+        assert!(rt.new_session(SessionSpec::default()).await.is_err());
+    })
+    .await
+    .unwrap();
+}
+
+fn install_openai_fixture(rt: &Runtime) -> String {
+    let mut provider = faux_provider_fn(Arc::new(|_| {
+        Box::pin(std::future::ready(FauxResponse::Text("offline".into())))
+    }));
+    provider.id = "openai".into();
+    let mut models = provider.get_models();
+    models[0].provider = "openai".into();
+    let id = models[0].id.clone();
+    provider.set_models(models);
+    rt.factory.globals.models.set_provider(provider);
+    id
+}
+
+#[tokio::test]
+async fn differing_provider_environment_warns_without_exposing_either_key() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        rt.factory
+            .globals
+            .credentials
+            .connect("openai", Some(loop_ai::Credential::api_key("owner-secret")))
+            .unwrap();
+        let model = install_openai_fixture(&rt);
+        let session = rt
+            .new_session(SessionSpec {
+                options: Some(loop_protocol::SessionOptions {
+                    provider: Some("openai".into()),
+                    model: Some(model),
+                    ..Default::default()
+                }),
+                env: Some(std::collections::BTreeMap::from([
+                    ("OPENAI_API_KEY".into(), "surface-secret".into()),
+                    ("LOOP_RUNTIME_TOKEN".into(), "runtime-secret".into()),
+                    ("TASK_VALUE".into(), "visible".into()),
+                ])),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let snapshot = loop_wire::RuntimeControl::config(
+            rt.as_ref(),
+            loop_protocol::rpc::SessionParams {
+                session: session.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(snapshot
+            .notices
+            .iter()
+            .any(|line| line.contains("differs from the Runtime")));
+        let public = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !public.contains("owner-secret")
+                && !public.contains("surface-secret")
+                && !public.contains("runtime-secret")
+        );
+        let result = LocalShell::run(
+            rt.as_ref(),
+            &session,
+            "printf '%s:%s:%s' \"$TASK_VALUE\" \"$OPENAI_API_KEY\" \"$LOOP_RUNTIME_TOKEN\"",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.stdout, "visible::");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn credential_warnings_follow_only_the_selected_provider_and_refresh_on_resume() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path()).await;
+        rt.factory
+            .globals
+            .credentials
+            .connect("openai", Some(loop_ai::Credential::api_key("owner-key")))
+            .unwrap();
+        let caller = || {
+            Some(std::collections::BTreeMap::from([(
+                "OPENAI_API_KEY".into(),
+                "caller-key".into(),
+            )]))
+        };
+        let unrelated = rt
+            .new_session(SessionSpec {
+                env: caller(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let config = loop_wire::RuntimeControl::config(
+            rt.as_ref(),
+            loop_protocol::rpc::SessionParams { session: unrelated },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !config.notices.iter().any(|line| line.contains("API key")),
+            "an unused provider must not warn"
+        );
+        let model = install_openai_fixture(&rt);
+        let session = rt
+            .new_session(SessionSpec {
+                env: caller(),
+                options: Some(loop_protocol::SessionOptions {
+                    provider: Some("openai".into()),
+                    model: Some(model),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let config = loop_wire::RuntimeControl::config(
+            rt.as_ref(),
+            loop_protocol::rpc::SessionParams {
+                session: session.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(config
+            .notices
+            .iter()
+            .any(|line| line.contains("openai") && line.contains("differs")));
+        rt.load_session(
+            &session,
+            SessionSpec {
+                env: Some(std::collections::BTreeMap::from([(
+                    "OPENAI_API_KEY".into(),
+                    "owner-key".into(),
+                )])),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let config = loop_wire::RuntimeControl::config(
+            rt.as_ref(),
+            loop_protocol::rpc::SessionParams { session },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !config.notices.iter().any(|line| line.contains("API key")),
+            "resuming with the actual key clears a stale notice"
+        );
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
 mod next_turn {
     use super::*;
     use loop_agent::harness::{SandboxMode, TaggedSandbox};

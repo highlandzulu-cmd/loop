@@ -82,6 +82,8 @@ pub mod methods {
     /// its normal signal shutdown: it closes every Session, removes its
     /// socket and exits. Served only by a shared Runtime.
     pub const RUNTIME_STOP: &str = "runtime/stop";
+    /// Stop an empty owner atomically, for version replacement.
+    pub const RUNTIME_STOP_EMPTY: &str = "runtime/stop_empty";
     /// Client → server request: [`super::SessionParams`] →
     /// [`super::ModelsResult`]. Needs the `set_model` capability.
     pub const SESSION_MODELS: &str = "session/models";
@@ -157,6 +159,7 @@ pub mod methods {
     /// Unix socket or an embedded adapter), never over a WebSocket.
     pub const HOST_ONLY: &[&str] = &[
         RUNTIME_STOP,
+        RUNTIME_STOP_EMPTY,
         RUNTIME_USAGE,
         RUNTIME_DEFAULTS,
         RUNTIME_PROVIDERS,
@@ -254,6 +257,9 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeStatus {
+    /// True only for an owner started automatically by a Surface.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_started: bool,
     /// The Runtime's process id.
     pub pid: u32,
     /// The socket this connection reached.
@@ -323,6 +329,9 @@ pub struct AttachResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct SessionSnapshot {
+    /// Public startup notices, including credential-environment differences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notices: Vec<String>,
     /// The Session.
     pub session: SessionRef,
     /// Opaque host workspace identity, when the server reports one.
@@ -914,6 +923,7 @@ pub fn json_schema() -> Value {
             methods::SHUTDOWN: method(up, "request", &empty, Some(&empty)),
             methods::RUNTIME_STATUS: method(up, "request", &empty, Some(&status)),
             methods::RUNTIME_STOP: method(up, "request", &empty, Some(&empty)),
+            methods::RUNTIME_STOP_EMPTY: method(up, "request", &empty, Some(&empty)),
         },
         "error": error,
         "$defs": generator.definitions(),
@@ -984,6 +994,7 @@ pub fn json_schema() -> Value {
         schema["methods"][name] = entry;
     }
     schema["methods"][methods::RUNTIME_STOP]["host_only"] = Value::Bool(true);
+    schema["methods"][methods::RUNTIME_STOP_EMPTY]["host_only"] = Value::Bool(true);
     schema
 }
 

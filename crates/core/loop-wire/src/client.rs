@@ -46,6 +46,8 @@ impl Drop for Initializing {
 /// A backend served over a connection ([`crate::serve`]).
 pub struct RemoteBackend {
     conn: Arc<Connection>,
+    is_websocket: bool,
+    connection_notices: Mutex<Vec<String>>,
     instance: BackendInstanceId,
     capabilities: Capabilities,
     server: PeerInfo,
@@ -138,6 +140,7 @@ impl RemoteBackend {
         host: Arc<dyn HostServices>,
         client_capabilities: ClientCapabilities,
     ) -> BackendResult<Arc<Self>> {
+        let is_websocket = transport.is_websocket;
         let (conn, incoming) = Connection::new(transport);
         let mut initializing = Initializing(Some(conn.clone()));
         let (updates, _) = broadcast::channel(UPDATE_BUFFER);
@@ -168,6 +171,8 @@ impl RemoteBackend {
         initializing.0 = None;
         Ok(Arc::new(Self {
             conn,
+            is_websocket,
+            connection_notices: Mutex::new(vec![]),
             instance: result.instance,
             capabilities: result.capabilities,
             server: result.server_info,
@@ -265,6 +270,29 @@ impl RemoteBackend {
         call(&self.conn, methods::SESSION_IMPORT, &params).await
     }
 
+    /// Whether this client sends data over WebSocket rather than a local socket.
+    pub fn is_websocket(&self) -> bool {
+        self.is_websocket
+    }
+
+    /// Add a Surface startup notice without sending or persisting it on the wire.
+    pub fn add_connection_notice(&self, notice: String) {
+        self.connection_notices.lock().push(notice);
+    }
+    /// Take connection startup notices once.
+    pub fn take_connection_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.connection_notices.lock())
+    }
+    /// Wait for the connection to the Runtime to close.
+    pub async fn closed(&self) {
+        self.conn.closed().await;
+    }
+
+    /// Close this Surface connection without stopping the Runtime.
+    pub fn disconnect(&self) {
+        self.conn.close();
+    }
+
     /// The server, as it introduced itself.
     pub fn server(&self) -> &PeerInfo {
         &self.server
@@ -309,6 +337,22 @@ impl RemoteBackend {
     /// The Runtime process and its Session counts (`runtime/status`).
     pub async fn status(&self) -> BackendResult<RuntimeStatus> {
         call(&self.conn, methods::RUNTIME_STATUS, &serde_json::json!({})).await
+    }
+
+    /// Stop an empty owner without racing a new Session admission.
+    pub async fn stop_empty(&self) -> BackendResult<()> {
+        if !self.capabilities.runtime_stop_empty {
+            return Err(BackendError::Unsupported(
+                methods::RUNTIME_STOP_EMPTY.into(),
+            ));
+        }
+        call::<Value>(
+            &self.conn,
+            methods::RUNTIME_STOP_EMPTY,
+            &serde_json::json!({}),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// Ask the Runtime to shut down (`runtime/stop`). It answers first, then
@@ -688,6 +732,7 @@ async fn read(
         }
     }
     conn.fail_pending().await;
+    conn.close();
 }
 
 /// Workspace admin and host-only methods over the wire. A method the server

@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Capabilities {
+    /// Host-local, atomic stop only when no Sessions are loaded.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_stop_empty: bool,
+    /// Accepts a caller environment in session/new.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_environment: bool,
     /// Provider credentials; host-local only.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub host_providers: bool,

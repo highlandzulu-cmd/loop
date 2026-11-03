@@ -198,7 +198,11 @@ where
         tokio::select! { biased; _ = closed.cancelled() => {}, _ = read => {} }
         closed.cancel();
     });
-    Transport { incoming, outgoing }
+    Transport {
+        incoming,
+        outgoing,
+        is_websocket: true,
+    }
 }
 
 /// Compare without leaking how many leading bytes matched.

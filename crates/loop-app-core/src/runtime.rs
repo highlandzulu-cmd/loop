@@ -486,6 +486,7 @@ impl Runtime {
                     .new_session(loop_protocol::SessionSpec {
                         cwd: Some(self.cwd.clone()),
                         name: None,
+                        ..Default::default()
                     })
                     .await?;
                 self.session_id = session.native_id;

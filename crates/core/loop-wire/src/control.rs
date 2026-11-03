@@ -170,6 +170,10 @@ pub trait RuntimeControl: Send + Sync {
     async fn stop(&self) -> BackendResult<()> {
         Err(unsupported("runtime/stop"))
     }
+    /// Stop only if no Session is loaded; admission is fenced by the owner.
+    async fn stop_empty(&self) -> BackendResult<()> {
+        Err(unsupported("runtime/stop_empty"))
+    }
     /// Workspace admin and host-only services, when this Runtime serves them.
     fn admin(&self) -> Option<&dyn RuntimeAdmin> {
         None

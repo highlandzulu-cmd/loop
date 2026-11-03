@@ -851,13 +851,11 @@ async fn busy_model_rules_are_the_same_over_the_wire() {
         let local = backend.model_control().unwrap();
         let wire = remote.model_control().unwrap();
         for control in [local, wire] {
-            assert_eq!(
-                control
-                    .set_model(&session, "faux/faux-model", None)
-                    .await
-                    .unwrap_err(),
-                BackendError::Busy
-            );
+            let result = control
+                .set_model(&session, "faux/faux-model", None)
+                .await
+                .unwrap();
+            assert!(result.pending, "a busy Session applies the model next turn");
             let result = control.set_effort(&session, "off", None).await.unwrap();
             assert!(result.pending);
         }

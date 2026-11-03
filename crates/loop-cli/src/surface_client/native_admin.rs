@@ -4,7 +4,10 @@ use loop_protocol::host::*;
 use loop_protocol::{admin::*, BackendError, BackendResult, Capabilities, ErrorCategory};
 use loop_wire::RuntimeAdmin;
 
-pub(super) struct NativeAdmin<'a>(pub tokio::sync::Mutex<&'a mut loop_app_core::Runtime>);
+pub(super) struct NativeAdmin<'a>(
+    pub tokio::sync::Mutex<&'a mut loop_app_core::Runtime>,
+    pub Option<&'a loop_wire::RemoteBackend>,
+);
 fn failed(e: impl std::fmt::Display) -> BackendError {
     BackendError::failed(ErrorCategory::Other, e.to_string())
 }
@@ -26,6 +29,9 @@ impl NativeAdmin<'_> {
 #[async_trait::async_trait]
 impl RuntimeAdmin for NativeAdmin<'_> {
     fn offered(&self) -> Capabilities {
+        if let Some(remote) = self.1 {
+            return remote.offered();
+        }
         Capabilities {
             host_providers: true,
             host_mcp_auth: true,
@@ -45,6 +51,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         }
     }
     async fn providers(&self, p: ProvidersParams) -> BackendResult<ProvidersResult> {
+        if let Some(remote) = self.1 {
+            return remote.providers(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         let mut result = ProvidersResult::default();
@@ -105,6 +114,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
     }
     #[cfg(feature = "telemetry")]
     async fn tracing(&self, p: TracingParams) -> BackendResult<TracingResult> {
+        if let Some(remote) = self.1 {
+            return remote.tracing(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         let state = match p.action {
@@ -129,6 +141,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         })
     }
     async fn mcp_auth(&self, p: McpAuthParams) -> BackendResult<McpAuthResult> {
+        if let Some(remote) = self.1 {
+            return remote.mcp_auth(p).await;
+        }
         let guard = self.0.lock().await;
         let r = &**guard;
         Self::workspace(r, &p.workspace_id)?;
@@ -175,6 +190,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         })
     }
     async fn web_search(&self, p: WebSearchParams) -> BackendResult<WebSearchResult> {
+        if let Some(remote) = self.1 {
+            return remote.web_search(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         Self::workspace(r, &p.workspace_id)?;
@@ -197,6 +215,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         })
     }
     async fn defaults(&self, p: DefaultsParams) -> BackendResult<DefaultsResult> {
+        if let Some(remote) = self.1 {
+            return remote.defaults(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         if let Some(id) = p.workspace_id {
@@ -270,6 +291,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         })
     }
     async fn settings(&self, p: SettingsParams) -> BackendResult<SettingsResult> {
+        if let Some(remote) = self.1 {
+            return remote.settings(p).await;
+        }
         let guard = self.0.lock().await;
         let r = &**guard;
         Self::workspace(r, &p.workspace_id)?;
@@ -284,6 +308,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         })
     }
     async fn sessions(&self) -> BackendResult<RuntimeSessionsResult> {
+        if let Some(remote) = self.1 {
+            return remote.sessions().await;
+        }
         let guard = self.0.lock().await;
         let r = &**guard;
         let mut sessions = vec![];
@@ -342,12 +369,18 @@ impl RuntimeAdmin for NativeAdmin<'_> {
     }
     #[cfg(feature = "usage")]
     async fn usage(&self, p: UsageParams) -> BackendResult<UsageResult> {
+        if let Some(remote) = self.1 {
+            return remote.usage(p).await;
+        }
         let guard = self.0.lock().await;
         let r = &**guard;
         r.flush_usage_log();
         crate::runtime_cmd::usage_page(&crate::config::paths::usage_dir(&r.agent_dir), &p)
     }
     async fn skills(&self, p: SkillsParams) -> BackendResult<SkillsResult> {
+        if let Some(remote) = self.1 {
+            return remote.skills(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         Self::workspace(r, &p.workspace_id)?;
@@ -390,6 +423,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         })
     }
     async fn templates(&self, p: TemplatesParams) -> BackendResult<TemplatesResult> {
+        if let Some(remote) = self.1 {
+            return remote.templates(p).await;
+        }
         let guard = self.0.lock().await;
         let r = &**guard;
         Self::workspace(r, &p.workspace_id)?;
@@ -428,6 +464,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         }
     }
     async fn reload(&self, p: ReloadParams) -> BackendResult<ReloadResult> {
+        if let Some(remote) = self.1 {
+            return remote.reload(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         Self::workspace(r, &p.workspace_id)?;
@@ -445,6 +484,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         Ok(ReloadResult::default())
     }
     async fn mcp(&self, p: McpParams) -> BackendResult<McpResult> {
+        if let Some(remote) = self.1 {
+            return remote.mcp(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         Self::workspace(r, &p.workspace_id)?;
@@ -508,6 +550,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         &self,
         p: PermissionModeParams,
     ) -> BackendResult<PermissionModeResult> {
+        if let Some(remote) = self.1 {
+            return remote.permission_mode(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         if p.session != r.session_ref() {
@@ -536,6 +581,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         })
     }
     async fn trust(&self, p: TrustParams) -> BackendResult<TrustResult> {
+        if let Some(remote) = self.1 {
+            return remote.trust(p).await;
+        }
         let mut guard = self.0.lock().await;
         let r = &mut **guard;
         Self::workspace(r, &p.workspace_id)?;

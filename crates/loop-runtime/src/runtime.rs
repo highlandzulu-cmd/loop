@@ -84,6 +84,9 @@ pub struct Runtime {
     recipients: AsyncMutex<HashMap<SessionKey, Recipients>>,
     admission: AsyncMutex<()>,
     stopped: AtomicBool,
+    idle_epoch: std::sync::atomic::AtomicU64,
+    /// In-memory only: caller environments must never enter persistent logs or settings.
+    launch_specs: Mutex<HashMap<SessionKey, SessionSpec>>,
     /// Tests start their own sandboxes instead of a platform one.
     #[cfg(test)]
     sandbox_starter: Mutex<Option<admin::SandboxStarter>>,
@@ -240,6 +243,7 @@ struct LiveSession {
     announced: Mutex<Announced>,
     /// A workspace reload waiting for the current turn or command to end.
     pending_workspace: Mutex<Option<Arc<admin::Generation>>>,
+    credential_notice: Mutex<Option<String>>,
     /// The workspace generation the Session uses, held until it switches.
     generation: Mutex<Option<Arc<admin::Generation>>>,
     /// The sandbox the Session runs in (`session/sandbox`).
@@ -365,6 +369,8 @@ impl Runtime {
             recipients: AsyncMutex::new(HashMap::new()),
             admission: AsyncMutex::new(()),
             stopped: AtomicBool::new(false),
+            idle_epoch: std::sync::atomic::AtomicU64::new(0),
+            launch_specs: Mutex::new(HashMap::new()),
             #[cfg(test)]
             sandbox_starter: Mutex::new(None),
             log,
@@ -542,6 +548,7 @@ impl Runtime {
             .filter(|s| s.busy.load(Ordering::Acquire))
             .count();
         loop_protocol::rpc::RuntimeStatus {
+            auto_started: false,
             pid: std::process::id(),
             socket: PathBuf::new(),
             listen_url: None,
@@ -568,12 +575,72 @@ impl Runtime {
             .cloned()
             .ok_or_else(|| BackendError::SessionNotFound(session.key.clone()))
     }
+    /// An auto-started owner may stop only after every Surface and work item leaves.
+    pub async fn is_idle(&self) -> bool {
+        let _admission = self.admission.lock().await;
+        if self
+            .watchers
+            .lock()
+            .unwrap()
+            .values()
+            .any(|set| !set.is_empty())
+        {
+            return false;
+        }
+        let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+        for live in sessions {
+            if live.busy.load(Ordering::Acquire) || live.escalations.has_pending().await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Changes whenever work or a Surface enters, including between idle polls.
+    pub fn idle_activity(&self) -> u64 {
+        self.idle_epoch.load(Ordering::Acquire)
+    }
+
+    async fn credential_notice(
+        &self,
+        model: Option<&str>,
+        env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Option<String> {
+        let (provider, _) = model?.split_once('/')?;
+        let preset = loop_ai::providers::PROVIDER_PRESETS
+            .iter()
+            .find(|preset| preset.id == provider)?;
+        let exported = preset
+            .api_key_envs
+            .iter()
+            .find_map(|key| env?.get(*key).filter(|value| !value.trim().is_empty()))?;
+        let configured = self.factory.globals.models.get_provider(provider)?;
+        let actual = loop_ai::auth::resolve_provider_auth(
+            provider,
+            &configured.auth,
+            self.factory.globals.credentials.as_ref(),
+            None,
+        )
+        .await
+        .ok();
+        if actual.as_ref().and_then(|auth| auth.api_key.as_deref()) == Some(exported.as_str()) {
+            return None;
+        }
+        Some(format!("This shell's {provider} API key differs from the Runtime's credential; the Runtime credential is used."))
+    }
+
     async fn open(
         &self,
         existing: Option<&SessionRef>,
-        spec: SessionSpec,
+        mut spec: SessionSpec,
         child: Option<subagent::ChildOpen>,
     ) -> BackendResult<SessionRef> {
+        // An attach checks this Surface's credentials, but never changes an
+        // existing Session's environment while another Surface may use it.
+        let caller_env = spec.env.clone();
+        if existing.is_some() {
+            spec.env = None;
+        }
         let _admission = loop {
             let admission = self.admission.lock().await;
             if self.stopped.load(Ordering::Acquire) {
@@ -592,7 +659,14 @@ impl Runtime {
                     drop(admission);
                     self.wait_removed(&live).await;
                 }
-                Ok(live) => return Ok(live.reference.clone()),
+                Ok(live) => {
+                    let model = live.opened.native.config().config.model;
+                    let notice = self
+                        .credential_notice(model.as_deref(), caller_env.as_ref())
+                        .await;
+                    *live.credential_notice.lock().unwrap() = notice;
+                    return Ok(live.reference.clone());
+                }
                 Err(_) => break admission,
             }
         };
@@ -610,6 +684,26 @@ impl Runtime {
         if full() && (!self.unload_one().await || full()) {
             return Err(BackendError::Busy);
         }
+        if let Some(existing) = existing {
+            if let Some(saved) = self
+                .launch_specs
+                .lock()
+                .unwrap()
+                .get(&existing.key)
+                .cloned()
+            {
+                if spec.env.is_none() {
+                    spec.env = saved.env;
+                }
+                if spec.options.is_none() {
+                    spec.options = saved.options;
+                }
+            }
+        }
+        if let Some(child) = &child {
+            spec.env = child.parent.opened.harness.session_environment();
+        }
+        let saved_spec = spec.clone();
         let mut opts = self.session_opts();
         if let Some(child) = &child {
             opts.cwd = child.cwd.clone();
@@ -631,7 +725,30 @@ impl Runtime {
                 opts.cwd = PathBuf::from(cwd);
             }
         }
-        let workspace = self.factory.workspace(&opts).await.map_err(failed)?;
+        if let Some(options) = &spec.options {
+            opts.provider = options.provider.clone();
+            opts.model = options.model.clone();
+            opts.system_prompt = options.system_prompt.clone();
+            opts.append_system_prompt = options.append_system_prompt.clone();
+            opts.no_context_files = options.no_context_files;
+            opts.no_web = options.no_web;
+            opts.permission_mode = options.permission_mode.clone();
+        }
+        let session_workspace_flags = spec.options.as_ref().is_some_and(|options| {
+            options.no_context_files
+                || options.no_web
+                || options.system_prompt.is_some()
+                || options.append_system_prompt.is_some()
+        });
+        let workspace = if session_workspace_flags {
+            Arc::new(
+                WorkspaceResources::load(&self.factory.globals, &opts)
+                    .await
+                    .map_err(failed)?,
+            )
+        } else {
+            self.factory.workspace(&opts).await.map_err(failed)?
+        };
         let created = existing.is_none();
         let id = match existing {
             Some(session) => session.native_id.clone(),
@@ -676,7 +793,17 @@ impl Runtime {
         };
         opts.session_id = Some(id.clone());
         let result = async {
-            let mut opened = self.factory.open(workspace, &opts).await.map_err(failed)?;
+            let mut opened = self
+                .factory
+                .open_with_environment(workspace, &opts, spec.env.as_ref())
+                .await
+                .map_err(failed)?;
+            let credential_notice = self
+                .credential_notice(
+                    opened.native.config().config.model.as_deref(),
+                    caller_env.as_ref(),
+                )
+                .await;
             let sandbox = opened
                 .harness
                 .ensure_sandbox_ready()
@@ -833,6 +960,7 @@ impl Runtime {
                     receipts: HashMap::new(),
                 }),
                 pending_workspace: Mutex::new(None),
+                credential_notice: Mutex::new(credential_notice),
                 generation: Mutex::new(None),
                 sandbox_choice: Mutex::new(sandbox_choice),
                 pending_sandbox: Mutex::new(None),
@@ -887,6 +1015,11 @@ impl Runtime {
                 .unwrap()
                 .insert(reference.key.clone(), live.clone());
             self.unloaded.lock().unwrap().remove(&reference.key);
+            self.launch_specs
+                .lock()
+                .unwrap()
+                .insert(reference.key.clone(), saved_spec);
+            self.idle_epoch.fetch_add(1, Ordering::AcqRel);
             lease.armed = false;
             Ok(reference)
         }
@@ -1336,6 +1469,63 @@ impl Runtime {
                 return;
             }
         }
+        self.finish_shutdown().await;
+    }
+
+    /// Version replacement must not close a Session admitted after discovery.
+    pub async fn shutdown_if_empty(&self) -> bool {
+        {
+            let _admission = self.admission.lock().await;
+            if !self.sessions.lock().unwrap().is_empty()
+                || self
+                    .watchers
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .any(|set| !set.is_empty())
+            {
+                return false;
+            }
+            if self.stopped.swap(true, Ordering::AcqRel) {
+                return false;
+            }
+        }
+        self.finish_shutdown().await;
+        true
+    }
+
+    /// Fence admissions and watched Sessions before an automatic idle shutdown.
+    pub async fn shutdown_if_idle(&self) -> bool {
+        {
+            let _admission = self.admission.lock().await;
+            let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
+            let mut guards = Vec::new();
+            for live in &sessions {
+                guards.push(live.lifecycle.lock().await);
+            }
+            if sessions
+                .iter()
+                .any(|live| live.busy.load(Ordering::Acquire))
+            {
+                return false;
+            }
+            for live in &sessions {
+                if live.escalations.has_pending().await {
+                    return false;
+                }
+            }
+            let watchers = self.watchers.lock().unwrap();
+            if watchers.values().any(|set| !set.is_empty())
+                || self.stopped.swap(true, Ordering::AcqRel)
+            {
+                return false;
+            }
+        }
+        self.finish_shutdown().await;
+        true
+    }
+
+    async fn finish_shutdown(&self) {
         self.turns.close();
         let keys: Vec<_> = self.sessions.lock().unwrap().keys().cloned().collect();
         futures::future::join_all(keys.iter().map(|key| async move {
@@ -1435,6 +1625,10 @@ impl Runtime {
             _ => None,
         };
         let mut watchers = self.watchers.lock().unwrap();
+        if attached && self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        self.idle_epoch.fetch_add(1, Ordering::AcqRel);
         if attached {
             watchers
                 .entry(session.key.clone())
@@ -1464,6 +1658,9 @@ impl Runtime {
             return Err(BackendError::SessionNotFound(session.key.clone()));
         }
         let added = self.set_watch(session, connection, true).await;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(failed("Runtime stopped"));
+        }
         let result = async {
             let unloading = self
                 .route(session)
@@ -1782,8 +1979,19 @@ impl Runtime {
         changed: ConfigChanged,
     ) -> SessionSnapshot {
         SessionSnapshot {
+            notices: self
+                .route(session)
+                .map(|live| {
+                    let mut notices = live.opened.startup_notices.clone();
+                    notices.extend(live.credential_notice.lock().unwrap().clone());
+                    notices
+                })
+                .unwrap_or_default(),
             session: session.clone(),
-            workspace_id: String::new(),
+            workspace_id: self
+                .route(session)
+                .map(|live| tree::workspace_id(&live.opened.workspace.cwd))
+                .unwrap_or_default(),
             at_seq,
             revision: changed.revision,
             branch_revision: 0,
@@ -1938,6 +2146,10 @@ impl Runtime {
     /// its settled output for snapshots taken meanwhile. Caller holds the
     /// lifecycle lock and has checked the Session is open.
     async fn reserve(&self, live: &LiveSession) -> BackendResult<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(failed("Runtime stopped"));
+        }
+        self.idle_epoch.fetch_add(1, Ordering::AcqRel);
         if !live.busy.load(Ordering::Acquire) {
             self.announce_control(live, None).await?;
             // The pump's committed point, without waiting on the Event
@@ -2139,6 +2351,7 @@ impl AgentBackend for Runtime {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            session_environment: true,
             session_config: true,
             session_skills: true,
             workflow: cfg!(feature = "orchestration"),

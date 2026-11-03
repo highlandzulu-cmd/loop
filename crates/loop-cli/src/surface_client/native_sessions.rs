@@ -236,6 +236,7 @@ impl RuntimeControl for NativeSessions {
         self.check(&p.session).await?;
         let changed = self.native.config();
         Ok(SessionSnapshot {
+            notices: vec![],
             session: p.session,
             workspace_id: self.workspace_id.clone(),
             at_seq: 0,

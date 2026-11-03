@@ -65,7 +65,6 @@ impl std::error::Error for RpcError {}
 pub type PeerRequestId = Value;
 
 /// A message from the peer.
-#[derive(Debug)]
 pub enum Incoming {
     /// The result of one of Loop's requests. Pass it to
     /// [`Connection::resolve`] once everything before it is handled.
@@ -112,6 +111,7 @@ impl Connection {
         let Transport {
             incoming: mut from_peer,
             outgoing: to_peer,
+            ..
         } = transport;
         let (outgoing, mut to_write) = mpsc::channel::<Value>(QUEUE_MESSAGES);
         let (incoming_tx, incoming) = mpsc::channel(QUEUE_MESSAGES);
@@ -157,10 +157,7 @@ impl Connection {
                     }
                     // Agents sometimes print logs to stdout; skip anything
                     // that is not JSON instead of failing the connection.
-                    Err(_) => tracing::debug!(
-                        line = %truncate(&text, 200),
-                        "skipping a non-JSON message"
-                    ),
+                    Err(_) => tracing::debug!(bytes = text.len(), "skipping a non-JSON message"),
                 }
             }
         });
@@ -253,6 +250,11 @@ impl Connection {
         }
     }
 
+    /// Wait until the transport closes.
+    pub async fn closed(&self) {
+        self.closed.cancelled().await;
+    }
+
     /// Stop both transport tasks. Consumers can drain already queued messages.
     pub fn close(&self) {
         self.closed.cancel();
@@ -336,10 +338,53 @@ fn dispatch(message: Value, incoming: &mpsc::Sender<Incoming>) -> Result<(), ()>
     incoming.try_send(incoming_message).map_err(|_| ())
 }
 
-fn truncate(text: &str, max: usize) -> &str {
-    match text.char_indices().nth(max) {
-        Some((i, _)) => &text[..i],
-        None => text,
+/// Redact environment maps before formatting diagnostic frames. Wire payloads
+/// themselves remain unchanged; an environment is never a log payload.
+fn diagnostic(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if key == "env" {
+                        json!({"key_count": value.as_object().map_or(0, |env| env.len())})
+                    } else {
+                        diagnostic(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(diagnostic).collect()),
+        other => other.clone(),
+    }
+}
+impl fmt::Debug for Incoming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request { id, method, params } => f
+                .debug_struct("Request")
+                .field("id", id)
+                .field("method", method)
+                .field("params", &diagnostic(params))
+                .finish(),
+            Self::Notification { method, params } => f
+                .debug_struct("Notification")
+                .field("method", method)
+                .field("params", &diagnostic(params))
+                .finish(),
+            Self::Response { id, result } => match result {
+                Ok(value) => f
+                    .debug_struct("Response")
+                    .field("id", id)
+                    .field("result", &diagnostic(value))
+                    .finish(),
+                Err(error) => f
+                    .debug_struct("Response")
+                    .field("id", id)
+                    .field("error", &error.to_string())
+                    .finish(),
+            },
+        }
     }
 }
 
