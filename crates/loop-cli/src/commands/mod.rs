@@ -640,8 +640,13 @@ pub fn dispatch(
 
 /// Format /help text.
 pub fn help_text(extra: &[(String, String)]) -> String {
+    help_text_for(extra, builtin_commands())
+}
+
+/// Format help for the commands available to the current Surface.
+pub fn help_text_for(extra: &[(String, String)], commands: Vec<SlashCommand>) -> String {
     let mut lines = vec!["Slash commands:".to_string()];
-    for c in builtin_commands() {
+    for c in commands {
         let hint = c.args_hint.unwrap_or("");
         lines.push(format!("  /{} {} — {}", c.name, hint, c.description));
     }

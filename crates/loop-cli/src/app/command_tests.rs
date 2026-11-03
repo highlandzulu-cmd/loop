@@ -1240,3 +1240,172 @@ async fn runtime_panel_labels_native_and_subscription_models_separately() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn busy_skill_activation_applies_on_the_next_turn_without_cancelling() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        test_support::resources_mut(&mut runtime)
+            .skills
+            .push(loop_agent::harness::types::Skill {
+                name: "inspect".into(),
+                description: "Inspect".into(),
+                body: "Inspect".into(),
+                path: dir.path().join("SKILL.md"),
+                disable_model_invocation: true,
+            });
+        test_support::sync_resources(&runtime).await;
+        test_support::install_read_tool(&runtime).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        test_support::pause_provider(&runtime, started.clone(), finish.clone());
+        let session = runtime.session_ref();
+        let turn = runtime
+            .backend()
+            .prompt(&session, vec![ContentBlock::text("working")])
+            .await
+            .unwrap();
+        started.notified().await;
+        let mut ui = Driver {
+            working: true,
+            status: "Working…".into(),
+            ..Default::default()
+        };
+        ui.input.insert_str("draft");
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Skill {
+                name: "inspect".into(),
+                args: "args".into(),
+            },
+        )
+        .await;
+        assert!(ui
+            .text()
+            .contains("skill inspect is active from the next turn"));
+        assert!(ui.working);
+        assert_eq!(ui.status, "Working…");
+        assert_eq!(ui.input.as_str(), "draft args");
+        assert_eq!(runtime.resource_view().active_skills, ["inspect"]);
+        assert!(runtime.backend().is_busy(&session));
+        finish.notify_one();
+        assert!(matches!(
+            turn.outcome().await,
+            TurnOutcome::Completed { .. }
+        ));
+        let observed = Arc::new(std::sync::Mutex::new(String::new()));
+        test_support::capture_system_prompt(&runtime, observed.clone());
+        prompt(&runtime, "next turn").await;
+        assert!(observed.lock().unwrap().contains("inspect"));
+        assert_eq!(
+            runtime.session_config().await.unwrap().config.active_skills,
+            ["inspect"]
+        );
+        runtime.shutdown().run().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn subscription_native_only_commands_refuse_without_exiting() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let backend = test_support::SubscriptionBackend::new();
+        runtime.adopt_agent(
+            "subscription",
+            backend.clone(),
+            backend.session(),
+            Some("agent-model".into()),
+        );
+        let mut ui = Driver::default();
+        for effect in [
+            CommandEffect::SetSandbox("status".into()),
+            CommandEffect::SetSandbox("off".into()),
+            CommandEffect::SetResponseHeaderTimeout(None),
+            CommandEffect::SetResponseHeaderTimeout(Some("60s".into())),
+        ] {
+            ui.effect(&mut runtime, effect).await;
+            assert!(ui.text().contains("not available for this Session"));
+            assert!(!ui.working);
+        }
+        ui.effect(&mut runtime, CommandEffect::Help).await;
+        let help = ui.text();
+        assert!(!help.contains("/sandbox ["));
+        assert!(!help.contains("/ttfb ["));
+        assert!(help.contains("/ttfb default <duration>"));
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SetResponseHeaderTimeout(Some("default 60s".into())),
+        )
+        .await;
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SetResponseHeaderTimeout(Some("default 60s".into())),
+        )
+        .await;
+        assert_eq!(runtime.timeout_default(None).await.unwrap(), 60_000);
+        ui.effect(&mut runtime, CommandEffect::Status("still usable".into()))
+            .await;
+        assert!(ui.text().contains("still usable"));
+        runtime.shutdown().run().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn slash_command_service_error_keeps_the_turn_and_tui_running() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        test_support::pause_provider(&runtime, started.clone(), finish.clone());
+        let session = runtime.session_ref();
+        let turn = runtime
+            .backend()
+            .prompt(&session, vec![ContentBlock::text("working")])
+            .await
+            .unwrap();
+        started.notified().await;
+        // Fail workspace/trust's persistent store while a turn is running.
+        std::fs::create_dir(dir.path().join("trust.json")).unwrap();
+        let mut ui = Driver {
+            working: true,
+            status: "Working…".into(),
+            ..Default::default()
+        };
+        ui.input.insert_str("/trust yes");
+        ui.key(&mut runtime, KeyCode::Enter, KeyModifiers::NONE)
+            .await;
+        assert!(runtime.backend().is_busy(&session));
+        assert!(ui.working);
+        assert_eq!(ui.status, "Working…");
+        let errors: Vec<_> = ui
+            .chat
+            .iter()
+            .filter_map(|item| match item {
+                ChatItem::Error { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("command failed:"));
+        assert!(!errors[0].contains('\n'));
+        ui.input.insert_str("/help");
+        ui.key(&mut runtime, KeyCode::Enter, KeyModifiers::NONE)
+            .await;
+        assert!(ui.text().contains("Slash commands:"));
+        finish.notify_one();
+        assert!(matches!(
+            turn.outcome().await,
+            TurnOutcome::Completed { .. }
+        ));
+        runtime.shutdown().run().await.unwrap();
+    })
+    .await
+    .unwrap();
+}

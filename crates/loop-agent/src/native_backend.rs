@@ -1084,9 +1084,6 @@ impl NativeBackend {
         let _setting = self.setting.lock().await;
         self.current_config(&p.session).await?;
         self.check_revision(p.expected_revision)?;
-        if self.is_busy_now() {
-            return Err(BackendError::Busy);
-        }
         if p.active {
             if !self.harness.activate_skill(&p.name).await {
                 return Err(invalid(format!("skill not found: {}", p.name)));

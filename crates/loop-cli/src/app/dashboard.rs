@@ -48,6 +48,7 @@ pub(super) struct ChatState<'a> {
     pub items: &'a [ChatItem],
     pub working: bool,
     pub turn_step: &'a str,
+    pub token_bar: &'a super::TokenBarState,
 }
 
 /// The open dashboard.
@@ -226,13 +227,21 @@ fn live_status(runtime: &SurfaceClient, chat: &ChatState<'_>, slow: &Slow) -> Li
         web: runtime.web_label(),
         cwd: runtime.cwd().display().to_string(),
         session_id: runtime.session_id().clone(),
-        context_tokens: slow.stats.as_ref().and_then(|s| s.context_tokens),
+        context_tokens: slow
+            .stats
+            .as_ref()
+            .and_then(|s| s.context_tokens)
+            .or(chat.token_bar.context_tokens),
         context_window: slow
             .stats
             .as_ref()
             .and_then(|s| s.context_window)
-            .unwrap_or(0),
-        session_tokens: slow.stats.as_ref().map_or(0, |s| s.total_tokens),
+            .unwrap_or(chat.token_bar.context_window),
+        session_tokens: slow.stats.as_ref().map(|s| s.total_tokens).or_else(|| {
+            chat.token_bar
+                .total_known
+                .then_some(chat.token_bar.total_tokens)
+        }),
         main_agent_working: chat.working,
         main_agent_step: if chat.working {
             chat.turn_step.to_string()
@@ -326,6 +335,7 @@ mod session_stats_tests {
                     items: &[],
                     working: false,
                     turn_step: "",
+                    token_bar: &super::super::TokenBarState::from_model(&runtime),
                 },
                 &slow,
             );
@@ -335,13 +345,104 @@ mod session_stats_tests {
                     state.context_tokens,
                     state.context_window
                 ),
-                (321, Some(123), 4096)
+                (Some(321), Some(123), 4096)
             );
             let loaded = runtime.loaded_sessions().await.unwrap();
             assert_eq!(loaded.totals.sessions, 1);
             assert_eq!(loaded.sessions[0].session, runtime.session_ref());
             let history = runtime.usage_history(None).await.unwrap();
             assert!(history.summary.is_some());
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod subscription_usage_tests {
+    use super::*;
+    use crate::surface_client::test_support;
+    use loop_protocol::AgentBackend;
+
+    #[tokio::test]
+    async fn dashboard_retains_subscription_usage_without_a_stats_service() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runtime = test_support::fixture(dir.path()).await;
+            let backend = test_support::SubscriptionBackend::new();
+            runtime.adopt_agent(
+                "subscription",
+                backend.clone(),
+                backend.session(),
+                Some("agent-model".into()),
+            );
+            assert!(runtime.backend().session_stats().is_none());
+            let mut updates = backend.subscribe();
+            let mut bar = super::super::TokenBarState::load(&runtime).await;
+            backend.usage(loop_protocol::Usage {
+                total_tokens: 1234,
+                context_window: Some(8192),
+                ..Default::default()
+            });
+            let event = updates.recv().await.unwrap();
+            let mut chat = vec![];
+            super::super::handle_update(
+                event.update,
+                event.origin,
+                &mut chat,
+                &mut String::new(),
+                &mut String::new(),
+                &mut None,
+                &mut None,
+                &mut false,
+                &mut bar,
+                &mut false,
+                None,
+                &mut None,
+            );
+            let slow = Slow::query(&mut runtime).await;
+            let state = live_status(
+                &runtime,
+                &ChatState {
+                    items: &chat,
+                    working: false,
+                    turn_step: "",
+                    token_bar: &bar,
+                },
+                &slow,
+            );
+            assert_eq!(state.context_tokens, Some(1234));
+            assert_eq!(state.context_window, 8192);
+            assert_eq!(state.session_tokens, None);
+            bar.sync_window(&runtime);
+            assert_eq!(bar.context_window, 8192);
+            // An incomplete stats response must not erase known context fields.
+            let partial = Slow {
+                stats: Some(loop_protocol::StatsSummary {
+                    total_tokens: 99,
+                    ..Default::default()
+                }),
+                ..slow
+            };
+            let state = live_status(
+                &runtime,
+                &ChatState {
+                    items: &chat,
+                    working: false,
+                    turn_step: "",
+                    token_bar: &bar,
+                },
+                &partial,
+            );
+            assert_eq!(
+                (
+                    state.session_tokens,
+                    state.context_tokens,
+                    state.context_window
+                ),
+                (Some(99), Some(1234), 8192)
+            );
+            runtime.shutdown().run().await.unwrap();
         })
         .await
         .unwrap();

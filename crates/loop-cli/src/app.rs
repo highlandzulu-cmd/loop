@@ -195,6 +195,7 @@ struct QueuedMessage {
 #[derive(Debug, Clone)]
 struct TokenBarState {
     total_tokens: u64,
+    total_known: bool,
     context_tokens: Option<u64>,
     context_window: u64,
 }
@@ -204,14 +205,16 @@ impl TokenBarState {
         // A stats service reports the window; until it does, it is unknown.
         let context_window = match runtime.backend().session_stats() {
             Some(_) => 0,
-            None => runtime
+            None if runtime.is_native() => runtime
                 .selected_model()
                 .as_ref()
                 .map_or(0, |m| m.context_window),
+            None => 0,
         };
         Self {
             total_tokens: 0,
-            context_tokens: Some(0),
+            total_known: false,
+            context_tokens: runtime.is_native().then_some(0),
             context_window,
         }
     }
@@ -236,6 +239,7 @@ impl TokenBarState {
     /// model's, which may differ from this Surface's selected model.
     fn apply_stats(&mut self, stats: &loop_protocol::StatsSummary) {
         self.total_tokens = stats.total_tokens;
+        self.total_known = true;
         if stats.context_tokens.is_some() {
             self.context_tokens = stats.context_tokens;
         }
@@ -244,7 +248,7 @@ impl TokenBarState {
 
     /// Without a stats service, the local selected model is all there is.
     fn sync_window(&mut self, runtime: &SurfaceClient) {
-        if runtime.backend().session_stats().is_some() {
+        if runtime.backend().session_stats().is_some() || !runtime.is_native() {
             return;
         }
         if let Some(m) = runtime.selected_model() {
@@ -257,6 +261,14 @@ impl TokenBarState {
     }
 
     fn apply_usage(&mut self, usage: &Usage) {
+        self.total_known |= [
+            usage.input,
+            usage.output,
+            usage.cache_read,
+            usage.cache_write,
+        ]
+        .iter()
+        .any(|&tokens| tokens > 0);
         self.total_tokens = self
             .total_tokens
             .saturating_add(usage.input)
@@ -278,6 +290,10 @@ impl TokenBarState {
             total_tokens: usage.total_tokens,
             ..Usage::default()
         });
+        self.context_tokens = Some(usage.total_tokens);
+        if let Some(window) = usage.context_window {
+            self.context_window = window;
+        }
     }
 
     fn usage_line(&self) -> String {
@@ -530,6 +546,7 @@ async fn run_loop(
                     items: &chat,
                     working,
                     turn_step: &turn_step,
+                    token_bar: &token_bar,
                 };
                 match dashboard::Screen::open(runtime, state).await {
                     Ok(screen) => dashboard = Some(screen),
@@ -575,6 +592,7 @@ async fn run_loop(
                     items: &chat,
                     working,
                     turn_step: &turn_step,
+                    token_bar: &token_bar,
                 };
                 screen.refresh(runtime, state).await?;
                 continue;
@@ -628,6 +646,16 @@ async fn run_loop(
         {
             let extra = dynamic_command_entries(runtime);
             commands::autocomplete_entries(input.as_str(), &extra)
+                .into_iter()
+                .filter(|entry| entry.name != "/sandbox" || runtime.supports_sandbox())
+                .map(|mut entry| {
+                    if entry.name == "/ttfb" && !runtime.supports_ttfb() {
+                        entry.description =
+                            "default <duration> — Save the host timeout default".into();
+                    }
+                    entry
+                })
+                .collect()
         } else {
             Vec::new()
         };
@@ -4595,6 +4623,7 @@ fn chat_from_agent_transcript(updates: Vec<SessionUpdate>, source: Option<&str>)
     let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, false, false);
     let mut token_bar = TokenBarState {
         total_tokens: 0,
+        total_known: false,
         context_tokens: None,
         context_window: 0,
     };
@@ -4865,11 +4894,129 @@ async fn apply_tracing_command(
     }
 }
 
+async fn apply_timeout_command(
+    runtime: &mut SurfaceClient,
+    arg: Option<&str>,
+    chat: &mut Vec<ChatItem>,
+) -> anyhow::Result<()> {
+    match arg {
+        None => {
+            let timeout = runtime.ttfb(None).await?;
+            let ms = timeout.effective_ms;
+            let label = timeout_label(ms);
+            let default = runtime.timeout_default(None).await?;
+            chat.push(sys(format!("response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000|inherit\n  settings.responseHeaderTimeoutMs: {default} (0 = unlimited)\n  /ttfb default <duration> saves for new Sessions after confirmation")));
+        }
+        Some("inherit") => {
+            runtime.ttfb(Some(None)).await?;
+            chat.push(sys("response header timeout → inherited default"));
+        }
+        Some(raw) => {
+            let saving = raw.strip_prefix("default ");
+            match parse_response_header_timeout(saving.unwrap_or(raw)) {
+                Ok(ms) if saving.is_some() => {
+                    if runtime.confirm_timeout_default(ms) {
+                        runtime.timeout_default(Some(ms)).await?;
+                        chat.push(sys(format!(
+                            "response header timeout default for new Sessions → {}",
+                            timeout_label(ms)
+                        )));
+                    } else {
+                        chat.push(sys(format!(
+                            "Run /ttfb default {} again to save this for new Sessions.",
+                            saving.unwrap()
+                        )));
+                    }
+                }
+                Ok(ms) => {
+                    runtime.ttfb(Some(Some(ms))).await?;
+                    chat.push(sys(format!(
+                        "response header timeout → {}",
+                        timeout_label(ms)
+                    )));
+                }
+                Err(error) => chat.push(sys(error)),
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "pre-existing signature; refactor tracked separately"
 )]
 async fn apply_effect(
+    effect: CommandEffect,
+    runtime: &mut SurfaceClient,
+    chat: &mut Vec<ChatItem>,
+    status: &mut String,
+    turn_step: &mut String,
+    pending_setup: &mut Option<SetupPrompt>,
+    model_picker: &mut Option<ModelPickerState>,
+    fork_picker: &mut Option<ForkPickerState>,
+    skill_picker: &mut Option<SkillPickerState>,
+    mcp_picker: &mut Option<McpPickerState>,
+    session_picker: &mut Option<SessionPickerState>,
+    tree_picker: &mut Option<TreePickerState>,
+    hide_thinking: &mut bool,
+    working: &mut bool,
+    message_queue: &mut VecDeque<QueuedMessage>,
+    streaming_assistant: &mut Option<usize>,
+    streaming_thinking: &mut Option<usize>,
+    redraw_request: &mut bool,
+    purge_ui_events: &mut bool,
+    input: &mut InputBuffer,
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    token_bar: &mut TokenBarState,
+    refresh_token_bar: &mut bool,
+) -> anyhow::Result<bool> {
+    // Command service failures are recoverable. Keep terminal and stream errors
+    // on their existing fatal paths outside command dispatch.
+    match try_apply_effect(
+        effect,
+        runtime,
+        chat,
+        status,
+        turn_step,
+        pending_setup,
+        model_picker,
+        fork_picker,
+        skill_picker,
+        mcp_picker,
+        session_picker,
+        tree_picker,
+        hide_thinking,
+        working,
+        message_queue,
+        streaming_assistant,
+        streaming_thinking,
+        redraw_request,
+        purge_ui_events,
+        input,
+        tx,
+        token_bar,
+        refresh_token_bar,
+    )
+    .await
+    {
+        Ok(quit) => Ok(quit),
+        Err(error) => {
+            let message = format!("{error:#}")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            chat.push(error_item(format!("command failed: {message}")));
+            Ok(false)
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "pre-existing signature; refactor tracked separately"
+)]
+async fn try_apply_effect(
     effect: CommandEffect,
     runtime: &mut SurfaceClient,
     chat: &mut Vec<ChatItem>,
@@ -5041,6 +5188,11 @@ async fn apply_effect(
             Ok(saved) => chat.push(sys(format!("defaults for new Sessions → {saved}"))),
             Err(err) => chat.push(error_item(format!("{err:#}"))),
         },
+        CommandEffect::SetSandbox(_) if !runtime.supports_sandbox() => {
+            chat.push(error_item(
+                "sandbox control is not available for this Session",
+            ));
+        }
         CommandEffect::SetSandbox(mode) => {
             if mode.is_empty() || mode.trim() == "status" {
                 let info = runtime
@@ -5051,8 +5203,11 @@ async fn apply_effect(
                         config: None,
                         expected_revision: None,
                     })
-                    .await?;
-                chat.push(sys(info.info));
+                    .await;
+                match info {
+                    Ok(info) => chat.push(sys(info.info)),
+                    Err(error) => chat.push(error_item(format!("sandbox: {error}"))),
+                }
                 if mode.is_empty() {
                     chat.push(sys(
                         "use /sandbox status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]",
@@ -5204,46 +5359,17 @@ async fn apply_effect(
                 ));
             }
         },
-        CommandEffect::SetResponseHeaderTimeout(arg) => match arg.as_deref() {
-            None => {
-                let timeout = runtime.ttfb(None).await?;
-                let ms = timeout.effective_ms;
-                let label = timeout_label(ms);
-                let default = runtime.timeout_default(None).await?;
-                chat.push(sys(format!("response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000|inherit\n  settings.responseHeaderTimeoutMs: {default} (0 = unlimited)\n  /ttfb default <duration> saves for new Sessions after confirmation")));
+        CommandEffect::SetResponseHeaderTimeout(arg) => {
+            if !runtime.supports_ttfb()
+                && !arg.as_deref().is_some_and(|s| s.starts_with("default "))
+            {
+                chat.push(error_item(
+                    "response-timeout control is not available for this Session",
+                ));
+            } else if let Err(error) = apply_timeout_command(runtime, arg.as_deref(), chat).await {
+                chat.push(error_item(format!("response header timeout: {error}")));
             }
-            Some("inherit") => {
-                runtime.ttfb(Some(None)).await?;
-                chat.push(sys("response header timeout → inherited default"));
-            }
-            Some(raw) => {
-                let saving = raw.strip_prefix("default ");
-                match parse_response_header_timeout(saving.unwrap_or(raw)) {
-                    Ok(ms) if saving.is_some() => {
-                        if runtime.confirm_timeout_default(ms) {
-                            runtime.timeout_default(Some(ms)).await?;
-                            chat.push(sys(format!(
-                                "response header timeout default for new Sessions → {}",
-                                timeout_label(ms)
-                            )));
-                        } else {
-                            chat.push(sys(format!(
-                                "Run /ttfb default {} again to save this for new Sessions.",
-                                saving.unwrap()
-                            )));
-                        }
-                    }
-                    Ok(ms) => {
-                        runtime.ttfb(Some(Some(ms))).await?;
-                        chat.push(sys(format!(
-                            "response header timeout → {}",
-                            timeout_label(ms)
-                        )));
-                    }
-                    Err(error) => chat.push(sys(error)),
-                }
-            }
-        },
+        }
         CommandEffect::Compact(instructions) => {
             if runtime.backend().compaction().is_none() {
                 chat.push(sys(
@@ -5285,7 +5411,20 @@ async fn apply_effect(
         }
         CommandEffect::Help => {
             let extra = dynamic_command_entries(runtime);
-            chat.push(sys(commands::help_text(&extra)));
+            let commands = commands::builtin_commands()
+                .into_iter()
+                .filter_map(|mut command| {
+                    if command.name == "sandbox" && !runtime.supports_sandbox() {
+                        return None;
+                    }
+                    if command.name == "ttfb" && !runtime.supports_ttfb() {
+                        command.args_hint = Some("default <duration>");
+                        command.description = "Save the host timeout default for new Sessions";
+                    }
+                    Some(command)
+                })
+                .collect();
+            chat.push(sys(commands::help_text_for(&extra, commands)));
         }
         CommandEffect::SessionInfo => {
             let stats = runtime.stats().await.map_err(|e| e.to_string());
@@ -5699,12 +5838,25 @@ async fn apply_effect(
         }
 
         CommandEffect::Skill { name, args } => {
-            if runtime.activate_skill(&name).await? {
+            let activated = match runtime.activate_skill(&name).await {
+                Ok(activated) => activated,
+                Err(error) => {
+                    chat.push(error_item(format!(
+                        "could not activate skill `{name}`: {error}"
+                    )));
+                    return Ok(false);
+                }
+            };
+            if activated {
                 let list = runtime.resource_view().active_skills.join(", ");
-                chat.push(sys(format!(
-                    "skill `{name}` is active ({list}). Type your message when ready."
-                )));
-                *status = format!("skill(s) active: {list} · type your message");
+                if agent_is_busy(runtime, *working) {
+                    chat.push(sys(format!("skill {name} is active from the next turn")));
+                } else {
+                    chat.push(sys(format!(
+                        "skill `{name}` is active ({list}). Type your message when ready."
+                    )));
+                    *status = format!("skill(s) active: {list} · type your message");
+                }
                 let args = args.trim();
                 if !args.is_empty() {
                     let current = input.as_str();
@@ -5996,6 +6148,7 @@ mod tests {
         let (mut assistant, mut thinking, mut working) = (None, None, false);
         let mut token_bar = TokenBarState {
             total_tokens: 0,
+            total_known: false,
             context_tokens: None,
             context_window: 0,
         };
@@ -6035,6 +6188,7 @@ mod tests {
         // This Surface selected a 1M model; the attached Session runs 200k.
         let mut bar = TokenBarState {
             total_tokens: 0,
+            total_known: false,
             context_tokens: Some(0),
             context_window: 1_000_000,
         };
@@ -6072,6 +6226,7 @@ mod tests {
         let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, false, false);
         let mut token_bar = TokenBarState {
             total_tokens: 0,
+            total_known: false,
             context_tokens: None,
             context_window: 0,
         };
@@ -6453,6 +6608,7 @@ mod plan_tests {
         let (mut assistant, mut thinking, mut working, mut refresh) = (None, None, true, false);
         let mut token_bar = TokenBarState {
             total_tokens: 0,
+            total_known: false,
             context_tokens: None,
             context_window: 0,
         };

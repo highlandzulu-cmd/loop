@@ -97,7 +97,7 @@ fn live() -> LiveStatus {
         session_id: "0192aaaa-bbbb".into(),
         context_tokens: Some(54_000),
         context_window: 128_000,
-        session_tokens: 1_200_000,
+        session_tokens: Some(1_200_000),
         main_agent_working: true,
         main_agent_step: "tool · bash".into(),
         external_agent: None,
