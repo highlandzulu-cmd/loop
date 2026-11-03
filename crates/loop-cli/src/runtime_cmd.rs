@@ -178,7 +178,6 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         stop: stop.clone(),
         limits,
         agent_dir: agent_dir.clone(),
-        defaults_revision: Default::default(),
     });
 
     let info = PeerInfo {
@@ -302,8 +301,6 @@ struct Control {
     limits: Limits,
     /// The host's agent directory: settings and the usage log.
     agent_dir: PathBuf,
-    /// Counts saved changes to new-Session defaults.
-    defaults_revision: std::sync::atomic::AtomicU64,
 }
 
 /// Workspace admin is the Runtime's; the host-only usage history and
@@ -357,34 +354,7 @@ impl loop_wire::RuntimeAdmin for Control {
             .map_err(failed)?
     }
     async fn defaults(&self, p: admin::DefaultsParams) -> BackendResult<admin::DefaultsResult> {
-        use loop_app_core::config::{paths, Settings};
-        use std::sync::atomic::Ordering;
-        let path = paths::settings_path(&self.agent_dir);
-        let revision = self.defaults_revision.load(Ordering::Acquire);
-        let mut settings = Settings::load_file(&path).map_err(failed)?;
-        if let Some(patch) = p.patch {
-            if p.expected_revision
-                .is_some_and(|expected| expected != revision)
-            {
-                return Err(loop_protocol::BackendError::Conflict { revision });
-            }
-            if let Some(ms) = patch.response_header_timeout_ms {
-                settings.response_header_timeout_ms = ms;
-            }
-            settings.save_file(&path).map_err(failed)?;
-            self.defaults_revision.fetch_add(1, Ordering::AcqRel);
-            // Loaded workspaces cache settings; new Sessions read them there.
-            self.runtime.reload_workspaces().await?;
-        }
-        Ok(admin::DefaultsResult {
-            revision: self.defaults_revision.load(Ordering::Acquire),
-            model: settings
-                .selected_model()
-                .map(|(provider, model)| format!("{provider}/{model}")),
-            effort: Some(settings.default_thinking_level.clone()),
-            mode: settings.permission_mode.clone(),
-            response_header_timeout_ms: Some(settings.response_header_timeout_ms),
-        })
+        self.runtime.update_defaults(p).await
     }
 }
 

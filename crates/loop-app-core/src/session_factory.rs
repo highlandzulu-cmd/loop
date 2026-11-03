@@ -716,7 +716,7 @@ impl SessionFactory {
         })
     }
 
-    /// Reread `opts.cwd`'s workspace (trust, settings, skills, templates,
+    /// Reread the model definitions and `opts.cwd`'s workspace (trust, settings, skills, templates,
     /// hooks, context, MCP connections) and cache it for new Sessions.
     /// Returns the new resources and the ones they replace, whose MCP
     /// connections the caller closes once no Session uses them. The
@@ -726,6 +726,13 @@ impl SessionFactory {
         opts: &BootstrapOpts,
     ) -> anyhow::Result<(Arc<WorkspaceResources>, Option<Arc<WorkspaceResources>>)> {
         let cwd = absolute_workspace(&opts.cwd)?;
+        let global = Settings::load_file(&settings_path(&self.globals.agent_dir))?;
+        crate::runtime::reload_model_definitions(
+            &self.globals.agent_dir,
+            &self.globals.models,
+            &global.providers,
+        )
+        .await?;
         let old = {
             let workspaces = self.workspaces.lock().await;
             workspaces.get(&cwd).and_then(|slot| slot.get().cloned())

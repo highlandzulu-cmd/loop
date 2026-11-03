@@ -1,15 +1,15 @@
 //! Workspace admin, Session sandbox and permission mode
 //! (`loop_wire::RuntimeAdmin`). Host-only methods are the daemon's.
 //!
-//! A workspace change writes the global settings file (or the trust store)
-//! and reloads the workspace: new Sessions open with the new resources at
+//! A workspace change writes that workspace's host-owned overrides (or the
+//! trust store) and reloads the workspace: new Sessions open with the new resources at
 //! once, idle Sessions switch now, and busy ones when their turn or user
 //! command ends.
 
 use std::path::Path;
-use std::sync::atomic::AtomicUsize;
 
 use loop_agent::harness::SandboxMode;
+use loop_app_core::config::workspace_settings::{WorkspaceOverrides, WorkspaceSettingsStore};
 use loop_app_core::config::{paths, settings::set_disabled_name, settings::set_skill_disabled};
 use loop_app_core::config::{Settings, TrustStore};
 use loop_protocol::admin::*;
@@ -20,27 +20,30 @@ use super::*;
 /// Tools the Runtime adds to its Sessions, kept across a reload.
 const RUNTIME_TOOLS: &[&str] = &[super::subagent::TOOL];
 
-/// A workspace reload a busy Session applies when its work ends.
-pub(super) struct PendingWorkspace {
-    resources: Arc<WorkspaceResources>,
-    retiring: Option<Arc<Retiring>>,
+/// One loaded version of a workspace. Its MCP connections close when the
+/// last holder releases it: the workspace (while current), each Session
+/// using it, and each Session that will switch to it after its work.
+pub(super) struct Generation {
+    pub(super) resources: Arc<WorkspaceResources>,
+    /// Set once its connections are closed; shared so a watcher need not
+    /// hold the generation.
+    pub(super) released: Arc<AtomicBool>,
 }
 
-/// Replaced workspace resources whose MCP connections close once every
-/// Session that still used them has switched.
-pub(super) struct Retiring {
-    old: Arc<WorkspaceResources>,
-    left: AtomicUsize,
-}
-
-impl Retiring {
-    async fn release(&self) {
-        if self.left.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.old.mcp_client.disconnect_all().await;
-        }
+impl Generation {
+    pub(super) fn new(resources: Arc<WorkspaceResources>) -> Arc<Self> {
+        Arc::new(Self {
+            resources,
+            released: Arc::default(),
+        })
     }
-    pub(super) async fn close(&self) {
-        self.old.mcp_client.disconnect_all().await;
+}
+
+/// Give up one hold on `generation`; the last one closes its connections.
+pub(super) async fn release(generation: Arc<Generation>) {
+    if let Some(generation) = Arc::into_inner(generation) {
+        generation.released.store(true, Ordering::Release);
+        generation.resources.mcp_client.disconnect_all().await;
     }
 }
 
@@ -49,28 +52,53 @@ impl LiveSession {
     /// end. The caller holds the lifecycle lock and has cleared `busy`.
     pub(super) async fn apply_pending(&self) {
         let pending = self.pending_workspace.lock().unwrap().take();
-        if let Some(pending) = pending {
+        if let Some(next) = pending {
             if let Err(error) = self
                 .opened
-                .apply_workspace(&pending.resources, RUNTIME_TOOLS)
+                .apply_workspace(&next.resources, RUNTIME_TOOLS)
                 .await
             {
                 eprintln!("Runtime: could not apply the reloaded workspace: {error}");
             }
-            if let Some(retiring) = pending.retiring {
-                retiring.release().await;
+            let previous = self.generation.lock().unwrap().replace(next);
+            if let Some(previous) = previous {
+                release(previous).await;
             }
         }
     }
 }
 
 impl Runtime {
+    /// Before an opened Session is published: move it onto the workspace's
+    /// current generation if a reload happened while it was opening, and
+    /// hold that generation. The caller holds the reload gate's read side.
+    pub(super) async fn adopt_generation(&self, live: &LiveSession) {
+        let current = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&live.opened.workspace.cwd)
+            .map(|state| Arc::clone(&state.generation));
+        let Some(current) = current else { return };
+        if !Arc::ptr_eq(&current.resources, &live.opened.workspace) {
+            if let Err(error) = live
+                .opened
+                .apply_workspace(&current.resources, RUNTIME_TOOLS)
+                .await
+            {
+                eprintln!("Runtime: could not apply the reloaded workspace: {error}");
+            }
+        }
+        *live.generation.lock().unwrap() = Some(current);
+    }
+
     /// Release what admin gave a closing Session: its place in a pending
     /// reload, and a sandbox of its own (never the workspace's shared one).
     pub(super) async fn release_admin(&self, live: &LiveSession) {
         let pending = live.pending_workspace.lock().unwrap().take();
-        if let Some(retiring) = pending.and_then(|p| p.retiring) {
-            retiring.release().await;
+        let current = live.generation.lock().unwrap().take();
+        for held in pending.into_iter().chain(current) {
+            release(held).await;
         }
         let shared = self
             .workspaces
@@ -138,13 +166,20 @@ impl Runtime {
             .map_err(failed)
     }
 
-    /// Change the global settings file (never a project file), as the
-    /// standalone commands do.
-    fn edit_settings(&self, edit: impl FnOnce(&mut Settings)) -> BackendResult<()> {
-        let path = paths::settings_path(&self.factory.globals.agent_dir);
-        let mut global = Settings::load_file(&path).map_err(failed)?;
-        edit(&mut global);
-        global.save_file(&path).map_err(failed)
+    /// Change `cwd`'s host-owned overrides, starting from its effective
+    /// settings. Never the global defaults or a project file. Caller holds
+    /// `admin`.
+    fn edit_workspace(
+        &self,
+        cwd: &Path,
+        current: &Settings,
+        edit: impl FnOnce(&mut WorkspaceOverrides, &Settings),
+    ) -> BackendResult<()> {
+        let mut store =
+            WorkspaceSettingsStore::load(&self.factory.globals.agent_dir).map_err(failed)?;
+        let mut overrides = store.get(cwd);
+        edit(&mut overrides, current);
+        store.set(cwd, overrides).map_err(failed)
     }
 
     /// Reload `cwd`'s workspace and move its live Sessions onto it: idle
@@ -154,34 +189,29 @@ impl Runtime {
         &self,
         cwd: &Path,
     ) -> BackendResult<(Arc<WorkspaceResources>, u64, Vec<String>, u32)> {
-        let (fresh, old) = self
+        // Opening Sessions publish under the read side, so none escapes.
+        let _publishing = self.reload_gate.write().await;
+        let (fresh, _) = self
             .factory
             .reload_workspace(&self.workspace_opts(cwd))
             .await
             .map_err(failed)?;
-        let revision = {
+        let generation = Generation::new(Arc::clone(&fresh));
+        let (revision, previous) = {
             let mut workspaces = self.workspaces.lock().unwrap();
             let state = workspaces
                 .entry(cwd.to_path_buf())
                 .or_insert_with(|| WorkspaceState {
                     resources: Arc::clone(&fresh),
+                    generation: Arc::clone(&generation),
                     sandbox: None,
                     revision: 0,
                 });
             state.resources = Arc::clone(&fresh);
             state.revision += 1;
-            state.revision
+            let previous = std::mem::replace(&mut state.generation, Arc::clone(&generation));
+            (state.revision, previous)
         };
-        // The reload's own count, released below.
-        let retiring = old.map(|old| {
-            Arc::new(Retiring {
-                old,
-                left: AtomicUsize::new(1),
-            })
-        });
-        if let Some(retiring) = &retiring {
-            self.retiring.lock().unwrap().push(Arc::clone(retiring));
-        }
         let live: Vec<Arc<LiveSession>> = self
             .sessions
             .lock()
@@ -199,19 +229,14 @@ impl Runtime {
             }
             if live.busy.load(Ordering::Acquire) {
                 pending += 1;
-                if let Some(retiring) = &retiring {
-                    retiring.left.fetch_add(1, Ordering::AcqRel);
-                }
+                // A generation it was only going to switch to is not in use.
                 let replaced = live
                     .pending_workspace
                     .lock()
                     .unwrap()
-                    .replace(PendingWorkspace {
-                        resources: Arc::clone(&fresh),
-                        retiring: retiring.clone(),
-                    });
-                if let Some(retiring) = replaced.and_then(|p| p.retiring) {
-                    retiring.release().await;
+                    .replace(Arc::clone(&generation));
+                if let Some(replaced) = replaced {
+                    release(replaced).await;
                 }
                 continue;
             }
@@ -225,10 +250,16 @@ impl Runtime {
                 }
                 Err(error) => notices.push(format!("{}: {error}", live.reference.key)),
             }
+            let used = live
+                .generation
+                .lock()
+                .unwrap()
+                .replace(Arc::clone(&generation));
+            if let Some(used) = used {
+                release(used).await;
+            }
         }
-        if let Some(retiring) = &retiring {
-            retiring.release().await;
-        }
+        release(previous).await;
         if notices.is_empty() {
             notices.extend(fresh.startup_notices.iter().cloned());
         }
@@ -335,17 +366,39 @@ impl Runtime {
 }
 
 impl Runtime {
-    /// Reload every workspace the Runtime has loaded, after a host setting
-    /// they all read changed. Returns how many Sessions wait for their work
-    /// to end.
-    pub async fn reload_workspaces(&self) -> BackendResult<u32> {
+    /// `runtime/defaults`: read, or save new-Session defaults in the global
+    /// settings and reload every loaded workspace. The revision check, the
+    /// read-modify-write and the reloads run under the admin lock, so they
+    /// never interleave with each other or with a workspace change.
+    pub async fn update_defaults(&self, params: DefaultsParams) -> BackendResult<DefaultsResult> {
         let _admin = self.admin.lock().await;
-        let loaded: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
-        let mut pending = 0;
-        for cwd in loaded {
-            pending += self.reload_workspace(&cwd).await?.3;
+        let path = paths::settings_path(&self.factory.globals.agent_dir);
+        let mut settings = Settings::load_file(&path).map_err(failed)?;
+        if let Some(patch) = params.patch {
+            let revision = self.defaults_revision.load(Ordering::Acquire);
+            if params.expected_revision.is_some_and(|e| e != revision) {
+                return Err(BackendError::Conflict { revision });
+            }
+            if let Some(ms) = patch.response_header_timeout_ms {
+                settings.response_header_timeout_ms = ms;
+            }
+            settings.save_file(&path).map_err(failed)?;
+            self.defaults_revision.fetch_add(1, Ordering::AcqRel);
+            // Loaded workspaces cache settings; new Sessions read them there.
+            let loaded: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
+            for cwd in loaded {
+                self.reload_workspace(&cwd).await?;
+            }
         }
-        Ok(pending)
+        Ok(DefaultsResult {
+            revision: self.defaults_revision.load(Ordering::Acquire),
+            model: settings
+                .selected_model()
+                .map(|(provider, model)| format!("{provider}/{model}")),
+            effort: Some(settings.default_thinking_level.clone()),
+            mode: settings.permission_mode.clone(),
+            response_header_timeout_ms: Some(settings.response_header_timeout_ms),
+        })
     }
 }
 
@@ -429,8 +482,10 @@ impl RuntimeAdmin for Runtime {
                     return Err(protocol(format!("no MCP server is named `{name}`")));
                 }
                 let enabled = action == AdminAction::Enable;
-                self.edit_settings(|s| {
-                    set_disabled_name(&mut s.disabled_mcp_servers, &name, enabled)
+                self.edit_workspace(&cwd, &current.settings, |o, s| {
+                    let mut list = s.disabled_mcp_servers.clone();
+                    set_disabled_name(&mut list, &name, enabled);
+                    o.disabled_mcp_servers = Some(list);
                 })?;
                 let (fresh, _, _, pending) = self.reload_workspace(&cwd).await?;
                 pending_sessions = pending;
@@ -465,14 +520,16 @@ impl RuntimeAdmin for Runtime {
                     )));
                 }
             }
-            self.edit_settings(|s| {
-                let web = s.web_search.get_or_insert_with(Default::default);
+            let current = self.workspace_now(&cwd).await?;
+            self.edit_workspace(&cwd, &current.settings, |o, s| {
+                let mut web = s.web_search.clone().unwrap_or_default();
                 if let Some(enabled) = params.enabled {
                     web.enabled = enabled;
                 }
                 if provider.is_some() {
                     web.provider = provider;
                 }
+                o.web_search = Some(web);
             })?;
             let (fresh, _, _, pending) = self.reload_workspace(&cwd).await?;
             pending_sessions = pending;
@@ -507,7 +564,11 @@ impl RuntimeAdmin for Runtime {
                     return Err(protocol(format!("no skill is named `{name}`")));
                 }
                 let enabled = action == AdminAction::Enable;
-                self.edit_settings(|s| set_skill_disabled(&mut s.disabled_skills, &name, enabled))?;
+                self.edit_workspace(&cwd, &current.settings, |o, s| {
+                    let mut list = s.disabled_skills.clone();
+                    set_skill_disabled(&mut list, &name, enabled);
+                    o.disabled_skills = Some(list);
+                })?;
                 let (fresh, _, _, pending) = self.reload_workspace(&cwd).await?;
                 pending_sessions = pending;
                 fresh

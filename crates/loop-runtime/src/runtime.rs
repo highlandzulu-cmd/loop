@@ -104,9 +104,11 @@ pub struct Runtime {
     pauses: Arc<pause::Pauses>,
     /// Serializes workspace admin changes (settings and trust writes, reloads).
     admin: AsyncMutex<()>,
-    /// Replaced workspace resources whose MCP connections close at shutdown
-    /// if no Session released them first.
-    retiring: Mutex<Vec<Arc<admin::Retiring>>>,
+    /// Reloads hold the write side; an opening Session publishes under the
+    /// read side, so it either is seen by a reload or adopts its result.
+    reload_gate: tokio::sync::RwLock<()>,
+    /// Counts saved changes to new-Session defaults (`runtime/defaults`).
+    defaults_revision: std::sync::atomic::AtomicU64,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -188,6 +190,8 @@ impl Drop for OpeningLease {
 struct WorkspaceState {
     resources: Arc<WorkspaceResources>,
     sandbox: Option<Arc<dyn Sandbox>>,
+    /// The current generation, held while it is current.
+    generation: Arc<admin::Generation>,
     /// Counts committed admin changes and reloads of this workspace.
     revision: u64,
 }
@@ -227,7 +231,9 @@ struct LiveSession {
     /// The Session's config as last committed to the Event Log.
     announced: Mutex<Announced>,
     /// A workspace reload waiting for the current turn or command to end.
-    pending_workspace: Mutex<Option<admin::PendingWorkspace>>,
+    pending_workspace: Mutex<Option<Arc<admin::Generation>>>,
+    /// The workspace generation the Session uses, held until it switches.
+    generation: Mutex<Option<Arc<admin::Generation>>>,
     /// The sandbox the Session runs in (`session/sandbox`).
     sandbox_choice: Mutex<loop_protocol::admin::SandboxChoice>,
 }
@@ -366,7 +372,8 @@ impl Runtime {
             destinations: Arc::default(),
             pauses: Arc::default(),
             admin: AsyncMutex::new(()),
-            retiring: Mutex::new(Vec::new()),
+            reload_gate: tokio::sync::RwLock::new(()),
+            defaults_revision: std::sync::atomic::AtomicU64::new(0),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -668,6 +675,7 @@ impl Runtime {
                     .entry(opened.workspace.cwd.clone())
                     .or_insert_with(|| WorkspaceState {
                         resources: opened.workspace.clone(),
+                        generation: admin::Generation::new(opened.workspace.clone()),
                         sandbox: None,
                         revision: 0,
                     });
@@ -786,6 +794,7 @@ impl Runtime {
                     receipts: HashMap::new(),
                 }),
                 pending_workspace: Mutex::new(None),
+                generation: Mutex::new(None),
                 sandbox_choice: Mutex::new(sandbox_choice),
             });
             if unannounced {
@@ -830,6 +839,9 @@ impl Runtime {
                 self.identity.clone(),
             ));
             *live.pump.lock().await = Some(task);
+            self.pauses.wait("open_publishing").await;
+            let _publishing = self.reload_gate.read().await;
+            self.adopt_generation(&live).await;
             self.sessions
                 .lock()
                 .unwrap()
@@ -1299,10 +1311,6 @@ impl Runtime {
             .drain()
             .map(|(_, value)| value)
             .collect();
-        let retiring: Vec<_> = self.retiring.lock().unwrap().drain(..).collect();
-        for retiring in retiring {
-            retiring.close().await;
-        }
         for workspace in workspaces {
             workspace.resources.mcp_client.disconnect_all().await;
             if let Some(sandbox) = workspace.sandbox {

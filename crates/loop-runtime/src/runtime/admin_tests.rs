@@ -188,8 +188,13 @@ async fn toggling_a_skill_saves_global_settings_and_reaches_sessions() {
             }]
         );
         assert!(!has_notes(&rt, &session).await);
-        let saved = std::fs::read_to_string(dir.path().join("agent/settings.json")).unwrap();
+        // Saved for this workspace on the host, not in the global defaults.
+        let saved =
+            std::fs::read_to_string(dir.path().join("agent/workspace-settings.json")).unwrap();
         assert!(saved.contains("notes"), "{saved}");
+        let global =
+            std::fs::read_to_string(dir.path().join("agent/settings.json")).unwrap_or_default();
+        assert!(!global.contains("notes"), "{global}");
         assert!(rt
             .skills(SkillsParams {
                 workspace_id: id.clone(),
@@ -415,6 +420,258 @@ async fn a_reloaded_session_matches_a_fresh_one_and_keeps_runtime_tools() {
         assert_eq!(tools_and_prompt(&rt, &fresh).await, before);
         // Snapshots report the workspace revision admin results use.
         assert_eq!(rt.snapshot(&session).await.unwrap().workspace_revision, 1);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+fn generation(rt: &Runtime, session: &SessionRef) -> Arc<admin::Generation> {
+    let live = rt.route(session).unwrap();
+    let held = live.generation.lock().unwrap().clone();
+    held.expect("a published Session holds its generation")
+}
+
+#[tokio::test]
+async fn a_second_reload_keeps_the_generation_a_busy_session_still_uses() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, log) = runtime(dir.path()).await;
+        let busy = rt.new_session(SessionSpec::default()).await.unwrap();
+        let in_use = generation(&rt, &busy);
+        let in_use_closed = Arc::clone(&in_use.released);
+        drop(in_use);
+        let turn = park(&rt, &log, &busy).await;
+        let reload = || {
+            admin(&rt).reload(ReloadParams {
+                workspace_id: workspace(dir.path()),
+                expected_revision: None,
+            })
+        };
+        reload().await.unwrap();
+        let skipped_closed = {
+            let live = rt.route(&busy).unwrap();
+            let pending = live.pending_workspace.lock().unwrap();
+            Arc::clone(&pending.as_ref().unwrap().released)
+        };
+        reload().await.unwrap();
+        // The generation it was only going to switch to is closed; the one
+        // its running turn uses keeps its connections.
+        assert!(skipped_closed.load(Ordering::Acquire));
+        assert!(!in_use_closed.load(Ordering::Acquire));
+
+        rt.cancel(&busy);
+        turn.outcome().await;
+        assert!(in_use_closed.load(Ordering::Acquire));
+        assert!(!generation(&rt, &busy).released.load(Ordering::Acquire));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_session_opening_across_a_reload_adopts_the_new_workspace() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".agents/skills/proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("SKILL.md"),
+            "---\nname: proj\ndescription: Project skill\n---\nBody\n",
+        )
+        .unwrap();
+        let (rt, _log) = runtime(dir.path()).await;
+        let trust = |trusted| TrustParams {
+            workspace_id: workspace(dir.path()),
+            trusted: Some(trusted),
+            expected_revision: None,
+        };
+        // Loads the workspace, trusted, with the project skill.
+        let first = rt.new_session(SessionSpec::default()).await.unwrap();
+        admin(&rt).trust(trust(true)).await.unwrap();
+        let offered = |names: Vec<String>| names.iter().any(|n| n == "proj");
+        let skills_of = |session: SessionRef| {
+            let rt = rt.clone();
+            async move {
+                let live = rt.route(&session).unwrap();
+                let names: Vec<String> = live
+                    .opened
+                    .harness
+                    .get_resources()
+                    .await
+                    .skills
+                    .into_iter()
+                    .map(|s| s.name)
+                    .collect();
+                names
+            }
+        };
+        assert!(offered(skills_of(first.clone()).await));
+
+        // A Session opens with the trusted workspace; trust is revoked
+        // before it is published.
+        let (reached, release) = rt.pauses.arm("open_publishing");
+        let opening = tokio::spawn({
+            let rt = rt.clone();
+            async move { rt.new_session(SessionSpec::default()).await }
+        });
+        reached.notified().await;
+        let revoked = admin(&rt).trust(trust(false)).await.unwrap();
+        assert_eq!(revoked.pending_sessions, 0);
+        release.send(false).unwrap();
+        let late = opening.await.unwrap().unwrap();
+        assert!(!offered(skills_of(late.clone()).await));
+        assert!(!offered(skills_of(first).await));
+        let current = rt
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&dir.path().canonicalize().unwrap())
+            .map(|state| Arc::clone(&state.generation))
+            .unwrap();
+        assert!(Arc::ptr_eq(&generation(&rt, &late), &current));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn workspace_toggles_stay_in_their_own_workspace() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "notes");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (rt, _log) = runtime(dir.path()).await;
+        let open = |cwd: &std::path::Path| SessionSpec {
+            cwd: Some(cwd.to_path_buf()),
+            ..SessionSpec::default()
+        };
+        let in_a = rt.new_session(open(&a)).await.unwrap();
+        let in_b = rt.new_session(open(&b)).await.unwrap();
+        let disabled = admin(&rt)
+            .skills(SkillsParams {
+                workspace_id: workspace(&a),
+                action: AdminAction::Disable,
+                name: Some("notes".into()),
+                expected_revision: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(disabled.revision, 1);
+        assert!(!has_notes(&rt, &in_a).await);
+        assert!(has_notes(&rt, &in_b).await);
+        let b_canonical = b.canonicalize().unwrap();
+        assert_eq!(rt.workspace_revision(&b_canonical), 0);
+        // B reloaded, or a new Session there, still has it.
+        let reloaded = admin(&rt)
+            .reload(ReloadParams {
+                workspace_id: workspace(&b),
+                expected_revision: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reloaded.revision, 1);
+        assert!(has_notes(&rt, &in_b).await);
+        let again = rt.new_session(open(&a)).await.unwrap();
+        assert!(!has_notes(&rt, &again).await);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reload_rereads_model_definitions() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _log) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let models = |ids: &[&str]| {
+            json!({"providers": [{"id": "local", "baseUrl": "http://127.0.0.1:9/v1",
+                "models": ids}]})
+            .to_string()
+        };
+        let path = dir.path().join("agent/models.json");
+        std::fs::write(&path, models(&["first"])).unwrap();
+        let catalog = &rt.factory.globals.models;
+        assert!(catalog.get_model("local", "first").is_none());
+        let reload = || {
+            admin(&rt).reload(ReloadParams {
+                workspace_id: workspace(dir.path()),
+                expected_revision: None,
+            })
+        };
+        reload().await.unwrap();
+        assert!(catalog.get_model("local", "first").is_some());
+        std::fs::write(&path, models(&["second"])).unwrap();
+        reload().await.unwrap();
+        assert!(catalog.get_model("local", "second").is_some());
+        let fresh = rt.new_session(SessionSpec::default()).await.unwrap();
+        let offered = ModelControl::models(&*rt, &fresh).await.unwrap();
+        assert!(
+            offered.models.iter().any(|m| m.id == "local/second"),
+            "{:?}",
+            offered.models
+        );
+        drop(session);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn defaults_writes_are_serialized_with_each_other_and_workspace_changes() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(dir.path(), "notes");
+        let (rt, _log) = runtime(dir.path()).await;
+        let _session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let save = |ms| {
+            rt.update_defaults(DefaultsParams {
+                patch: Some(DefaultsPatch {
+                    response_header_timeout_ms: Some(ms),
+                }),
+                expected_revision: Some(0),
+                ..DefaultsParams::default()
+            })
+        };
+        let (one, two) = tokio::join!(save(11_000), save(22_000));
+        let conflicts = [&one, &two]
+            .iter()
+            .filter(|r| matches!(r, Err(BackendError::Conflict { revision: 1 })))
+            .count();
+        assert_eq!(conflicts, 1, "{one:?} {two:?}");
+        let saved = one.or(two).unwrap().response_header_timeout_ms.unwrap();
+
+        // A defaults write racing a workspace toggle loses neither.
+        let toggle = admin(&rt).skills(SkillsParams {
+            workspace_id: workspace(dir.path()),
+            action: AdminAction::Disable,
+            name: Some("notes".into()),
+            expected_revision: None,
+        });
+        let defaults = rt.update_defaults(DefaultsParams {
+            patch: Some(DefaultsPatch {
+                response_header_timeout_ms: Some(33_000),
+            }),
+            ..DefaultsParams::default()
+        });
+        let (toggled, written) = tokio::join!(toggle, defaults);
+        toggled.unwrap();
+        assert_eq!(written.unwrap().revision, 2);
+        let global = std::fs::read_to_string(dir.path().join("agent/settings.json")).unwrap();
+        assert!(
+            global.contains("33000") && !global.contains(&saved.to_string()),
+            "{global}"
+        );
+        let overrides =
+            std::fs::read_to_string(dir.path().join("agent/workspace-settings.json")).unwrap();
+        assert!(overrides.contains("notes"), "{overrides}");
         rt.shutdown().await;
     })
     .await
