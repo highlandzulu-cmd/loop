@@ -68,6 +68,7 @@ async fn connect(rt: &Arc<Runtime>) -> (Arc<RemoteBackend>, Served) {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let remote = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -260,6 +261,7 @@ async fn a_v1_client_works_and_unknown_methods_stay_unknown_without_control_body
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let old = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -361,6 +363,7 @@ async fn an_observer_is_not_asked_to_answer_body() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let (conn, mut incoming) = Connection::new(client);
@@ -520,6 +523,7 @@ async fn prompt_completes_only_after_its_end_update_body() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let remote = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -655,7 +659,7 @@ async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
         let other = legacy.new_session(SessionSpec::default()).await.unwrap();
         say(&legacy, &source, "source prompt").await;
         let (server, client) = memory();
-        let _capable_server = serve_with_control(rt.clone(), rt.clone(), server, info(), ServeOptions { owns_backend:false });
+        let _capable_server = serve_with_control(rt.clone(), rt.clone(), server, info(), ServeOptions { owns_backend: false, authority: loop_wire::Authority::HostLocal });
         let capable = RemoteBackend::connect_with_capabilities(client,info(),Arc::new(Reject),ClientCapabilities { interact:true,branch_reset:true }).await.unwrap();
         let mut capable_rx = capable.subscribe();
         let attached = capable.attach(&source,log.latest_seq(&source.key).await.unwrap()).await.unwrap();
@@ -738,6 +742,7 @@ async fn a_legacy_reattach_recovers_the_current_branch() {
             info(),
             ServeOptions {
                 owns_backend: false,
+                authority: loop_wire::Authority::HostLocal,
             },
         );
         let capable = RemoteBackend::connect_with_capabilities(
@@ -853,6 +858,7 @@ async fn compaction_resets_capable_watchers_and_detaches_legacy_ones() {
             info(),
             ServeOptions {
                 owns_backend: false,
+                authority: loop_wire::Authority::HostLocal,
             },
         );
         let capable = RemoteBackend::connect_with_capabilities(

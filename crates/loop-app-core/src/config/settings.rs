@@ -648,6 +648,10 @@ pub fn load_settings(
             settings.merge_project(project);
         }
     }
+    // The host's own choices for this workspace win over project files.
+    crate::config::workspace_settings::WorkspaceSettingsStore::load(agent_dir)?
+        .get(cwd)
+        .apply(&mut settings);
     Ok(settings)
 }
 

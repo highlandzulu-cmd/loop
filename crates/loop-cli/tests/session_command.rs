@@ -133,6 +133,7 @@ fn serve(
         },
         loop_wire::server::ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     )
 }

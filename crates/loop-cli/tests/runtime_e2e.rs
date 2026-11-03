@@ -1122,3 +1122,65 @@ async fn closing_a_parent_with_a_running_subagent_needs_force_and_cascades() {
     })
     .await
 }
+
+#[tokio::test]
+async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket() {
+    bounded(async {
+        use loop_protocol::admin::*;
+        use loop_wire::RuntimeAdmin;
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let client = fx.client().await;
+        let offered = client.capabilities();
+        assert!(offered.workspace_reload && offered.workspace_skills && offered.workspace_trust);
+        assert!(offered.permission_mode && offered.session_sandbox);
+        // The 0600 Unix socket is host-local: host-only methods are offered.
+        assert!(offered.host_defaults && offered.host_usage);
+
+        let session = client
+            .new_session(loop_protocol::SessionSpec {
+                cwd: Some(fx.work.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let workspace_id = client
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.r#ref.key == session.key)
+            .and_then(|s| s.summary.workspace_id)
+            .expect("the listing names the workspace");
+        let reloaded = client
+            .reload(ReloadParams {
+                workspace_id: workspace_id.clone(),
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reloaded.revision, 1);
+        assert_eq!(reloaded.pending_sessions, 0);
+        assert!(offered.runtime_sessions);
+        let panel = client.sessions().await.unwrap();
+        assert_eq!(panel.totals.sessions, 1);
+        assert_eq!(panel.sessions[0].workspace_id, workspace_id);
+
+        let saved = client
+            .defaults(DefaultsParams {
+                patch: Some(DefaultsPatch {
+                    response_header_timeout_ms: Some(45_000),
+                }),
+                ..DefaultsParams::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.response_header_timeout_ms, Some(45_000));
+        let settings = std::fs::read_to_string(fx.agent.join("settings.json")).unwrap();
+        assert!(settings.contains("45000"), "{settings}");
+        let usage = client.usage(UsageParams::default()).await.unwrap();
+        assert!(usage.next_cursor.is_none());
+        serve.stop().await;
+    })
+    .await
+}

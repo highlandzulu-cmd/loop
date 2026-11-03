@@ -293,6 +293,10 @@ pub enum PendingSessionWrite {
 /// `{"timeout_ms": n}`, or `{"timeout_ms": null}` to inherit the default.
 pub const RESPONSE_TIMEOUT_ENTRY: &str = "response_timeout";
 
+/// Custom entry type recording a Session's permission mode:
+/// `{"mode": "ask"}` (`session/permission_mode`).
+pub const PERMISSION_MODE_ENTRY: &str = "permission_mode";
+
 /// Reader over a session's entries.
 #[async_trait]
 pub trait SessionReader: Send + Sync {
@@ -512,8 +516,11 @@ pub struct SessionConfigEntries {
     /// Response-timeout override last recorded; `None` inherits the
     /// default, `Some(0)` waits indefinitely.
     pub response_timeout_ms: Option<u64>,
-    /// How many model, effort, name, branch, compaction and response-timeout
-    /// changes the Session ever recorded: its one Session revision, stable across restarts.
+    /// Permission mode last recorded with `session/permission_mode`.
+    pub permission_mode: Option<String>,
+    /// How many model, effort, name, branch, compaction, response-timeout
+    /// and permission-mode changes the Session ever recorded: its one
+    /// Session revision, stable across restarts.
     pub revision: u64,
 }
 
@@ -542,6 +549,12 @@ pub fn config_from_entries(
             } if custom_type == RESPONSE_TIMEOUT_ENTRY => {
                 config.revision += 1;
                 config.response_timeout_ms = data["timeout_ms"].as_u64();
+            }
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == PERMISSION_MODE_ENTRY => {
+                config.revision += 1;
+                config.permission_mode = data["mode"].as_str().map(str::to_owned);
             }
             _ => {}
         }

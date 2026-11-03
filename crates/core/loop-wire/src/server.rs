@@ -61,11 +61,36 @@ pub struct ServeOptions {
     /// Shut down the backend when this connection receives `shutdown`.
     /// Shared Runtime connections set this to false.
     pub owns_backend: bool,
+    /// What the transport proves about the client. Defaults to remote.
+    pub authority: Authority,
 }
 impl Default for ServeOptions {
     fn default() -> Self {
-        Self { owns_backend: true }
+        Self {
+            owns_backend: true,
+            authority: Authority::Remote,
+        }
     }
+}
+
+/// Authority the transport, never a request field, gives a connection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Authority {
+    /// The Runtime host's own user: its 0600 Unix socket in a 0700
+    /// directory, or a trusted embedded adapter. Host-only methods are served.
+    HostLocal,
+    /// Anything else, such as an authenticated WebSocket (even through a
+    /// tunnel): Session and workspace methods only.
+    #[default]
+    Remote,
+}
+
+/// Whether `method` with `params` needs host-local authority: the host-only
+/// methods, and a `workspace/trust` change.
+fn host_only(method: &str, params: &Value) -> bool {
+    methods::HOST_ONLY.contains(&method)
+        || (method == methods::WORKSPACE_TRUST
+            && params.get("trusted").is_some_and(|t| !t.is_null()))
 }
 
 /// Serve `backend` to one client over `transport` with backend ownership.
@@ -212,6 +237,19 @@ async fn run(
                                 capabilities.efforts = false;
                                 capabilities.modes = false;
                             }
+                            let offered = admin_offered(runtime.as_deref());
+                            let host = options.authority == Authority::HostLocal;
+                            capabilities.workspace_mcp = offered.workspace_mcp;
+                            capabilities.workspace_web_search = offered.workspace_web_search;
+                            capabilities.workspace_skills = offered.workspace_skills;
+                            capabilities.workspace_templates = offered.workspace_templates;
+                            capabilities.workspace_reload = offered.workspace_reload;
+                            capabilities.workspace_trust = offered.workspace_trust;
+                            capabilities.session_sandbox = offered.session_sandbox;
+                            capabilities.permission_mode = offered.permission_mode;
+                            capabilities.runtime_sessions = offered.runtime_sessions;
+                            capabilities.host_usage = offered.host_usage && host;
+                            capabilities.host_defaults = offered.host_defaults && host;
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
@@ -233,6 +271,13 @@ async fn run(
                         id,
                         Err((codes::INVALID_REQUEST, "call initialize first".into())),
                     );
+                    continue;
+                }
+                // Refused before parsing or dispatch, whatever the params.
+                if options.authority != Authority::HostLocal && host_only(&method, &params) {
+                    let body =
+                        RpcErrorBody::from(&loop_protocol::BackendError::Forbidden(method.clone()));
+                    respond(&conn, id, Err(body));
                     continue;
                 }
                 if method == methods::SHUTDOWN {
@@ -531,6 +576,26 @@ async fn handle(
                 Err(error) => return conn.respond(id, Err(error)),
             }
         }
+        // Reserved host-only names; refused remotely before dispatch.
+        methods::RUNTIME_PROVIDERS | methods::RUNTIME_MCP_AUTH | methods::RUNTIME_TRACING => {
+            Err(loop_protocol::BackendError::Unsupported(method.into()))
+        }
+        methods::WORKSPACE_MCP
+        | methods::WORKSPACE_WEB_SEARCH
+        | methods::WORKSPACE_SKILLS
+        | methods::WORKSPACE_TEMPLATES
+        | methods::WORKSPACE_RELOAD
+        | methods::WORKSPACE_TRUST
+        | methods::SESSION_SANDBOX
+        | methods::SESSION_PERMISSION_MODE
+        | methods::RUNTIME_SESSIONS
+        | methods::RUNTIME_USAGE
+        | methods::RUNTIME_DEFAULTS => {
+            match admin(admin_offered(runtime), runtime, method, params).await {
+                Ok(result) => result,
+                Err(error) => return conn.respond(id, Err(error)),
+            }
+        }
         _ => {
             return conn.respond(
                 id,
@@ -690,6 +755,60 @@ async fn session_services(
                 .await
                 .map(|r| to_value(&r))
         }
+    })
+}
+
+/// The admin flags the Runtime's admin service offers; none without one.
+fn admin_offered(runtime: Option<&dyn RuntimeControl>) -> loop_protocol::Capabilities {
+    runtime
+        .and_then(|r| r.admin())
+        .map(|a| a.offered())
+        .unwrap_or_default()
+}
+
+/// Workspace admin and host-only services. Host-local authority was
+/// checked before dispatch. A Runtime without the service, or without the
+/// method's capability, answers Unsupported; the outer error is a malformed
+/// request.
+async fn admin(
+    capabilities: loop_protocol::Capabilities,
+    runtime: Option<&dyn RuntimeControl>,
+    method: &str,
+    params: Value,
+) -> Result<BackendResult<Value>, (i64, String)> {
+    let offered = match method {
+        methods::WORKSPACE_MCP => capabilities.workspace_mcp,
+        methods::WORKSPACE_WEB_SEARCH => capabilities.workspace_web_search,
+        methods::WORKSPACE_SKILLS => capabilities.workspace_skills,
+        methods::WORKSPACE_TEMPLATES => capabilities.workspace_templates,
+        methods::WORKSPACE_RELOAD => capabilities.workspace_reload,
+        methods::WORKSPACE_TRUST => capabilities.workspace_trust,
+        methods::SESSION_SANDBOX => capabilities.session_sandbox,
+        methods::SESSION_PERMISSION_MODE => capabilities.permission_mode,
+        methods::RUNTIME_SESSIONS => capabilities.runtime_sessions,
+        methods::RUNTIME_USAGE => capabilities.host_usage,
+        _ => capabilities.host_defaults,
+    };
+    let Some(admin) = runtime.and_then(|r| r.admin()).filter(|_| offered) else {
+        return Ok(Err(loop_protocol::BackendError::Unsupported(method.into())));
+    };
+    Ok(match method {
+        methods::WORKSPACE_MCP => admin.mcp(parse(params)?).await.map(|r| to_value(&r)),
+        methods::WORKSPACE_WEB_SEARCH => {
+            admin.web_search(parse(params)?).await.map(|r| to_value(&r))
+        }
+        methods::WORKSPACE_SKILLS => admin.skills(parse(params)?).await.map(|r| to_value(&r)),
+        methods::WORKSPACE_TEMPLATES => admin.templates(parse(params)?).await.map(|r| to_value(&r)),
+        methods::WORKSPACE_RELOAD => admin.reload(parse(params)?).await.map(|r| to_value(&r)),
+        methods::WORKSPACE_TRUST => admin.trust(parse(params)?).await.map(|r| to_value(&r)),
+        methods::SESSION_SANDBOX => admin.sandbox(parse(params)?).await.map(|r| to_value(&r)),
+        methods::SESSION_PERMISSION_MODE => admin
+            .permission_mode(parse(params)?)
+            .await
+            .map(|r| to_value(&r)),
+        methods::RUNTIME_SESSIONS => admin.sessions().await.map(|r| to_value(&r)),
+        methods::RUNTIME_USAGE => admin.usage(parse(params)?).await.map(|r| to_value(&r)),
+        _ => admin.defaults(parse(params)?).await.map(|r| to_value(&r)),
     })
 }
 

@@ -209,6 +209,7 @@ async fn connection_shutdown_keeps_other_sessions_available() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let one = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -221,6 +222,7 @@ async fn connection_shutdown_keeps_other_sessions_available() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let two = RemoteBackend::connect(client, info(), Arc::new(Reject))

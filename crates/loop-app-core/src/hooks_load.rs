@@ -563,6 +563,51 @@ pub fn register_workspace_hooks(
     notices
 }
 
+/// A Session's workspace hooks, replaceable when the workspace reloads.
+/// The harness keeps one handler that runs whatever the slot holds.
+#[derive(Clone, Default)]
+pub struct HookSlot(Arc<std::sync::RwLock<Arc<Vec<Hook>>>>);
+
+impl HookSlot {
+    /// Run `loaded` from now on, in `workspace`; returns its notices.
+    pub fn replace(&self, mut loaded: LoadedHooks, workspace: &Path) -> Vec<String> {
+        for hook in &mut loaded.hooks {
+            hook.workspace = Some(workspace.to_path_buf());
+        }
+        let notices = std::mem::take(&mut loaded.notices);
+        for notice in &notices {
+            tracing::warn!("{notice}");
+        }
+        *self.0.write().unwrap() = Arc::new(loaded.hooks);
+        notices
+    }
+}
+
+/// [`register_workspace_hooks`] through a [`HookSlot`], so a reload can
+/// replace the hooks instead of adding a second set.
+pub fn register_reloadable_hooks(
+    harness: &loop_agent::harness::AgentHarness,
+    loaded: LoadedHooks,
+    workspace: &Path,
+) -> (Vec<String>, HookSlot) {
+    let slot = HookSlot::default();
+    let notices = slot.replace(loaded, workspace);
+    let current = slot.clone();
+    harness.hooks().on(move |event| {
+        let hooks = Arc::clone(&current.0.read().unwrap());
+        async move {
+            let mut merged = HookOutcome::default();
+            for hook in hooks.iter() {
+                if let Some(outcome) = hook.outcome(&event).await {
+                    merged.merge(outcome);
+                }
+            }
+            merged
+        }
+    });
+    (notices, slot)
+}
+
 /// Validate a single hook file (tests / /reload).
 pub fn parse_hook_file(path: &Path) -> anyhow::Result<()> {
     let raw = std::fs::read_to_string(path)?;

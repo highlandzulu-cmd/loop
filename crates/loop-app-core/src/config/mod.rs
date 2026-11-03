@@ -6,6 +6,7 @@ pub mod providers;
 pub mod settings;
 pub mod tracing;
 pub mod trust;
+pub mod workspace_settings;
 
 pub use auth::{provider_has_key, FileCredentialStore};
 pub use paths::*;

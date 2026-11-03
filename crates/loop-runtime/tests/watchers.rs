@@ -73,6 +73,7 @@ impl Client {
             },
             ServeOptions {
                 owns_backend: false,
+                authority: loop_wire::Authority::HostLocal,
             },
         );
         let (conn, mut incoming) = Connection::new(client);

@@ -51,7 +51,7 @@ impl LiveSession {
 }
 
 pub(super) const DEFAULT_DEPTH: u32 = 2;
-const TOOL: &str = "subagent";
+pub(super) const TOOL: &str = "subagent";
 
 /// What `open` needs to create a child Session.
 pub(super) struct ChildOpen {

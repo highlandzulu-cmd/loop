@@ -23,7 +23,9 @@ use tokio::sync::broadcast;
 use crate::effort::{effective_effort, native_efforts, parse_thinking, NATIVE_EFFORTS};
 use crate::harness::agent_harness::AgentHarness;
 use crate::harness::session::format_session_stats;
-use crate::harness::session::types::{PendingSessionWrite, RESPONSE_TIMEOUT_ENTRY};
+use crate::harness::session::types::{
+    PendingSessionWrite, PERMISSION_MODE_ENTRY, RESPONSE_TIMEOUT_ENTRY,
+};
 use crate::harness::types::{AgentHarnessError, AgentHarnessPhase, ShellExecOptions};
 use crate::protocol_events::{replay, turn_outcome, NativeEventMapper};
 use crate::types::AgentThinkingLevel;
@@ -947,6 +949,32 @@ impl Compaction for NativeBackend {
 }
 
 impl NativeBackend {
+    /// The current Session's revision.
+    pub fn revision(&self) -> u64 {
+        self.config.lock().revision
+    }
+
+    /// Record the Session's permission mode in its tree, counted in its
+    /// revision. The caller applies the mode to its own gate.
+    pub async fn record_permission_mode(
+        &self,
+        session: &SessionRef,
+        mode: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        let _setting = self.setting.lock().await;
+        self.current_config(session).await?;
+        self.check_revision(expected_revision)?;
+        self.harness
+            .record_config(PendingSessionWrite::Custom {
+                custom_type: PERMISSION_MODE_ENTRY.into(),
+                data: serde_json::json!({ "mode": mode }),
+            })
+            .await
+            .map_err(harness_error)?;
+        Ok(self.announce_change().await)
+    }
+
     /// Check a user command's timeout: by default, and at most, the
     /// `bash.maxTimeoutMs` limit.
     pub fn shell_timeout(&self, requested: Option<u64>) -> BackendResult<u64> {

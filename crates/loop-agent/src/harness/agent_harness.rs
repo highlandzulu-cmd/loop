@@ -466,6 +466,12 @@ impl AgentHarness {
         *self.sandbox.write().await = mode;
     }
 
+    /// Replace the sandbox without destroying the previous one, which is
+    /// returned: it may be shared with other Sessions.
+    pub async fn replace_sandbox(&self, mode: SandboxMode) -> SandboxMode {
+        std::mem::replace(&mut *self.sandbox.write().await, mode)
+    }
+
     /// Disable sandbox and destroy the previous instance if any.
     pub async fn clear_sandbox(&self) {
         let prev = std::mem::replace(&mut *self.sandbox.write().await, SandboxMode::Disabled);
