@@ -379,6 +379,39 @@ impl Runtime {
             if params.expected_revision.is_some_and(|e| e != revision) {
                 return Err(BackendError::Conflict { revision });
             }
+            // Every field is checked before anything is written.
+            let model = match &patch.model {
+                Some(spec) => {
+                    let (provider, id) = spec.split_once('/').ok_or_else(|| {
+                        protocol(format!("choose a model as provider/model, not `{spec}`"))
+                    })?;
+                    let models = &self.factory.globals.models;
+                    if models.credentials().is_logged_out(provider) {
+                        return Err(protocol(format!(
+                            "{provider} is logged out; run /login {provider}"
+                        )));
+                    }
+                    models
+                        .get_model(provider, id)
+                        .ok_or_else(|| protocol(format!("model not found: {spec}")))?;
+                    Some((provider.to_owned(), id.to_owned()))
+                }
+                None => None,
+            };
+            if let Some(effort) = &patch.effort {
+                if !loop_agent::effort::NATIVE_EFFORTS.contains(&effort.as_str()) {
+                    return Err(protocol(format!(
+                        "unknown effort `{effort}`; choose one of: {}",
+                        loop_agent::effort::NATIVE_EFFORTS.join(", ")
+                    )));
+                }
+            }
+            if let Some((provider, id)) = &model {
+                settings.set_selected_model(provider, id);
+            }
+            if let Some(effort) = patch.effort {
+                settings.default_thinking_level = effort;
+            }
             if let Some(ms) = patch.response_header_timeout_ms {
                 settings.response_header_timeout_ms = ms;
             }

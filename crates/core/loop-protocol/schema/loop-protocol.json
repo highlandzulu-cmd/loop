@@ -575,6 +575,20 @@
     "DefaultsPatch": {
       "description": "Changes to saved defaults for new Sessions.",
       "properties": {
+        "effort": {
+          "description": "Default reasoning effort for new Sessions.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Default model for new Sessions, `provider/id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "response_header_timeout_ms": {
           "description": "Response-header timeout for new Sessions in ms; 0 waits indefinitely.",
           "format": "uint64",

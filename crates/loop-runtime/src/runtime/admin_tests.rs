@@ -635,6 +635,7 @@ async fn defaults_writes_are_serialized_with_each_other_and_workspace_changes() 
             rt.update_defaults(DefaultsParams {
                 patch: Some(DefaultsPatch {
                     response_header_timeout_ms: Some(ms),
+                    ..DefaultsPatch::default()
                 }),
                 expected_revision: Some(0),
                 ..DefaultsParams::default()
@@ -658,6 +659,7 @@ async fn defaults_writes_are_serialized_with_each_other_and_workspace_changes() 
         let defaults = rt.update_defaults(DefaultsParams {
             patch: Some(DefaultsPatch {
                 response_header_timeout_ms: Some(33_000),
+                ..DefaultsPatch::default()
             }),
             ..DefaultsParams::default()
         });

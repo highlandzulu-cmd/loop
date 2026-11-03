@@ -696,3 +696,57 @@ composer. Forks get new leases. Embedded owners have no daemon lock and no
 lock-based recovery privilege. WebSockets require tokens on loopback and cannot
 bind remotely before TLS. These boundaries are part of the proposed decision,
 not incidental details for each implementation slice to redefine.
+
+## S3.5 implementation TODO: temporary native escape hatch
+
+The first S3.5 branch migrates groups 1 and 2. `app::run`, its helpers and the
+usage dashboard take `loop_cli::SurfaceClient`. The facade owns a private native
+adapter; neither it nor `LegacyHost` dereferences to the application Runtime.
+Compile-fail tests enforce that boundary. Model/effort use `ModelControl`.
+Session operations use the S3.3 `RuntimeControl` request/result types through a
+native service adapter. The adapter reuses S3.3's atomic destination creation,
+including separate leases, fresh entry ids and approval-grant filtering.
+Export/import filesystem access is in the TUI; services exchange bounded payloads.
+
+These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
+`legacy_mut()` and must move one group at a time after S3.4:
+
+- Group 3: sandbox, permission modes, review grants and approval bridge setup,
+  workspace trust/settings/reload, web search, MCP tools and MCP OAuth. `/ttfb`
+  still uses the old native timeout/default path in this group.
+- Group 4: skills, prompt templates, dynamic command discovery, workflows and
+  the current native workflow event bridge.
+- Group 5: usage/dashboard host data, tracing-backed usage logs and the effective
+  settings/session diagnostics that still combine local and host values.
+- Group 6: provider login/logout, catalog refresh, ACP startup/sign-in and tracing
+  setup. ACP keeps its existing in-process startup path until S3.7.
+- Local theme/preferences still use the old settings persistence while the
+  workspace/local settings split is completed with these groups.
+- Also behind the escape hatch until their groups move: starting a
+  subscription agent from `/model` or the picker (`legacy().agents()`, group 6
+  with ACP startup, although it is a model choice) and `/default` saving
+  model/effort through the host settings (group 6; over a Runtime it is the
+  host-only `runtime/defaults`).
+- Facade getters still return host-shaped data that a remote Runtime cannot
+  serve as is: `selected_model()` (a `loop_ai::Model`), `agent_dir()`,
+  `sessions_db()` and `native_effort()` (reads the harness). S3.6 replaces them
+  with view types (spec strings, choice ids) rather than a second migration.
+- `LegacyHost` no longer exposes the native backend or model catalog, so
+  migrated groups 1–2 cannot be reached around the facade.
+
+The native adapter serves one active harness. It has no Event Log attachment or
+immutable transcript paging; those remain S3.6 work. Its direct Session service
+can copy/export the committed source while a turn runs. Replacing the active
+native harness requires an idle source; it must never cancel a source turn as a
+side effect of loading a copy. Native sequence/branch stamps are zero until a
+Runtime owns their ordered publication. Runtime and Remote retain their S3.3
+snapshot, revision and replay contracts.
+
+Release note: `/model`, Ctrl+L, Ctrl+P, `/effort` and Shift+Tab now change only the
+current Session. They no longer silently save a new-Session default, including
+for ACP selections. When a change leaves the Session off the saved defaults, the
+TUI prints “/default saves this for new Sessions”; `/default` saves the current
+Session's model and effort (for a subscription agent, its model and its
+remembered effort). A started subscription agent prints it only when the user
+chose it, never at startup or on resume. Explicit host default saving remains separate. Resuming a
+Session restores its own model/effort, including explicit `off`.

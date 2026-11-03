@@ -1170,6 +1170,7 @@ async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket()
             .defaults(DefaultsParams {
                 patch: Some(DefaultsPatch {
                     response_header_timeout_ms: Some(45_000),
+                    ..DefaultsPatch::default()
                 }),
                 ..DefaultsParams::default()
             })

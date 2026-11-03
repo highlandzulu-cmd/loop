@@ -1,16 +1,14 @@
-//! `/model` and `/effort` in the terminal app: the Session records its
-//! choice, the TUI still saves it as the default for new Sessions, and
-//! resuming restores the Session's own choice, including an explicit `off`,
-//! without saving it as the default (separate test binary: it mutates
-//! process env).
+//! The TUI facade records model/effort in the Session and restores explicit off.
+//! Selecting never saves defaults; saving host settings later must not do so
+//! either. Separate binary because bootstrap uses process environment variables.
 
 use loop_cli::config::paths::{settings_path, ENV_AGENT_DIR, ENV_SESSION_DIR};
-use loop_cli::{bootstrap_cli, BootstrapOpts, CliRuntime};
+use loop_cli::{bootstrap_cli, BootstrapOpts, SurfaceClient};
 use loop_test_support::{FakeHttpServer, FakeResponse};
 
 const MODELS: &str = r#"{"data":[{"id":"m-one","supported_parameters":["tools","reasoning"]},{"id":"m-two","supported_parameters":["tools","reasoning"]}]}"#;
 
-async fn boot(cwd: &std::path::Path, session_id: Option<String>) -> CliRuntime {
+async fn boot(cwd: &std::path::Path, session_id: Option<String>) -> SurfaceClient {
     bootstrap_cli(BootstrapOpts {
         cwd: cwd.to_path_buf(),
         provider: None,
@@ -27,6 +25,7 @@ async fn boot(cwd: &std::path::Path, session_id: Option<String>) -> CliRuntime {
     })
     .await
     .unwrap()
+    .into()
 }
 
 fn saved(agent_dir: &std::path::Path) -> serde_json::Value {
@@ -40,7 +39,7 @@ fn set_default_effort(agent_dir: &std::path::Path, level: &str) {
 }
 
 #[tokio::test]
-async fn session_choices_are_recorded_saved_as_defaults_and_restored() {
+async fn session_choices_are_recorded_and_restored_without_saving_defaults() {
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
         let agent_dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
@@ -63,21 +62,27 @@ async fn session_choices_are_recorded_saved_as_defaults_and_restored() {
         }
 
         let mut runtime = boot(cwd.path(), None).await;
+        let defaults = saved(agent_dir.path());
         runtime.select_model("gw", "m-one").await.unwrap();
-        // Today's TUI behaviour: a choice is also the default for new Sessions.
-        assert_eq!(saved(agent_dir.path())["defaultModel"], "m-one");
+        assert_eq!(saved(agent_dir.path()), defaults);
         assert_eq!(runtime.set_effort("high").await.unwrap(), "high");
-        assert_eq!(saved(agent_dir.path())["defaultThinkingLevel"], "high");
+        assert_eq!(saved(agent_dir.path()), defaults);
         assert_eq!(runtime.native_effort(), "high");
         assert_eq!(runtime.efforts().await.unwrap().1, "high");
         assert_eq!(runtime.cycle_effort().await.unwrap(), "off");
         assert_eq!(runtime.native_effort(), "off");
-        assert_eq!(saved(agent_dir.path())["defaultThinkingLevel"], "off");
-        let off_session = runtime.session_id.clone();
+        assert_eq!(saved(agent_dir.path()), defaults);
+        let off_session = runtime.session_id().clone();
 
         runtime.new_session().await.unwrap();
+        assert!(
+            runtime.selected_model().is_none(),
+            "new Sessions inherit the unchanged default"
+        );
+        runtime.select_model("gw", "m-two").await.unwrap();
         runtime.set_effort("low").await.unwrap();
-        let low_session = runtime.session_id.clone();
+        let low_session = runtime.session_id().clone();
+        runtime.shutdown().run().await.unwrap();
         drop(runtime);
 
         // The default changes elsewhere; each Session keeps its own choice.
@@ -98,18 +103,21 @@ async fn session_choices_are_recorded_saved_as_defaults_and_restored() {
         assert_eq!(runtime.native_effort(), "off");
 
         // Restoring a Session never saves its choice as the default.
-        runtime.save_settings().unwrap();
+        runtime.legacy().save_settings().unwrap();
         assert_eq!(saved(agent_dir.path())["defaultThinkingLevel"], "medium");
+        runtime.shutdown().run().await.unwrap();
         drop(runtime);
         let runtime = boot(cwd.path(), Some(low_session)).await;
         assert_eq!(runtime.native_effort(), "low");
-        runtime.save_settings().unwrap();
+        runtime.legacy().save_settings().unwrap();
         assert_eq!(saved(agent_dir.path())["defaultThinkingLevel"], "medium");
 
         // A new Session without a choice of its own uses the default.
+        runtime.shutdown().run().await.unwrap();
         drop(runtime);
         let runtime = boot(cwd.path(), None).await;
         assert_eq!(runtime.native_effort(), "medium");
+        runtime.shutdown().run().await.unwrap();
     })
     .await
     .expect("test timed out");
