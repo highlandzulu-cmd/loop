@@ -69,6 +69,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[level]"),
         },
         SlashCommand {
+            name: "default",
+            description: "Save this Session's model and effort for new Sessions",
+            args_hint: None,
+        },
+        SlashCommand {
             name: "scoped-models",
             description: "Manage models for Ctrl+P cycling",
             args_hint: None,
@@ -298,6 +303,8 @@ pub enum CommandEffect {
     Permissions(Option<String>),
     /// Show the reasoning effort levels (None) or set one.
     Effort(Option<String>),
+    /// `/default`: save the Session's model and effort for new Sessions.
+    SaveDefaults,
     /// Sandbox mode change.
     SetSandbox(String),
     /// Langfuse tracing control.
@@ -525,6 +532,7 @@ pub fn dispatch(
         } else {
             Some(cmd.args.trim().to_owned())
         }),
+        "default" => CommandEffect::SaveDefaults,
         "effort" => CommandEffect::Effort(if cmd.args.is_empty() {
             None
         } else {

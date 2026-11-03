@@ -927,7 +927,9 @@ impl SessionStore for SqliteSessionStore {
         if guard.failed() {
             return Err(guard.refusal());
         }
-        let identity = self.identity.clone().expect("standalone identity");
+        let identity = self.identity.clone().ok_or_else(|| {
+            SessionError::Invalid("Surface destinations require a writer identity".into())
+        })?;
         let mut created = self
             .create_destination(
                 file,

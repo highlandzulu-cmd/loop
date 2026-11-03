@@ -28,6 +28,7 @@ pub use legacy::LegacyHost;
 pub struct SurfaceClient {
     host: LegacyHost,
     sessions: Arc<dyn RuntimeControl>,
+    native_sessions: Arc<native_sessions::NativeSessions>,
     native_backend: Arc<dyn AgentBackend>,
     workspace_id: String,
     /// Terminal keybindings.
@@ -83,6 +84,7 @@ impl From<CliRuntime> for SurfaceClient {
         let workspace_id = native.workspace_id.clone();
         Self {
             sessions: native.clone(),
+            native_sessions: native.clone(),
             native_backend: native,
             workspace_id,
             host: LegacyHost { inner },
@@ -166,6 +168,10 @@ impl SurfaceClient {
     pub fn route_agent_replay(&mut self, id: &str) {
         self.host.inner.session_id = id.into();
     }
+    /// Ask the native harness to stop work as the TUI exits.
+    pub fn request_shutdown(&self) {
+        self.host.inner.harness.request_shutdown();
+    }
     pub fn shutdown(&self) -> loop_app_core::runtime::SessionShutdown {
         self.host.inner.session_shutdown()
     }
@@ -204,6 +210,11 @@ impl SurfaceClient {
     }
     pub async fn use_native(&mut self) {
         self.host.inner.use_native().await
+    }
+    /// The model catalog, for tests that compare the picker with it.
+    #[cfg(test)]
+    pub(crate) fn catalog(&self) -> &Arc<loop_ai::Models> {
+        &self.host.inner.models
     }
     /// S3.3's typed Session control service. No filesystem paths cross it.
     pub fn sessions(&self) -> &dyn RuntimeControl {
@@ -401,11 +412,15 @@ impl SurfaceClient {
             .open_native_session(&destination.session.native_id)
             .await
         {
-            self.sessions
-                .close(&destination.session, false)
+            self.native_sessions
+                .discard_destination(&destination.session)
                 .await
                 .map_err(|cleanup| {
-                    anyhow::anyhow!("{error:#}; could not remove the unused copy: {cleanup}")
+                    anyhow::anyhow!(
+                        "{error:#}; the unused copy {} could not be removed ({cleanup}); \
+                         delete it from /sessions",
+                        destination.session.native_id
+                    )
                 })?;
             return Err(error);
         }
@@ -437,17 +452,16 @@ impl SurfaceClient {
             .await?)
     }
 
-    pub async fn available_models(&self) -> Vec<loop_ai::Model> {
-        let session = self.host.inner.native.current_session().await;
-        let Ok(choices) = self
-            .native_backend
+    fn native_control(&self) -> anyhow::Result<&dyn loop_protocol::ModelControl> {
+        self.native_backend
             .model_control()
-            .expect("native model control")
-            .models(&session)
-            .await
-        else {
-            return vec![];
-        };
+            .ok_or_else(|| anyhow::anyhow!("Loop's own agent offers no model choice here"))
+    }
+
+    /// The native Session's model choices, in picker order.
+    pub async fn available_models(&self) -> anyhow::Result<Vec<loop_ai::Model>> {
+        let session = self.host.inner.native.current_session().await;
+        let choices = self.native_control()?.models(&session).await?;
         let models = choices
             .models
             .into_iter()
@@ -456,23 +470,23 @@ impl SurfaceClient {
                 self.host.inner.models.get_model(provider, id)
             })
             .collect();
-        crate::config::providers::sort_models_for_picker(models)
+        Ok(crate::config::providers::sort_models_for_picker(models))
     }
 
-    pub async fn cycle_models(&self) -> Vec<loop_ai::Model> {
-        let models = self.available_models().await;
+    pub async fn cycle_models(&self) -> anyhow::Result<Vec<loop_ai::Model>> {
+        let models = self.available_models().await?;
         let enabled = &self.host.inner.settings.enabled_models;
         if enabled.is_empty() {
-            return models;
+            return Ok(models);
         }
-        models
+        Ok(models
             .into_iter()
             .filter(|model| {
                 enabled
                     .iter()
                     .any(|id| id == &model.id || id == &format!("{}/{}", model.provider, model.id))
             })
-            .collect()
+            .collect())
     }
 
     pub async fn resolve_model(&self, spec: &str) -> anyhow::Result<loop_ai::Model> {
@@ -485,11 +499,12 @@ impl SurfaceClient {
         provider: &str,
         id: &str,
     ) -> anyhow::Result<loop_ai::Model> {
+        if loop_ai::CredentialStore::is_logged_out(self.host.inner.credentials.as_ref(), provider) {
+            anyhow::bail!("{provider} is logged out; run /login {provider}");
+        }
         let model = self.resolve_model(&format!("{provider}/{id}")).await?;
         let session = self.host.inner.native.current_session().await;
-        self.native_backend
-            .model_control()
-            .expect("native model control")
+        self.native_control()?
             .set_model(&session, &format!("{provider}/{id}"), None)
             .await?;
         self.host.inner.selected_model = Some(model.clone());
@@ -512,6 +527,14 @@ impl SurfaceClient {
 
     pub async fn set_effort(&mut self, level: &str) -> anyhow::Result<String> {
         let level = level.trim().to_lowercase();
+        // Checked here for every backend, so an agent's refusal reads the same.
+        let (levels, _) = self.efforts().await?;
+        if !levels.contains(&level) {
+            anyhow::bail!(
+                "unknown effort `{level}`; choose one of: {}",
+                levels.join(", ")
+            );
+        }
         self.backend()
             .model_control()
             .ok_or_else(|| anyhow::anyhow!("this subscription has no reasoning effort setting"))?
@@ -521,6 +544,77 @@ impl SurfaceClient {
             self.host.inner.agent_effort = Some(level.clone());
         }
         Ok(level)
+    }
+
+    /// The configured effort of the current Session (not limited by the
+    /// model), as `/default` saves it.
+    async fn session_effort(&self) -> anyhow::Result<String> {
+        Ok(self.efforts().await?.1)
+    }
+
+    /// Whether the current Session already runs on the saved defaults for
+    /// new Sessions, so there is nothing for `/default` to save.
+    pub async fn on_defaults(&self) -> bool {
+        let settings = &self.host.inner.settings;
+        let effort = self.session_effort().await.unwrap_or_default();
+        match self.active_agent() {
+            None => {
+                let model = self
+                    .selected_model()
+                    .as_ref()
+                    .map(|m| (m.provider.clone(), m.id.clone()));
+                let saved = settings
+                    .selected_model()
+                    .map(|(p, m)| (p.to_owned(), m.to_owned()));
+                model == saved && effort == settings.default_thinking_level
+            }
+            Some(id) => {
+                let saved = settings.selected_model();
+                saved.is_some_and(|(p, m)| p == id && Some(m) == self.agent_model().as_deref())
+                    && self.host.inner.agents.effort(id).unwrap_or_default() == effort
+            }
+        }
+    }
+
+    /// `/default`: save the current Session's model and effort as the
+    /// defaults for new Sessions. Returns what was saved, as `model · effort`.
+    ///
+    /// Today this writes the host settings in process. Over a Runtime it is
+    /// `runtime/defaults` (see [`save_defaults_on`]), which is host-only.
+    pub async fn save_defaults(&mut self) -> anyhow::Result<String> {
+        let effort = self.session_effort().await?;
+        let label = match self.active_agent().clone() {
+            None => {
+                let model = self
+                    .selected_model()
+                    .clone()
+                    .ok_or_else(|| anyhow::anyhow!("choose a model first: /model"))?;
+                let inner = &mut self.host.inner;
+                inner.settings.default_thinking_level = effort.clone();
+                inner
+                    .native
+                    .set_default_effort(loop_agent::effort::parse_thinking(&effort));
+                // Saves the settings file too.
+                inner.remember_model(&model.provider, &model.id)?;
+                format!("{}/{}", model.provider, model.id)
+            }
+            Some(id) => {
+                let model = self.agent_model().clone();
+                let inner = &mut self.host.inner;
+                if let Some(model) = &model {
+                    inner.remember_model(&id, model)?;
+                }
+                if !effort.is_empty() {
+                    inner.agents.remember_effort(&id, &effort)?;
+                }
+                model.map_or(id.clone(), |m| format!("{id}/{m}"))
+            }
+        };
+        Ok(if effort.is_empty() {
+            label
+        } else {
+            format!("{label} · {effort}")
+        })
     }
 
     pub async fn cycle_effort(&mut self) -> anyhow::Result<String> {
@@ -758,6 +852,73 @@ mod transfer_limit_tests {
             let error = result.unwrap_err().to_string();
             assert!(error.contains("16 MiB"), "{error}");
             client.shutdown().run().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    use loop_protocol::{ContentBlock, TurnOutcome};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn closing_a_session_keeps_it_listed_and_loadable() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut client = test_support::fixture(dir.path()).await;
+            let first = client.session_ref();
+            client
+                .backend()
+                .prompt(&first, vec![ContentBlock::text("keep me")])
+                .await
+                .unwrap()
+                .outcome()
+                .await;
+            client.new_session().await.unwrap();
+            client.sessions().close(&first, false).await.unwrap();
+            let listed = client.list_sessions().await.unwrap();
+            assert!(listed.iter().any(|c| c.id == first.native_id), "{listed:?}");
+            client.open_native_session(&first.native_id).await.unwrap();
+            assert_eq!(client.session_ref(), first);
+            client.shutdown().run().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompts_work_without_a_session_store() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let client = test_support::fixture_with(dir.path(), false).await;
+            let turn = client
+                .backend()
+                .prompt(&client.session_ref(), vec![ContentBlock::text("hello")])
+                .await
+                .unwrap();
+            assert!(matches!(
+                turn.outcome().await,
+                TurnOutcome::Completed { .. }
+            ));
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_workspace_id_is_the_hosts_stable_one() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let one = test_support::fixture(dir.path()).await;
+            let expected = loop_runtime::workspace_id(&dir.path().canonicalize().unwrap());
+            assert_eq!(one.workspace_id, expected);
+            one.shutdown().run().await.unwrap();
+            let two = test_support::fixture(dir.path()).await;
+            assert_eq!(two.workspace_id, expected);
+            two.shutdown().run().await.unwrap();
         })
         .await
         .unwrap();

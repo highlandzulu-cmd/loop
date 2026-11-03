@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 
 use loop_agent::harness::{format_prompt_template_invocation, SandboxMode};
 use loop_ai::providers::SOKET_BASE_URL;
-use loop_ai::{calculate_context_tokens, CredentialStore, ModelsRefreshOptions, Usage};
+use loop_ai::{calculate_context_tokens, CredentialStore, Usage};
 use loop_app_core::interaction::{
     approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
 };
@@ -81,6 +81,8 @@ enum UiEvent {
     AgentReady {
         id: String,
         model: Option<String>,
+        /// The user chose this agent (`/model`), rather than startup or resume.
+        explicit: bool,
         result: Result<(Arc<dyn AgentBackend>, loop_protocol::SessionRef), String>,
     },
     /// A message from background agent work (sign-in).
@@ -467,7 +469,7 @@ async fn run_loop(
             PendingAgent::Resume(record) => record.agent.clone(),
         };
         if runtime.legacy().agents().is_signed_in(&id) {
-            chat.push(sys(start_agent(runtime, pending, &tx)));
+            chat.push(sys(start_agent(runtime, pending, false, &tx)));
         } else {
             chat.push(sys(format!(
                 "sign in to {id} first, then pick its model with /model · login is open below"
@@ -1217,7 +1219,7 @@ async fn run_loop(
         .await;
     }
 
-    runtime.legacy().harness().request_shutdown();
+    runtime.request_shutdown();
     let has_user_message = chat
         .iter()
         .any(|item| matches!(item, ChatItem::User { .. }));
@@ -1630,7 +1632,12 @@ async fn drain_ui_events(
                     live_plan,
                 );
             }
-            UiEvent::AgentReady { id, model, result } => {
+            UiEvent::AgentReady {
+                id,
+                model,
+                explicit,
+                result,
+            } => {
                 runtime.starting_agent = None;
                 match result {
                     Ok((backend, session)) => {
@@ -1644,6 +1651,10 @@ async fn drain_ui_events(
                         *status = format!("ready · {label}");
                         if !resumed {
                             push_before_queued(chat, sys(format!("model → {label} · new session")));
+                        }
+                        if agent_ready_offers_default(explicit, resumed)
+                            && !runtime.on_defaults().await
+                        {
                             push_before_queued(chat, sys(SAVE_DEFAULT_HINT));
                         }
                     }
@@ -1943,6 +1954,7 @@ fn ensure_forwarding(
 fn start_agent(
     runtime: &mut SurfaceClient,
     pending: PendingAgent,
+    explicit: bool,
     tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> String {
     let (id, model) = match &pending {
@@ -1986,6 +1998,7 @@ fn start_agent(
         let _ = tx.send(UiEvent::AgentReady {
             id: task_id,
             model,
+            explicit,
             result,
         });
     });
@@ -2716,7 +2729,7 @@ async fn handle_key(
                                 id: provider.to_owned(),
                                 model: Some(model.to_owned()),
                             };
-                            chat.push(sys(start_agent(runtime, pending, tx)));
+                            chat.push(sys(start_agent(runtime, pending, true, tx)));
                         } else {
                             choose_model(runtime, token_bar, provider, model, chat).await;
                         }
@@ -3412,7 +3425,7 @@ async fn handle_key(
             Action::ModelSelect => {
                 *fork_picker = None;
                 *model_picker = Some(ModelPickerState::new(
-                    runtime.available_models().await,
+                    picker_models(runtime, chat).await,
                     subscription_models(runtime),
                 ));
                 return Ok(());
@@ -3439,7 +3452,7 @@ async fn handle_key(
                 match runtime.cycle_effort().await {
                     Ok(level) => {
                         chat.push(sys(format!("effort → {level}")));
-                        chat.push(sys(SAVE_DEFAULT_HINT));
+                        offer_save_default(runtime, chat).await;
                         *status = effort_status(runtime);
                     }
                     Err(err) => chat.push(error_item(format!("{err:#}"))),
@@ -3682,7 +3695,7 @@ async fn resume_session(
             chat.clear();
             *redraw_request = true;
             *purge_ui_events = true;
-            let note = start_agent(runtime, PendingAgent::Resume(record), tx);
+            let note = start_agent(runtime, PendingAgent::Resume(record), false, tx);
             chat.push(sys(note));
             *status = format!("resuming · {}", choice.title);
         }
@@ -5203,7 +5216,7 @@ async fn apply_effect(
         CommandEffect::SelectModel(None) => {
             *fork_picker = None;
             *model_picker = Some(ModelPickerState::new(
-                runtime.available_models().await,
+                picker_models(runtime, chat).await,
                 subscription_models(runtime),
             ));
         }
@@ -5217,7 +5230,7 @@ async fn apply_effect(
                     id: provider.to_owned(),
                     model: Some(model.to_owned()),
                 };
-                chat.push(sys(start_agent(runtime, pending, tx)));
+                chat.push(sys(start_agent(runtime, pending, true, tx)));
             }
         }
         CommandEffect::SelectModel(Some(spec)) => match runtime.resolve_model(&spec).await {
@@ -5310,9 +5323,13 @@ async fn apply_effect(
         CommandEffect::Effort(Some(level)) => match runtime.set_effort(&level).await {
             Ok(level) => {
                 chat.push(sys(format!("effort → {level}")));
-                chat.push(sys(SAVE_DEFAULT_HINT));
+                offer_save_default(runtime, chat).await;
                 *status = effort_status(runtime);
             }
+            Err(err) => chat.push(error_item(format!("{err:#}"))),
+        },
+        CommandEffect::SaveDefaults => match runtime.save_defaults().await {
+            Ok(saved) => chat.push(sys(format!("defaults for new Sessions → {saved}"))),
             Err(err) => chat.push(error_item(format!("{err:#}"))),
         },
         CommandEffect::SetSandbox(mode) => {
@@ -5549,11 +5566,7 @@ async fn apply_effect(
                         .settings_mut()
                         .response_header_timeout_ms = ms;
                     // The saved default; a Session override still wins.
-                    runtime
-                        .legacy()
-                        .native()
-                        .set_default_response_timeout(ms)
-                        .await;
+                    runtime.legacy().set_default_response_timeout(ms).await;
                     let _ = runtime.legacy().save_settings();
                     let label = if ms == 0 {
                         "off (unlimited — for long-running workflows)".into()
@@ -5687,15 +5700,7 @@ async fn apply_effect(
             chat.push(sys(format!("project trust → {decision}")));
         }
         CommandEffect::Reload => {
-            let _ = runtime
-                .legacy()
-                .models()
-                .refresh(ModelsRefreshOptions {
-                    allow_network: Some(true),
-                    force: true,
-                    provider_id: None,
-                })
-                .await;
+            runtime.legacy().refresh_models().await;
             *runtime.legacy_mut().resources_mut() = crate::resources::load_resources(
                 runtime.agent_dir(),
                 runtime.cwd(),
@@ -6213,7 +6218,13 @@ async fn cycle_model(
     forward: bool,
     chat: &mut Vec<ChatItem>,
 ) {
-    let models = runtime.cycle_models().await;
+    let models = match runtime.cycle_models().await {
+        Ok(models) => models,
+        Err(err) => {
+            chat.push(error_item(format!("could not list models: {err:#}")));
+            return;
+        }
+    };
     if models.is_empty() {
         return;
     }
@@ -6230,10 +6241,36 @@ async fn cycle_model(
     choose_model(runtime, token_bar, &m.provider, &m.id, chat).await;
 }
 
-/// Footer text when no model is selected.
-const SAVE_DEFAULT_HINT: &str = "save as default for new Sessions";
+/// Offered after the user changes the Session's model or effort away from
+/// the saved defaults.
+const SAVE_DEFAULT_HINT: &str = "/default saves this for new Sessions";
 
+/// Footer text when no model is selected.
 const NO_MODEL_LABEL: &str = "no model · /model to choose";
+
+/// Whether a started subscription agent offers `/default`: only one the user
+/// chose, in a new Session.
+fn agent_ready_offers_default(explicit: bool, resumed: bool) -> bool {
+    explicit && !resumed
+}
+
+/// Offer `/default` unless the Session already runs on the defaults.
+async fn offer_save_default(runtime: &SurfaceClient, chat: &mut Vec<ChatItem>) {
+    if !runtime.on_defaults().await {
+        chat.push(sys(SAVE_DEFAULT_HINT));
+    }
+}
+
+/// The model picker's native choices; a listing failure is shown, not hidden.
+async fn picker_models(runtime: &SurfaceClient, chat: &mut Vec<ChatItem>) -> Vec<loop_ai::Model> {
+    match runtime.available_models().await {
+        Ok(models) => models,
+        Err(err) => {
+            chat.push(error_item(format!("could not list models: {err:#}")));
+            vec![]
+        }
+    }
+}
 
 /// Select the Session model, refresh its token bar and offer to save a default.
 async fn choose_model(
@@ -6252,7 +6289,7 @@ async fn choose_model(
             // The Session's stats name the new model's window.
             token_bar.refresh(runtime).await;
             chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
-            chat.push(sys(SAVE_DEFAULT_HINT));
+            offer_save_default(runtime, chat).await;
         }
         Err(err) => chat.push(error_item(format!("{err:#}"))),
     }

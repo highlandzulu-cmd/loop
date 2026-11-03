@@ -20,7 +20,10 @@ pub(super) struct NativeSessions {
     pub workspace_id: String,
     /// Serializes capture with prompt admission and native branch mutations.
     operation: Mutex<()>,
-    committed: Mutex<Option<SessionFile>>,
+    /// The Session and branch head a running turn started from. Only the
+    /// head is recorded at admission; the branch is read when a copy,
+    /// export or tree needs it during the turn.
+    committed: Mutex<Option<(String, Option<String>)>>,
     receipts: Mutex<HashMap<String, (String, DestinationResult)>>,
 }
 fn failed(error: impl std::fmt::Display) -> BackendError {
@@ -45,15 +48,41 @@ impl NativeSessions {
         store: Option<Arc<dyn SessionStore>>,
         cwd: PathBuf,
     ) -> Self {
+        let workspace_id =
+            loop_runtime::workspace_id(&cwd.canonicalize().unwrap_or_else(|_| cwd.clone()));
         Self {
             native,
             store,
             cwd,
-            workspace_id: format!("workspace-{}", loop_ai::new_id()),
+            workspace_id,
             operation: Mutex::new(()),
             committed: Mutex::new(None),
             receipts: Mutex::new(HashMap::new()),
         }
+    }
+    /// Delete a copy this client created and never used. Refuses any other
+    /// Session, so it cannot remove history.
+    pub async fn discard_destination(&self, session: &SessionRef) -> BackendResult<()> {
+        let _operation = self.operation.lock().await;
+        let mut receipts = self.receipts.lock().await;
+        if !receipts
+            .values()
+            .any(|(_, result)| result.session == *session)
+        {
+            return Err(failed(format!(
+                "{} is not an unused copy made here",
+                session.native_id
+            )));
+        }
+        if self.native.current_session().await == *session {
+            return Err(BackendError::Busy);
+        }
+        self.store()?
+            .delete(&session.native_id)
+            .await
+            .map_err(failed)?;
+        receipts.retain(|_, (_, result)| result.session != *session);
+        Ok(())
     }
     async fn retry(
         &self,
@@ -93,33 +122,37 @@ impl NativeSessions {
     }
     async fn capture(&self, session: &SessionRef) -> BackendResult<SessionFile> {
         self.check(session).await?;
-        if self.native.is_busy(session) {
-            let mut file = self
-                .committed
-                .lock()
-                .await
-                .as_ref()
-                .filter(|file| file.id == session.native_id)
-                .cloned()
-                .ok_or_else(|| failed("committed Session snapshot unavailable"))?;
-            file.name = self
-                .store()?
-                .load(&session.native_id)
-                .await
-                .map_err(failed)?
-                .metadata()
-                .name
-                .clone();
-            return Ok(file);
-        }
         let reader = self
             .store()?
             .load(&session.native_id)
             .await
             .map_err(failed)?;
-        SessionFile::from_reader(reader.as_ref())
+        let mut file = SessionFile::from_reader(reader.as_ref())
             .await
-            .map_err(failed)
+            .map_err(failed)?;
+        if self.native.is_busy(session) {
+            // The running turn only appends below the head it started from.
+            let head = self
+                .committed
+                .lock()
+                .await
+                .as_ref()
+                .filter(|(id, _)| *id == session.native_id)
+                .map(|(_, head)| head.clone())
+                .ok_or_else(|| failed("committed Session snapshot unavailable"))?;
+            let keep = match head {
+                Some(head) => {
+                    file.entries
+                        .iter()
+                        .position(|entry| entry.id() == head)
+                        .ok_or_else(|| failed("committed Session head not on the branch"))?
+                        + 1
+                }
+                None => 0,
+            };
+            file.entries.truncate(keep);
+        }
+        Ok(file)
     }
     async fn destination(
         &self,
@@ -480,6 +513,9 @@ impl RuntimeControl for NativeSessions {
         )
         .await
     }
+    /// Closing never deletes: a Session the TUI is not on holds nothing
+    /// open here, and the one it is on stays (as on a Runtime, history is
+    /// kept). Use [`NativeSessions::discard_destination`] for an unused copy.
     async fn close(&self, session: &SessionRef, _force: bool) -> BackendResult<()> {
         let _operation = self.operation.lock().await;
         if session.instance != *self.native.instance() {
@@ -488,14 +524,6 @@ impl RuntimeControl for NativeSessions {
         if self.native.current_session().await == *session {
             return Err(BackendError::Busy);
         }
-        self.store()?
-            .delete(&session.native_id)
-            .await
-            .map_err(failed)?;
-        self.receipts
-            .lock()
-            .await
-            .retain(|_, (_, result)| result.session != *session);
         Ok(())
     }
     async fn attach(&self, _session: &SessionRef, _after_seq: u64) -> BackendResult<Attachment> {
@@ -548,8 +576,9 @@ impl AgentBackend for NativeSessions {
         input: Vec<ContentBlock>,
     ) -> BackendResult<TurnHandle> {
         let _operation = self.operation.lock().await;
-        let file = self.capture(session).await?;
-        *self.committed.lock().await = Some(file);
+        // One small read; a failure only affects copies during this turn.
+        let head = self.native.harness().session_head().await.ok().flatten();
+        *self.committed.lock().await = Some((session.native_id.clone(), head));
         self.native.prompt(session, input).await
     }
     fn cancel(&self, session: &SessionRef) {

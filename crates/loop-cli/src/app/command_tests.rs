@@ -79,11 +79,7 @@ async fn model_command_changes_this_session_and_offers_to_save_defaults() {
         )
         .await;
         assert!(ui.text().contains("model → faux/second"), "{}", ui.text());
-        assert!(
-            ui.text().contains("save as default for new Sessions"),
-            "{}",
-            ui.text()
-        );
+        assert!(ui.text().contains(SAVE_DEFAULT_HINT), "{}", ui.text());
         assert_eq!(
             runtime.selected_model_spec().as_deref(),
             Some("faux/second")
@@ -197,12 +193,7 @@ async fn model_picker_and_cycle_keys_share_the_session_selection() {
             runtime.selected_model_spec().as_deref(),
             Some("faux/second")
         );
-        assert_eq!(
-            ui.text()
-                .matches("save as default for new Sessions")
-                .count(),
-            3
-        );
+        assert_eq!(ui.text().matches(SAVE_DEFAULT_HINT).count(), 3);
         assert!(runtime.legacy().settings().selected_model().is_none());
         let before = runtime.selected_model_spec();
         ui.effect(
@@ -238,12 +229,7 @@ async fn effort_command_cycle_and_status_keep_defaults_separate() {
             .await;
         assert_eq!(runtime.native_effort(), "off");
         assert!(ui.status.ends_with("faux/faux-model · off"));
-        assert_eq!(
-            ui.text()
-                .matches("save as default for new Sessions")
-                .count(),
-            2
-        );
+        assert_eq!(ui.text().matches(SAVE_DEFAULT_HINT).count(), 2);
         assert_eq!(runtime.legacy().settings().default_thinking_level, default);
         ui.effect(&mut runtime, CommandEffect::Effort(Some("invalid".into())))
             .await;
@@ -543,6 +529,179 @@ async fn model_cycle_respects_enabled_models_without_hiding_picker_choices() {
             .await;
         assert_eq!(ui.model.as_ref().unwrap().all.len(), 2);
         runtime.shutdown().run().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+fn hints(ui: &Driver) -> usize {
+    ui.text().matches(SAVE_DEFAULT_HINT).count()
+}
+
+#[tokio::test]
+async fn default_command_saves_the_sessions_model_and_effort_for_new_sessions() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        assert_eq!(SAVE_DEFAULT_HINT, "/default saves this for new Sessions");
+        let mut ui = Driver::default();
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SelectModel(Some("faux/second".into())),
+        )
+        .await;
+        assert_eq!(hints(&ui), 1, "{}", ui.text());
+        ui.effect(&mut runtime, CommandEffect::Effort(Some("high".into())))
+            .await;
+        assert_eq!(hints(&ui), 2, "{}", ui.text());
+        ui.effect(&mut runtime, CommandEffect::SaveDefaults).await;
+        assert!(
+            ui.text()
+                .contains("defaults for new Sessions → faux/second · high"),
+            "{}",
+            ui.text()
+        );
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(crate::config::paths::settings_path(dir.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["defaultProvider"], "faux");
+        assert_eq!(saved["defaultModel"], "second");
+        assert_eq!(saved["defaultThinkingLevel"], "high");
+        // Choosing what is already the default offers nothing to save.
+        ui.effect(&mut runtime, CommandEffect::Effort(Some("high".into())))
+            .await;
+        assert_eq!(hints(&ui), 2, "{}", ui.text());
+        ui.effect(&mut runtime, CommandEffect::NewSession).await;
+        assert_eq!(
+            runtime.selected_model_spec().as_deref(),
+            Some("faux/second")
+        );
+        assert_eq!(runtime.native_effort(), "high");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn each_change_offers_the_default_hint_once() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::Effort(Some("high".into())))
+            .await;
+        assert_eq!(hints(&ui), 1, "{}", ui.text());
+        ui.key(&mut runtime, KeyCode::BackTab, KeyModifiers::SHIFT)
+            .await;
+        assert_eq!(hints(&ui), 2, "{}", ui.text());
+        ui.key(&mut runtime, KeyCode::Char('p'), KeyModifiers::CONTROL)
+            .await;
+        assert_eq!(hints(&ui), 3, "{}", ui.text());
+        // A new Session (its transcript starts empty) is on the defaults:
+        // nothing to save.
+        ui.effect(&mut runtime, CommandEffect::NewSession).await;
+        assert_eq!(hints(&ui), 0, "{}", ui.text());
+        // A subscription agent the user did not choose (startup, resume)
+        // never offers it.
+        assert!(!agent_ready_offers_default(false, false));
+        assert!(!agent_ready_offers_default(true, true));
+        assert!(agent_ready_offers_default(true, false));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_unknown_effort_names_the_choices() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let error = runtime.set_effort("extreme").await.unwrap_err().to_string();
+        assert!(
+            error.starts_with("unknown effort `extreme`; choose one of: off"),
+            "{error}"
+        );
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_logged_out_provider_cannot_be_selected() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        runtime.legacy().credentials().logout("faux").unwrap();
+        let before = runtime.selected_model_spec();
+        let error = runtime
+            .select_model("faux", "second")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "faux is logged out; run /login faux");
+        assert_eq!(runtime.selected_model_spec(), before);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_model_picker_lists_connected_providers_in_picker_order() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = fixture(dir.path()).await;
+        let expected = crate::config::providers::sort_models_for_picker(
+            runtime.catalog().get_available().await,
+        );
+        let listed = runtime.available_models().await.unwrap();
+        let ids = |models: &[loop_ai::Model]| -> Vec<String> {
+            models
+                .iter()
+                .map(|m| format!("{}/{}", m.provider, m.id))
+                .collect()
+        };
+        assert_eq!(ids(&listed), ids(&expected));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn opening_a_session_during_a_turn_is_refused_without_cancelling_it() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        prompt(&runtime, "first").await;
+        let first = runtime.session_id().clone();
+        runtime.new_session().await.unwrap();
+        let second = runtime.session_ref();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        crate::surface_client::test_support::pause_provider(
+            &runtime,
+            started.clone(),
+            finish.clone(),
+        );
+        let turn = runtime
+            .backend()
+            .prompt(&second, vec![ContentBlock::text("running")])
+            .await
+            .unwrap();
+        started.notified().await;
+        let error = runtime
+            .open_native_session(&first)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already running"), "{error}");
+        assert_eq!(runtime.session_ref(), second);
+        assert!(runtime.backend().is_busy(&second));
+        finish.notify_one();
+        assert!(matches!(
+            turn.outcome().await,
+            TurnOutcome::Completed { .. }
+        ));
     })
     .await
     .unwrap();

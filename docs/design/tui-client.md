@@ -722,6 +722,17 @@ These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
   setup. ACP keeps its existing in-process startup path until S3.7.
 - Local theme/preferences still use the old settings persistence while the
   workspace/local settings split is completed with these groups.
+- Also behind the escape hatch until their groups move: starting a
+  subscription agent from `/model` or the picker (`legacy().agents()`, group 6
+  with ACP startup, although it is a model choice) and `/default` saving
+  model/effort through the host settings (group 6; over a Runtime it is the
+  host-only `runtime/defaults`).
+- Facade getters still return host-shaped data that a remote Runtime cannot
+  serve as is: `selected_model()` (a `loop_ai::Model`), `agent_dir()`,
+  `sessions_db()` and `native_effort()` (reads the harness). S3.6 replaces them
+  with view types (spec strings, choice ids) rather than a second migration.
+- `LegacyHost` no longer exposes the native backend or model catalog, so
+  migrated groups 1–2 cannot be reached around the facade.
 
 The native adapter serves one active harness. It has no Event Log attachment or
 immutable transcript paging; those remain S3.6 work. Its direct Session service
@@ -733,6 +744,9 @@ snapshot, revision and replay contracts.
 
 Release note: `/model`, Ctrl+L, Ctrl+P, `/effort` and Shift+Tab now change only the
 current Session. They no longer silently save a new-Session default, including
-for ACP selections. After each successful change the TUI prints “save as default
-for new Sessions”. Explicit host default saving remains separate. Resuming a
+for ACP selections. When a change leaves the Session off the saved defaults, the
+TUI prints “/default saves this for new Sessions”; `/default` saves the current
+Session's model and effort (for a subscription agent, its model and its
+remembered effort). A started subscription agent prints it only when the user
+chose it, never at startup or on resume. Explicit host default saving remains separate. Resuming a
 Session restores its own model/effort, including explicit `off`.

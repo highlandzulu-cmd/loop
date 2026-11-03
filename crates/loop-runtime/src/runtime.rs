@@ -66,6 +66,11 @@ mod unload_tests;
 mod pause;
 mod tree;
 
+/// The host's opaque, stable id for the workspace at canonical `cwd`.
+pub fn workspace_id(cwd: &std::path::Path) -> String {
+    tree::workspace_id(cwd)
+}
+
 /// One Runtime owns all live native Sessions and their durable update streams.
 pub struct Runtime {
     instance: BackendInstanceId,

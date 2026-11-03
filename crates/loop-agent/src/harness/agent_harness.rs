@@ -293,6 +293,12 @@ impl AgentHarness {
         Ok(sid)
     }
 
+    /// The current Session's active leaf entry id (one small read).
+    pub async fn session_head(&self) -> Result<Option<String>, AgentHarnessError> {
+        let reader = self.session.lock().await.reader();
+        reader.read_head().await.map_err(AgentHarnessError::Session)
+    }
+
     /// The current Session's branches as `/tree` rows.
     pub async fn session_tree(
         &self,

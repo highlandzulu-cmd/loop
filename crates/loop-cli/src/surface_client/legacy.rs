@@ -113,8 +113,21 @@ impl LegacyHost {
     ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
         self.inner.setup_tracing(request)
     }
-    pub fn models(&self) -> &Arc<loop_ai::Models> {
-        &self.inner.models
+    /// Group 3 (`/ttfb` default): the response timeout for new Sessions.
+    pub async fn set_default_response_timeout(&self, ms: u64) {
+        self.inner.native.set_default_response_timeout(ms).await
+    }
+    /// Group 3 (`/reload`): refresh the model catalog.
+    pub async fn refresh_models(&self) {
+        let _ = self
+            .inner
+            .models
+            .refresh(loop_ai::ModelsRefreshOptions {
+                allow_network: Some(true),
+                force: true,
+                provider_id: None,
+            })
+            .await;
     }
     pub fn harness(&self) -> &Arc<loop_agent::harness::AgentHarness> {
         &self.inner.harness
@@ -160,9 +173,6 @@ impl LegacyHost {
     }
     pub fn project_trusted_mut(&mut self) -> &mut bool {
         &mut self.inner.project_trusted
-    }
-    pub fn native(&self) -> &Arc<loop_agent::native_backend::NativeBackend> {
-        &self.inner.native
     }
     pub fn tool_approval(&self) -> &Option<Arc<ToolApprovalBridge>> {
         &self.inner.tool_approval

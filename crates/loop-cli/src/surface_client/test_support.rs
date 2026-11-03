@@ -6,6 +6,12 @@ use loop_agent::native_backend::NativeBackend;
 use loop_ai::providers::{faux_provider, FauxScript};
 use std::path::Path;
 pub(crate) async fn fixture(dir: &Path) -> SurfaceClient {
+    fixture_with(dir, true).await
+}
+
+/// A fixture whose standalone Session store is `None` when `with_store` is
+/// false, as on platforms without writer leases.
+pub(crate) async fn fixture_with(dir: &Path, with_store: bool) -> SurfaceClient {
     let models = Arc::new(loop_ai::Models::new());
     let provider = faux_provider(FauxScript::new());
     let mut model = provider.get_model("faux-model").unwrap();
@@ -75,7 +81,7 @@ pub(crate) async fn fixture(dir: &Path) -> SurfaceClient {
         web_disabled_for_run: true,
         #[cfg(feature = "telemetry")]
         telemetry: None,
-        session_store: Some(store),
+        session_store: with_store.then_some(store),
     };
     crate::CliRuntime {
         inner,
