@@ -5,8 +5,8 @@ terminal is then only a Surface. You can close it, open another, or watch the
 same Session from two terminals. Work keeps running in the Runtime, which keeps
 an Event Log so any Surface can catch up later.
 
-The Runtime works on **Linux and macOS** only, because it listens on a Unix
-socket. On other platforms `loop runtime` and `loop session` exit with an error.
+Loop supports **Linux and macOS** only (on Windows, use WSL). The Runtime
+listens on a Unix socket.
 
 ## Start the Runtime
 

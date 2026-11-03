@@ -177,15 +177,8 @@ impl Shell for HostExecutionEnv {
     ) -> Result<ShellOutput, ExecutionError> {
         let cwd = options.cwd.clone().unwrap_or_else(|| self.cwd.clone());
 
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", command]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", command]);
-            c
-        };
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", command]);
         cmd.current_dir(&cwd);
         if !options.inherit_env {
             cmd.env_clear();
@@ -208,7 +201,6 @@ pub(crate) async fn exec_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    #[cfg(unix)]
     if stop_background {
         // SAFETY: setsid is async-signal-safe and no allocator/locks are used
         // between fork and exec. Do not setpgid first: a group leader cannot setsid.
@@ -404,8 +396,7 @@ async fn drain(stdout: &mut PipeTask, stderr: &mut PipeTask) {
     }
 }
 
-/// Kills a process and everything in its process group (Unix) or tree
-/// (Windows), unless disarmed. Without it, a grandchild such as the `sleep`
+/// Kills a process and everything in its process group, unless disarmed. Without it, a grandchild such as the `sleep`
 /// in `sh -c "sleep 60; echo"` keeps the output pipes open after a timeout.
 struct TreeKiller {
     pid: Option<u32>,
@@ -420,18 +411,11 @@ impl TreeKiller {
         let Some(pid) = self.pid.take() else {
             return Ok(());
         };
-        #[cfg(unix)]
         // SAFETY: child PIDs fit pid_t; a negative PID targets its dedicated
         // process group. Never launch a PATH-resolved cleanup helper on the host.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
-        #[cfg(windows)]
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
         #[cfg(target_os = "macos")]
         result.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
         Ok(())

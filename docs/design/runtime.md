@@ -12,8 +12,8 @@ for views, replay and audit. The first **Subagent** runs as a child Session.
 
 ## 1. Scope and current foundations
 
-S2 supports Linux and macOS. Windows reports that `loop runtime` and `loop session`
-are unsupported. Unix socket code is behind `cfg(unix)`.
+Loop supports Linux and macOS only. Windows is not supported, and the build fails
+there with a compile error.
 
 Not in S2:
 - the TUI as a Runtime client, `--connect`, and URL or QR remote control (S3);

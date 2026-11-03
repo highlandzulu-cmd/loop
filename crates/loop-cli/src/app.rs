@@ -3823,13 +3823,7 @@ fn open_browser(url: &str) -> std::io::Result<std::process::Child> {
     {
         std::process::Command::new("open").arg(url).spawn()
     }
-    #[cfg(target_os = "windows")]
-    {
-        return std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .spawn();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(not(target_os = "macos"))]
     {
         std::process::Command::new("xdg-open").arg(url).spawn()
     }

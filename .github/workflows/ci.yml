@@ -67,7 +67,6 @@ jobs:
         include:
           - os: ubuntu-latest
           - os: macos-latest
-          - os: windows-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -87,16 +86,8 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-      - name: Check Unix installer syntax
-        if: runner.os != 'Windows'
+      - name: Check installer syntax
         run: bash -n install.sh
-
-      - name: Lifecycle (Windows PowerShell 5.1)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          LOOP_TEST_POWERSHELL: powershell.exe
-        run: cargo test -p loop-update --test lifecycle --locked
 
       # Telemetry is a default feature of loop-cli, so the steps above cover it.
       # The builds without it have no OS-specific parts, so they are only tested on Linux.

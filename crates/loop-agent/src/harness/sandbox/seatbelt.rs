@@ -1384,11 +1384,7 @@ mod tests {
     #[test]
     fn paths_are_parameters_not_profile_source() {
         let root = tempfile::tempdir().unwrap();
-        let tricky = root.path().join(if cfg!(windows) {
-            "quote (allow default)"
-        } else {
-            "quote\" (allow default)"
-        });
+        let tricky = root.path().join("quote\" (allow default)");
         std::fs::create_dir(&tricky).unwrap();
         let policy =
             SeatbeltPolicy::new(&tricky, root.path(), root.path(), &[], false, &[]).unwrap();

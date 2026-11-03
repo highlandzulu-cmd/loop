@@ -1,5 +1,5 @@
 //! A self-contained executable so tests exercise replacement/deletion of a
-//! running program, including the Windows helper, rather than just file copies.
+//! running program, including the self-replace helper, rather than just file copies.
 use loop_update::{Installation, ReleaseClient, ReleaseVersion};
 use std::{
     collections::HashMap,
@@ -221,7 +221,7 @@ fn run(binary: &Path, args: &[&str], pass: bool) -> String {
 }
 
 fn fixture(dir: &Path, version: &str) -> PathBuf {
-    let path = dir.join(format!("fixture-{version}{}", std::env::consts::EXE_SUFFIX));
+    let path = dir.join(format!("fixture-{version}"));
     let mut bytes = fs::read(std::env::current_exe().unwrap()).unwrap();
     let old = b"LOOP_FIXTURE_VERSION=0.3.4";
     let replacement = format!("LOOP_FIXTURE_VERSION={version}");
@@ -252,53 +252,25 @@ fn fixture(dir: &Path, version: &str) -> PathBuf {
 
 fn archive(binary: &Path) -> (String, Vec<u8>) {
     let target = loop_update::platform_target().unwrap();
-    let member = format!("loop-{target}/loop{}", std::env::consts::EXE_SUFFIX);
-    #[cfg(windows)]
-    {
-        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
-        zip.start_file(member, zip::write::SimpleFileOptions::default())
-            .unwrap();
-        zip.write_all(&fs::read(binary).unwrap()).unwrap();
-        (
-            format!("loop-{target}.zip"),
-            zip.finish().unwrap().into_inner(),
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        let mut tar = tar::Builder::new(gzip);
-        tar.append_path_with_name(binary, member).unwrap();
-        (
-            format!("loop-{target}.tar.gz"),
-            tar.into_inner().unwrap().finish().unwrap(),
-        )
-    }
+    let member = format!("loop-{target}/loop");
+    let gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gzip);
+    tar.append_path_with_name(binary, member).unwrap();
+    (
+        format!("loop-{target}.tar.gz"),
+        tar.into_inner().unwrap().finish().unwrap(),
+    )
 }
 
 fn installer_command(repo: &Path, bin: &Path, binary: &Path, hash: &str) -> Command {
-    if cfg!(windows) {
-        let shell = std::env::var("LOOP_TEST_POWERSHELL").unwrap_or_else(|_| "pwsh".into());
-        let mut command = Command::new(shell);
-        command
-            .args(["-NoProfile", "-File"])
-            .arg(repo.join("install.ps1"))
-            .arg("-InstallDir")
-            .arg(bin)
-            .arg("-Binary")
-            .arg(binary)
-            .args(["-Checksum", hash, "-NoModifyPath"]);
-        command
-    } else {
-        let mut command = Command::new("bash");
-        command
-            .arg(repo.join("install.sh"))
-            .arg("--binary")
-            .arg(binary)
-            .args(["--checksum", hash, "--no-modify-path"])
-            .env("LOOP_INSTALL_DIR", bin);
-        command
-    }
+    let mut command = Command::new("bash");
+    command
+        .arg(repo.join("install.sh"))
+        .arg("--binary")
+        .arg(binary)
+        .args(["--checksum", hash, "--no-modify-path"])
+        .env("LOOP_INSTALL_DIR", bin);
+    command
 }
 
 async fn run_lifecycle() {
@@ -320,7 +292,7 @@ async fn run_lifecycle() {
     fs::write(bin.join("unrelated-file"), "also keep").unwrap();
     let v1 = fixture(tmp.path(), "0.3.4");
     let v2 = fixture(tmp.path(), "0.3.5");
-    let exe = bin.join(format!("loop{}", std::env::consts::EXE_SUFFIX));
+    let exe = bin.join("loop");
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let hash = loop_update::sha256_file(&v1).unwrap();
     let mut installer = installer_command(&repo, &bin, &v1, &hash);
@@ -339,40 +311,37 @@ async fn run_lifecycle() {
     assert!(!bad_installer.output().unwrap().status.success());
     assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::symlink;
-        let tools = tmp.path().join("tools-without-sha256");
-        fs::create_dir(&tools).unwrap();
-        for name in [
-            "uname", "sysctl", "grep", "ls", "ldd", "mkdir", "rmdir", "rm", "awk", "tr", "head",
-        ] {
-            if let Some(source) = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-                .iter()
-                .map(|dir| Path::new(dir).join(name))
-                .find(|p| p.is_file())
-            {
-                symlink(source, tools.join(name)).unwrap();
-            }
+    use std::os::unix::fs::symlink;
+    let tools = tmp.path().join("tools-without-sha256");
+    fs::create_dir(&tools).unwrap();
+    for name in [
+        "uname", "sysctl", "grep", "ls", "ldd", "mkdir", "rmdir", "rm", "awk", "tr", "head",
+    ] {
+        if let Some(source) = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(name))
+            .find(|p| p.is_file())
+        {
+            symlink(source, tools.join(name)).unwrap();
         }
-        let output = Command::new("/bin/bash")
-            .arg(repo.join("install.sh"))
-            .arg("--binary")
-            .arg(&v2)
-            .args(["--checksum", &hash, "--no-modify-path"])
-            .env("LOOP_INSTALL_DIR", &bin)
-            .env("PATH", &tools)
-            .env("LOOP_ALLOW_UNVERIFIED", "1")
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("No SHA-256 tool"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
     }
+    let output = Command::new("/bin/bash")
+        .arg(repo.join("install.sh"))
+        .arg("--binary")
+        .arg(&v2)
+        .args(["--checksum", &hash, "--no-modify-path"])
+        .env("LOOP_INSTALL_DIR", &bin)
+        .env("PATH", &tools)
+        .env("LOOP_ALLOW_UNVERIFIED", "1")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("No SHA-256 tool"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
 
     // Repair a truncated installed binary even when a stale rollback record exists.
     fs::write(&exe, "garbage executable").unwrap();
@@ -400,54 +369,51 @@ async fn run_lifecycle() {
     run(&exe, &["--rollback"], true);
     assert!(run(&exe, &["--version"], true).contains("0.3.4"));
 
-    #[cfg(unix)]
-    {
-        for signal in ["INT", "HUP", "TERM"] {
-            let ready = bin.join("ready");
-            let mut child = Command::new(&exe)
-                .arg("--hold-lock")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .unwrap();
-            for _ in 0..200 {
-                if ready.exists() {
-                    break;
-                }
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "child exited before acquiring lock"
-                );
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            assert!(ready.exists());
-            std::thread::sleep(Duration::from_millis(100));
-            assert!(Command::new("kill")
-                .args([format!("-{signal}"), child.id().to_string()])
-                .status()
-                .unwrap()
-                .success());
-            for _ in 0..200 {
-                if child.try_wait().unwrap().is_some() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(25));
+    for signal in ["INT", "HUP", "TERM"] {
+        let ready = bin.join("ready");
+        let mut child = Command::new(&exe)
+            .arg("--hold-lock")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..200 {
+            if ready.exists() {
+                break;
             }
             assert!(
-                child.try_wait().unwrap().is_some(),
-                "signal cleanup timed out"
+                child.try_wait().unwrap().is_none(),
+                "child exited before acquiring lock"
             );
-            fs::remove_file(ready).unwrap();
-            assert!(
-                !bin.join(".loop-update/operation.lock").exists(),
-                "signal {signal} left a lock"
-            );
-            assert!(!fs::read_dir(bin.join(".loop-update"))
-                .unwrap()
-                .flatten()
-                .any(|e| e.file_name().to_string_lossy().starts_with("stage-")));
-            assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
+            std::thread::sleep(Duration::from_millis(25));
         }
+        assert!(ready.exists());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(Command::new("kill")
+            .args([format!("-{signal}"), child.id().to_string()])
+            .status()
+            .unwrap()
+            .success());
+        for _ in 0..200 {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "signal cleanup timed out"
+        );
+        fs::remove_file(ready).unwrap();
+        assert!(
+            !bin.join(".loop-update/operation.lock").exists(),
+            "signal {signal} left a lock"
+        );
+        assert!(!fs::read_dir(bin.join(".loop-update"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.file_name().to_string_lossy().starts_with("stage-")));
+        assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
     }
 
     let server = Server::new();
@@ -537,53 +503,50 @@ async fn run_lifecycle() {
     fs::write(&archive_file, &bytes).unwrap();
     let archive_hash = loop_update::sha256_file(&archive_file).unwrap();
     server.set(&hash_path, format!("{archive_hash}  {asset}").into_bytes());
-    #[cfg(unix)]
-    {
-        // Cancel an in-flight download. No install lock may be held, and the
-        // temporary download directory must be removed without replacing loop.
-        let slow = Server::new();
-        slow.set(
-            "/latest",
-            br#"{"tag_name":"v0.3.5","draft":false,"prerelease":false}"#.to_vec(),
-        );
-        slow.set(&hash_path, format!("{archive_hash}  {asset}").into_bytes());
-        slow.stall(&asset_path);
-        let mut child = Command::new(&exe)
-            .args(["--update", &slow.url])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        for _ in 0..200 {
-            if slow.request_count() >= 3 {
-                break;
-            }
-            assert!(child.try_wait().unwrap().is_none());
-            std::thread::sleep(Duration::from_millis(25));
+    // Cancel an in-flight download. No install lock may be held, and the
+    // temporary download directory must be removed without replacing loop.
+    let slow = Server::new();
+    slow.set(
+        "/latest",
+        br#"{"tag_name":"v0.3.5","draft":false,"prerelease":false}"#.to_vec(),
+    );
+    slow.set(&hash_path, format!("{archive_hash}  {asset}").into_bytes());
+    slow.stall(&asset_path);
+    let mut child = Command::new(&exe)
+        .args(["--update", &slow.url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    for _ in 0..200 {
+        if slow.request_count() >= 3 {
+            break;
         }
-        assert_eq!(slow.request_count(), 3);
-        assert!(
-            !bin.join(".loop-update/operation.lock").exists(),
-            "download must not hold installation lock"
-        );
-        assert!(Command::new("kill")
-            .args(["-INT".into(), child.id().to_string()])
-            .status()
-            .unwrap()
-            .success());
-        for _ in 0..200 {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-        assert!(child.try_wait().unwrap().is_some());
-        assert!(!fs::read_dir(&bin).unwrap().flatten().any(|e| e
-            .file_name()
-            .to_string_lossy()
-            .starts_with("stage-download-")));
-        assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
+        assert!(child.try_wait().unwrap().is_none());
+        std::thread::sleep(Duration::from_millis(25));
     }
+    assert_eq!(slow.request_count(), 3);
+    assert!(
+        !bin.join(".loop-update/operation.lock").exists(),
+        "download must not hold installation lock"
+    );
+    assert!(Command::new("kill")
+        .args(["-INT".into(), child.id().to_string()])
+        .status()
+        .unwrap()
+        .success());
+    for _ in 0..200 {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(child.try_wait().unwrap().is_some());
+    assert!(!fs::read_dir(&bin).unwrap().flatten().any(|e| e
+        .file_name()
+        .to_string_lossy()
+        .starts_with("stage-download-")));
+    assert_eq!(loop_update::sha256_file(&exe).unwrap(), hash);
     run(&exe, &["--update", &server.url], true);
     assert!(run(&exe, &["--version"], true).contains("0.3.5"));
     assert_eq!(
@@ -592,9 +555,7 @@ async fn run_lifecycle() {
     );
 
     // A corrupted backup must never replace the current binary.
-    let previous = bin
-        .join(".loop-update")
-        .join(format!("previous-{hash}{}", std::env::consts::EXE_SUFFIX));
+    let previous = bin.join(".loop-update").join(format!("previous-{hash}"));
     fs::write(&previous, "damaged").unwrap();
     run(&exe, &["--rollback"], false);
     assert!(run(&exe, &["--version"], true).contains("0.3.5"));
@@ -619,7 +580,7 @@ async fn run_lifecycle() {
     );
     drop(installation);
     run(&exe, &["--uninstall"], true);
-    // Windows defers deletion until the child and its deletion helper exit.
+    // Self-delete may finish just after the child exits.
     for _ in 0..100 {
         if !exe.exists() {
             break;

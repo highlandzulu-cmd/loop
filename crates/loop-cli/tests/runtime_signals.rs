@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use std::{future::Future, io::Write, task::Poll, time::Duration};
 use tokio::io::{AsyncBufReadExt, BufReader};
 

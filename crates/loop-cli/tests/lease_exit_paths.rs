@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! Every way a terminal `loop` process ends must leave no Session lease row
 //! behind in `sessions.db`. Each test runs the real binary against a fake
 //! OpenAI-compatible model with an isolated agent directory.

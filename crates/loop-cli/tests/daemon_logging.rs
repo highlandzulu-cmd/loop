@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 use loop_cli::debug_log::{init_tracing, TracingMode};
 
 #[test]

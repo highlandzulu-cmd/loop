@@ -62,7 +62,6 @@ semver = "1"
 self-replace = "1.5"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
-zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 percent-encoding = "2"
 
 serde = { version = "1", features = ["derive"] }

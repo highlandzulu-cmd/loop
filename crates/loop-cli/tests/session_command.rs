@@ -1,4 +1,3 @@
-#![cfg(unix)]
 use loop_cli::session_cmd::{connect, drive, Input, SessionArgs, Terminal};
 use loop_protocol::{rpc::PeerInfo, AgentBackend, ContentBlock, SessionSpec};
 use loop_runtime::{log::MemoryEventLog, Runtime, RuntimeLimits};

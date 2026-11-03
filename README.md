@@ -47,13 +47,6 @@ curl -fsSL https://loop.soket.ai/install | bash -s -- --no-modify-path
 
 From a clone of this repo you can also run `./install.sh`. Assets come from [soketlabs/loop releases](https://github.com/soketlabs/loop/releases).
 
-On native Windows, run the PowerShell installer from a clone:
-
-```powershell
-.\install.ps1
-.\install.ps1 -Version 0.3.4 -NoModifyPath
-```
-
 For installer-owned binaries, opening the terminal chat checks GitHub in the background. If a newer
 release is available, it shows a notice with the `loop update` command. It does
 not install updates at startup. Offline checks do not block the chat.
@@ -84,16 +77,17 @@ First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, Anthr
 | macOS (Intel) | x86_64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux (glibc) | x86_64, arm64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux via WSL | x86_64, arm64 | Supported (uses the Linux build) | `curl -fsSL https://loop.soket.ai/install \| bash` inside WSL |
-| Windows (native) | x86_64 | Installer and lifecycle tests in CI | `./install.ps1` in PowerShell |
 | Linux (musl, e.g. Alpine) | any | Not supported | [Build from source](#build--test) |
+
+Loop supports Linux and macOS only. Native Windows is not supported; use WSL.
 
 ### Feature support
 
-| Feature | Linux | macOS | Windows |
-|---------|-------|-------|---------|
-| Sandboxing | Podman | Seatbelt (partial) | Planned |
-| Compaction (manual) | Supported | Supported | In testing |
-| mcp-serve | Supported | Supported | In testing |
+| Feature | Linux | macOS |
+|---------|-------|-------|
+| Sandboxing | Podman | Seatbelt (partial) |
+| Compaction (manual) | Supported | Supported |
+| mcp-serve | Supported | Supported |
 
 The installer detects your OS and CPU, downloads the latest matching release from GitHub, verifies its SHA-256 checksum, installs to `~/.loop/bin`, and adds that directory to your `PATH`. Re-running it is safe: it skips the download if you already have the latest version (use `--force` to reinstall).
 

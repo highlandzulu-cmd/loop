@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! `loop runtime start|stop|status` end to end: spawn the built binary with an isolated agent dir.
 
 use std::{

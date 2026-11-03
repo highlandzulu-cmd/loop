@@ -26,30 +26,7 @@ pub struct StartArgs {
     pub cwd: PathBuf,
 }
 
-#[cfg(not(unix))]
-const UNSUPPORTED: &str =
-    "`loop runtime` is not supported on this platform (it needs Unix sockets); Linux and macOS are supported";
-
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
-#[cfg(not(unix))]
-pub async fn start(_args: StartArgs) -> anyhow::Result<()> {
-    anyhow::bail!(UNSUPPORTED)
-}
-
-/// Ask the Runtime on `socket` to stop.
-#[cfg(not(unix))]
-pub async fn stop(_socket: Option<PathBuf>) -> anyhow::Result<()> {
-    anyhow::bail!(UNSUPPORTED)
-}
-
-/// Print the Runtime's status. `Ok(false)` when no Runtime answers.
-#[cfg(not(unix))]
-pub async fn status(_socket: Option<PathBuf>, _json: bool) -> anyhow::Result<bool> {
-    anyhow::bail!(UNSUPPORTED)
-}
-
-/// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
-#[cfg(unix)]
 pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     use anyhow::Context;
     use loop_app_core::{
@@ -290,14 +267,8 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     drop(lock);
     Ok(())
 }
-
-#[cfg(unix)]
 use std::sync::Arc;
-
-#[cfg(unix)]
 struct TokenFile(PathBuf);
-
-#[cfg(unix)]
 impl Drop for TokenFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
@@ -357,7 +328,6 @@ impl Limits {
 
 /// The Runtime as one socket serves it: `runtime/status` names this socket
 /// and `runtime/stop` ends the accept loop like a signal does.
-#[cfg(unix)]
 struct Control {
     runtime: Arc<loop_runtime::Runtime>,
     socket: PathBuf,
@@ -372,7 +342,6 @@ struct Control {
 /// Workspace admin is the Runtime's; the host-only usage history and
 /// new-Session defaults are the daemon's, served only host-locally (the
 /// wire refuses them on any other connection).
-#[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_wire::RuntimeAdmin for Control {
     async fn settings(&self, p: admin::SettingsParams) -> BackendResult<admin::SettingsResult> {
@@ -427,11 +396,9 @@ impl loop_wire::RuntimeAdmin for Control {
         self.runtime.update_defaults(p).await
     }
 }
-
-#[cfg(unix)]
 use loop_protocol::{admin, BackendResult};
 
-#[cfg(all(unix, feature = "usage"))]
+#[cfg(feature = "usage")]
 fn failed(error: impl std::fmt::Display) -> loop_protocol::BackendError {
     loop_protocol::BackendError::failed(loop_protocol::ErrorCategory::Internal, error.to_string())
 }
@@ -488,8 +455,6 @@ pub(crate) fn usage_page(
         log_status,
     })
 }
-
-#[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_wire::RuntimeControl for Control {
     async fn config(
@@ -651,8 +616,6 @@ impl loop_wire::RuntimeControl for Control {
         Ok(())
     }
 }
-
-#[cfg(unix)]
 fn socket_or_default(socket: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     match socket {
         Some(socket) => Ok(socket),
@@ -664,7 +627,6 @@ fn socket_or_default(socket: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 /// A control connection to the Runtime on `socket`, or `None` when nothing
 /// answers there.
-#[cfg(unix)]
 async fn control_client(
     socket: &std::path::Path,
 ) -> anyhow::Result<Option<Arc<loop_wire::RemoteBackend>>> {
@@ -686,10 +648,7 @@ async fn control_client(
     .map_err(|_| anyhow::anyhow!("the Runtime at {} did not answer", socket.display()))??;
     Ok(Some(backend))
 }
-
-#[cfg(unix)]
 struct NoInteraction;
-#[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_protocol::HostServices for NoInteraction {
     async fn interact(
@@ -704,7 +663,6 @@ impl loop_protocol::HostServices for NoInteraction {
 
 /// Ask the Runtime on `socket` to stop and wait for its socket to go. Never
 /// signals a process: with nothing answering it only says so.
-#[cfg(unix)]
 pub async fn stop(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let socket = socket_or_default(socket)?;
     let Some(backend) = control_client(&socket).await? else {
@@ -743,7 +701,6 @@ pub async fn stop(socket: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// Print the Runtime's status. `Ok(false)` when no Runtime answers.
-#[cfg(unix)]
 pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool> {
     let socket = socket_or_default(socket)?;
     let Some(backend) = control_client(&socket).await? else {
@@ -814,7 +771,7 @@ where
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

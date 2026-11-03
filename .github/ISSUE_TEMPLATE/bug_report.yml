@@ -115,7 +115,6 @@ body:
         - Linux glibc, x86_64
         - Linux glibc, aarch64
         - Linux via WSL
-        - Windows native, x86_64
         - Other (specify below)
     validations:
       required: true

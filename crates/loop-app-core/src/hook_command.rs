@@ -71,7 +71,6 @@ pub async fn run(
     if cwd.is_dir() {
         command.current_dir(cwd);
     }
-    #[cfg(unix)]
     command.process_group(0);
 
     let mut child = command
@@ -177,22 +176,15 @@ struct TreeKiller(Option<u32>);
 impl Drop for TreeKiller {
     fn drop(&mut self) {
         let Some(pid) = self.0 else { return };
-        #[cfg(unix)]
         let _ = std::process::Command::new("kill")
             .args(["-KILL", "--", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        #[cfg(windows)]
-        let _ = std::process::Command::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
