@@ -12,7 +12,7 @@ use loop_dashboard::{
     Dashboard, LiveStatus, McpServerStatus, Options, Palette, SubAgent, SubAgentState,
 };
 
-use super::{CardStatus, ChatItem, CliRuntime, Theme, TokenBarState};
+use super::{CardStatus, ChatItem, SurfaceClient, Theme, TokenBarState};
 
 /// How often the Now view is rebuilt from the chat's in-memory state.
 const LIVE_EVERY: Duration = Duration::from_millis(500);
@@ -62,20 +62,20 @@ pub(super) struct Screen {
 }
 
 impl Screen {
-    pub async fn open(runtime: &CliRuntime, chat: ChatState<'_>) -> io::Result<Self> {
+    pub async fn open(runtime: &SurfaceClient, chat: ChatState<'_>) -> io::Result<Self> {
         let slow = Slow::query(runtime).await;
-        let usage_log = runtime.usage_log();
+        let usage_log = runtime.legacy().usage_log();
         let dir = usage_log
             .as_ref()
             .and_then(|log| log.path.parent().map(PathBuf::from))
-            .unwrap_or_else(|| loop_app_core::config::paths::usage_dir(&runtime.agent_dir));
+            .unwrap_or_else(|| loop_app_core::config::paths::usage_dir(runtime.agent_dir()));
         let notice = usage_log
             .and_then(|log| log.last_error)
             .map(|err| format!("The usage log could not be written: {err}"));
-        let mut options = options(&runtime.theme, dir, notice);
+        let mut options = options(runtime.theme(), dir, notice);
         options.live = Some(live_status(runtime, &chat, &slow));
         // Include this session's latest spans; they show up on the next reload.
-        runtime.flush_usage_log();
+        runtime.legacy().flush_usage_log();
         Ok(Self {
             board: Dashboard::open(options)?,
             size: crossterm::terminal::size().ok(),
@@ -98,10 +98,14 @@ impl Screen {
     }
 
     /// Refresh the live status when due and redraw.
-    pub async fn refresh(&mut self, runtime: &CliRuntime, chat: ChatState<'_>) -> io::Result<()> {
+    pub async fn refresh(
+        &mut self,
+        runtime: &SurfaceClient,
+        chat: ChatState<'_>,
+    ) -> io::Result<()> {
         if self.slow_at.elapsed() >= SLOW_EVERY {
             self.slow = Slow::query(runtime).await;
-            runtime.flush_usage_log();
+            runtime.legacy().flush_usage_log();
             self.slow_at = Instant::now();
         }
         if self.live_at.elapsed() >= LIVE_EVERY {
@@ -128,8 +132,8 @@ struct Slow {
 }
 
 impl Slow {
-    async fn query(runtime: &CliRuntime) -> Self {
-        let sandbox = runtime.harness.sandbox_info().await;
+    async fn query(runtime: &SurfaceClient) -> Self {
+        let sandbox = runtime.legacy().harness().sandbox_info().await;
         let sandbox = sandbox
             .fields
             .iter()
@@ -138,16 +142,24 @@ impl Slow {
             .collect::<Vec<_>>()
             .join(" · ");
         let connected: HashMap<String, usize> = runtime
-            .mcp_client
+            .legacy()
+            .mcp_client()
             .list_connections()
             .await
             .into_iter()
             .collect();
         let mut mcp_servers: Vec<McpServerStatus> = runtime
-            .settings
+            .legacy()
+            .settings()
             .mcp_servers
             .keys()
-            .filter(|name| !runtime.settings.disabled_mcp_servers.contains(name))
+            .filter(|name| {
+                !runtime
+                    .legacy()
+                    .settings()
+                    .disabled_mcp_servers
+                    .contains(name)
+            })
             .map(|name| McpServerStatus {
                 name: name.clone(),
                 tools: connected.get(name).copied().unwrap_or(0),
@@ -171,21 +183,22 @@ impl Slow {
 }
 
 /// The Now view's status, from in-memory state only.
-fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveStatus {
-    let subscription = runtime
-        .active_agent
-        .as_deref()
-        .map(|id| match runtime.agents.entry(id) {
-            Some(entry) => entry.display_name().to_string(),
-            None => id.to_string(),
-        });
+fn live_status(runtime: &SurfaceClient, chat: &ChatState<'_>, slow: &Slow) -> LiveStatus {
+    let subscription =
+        runtime
+            .active_agent()
+            .as_deref()
+            .map(|id| match runtime.legacy().agents().entry(id) {
+                Some(entry) => entry.display_name().to_string(),
+                None => id.to_string(),
+            });
     let (model, effort) = match &subscription {
         Some(agent) => (
             runtime
-                .agent_model
+                .agent_model()
                 .as_ref()
                 .map_or(agent.clone(), |m| format!("{agent}/{m}")),
-            runtime.agent_effort.clone(),
+            runtime.agent_effort().clone(),
         ),
         None => (
             runtime
@@ -219,11 +232,11 @@ fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveS
         taken_at: chrono::Local::now(),
         model,
         effort,
-        permission_mode: runtime.permission_mode().label().to_string(),
+        permission_mode: runtime.legacy().permission_mode().label().to_string(),
         sandbox: slow.sandbox.clone(),
-        web: runtime.web_tools().status(),
-        cwd: runtime.cwd.display().to_string(),
-        session_id: runtime.session_id.clone(),
+        web: runtime.legacy().web_tools().status(),
+        cwd: runtime.cwd().display().to_string(),
+        session_id: runtime.session_id().clone(),
         context_tokens: chat.token_bar.context_tokens,
         context_window: chat.token_bar.context_window,
         session_tokens: chat.token_bar.total_tokens,
@@ -236,17 +249,19 @@ fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveS
         external_agent: subscription.map(|agent| format!("{agent} · subscription agent")),
         sub_agents,
         skills_loaded: runtime
-            .resources
+            .legacy()
+            .resources()
             .skills
             .iter()
             .map(|s| s.name.clone())
             .collect(),
-        skills_active: runtime.active_skills.clone(),
-        skills_disabled: runtime.resources.disabled_skills.len(),
+        skills_active: runtime.legacy().active_skills().clone(),
+        skills_disabled: runtime.legacy().resources().disabled_skills.len(),
         mcp_servers: slow.mcp_servers.clone(),
-        extensions: runtime.resources.extension_paths.len(),
-        hooks: runtime.resources.hook_paths.len(),
+        extensions: runtime.legacy().resources().extension_paths.len(),
+        hooks: runtime.legacy().resources().hook_paths.len(),
         usage_log: runtime
+            .legacy()
             .usage_log()
             .map(|log| log.path.display().to_string()),
     }

@@ -564,7 +564,7 @@ async fn real_main() -> anyhow::Result<()> {
             Err(err) => Err(err),
         }
     } else {
-        loop_cli::app::run(runtime).await
+        loop_cli::app::run(runtime.into()).await
     };
     // Idempotent: the TUI and `--print` already released.
     release().await;

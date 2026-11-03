@@ -15,6 +15,8 @@ pub mod runtime_cmd;
 pub mod runtime_signals;
 pub mod session_cmd;
 pub mod setup_prompt;
+pub mod surface_client;
+pub use surface_client::SurfaceClient;
 #[cfg(feature = "telemetry")]
 pub mod tracing_setup;
 pub mod tui;

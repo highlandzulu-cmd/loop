@@ -912,6 +912,42 @@ impl SessionStore for SqliteSessionStore {
         .map_err(|e| SessionError::Storage(e.to_string()))?
     }
 
+    async fn create_surface_destination(
+        &self,
+        file: super::super::SessionFile,
+        cwd: String,
+        parent: Option<String>,
+        request_key: String,
+        fingerprint: String,
+        receipt: String,
+    ) -> Result<String, SessionError> {
+        let guard = self.resume_guard.as_ref().ok_or_else(|| {
+            SessionError::Invalid("Surface destinations require a standalone writer".into())
+        })?;
+        if guard.failed() {
+            return Err(guard.refusal());
+        }
+        let identity = self.identity.clone().expect("standalone identity");
+        let mut created = self
+            .create_destination(
+                file,
+                cwd,
+                parent,
+                request_key,
+                fingerprint,
+                receipt,
+                identity,
+            )
+            .await?;
+        if guard.failed() {
+            created.rollback().await?;
+            return Err(guard.refusal());
+        }
+        guard.track(&created.id);
+        created.admitted();
+        Ok(created.id.clone())
+    }
+
     async fn fork(
         &self,
         source_id: &str,

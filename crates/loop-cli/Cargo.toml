@@ -35,6 +35,7 @@ loop-telemetry = { workspace = true, optional = true }
 loop-dashboard = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -354,6 +354,23 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<SessionTreeEntry, SessionError>;
     /// Delete session.
     async fn delete(&self, id: &str) -> Result<(), SessionError>;
+    /// Create an independently leased destination from a captured branch for a
+    /// standalone Surface. Uses the same atomic copy and grant filtering as the
+    /// Runtime's destination service. The source is never switched or cancelled.
+    async fn create_surface_destination(
+        &self,
+        _file: super::SessionFile,
+        _cwd: String,
+        _parent: Option<String>,
+        _request_key: String,
+        _fingerprint: String,
+        _receipt: String,
+    ) -> Result<String, SessionError> {
+        Err(SessionError::Invalid(
+            "this store cannot create a Surface destination".into(),
+        ))
+    }
+
     /// Fork session.
     ///
     /// When `selection` is [`SessionForkSelection::ThroughEntry`], pass the
