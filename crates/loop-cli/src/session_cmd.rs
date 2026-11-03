@@ -10,6 +10,8 @@ pub struct SessionArgs {
     pub new: bool,
     pub cwd: Option<PathBuf>,
     pub socket: Option<PathBuf>,
+    pub url: Option<String>,
+    pub token_file: Option<PathBuf>,
     /// List finished Subagent children too.
     pub all: bool,
     /// Print every Session as a JSON array of `SessionInfo` instead.
@@ -31,19 +33,41 @@ pub use unix::{connect, drive, AttachClient, Input, Terminal};
 #[cfg(unix)]
 pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
     let mut terminal = unix::StdioTerminal::new()?;
-    let socket = match args.socket.clone() {
-        Some(socket) => socket,
-        None => crate::config::paths::runtime_socket_path(&crate::config::paths::get_agent_dir())?,
+    let transport = if let Some(url) = &args.url {
+        let token = match &args.token_file {
+            Some(path) => loop_wire::token::read(path)
+                .map_err(|e| anyhow::anyhow!("cannot read private Runtime token file: {e}"))?,
+            None => std::env::var("LOOP_RUNTIME_TOKEN")
+                .ok()
+                .filter(|token| !token.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "WebSocket connections require LOOP_RUNTIME_TOKEN or --token-file"
+                    )
+                })?,
+        };
+        loop_wire::socket::websocket_connect(url, token.trim()).await?
+    } else {
+        let socket = match args.socket.clone() {
+            Some(socket) => socket,
+            None => {
+                crate::config::paths::runtime_socket_path(&crate::config::paths::get_agent_dir())?
+            }
+        };
+        let stream = tokio::net::UnixStream::connect(&socket)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Cannot connect to Runtime at {}: {e}. Start one with `loop runtime start`.",
+                    socket.display()
+                )
+            })?;
+        loop_wire::socket::unix(stream)
     };
-    let stream = tokio::net::UnixStream::connect(&socket)
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Cannot connect to Runtime at {}: {e}. Start one with `loop runtime start`.",
-                socket.display()
-            )
-        })?;
-    let (backend, events) = connect(loop_wire::socket::unix(stream)).await?;
+    let (backend, events) =
+        tokio::time::timeout(std::time::Duration::from_secs(10), connect(transport))
+            .await
+            .map_err(|_| anyhow::anyhow!("Runtime connection timed out"))??;
     drive(backend, events, args, &mut terminal).await
 }
 
@@ -252,7 +276,10 @@ mod unix {
             // peer never replies and the wire reader already drained requests.
         });
         let backend = match RemoteBackend::connect(
-            Transport { incoming, outgoing },
+            Transport {
+                incoming: incoming.into(),
+                outgoing: outgoing.into(),
+            },
             PeerInfo {
                 name: "loop session".into(),
                 version: env!("CARGO_PKG_VERSION").into(),

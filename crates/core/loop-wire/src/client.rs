@@ -33,6 +33,16 @@ use crate::transport::Transport;
 /// Updates a client keeps for a slow subscriber before it lags.
 const UPDATE_BUFFER: usize = 4096;
 
+struct Initializing(Option<Arc<Connection>>);
+
+impl Drop for Initializing {
+    fn drop(&mut self) {
+        if let Some(conn) = &self.0 {
+            conn.close();
+        }
+    }
+}
+
 /// A backend served over a connection ([`crate::serve`]).
 pub struct RemoteBackend {
     conn: Arc<Connection>,
@@ -49,6 +59,27 @@ pub struct RemoteBackend {
 }
 
 impl RemoteBackend {
+    /// Connect to the Runtime over an authenticated WebSocket, then initialize.
+    /// The caller supplies the token; it is never included in diagnostics.
+    pub async fn connect_websocket(
+        url: &str,
+        token: &str,
+        client: PeerInfo,
+        host: Arc<dyn HostServices>,
+    ) -> BackendResult<Arc<Self>> {
+        let transport = crate::socket::websocket_connect(url, token)
+            .await
+            .map_err(|error| BackendError::failed(ErrorCategory::Protocol, error.to_string()))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Self::connect(transport, client, host),
+        )
+        .await
+        .map_err(|_| {
+            BackendError::failed(ErrorCategory::Protocol, "Runtime initialization timed out")
+        })?
+    }
+
     /// Connect over `transport` and agree on a version. `host` answers the
     /// server's `host/interact` requests.
     pub async fn connect(
@@ -76,6 +107,7 @@ impl RemoteBackend {
         client_capabilities: ClientCapabilities,
     ) -> BackendResult<Arc<Self>> {
         let (conn, incoming) = Connection::new(transport);
+        let mut initializing = Initializing(Some(conn.clone()));
         let (updates, _) = broadcast::channel(UPDATE_BUFFER);
         let busy: Arc<Mutex<HashSet<SessionKey>>> = Arc::default();
         tokio::spawn(read(
@@ -101,6 +133,7 @@ impl RemoteBackend {
                 ),
             ));
         }
+        initializing.0 = None;
         Ok(Arc::new(Self {
             conn,
             instance: result.instance,
@@ -573,7 +606,7 @@ async fn call<T: DeserializeOwned>(
 /// Handle everything the server sends, in order.
 async fn read(
     conn: Arc<Connection>,
-    mut incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
+    mut incoming: tokio::sync::mpsc::Receiver<Incoming>,
     updates: broadcast::Sender<UpdateEnvelope>,
     busy: Arc<Mutex<HashSet<SessionKey>>>,
     host: Arc<dyn HostServices>,

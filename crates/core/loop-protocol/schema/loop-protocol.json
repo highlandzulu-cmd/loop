@@ -2136,6 +2136,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "listen_url": {
+          "description": "Loopback WebSocket endpoint, without credentials.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "loaded": {
           "description": "Sessions held in memory.",
           "format": "uint64",

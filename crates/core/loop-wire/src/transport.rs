@@ -5,21 +5,136 @@
 //! Unix sockets (one message per line), [`memory`] for two peers in one
 //! process. Dropping the outgoing side closes the underlying stream's output.
 
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
 
 /// Longest message accepted from the peer. Longer ones are dropped so a
 /// misbehaving peer cannot exhaust memory.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Most whole messages queued in either direction on a WebSocket.
+pub const SOCKET_QUEUE_MESSAGES: usize = 128;
+
+#[derive(Debug)]
+struct QueuedMessage {
+    text: String,
+    _permit: OwnedSemaphorePermit,
+}
+
+/// Nonblocking message sender. Bounded sockets disconnect on overflow so a
+/// slow Surface can reconnect and replay instead of exhausting the host.
+#[derive(Debug, Clone)]
+pub struct MessageSender(SenderKind);
+
+#[derive(Debug, Clone)]
+enum SenderKind {
+    Unbounded(mpsc::UnboundedSender<String>),
+    Bounded(
+        mpsc::Sender<QueuedMessage>,
+        Arc<Semaphore>,
+        CancellationToken,
+    ),
+}
+
+impl From<mpsc::UnboundedSender<String>> for MessageSender {
+    fn from(sender: mpsc::UnboundedSender<String>) -> Self {
+        Self(SenderKind::Unbounded(sender))
+    }
+}
+
+impl MessageSender {
+    /// Queue a message, or close an overloaded socket and return the unsent text.
+    pub fn send(&self, text: String) -> Result<(), mpsc::error::SendError<String>> {
+        let (sender, budget, closed) = match &self.0 {
+            SenderKind::Unbounded(sender) => return sender.send(text),
+            SenderKind::Bounded(sender, budget, closed) => (sender, budget, closed),
+        };
+        if closed.is_cancelled() {
+            return Err(mpsc::error::SendError(text));
+        }
+        let permit = if text.len() <= MAX_MESSAGE_BYTES {
+            budget
+                .clone()
+                .try_acquire_many_owned(text.len().max(1) as u32)
+                .ok()
+        } else {
+            None
+        };
+        let Some(permit) = permit else {
+            tracing::warn!("WebSocket queue byte limit reached; disconnecting client for replay");
+            closed.cancel();
+            return Err(mpsc::error::SendError(text));
+        };
+        sender
+            .try_send(QueuedMessage {
+                text,
+                _permit: permit,
+            })
+            .map_err(|error| {
+                tracing::warn!("WebSocket queue full or closed; disconnecting client for replay");
+                closed.cancel();
+                mpsc::error::SendError(error.into_inner().text)
+            })
+    }
+}
+
+/// Incoming whole messages from a transport.
+#[derive(Debug)]
+pub struct MessageReceiver(ReceiverKind);
+
+#[derive(Debug)]
+enum ReceiverKind {
+    Unbounded(mpsc::UnboundedReceiver<String>),
+    Bounded(mpsc::Receiver<QueuedMessage>),
+}
+
+impl From<mpsc::UnboundedReceiver<String>> for MessageReceiver {
+    fn from(receiver: mpsc::UnboundedReceiver<String>) -> Self {
+        Self(ReceiverKind::Unbounded(receiver))
+    }
+}
+
+impl MessageReceiver {
+    /// Receive an already queued message without waiting.
+    pub fn try_recv(&mut self) -> Result<String, mpsc::error::TryRecvError> {
+        match &mut self.0 {
+            ReceiverKind::Unbounded(receiver) => receiver.try_recv(),
+            ReceiverKind::Bounded(receiver) => receiver.try_recv().map(|message| message.text),
+        }
+    }
+
+    /// Receive the next message in order, or `None` after the peer closes.
+    pub async fn recv(&mut self) -> Option<String> {
+        match &mut self.0 {
+            ReceiverKind::Unbounded(receiver) => receiver.recv().await,
+            ReceiverKind::Bounded(receiver) => receiver.recv().await.map(|message| message.text),
+        }
+    }
+}
+
+pub(crate) fn bounded(closed: CancellationToken) -> (MessageSender, MessageReceiver) {
+    let (sender, receiver) = mpsc::channel(SOCKET_QUEUE_MESSAGES);
+    (
+        MessageSender(SenderKind::Bounded(
+            sender,
+            Arc::new(Semaphore::new(MAX_MESSAGE_BYTES)),
+            closed,
+        )),
+        MessageReceiver(ReceiverKind::Bounded(receiver)),
+    )
+}
 
 /// One end of a connection: the messages that arrive, and a sender for the
 /// messages to send.
 #[derive(Debug)]
 pub struct Transport {
     /// Messages from the peer, in order. Closes when the peer's side ends.
-    pub incoming: mpsc::UnboundedReceiver<String>,
+    pub incoming: MessageReceiver,
     /// Messages to the peer. Dropping it closes the output.
-    pub outgoing: mpsc::UnboundedSender<String>,
+    pub outgoing: MessageSender,
 }
 
 /// Two connected ends in one process.
@@ -28,12 +143,12 @@ pub fn memory() -> (Transport, Transport) {
     let (b_tx, b_rx) = mpsc::unbounded_channel();
     (
         Transport {
-            incoming: b_rx,
-            outgoing: a_tx,
+            incoming: b_rx.into(),
+            outgoing: a_tx.into(),
         },
         Transport {
-            incoming: a_rx,
-            outgoing: b_tx,
+            incoming: a_rx.into(),
+            outgoing: b_tx.into(),
         },
     )
 }
@@ -79,7 +194,10 @@ where
             }
         }
     });
-    Transport { incoming, outgoing }
+    Transport {
+        incoming: incoming.into(),
+        outgoing: outgoing.into(),
+    }
 }
 
 /// Read one line, dropping lines over [`MAX_MESSAGE_BYTES`]. Returns the

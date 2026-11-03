@@ -613,7 +613,7 @@ async fn dispatch(
     backend: Weak<AcpBackend>,
     generation: u64,
     conn: Arc<Connection>,
-    mut incoming: mpsc::UnboundedReceiver<Incoming>,
+    mut incoming: mpsc::Receiver<Incoming>,
 ) {
     while let Some(message) = incoming.recv().await {
         if let Incoming::Response { id, result } = message {

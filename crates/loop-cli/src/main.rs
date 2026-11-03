@@ -145,6 +145,9 @@ enum RuntimeCommand {
     /// effect only through that flag, never from settings. The global
     /// `--cwd` sets the folder for Sessions that name none.
     Start {
+        /// Also serve WebSocket clients on a loopback IP address and port.
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
         /// Socket path (default: `run/runtime.sock` in the agent directory).
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -190,6 +193,12 @@ enum SessionCommand {
         /// Runtime socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Runtime WebSocket URL (use an SSH tunnel for another host).
+        #[arg(long, conflicts_with = "socket")]
+        url: Option<String>,
+        /// Private token file; otherwise read LOOP_RUNTIME_TOKEN.
+        #[arg(long, requires = "url")]
+        token_file: Option<PathBuf>,
     },
     /// Create a Session and attach to it. Ctrl+D detaches.
     New {
@@ -208,6 +217,12 @@ enum SessionCommand {
         /// Runtime socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Runtime WebSocket URL (use an SSH tunnel for another host).
+        #[arg(long, conflicts_with = "socket")]
+        url: Option<String>,
+        /// Private token file; otherwise read LOOP_RUNTIME_TOKEN.
+        #[arg(long, requires = "url")]
+        token_file: Option<PathBuf>,
     },
     /// Unload a Session from the Runtime. Its history is kept, and
     /// `loop session attach` loads it again.
@@ -326,6 +341,7 @@ async fn real_main() -> anyhow::Result<()> {
                 use loop_cli::runtime_cmd;
                 return match command {
                     RuntimeCommand::Start {
+                        listen,
                         socket,
                         max_sessions,
                         max_active_turns,
@@ -335,6 +351,7 @@ async fn real_main() -> anyhow::Result<()> {
                             None => std::env::current_dir()?,
                         };
                         runtime_cmd::start(runtime_cmd::StartArgs {
+                            listen: *listen,
                             socket: socket.clone(),
                             max_sessions: *max_sessions,
                             max_active_turns: *max_active_turns,
@@ -355,7 +372,15 @@ async fn real_main() -> anyhow::Result<()> {
             Commands::Session(command) => {
                 use loop_cli::session_cmd::{run, SessionArgs};
                 let args = match command {
-                    SessionCommand::List { all, json, socket } => SessionArgs {
+                    SessionCommand::List {
+                        all,
+                        json,
+                        socket,
+                        url,
+                        token_file,
+                    } => SessionArgs {
+                        url: url.clone(),
+                        token_file: token_file.clone(),
                         cwd: cli.cwd.clone(),
                         socket: socket.clone(),
                         all: *all,
@@ -368,7 +393,14 @@ async fn real_main() -> anyhow::Result<()> {
                         socket: socket.clone(),
                         ..Default::default()
                     },
-                    SessionCommand::Attach { id, socket } => SessionArgs {
+                    SessionCommand::Attach {
+                        id,
+                        socket,
+                        url,
+                        token_file,
+                    } => SessionArgs {
+                        url: url.clone(),
+                        token_file: token_file.clone(),
                         id: Some(id.clone()),
                         socket: socket.clone(),
                         ..Default::default()
@@ -606,6 +638,7 @@ mod tests {
             socket,
             max_sessions,
             max_active_turns,
+            ..
         })) = cli.command
         else {
             panic!("not runtime start")
@@ -632,6 +665,7 @@ mod tests {
             socket,
             max_sessions,
             max_active_turns,
+            ..
         })) = cli.command
         else {
             panic!("not runtime start")
@@ -662,7 +696,8 @@ mod tests {
             Some(Commands::Session(SessionCommand::List {
                 all: true,
                 json: true,
-                socket: None
+                socket: None,
+                ..
             }))
         ));
         let cli = parse(&[

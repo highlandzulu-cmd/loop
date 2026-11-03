@@ -244,6 +244,7 @@ fn runtime_status_wire() {
         &RuntimeStatus {
             pid: 42,
             socket: "/a/run/runtime.sock".into(),
+            listen_url: None,
             generation: 3,
             loaded: 2,
             busy: 1,
@@ -259,6 +260,7 @@ fn runtime_status_wire() {
         &RuntimeStatus {
             pid: 42,
             socket: "/s".into(),
+            listen_url: Some("ws://127.0.0.1:1234/".into()),
             generation: 3,
             loaded: 0,
             busy: 0,
@@ -267,7 +269,7 @@ fn runtime_status_wire() {
             max_sessions_from: Some("settings".into()),
             max_active_turns_from: Some("default".into()),
         },
-        json!({"pid":42,"socket":"/s","generation":3,"loaded":0,"busy":0,
+        json!({"pid":42,"socket":"/s","listen_url":"ws://127.0.0.1:1234/","generation":3,"loaded":0,"busy":0,
             "max_sessions":3,"max_active_turns":8,
             "max_sessions_from":"settings","max_active_turns_from":"default"}),
     );

@@ -250,6 +250,9 @@ pub struct RuntimeStatus {
     pub pid: u32,
     /// The socket this connection reached.
     pub socket: std::path::PathBuf,
+    /// Loopback WebSocket endpoint, without credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_url: Option<String>,
     /// The Runtime generation.
     pub generation: u64,
     /// Sessions held in memory.

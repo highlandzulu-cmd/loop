@@ -191,7 +191,7 @@ async fn run(
     backend: Arc<dyn AgentBackend>,
     runtime: Option<Arc<dyn RuntimeControl>>,
     conn: Arc<Connection>,
-    mut incoming: mpsc::UnboundedReceiver<Incoming>,
+    mut incoming: mpsc::Receiver<Incoming>,
     info: PeerInfo,
     options: ServeOptions,
     host: Arc<ClientHost>,
