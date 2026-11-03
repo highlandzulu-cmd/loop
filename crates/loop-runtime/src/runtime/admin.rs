@@ -300,6 +300,21 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// Reload every workspace the Runtime has loaded, after a host setting
+    /// they all read changed. Returns how many Sessions wait for their work
+    /// to end.
+    pub async fn reload_workspaces(&self) -> BackendResult<u32> {
+        let _admin = self.admin.lock().await;
+        let loaded: Vec<PathBuf> = self.workspaces.lock().unwrap().keys().cloned().collect();
+        let mut pending = 0;
+        for cwd in loaded {
+            pending += self.reload_workspace(&cwd).await?.3;
+        }
+        Ok(pending)
+    }
+}
+
 #[async_trait]
 impl RuntimeAdmin for Runtime {
     fn offered(&self) -> Capabilities {

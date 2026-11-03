@@ -177,6 +177,8 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         socket: std::path::absolute(&socket).unwrap_or_else(|_| socket.clone()),
         stop: stop.clone(),
         limits,
+        agent_dir: agent_dir.clone(),
+        defaults_revision: Default::default(),
     });
 
     let info = PeerInfo {
@@ -298,11 +300,156 @@ struct Control {
     socket: PathBuf,
     stop: tokio_util::sync::CancellationToken,
     limits: Limits,
+    /// The host's agent directory: settings and the usage log.
+    agent_dir: PathBuf,
+    /// Counts saved changes to new-Session defaults.
+    defaults_revision: std::sync::atomic::AtomicU64,
+}
+
+/// Workspace admin is the Runtime's; the host-only usage history and
+/// new-Session defaults are the daemon's, served only host-locally (the
+/// wire refuses them on any other connection).
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl loop_wire::RuntimeAdmin for Control {
+    fn offered(&self) -> loop_protocol::Capabilities {
+        loop_protocol::Capabilities {
+            host_usage: cfg!(feature = "usage"),
+            host_defaults: true,
+            ..self.runtime.offered()
+        }
+    }
+    async fn mcp(&self, p: admin::McpParams) -> BackendResult<admin::McpResult> {
+        self.runtime.mcp(p).await
+    }
+    async fn web_search(&self, p: admin::WebSearchParams) -> BackendResult<admin::WebSearchResult> {
+        self.runtime.web_search(p).await
+    }
+    async fn skills(&self, p: admin::SkillsParams) -> BackendResult<admin::SkillsResult> {
+        self.runtime.skills(p).await
+    }
+    async fn templates(&self, p: admin::TemplatesParams) -> BackendResult<admin::TemplatesResult> {
+        self.runtime.templates(p).await
+    }
+    async fn reload(&self, p: admin::ReloadParams) -> BackendResult<admin::ReloadResult> {
+        loop_wire::RuntimeAdmin::reload(self.runtime.as_ref(), p).await
+    }
+    async fn trust(&self, p: admin::TrustParams) -> BackendResult<admin::TrustResult> {
+        self.runtime.trust(p).await
+    }
+    async fn sandbox(&self, p: admin::SandboxParams) -> BackendResult<admin::SandboxResult> {
+        self.runtime.sandbox(p).await
+    }
+    async fn permission_mode(
+        &self,
+        p: admin::PermissionModeParams,
+    ) -> BackendResult<admin::PermissionModeResult> {
+        self.runtime.permission_mode(p).await
+    }
+    #[cfg(feature = "usage")]
+    async fn usage(&self, p: admin::UsageParams) -> BackendResult<admin::UsageResult> {
+        let dir = loop_app_core::config::paths::usage_dir(&self.agent_dir);
+        tokio::task::spawn_blocking(move || usage_page(&dir, &p))
+            .await
+            .map_err(failed)?
+    }
+    async fn defaults(&self, p: admin::DefaultsParams) -> BackendResult<admin::DefaultsResult> {
+        use loop_app_core::config::{paths, Settings};
+        use std::sync::atomic::Ordering;
+        let path = paths::settings_path(&self.agent_dir);
+        let revision = self.defaults_revision.load(Ordering::Acquire);
+        let mut settings = Settings::load_file(&path).map_err(failed)?;
+        if let Some(patch) = p.patch {
+            if p.expected_revision
+                .is_some_and(|expected| expected != revision)
+            {
+                return Err(loop_protocol::BackendError::Conflict { revision });
+            }
+            if let Some(ms) = patch.response_header_timeout_ms {
+                settings.response_header_timeout_ms = ms;
+            }
+            settings.save_file(&path).map_err(failed)?;
+            self.defaults_revision.fetch_add(1, Ordering::AcqRel);
+            // Loaded workspaces cache settings; new Sessions read them there.
+            self.runtime.reload_workspaces().await?;
+        }
+        Ok(admin::DefaultsResult {
+            revision: self.defaults_revision.load(Ordering::Acquire),
+            model: settings
+                .selected_model()
+                .map(|(provider, model)| format!("{provider}/{model}")),
+            effort: Some(settings.default_thinking_level.clone()),
+            mode: settings.permission_mode.clone(),
+            response_header_timeout_ms: Some(settings.response_header_timeout_ms),
+        })
+    }
+}
+
+#[cfg(unix)]
+use loop_protocol::{admin, BackendResult};
+
+#[cfg(unix)]
+fn failed(error: impl std::fmt::Display) -> loop_protocol::BackendError {
+    loop_protocol::BackendError::failed(loop_protocol::ErrorCategory::Internal, error.to_string())
+}
+
+/// One page of the host's usage log, one row per Session, most recently
+/// active first. The cursor is the next row's offset.
+#[cfg(feature = "usage")]
+fn usage_page(
+    dir: &std::path::Path,
+    params: &admin::UsageParams,
+) -> BackendResult<admin::UsageResult> {
+    let bad = || {
+        loop_protocol::BackendError::failed(
+            loop_protocol::ErrorCategory::Protocol,
+            "invalid page cursor or limit (use 1 to 1000)",
+        )
+    };
+    let start: usize = match &params.cursor {
+        Some(cursor) => cursor.parse().map_err(|_| bad())?,
+        None => 0,
+    };
+    let limit = params.limit.unwrap_or(100) as usize;
+    if limit == 0 || limit > 1000 {
+        return Err(bad());
+    }
+    let summary = loop_dashboard::summarize_dir(dir, params.days);
+    let mut sessions = summary.sessions;
+    sessions.sort_by_key(|row| std::cmp::Reverse(row.last_active));
+    if start > sessions.len() {
+        return Err(bad());
+    }
+    let end = start.saturating_add(limit).min(sessions.len());
+    let rows = sessions[start..end]
+        .iter()
+        .map(|row| serde_json::to_value(row).unwrap_or_default())
+        .collect();
+    let log_status = if summary.files == 0 {
+        "no usage logged yet".to_owned()
+    } else {
+        format!(
+            "read {} log file(s); skipped {} unreadable line(s)",
+            summary.files, summary.skipped_lines
+        )
+    };
+    Ok(admin::UsageResult {
+        rows,
+        totals: serde_json::to_value(&summary.totals).unwrap_or_default(),
+        next_cursor: (end < sessions.len()).then(|| end.to_string()),
+        taken_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64),
+        log_status,
+    })
 }
 
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_wire::RuntimeControl for Control {
+    fn admin(&self) -> Option<&dyn loop_wire::RuntimeAdmin> {
+        Some(self)
+    }
     async fn attach_snapshot_watching(
         &self,
         connection: u64,
