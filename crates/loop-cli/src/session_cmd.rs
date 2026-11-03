@@ -895,7 +895,8 @@ mod unix {
                 },
                 update = updates.recv() => {
                     let envelope = update.map_err(|e| anyhow::anyhow!("Runtime updates interrupted ({e}); reattach to replay"))?;
-                    if envelope.session != session.key { continue; }
+                    // Seq 0 is a withdrawal notice; this command handles those as host events.
+                    if envelope.session != session.key || envelope.seq == 0 { continue; }
                     last_seq = envelope.seq;
                     if let loop_protocol::SessionUpdate::MessageChunk { role: loop_protocol::Role::User, content, .. } = &envelope.update {
                         if content.as_text().map(str::trim).is_some_and(|text| sent.front().is_some_and(|mine| mine.trim() == text)) {

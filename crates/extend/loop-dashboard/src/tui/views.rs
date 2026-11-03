@@ -1337,25 +1337,12 @@ impl App {
                 "{} loaded · {} busy · {} tokens ({} unknown)",
                 runtime.totals.sessions,
                 runtime.totals.busy,
-                runtime.totals.tokens,
+                thousands(runtime.totals.tokens),
                 runtime.totals.unknown_tokens
             )),
             Line::from(""),
-            Line::from(format!(
-                "{:<30} {:<8} {:<30} {}",
-                "Session", "State", "Model", "Tokens"
-            )),
         ];
-        lines.extend(runtime.sessions.iter().map(|row| {
-            Line::from(format!(
-                "{:<30} {:<8} {:<30} {}",
-                row.session.native_id,
-                row.state,
-                row.model.as_deref().unwrap_or("unknown"),
-                row.tokens
-                    .map_or_else(|| "unknown".into(), |n| n.to_string())
-            ))
-        }));
+        lines.extend(runtime_table(runtime).into_iter().map(Line::from));
         frame.render_widget(
             Paragraph::new(lines)
                 .block(Block::bordered().title(" Runtime "))
@@ -1363,4 +1350,41 @@ impl App {
             area,
         );
     }
+}
+
+/// Cut `text` to `width` characters, marking the cut with `…`.
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// The Runtime panel's header and rows with aligned columns: ids and models
+/// are cut to fit, token counts are right-aligned with thousands separators.
+pub(super) fn runtime_table(runtime: &loop_protocol::admin::RuntimeSessionsResult) -> Vec<String> {
+    const ID: usize = 36;
+    const MODEL: usize = 30;
+    const TOKENS: usize = 12;
+    let row = |id: &str, state: &str, model: &str, tokens: &str| {
+        format!(
+            "{:<ID$} {:<8} {:<MODEL$} {:>TOKENS$}",
+            fit(id, ID),
+            fit(state, 8),
+            fit(model, MODEL),
+            tokens
+        )
+    };
+    let mut out = vec![row("Session", "State", "Model", "Tokens")];
+    out.extend(runtime.sessions.iter().map(|s| {
+        row(
+            &s.session.native_id,
+            &s.state,
+            s.model.as_deref().unwrap_or("unknown"),
+            &s.tokens.map_or_else(|| "unknown".into(), thousands),
+        )
+    }));
+    out
 }

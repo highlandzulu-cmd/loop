@@ -707,6 +707,28 @@ async fn read(
                     Err(error) => tracing::debug!(%error, "skipping an unreadable update"),
                 }
             }
+            // Another Surface answered (or the turn ended): tell subscribers
+            // so a still-open approval can close. Seq 0 is outside the
+            // stream's numbering; consumers act on it before ordering checks.
+            Incoming::Notification { method, params }
+                if method == methods::HOST_INTERACT_WITHDRAWN =>
+            {
+                if let Ok(withdrawn) =
+                    serde_json::from_value::<loop_protocol::rpc::InteractWithdrawnParams>(params)
+                {
+                    let _ = updates.send(UpdateEnvelope::live(
+                        withdrawn.session.instance.clone(),
+                        0,
+                        withdrawn.session.key.clone(),
+                        None,
+                        0,
+                        SessionUpdate::InteractionResolved {
+                            id: withdrawn.id,
+                            outcome: loop_protocol::InteractionOutcome::Cancelled,
+                        },
+                    ));
+                }
+            }
             Incoming::Notification { .. } => {}
             Incoming::Request { id, method, params } if method == methods::HOST_INTERACT => {
                 let conn = Arc::clone(&conn);

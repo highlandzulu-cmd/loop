@@ -476,11 +476,14 @@ async fn a_tui_ended_by_sighup_keeps_the_runtime_lease_until_the_owner_stops() {
 }
 
 #[tokio::test]
-async fn a_failed_runtime_connection_falls_back_and_releases_the_native_lease() {
+async fn a_failed_runtime_start_falls_back_and_shows_the_warning_inside_the_tui() {
     bounded(async {
         let fx = Fixture::new(Model::Answer);
+        // A directory where the socket belongs keeps the owner from binding.
+        let socket = loop_cli::config::paths::runtime_socket_path(&fx.agent).unwrap();
+        std::fs::create_dir_all(&socket).unwrap();
         let pty = Pty::open();
-        let mut cmd = fx.command(&["--connect", "/does/not/exist/runtime.sock"]);
+        let mut cmd = fx.command(&[]);
         pty.attach(&mut cmd);
         let mut child = tokio::process::Command::from(cmd)
             .kill_on_drop(true)
@@ -617,7 +620,7 @@ async fn a_signal_during_startup_leaves_no_lease() {
 }
 
 #[tokio::test]
-async fn a_stopped_or_incompatible_explicit_owner_falls_back_instead_of_exiting() {
+async fn a_stopped_or_incompatible_explicit_owner_is_an_error_never_a_fallback() {
     for (version, loaded) in [(env!("CARGO_PKG_VERSION"), 0), ("0.0.1", 0), ("0.0.1", 1)] {
         bounded(async {
             use loop_wire::connection::{Connection, Incoming};
@@ -647,16 +650,12 @@ async fn a_stopped_or_incompatible_explicit_owner_falls_back_instead_of_exiting(
             pty.attach(&mut cmd);
             let mut child = tokio::process::Command::from(cmd).kill_on_drop(true).spawn().unwrap();
             let screen = pty.drain();
-            tokio::select! {
-                _ = fx.wait_for_lease() => {},
-                status = child.wait() => panic!("CLI exited instead of falling back: {status:?}"),
-            }
-            assert_eq!(fx.leases().await[0].1, "standalone");
-            tokio::time::timeout(WAIT, async {
-                while !String::from_utf8_lossy(&screen.lock().unwrap()).contains("/help for commands") { tokio::time::sleep(Duration::from_millis(20)).await; }
-            }).await.unwrap();
-            pty.keys(b"\x04");
-            assert!(tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap().success());
+            let status = tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap();
+            assert!(!status.success(), "an explicit target must not fall back");
+            let shown = String::from_utf8_lossy(&screen.lock().unwrap()).to_string();
+            assert!(shown.contains("loop: "), "{shown}");
+            assert!(!shown.contains("/help for commands"), "no in-process TUI: {shown}");
+            assert_eq!(fx.leases().await, []);
             peer.await.unwrap();
             assert_eq!(fx.leases().await, []);
         }).await;
@@ -840,6 +839,29 @@ async fn explicit_and_saved_subscription_agents_stay_in_process_while_signed_out
                 .success());
             assert_eq!(fx.leases().await, []);
         }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_explicit_websocket_target_without_a_token_exits_with_one_clear_error() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let pty = Pty::open();
+        let mut cmd = fx.command(&["--connect", "ws://127.0.0.1:9"]);
+        cmd.env_remove("LOOP_RUNTIME_TOKEN");
+        pty.attach(&mut cmd);
+        let mut child = tokio::process::Command::from(cmd).kill_on_drop(true).spawn().unwrap();
+        let screen = pty.drain();
+        let status = tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap();
+        assert!(!status.success());
+        let shown = String::from_utf8_lossy(&screen.lock().unwrap()).to_string();
+        assert!(
+            shown.contains("could not connect to ws://127.0.0.1:9: missing token, pass --token-file or set LOOP_RUNTIME_TOKEN"),
+            "{shown}"
+        );
+        assert!(!shown.contains("in-process"), "{shown}");
+        assert_eq!(fx.leases().await, []);
     })
     .await;
 }

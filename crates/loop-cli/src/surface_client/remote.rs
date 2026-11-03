@@ -188,6 +188,10 @@ impl SurfaceClient {
     pub fn is_remote(&self) -> bool {
         self.remote.is_some()
     }
+    /// Connected over WebSocket: credentials and tracing belong to that host.
+    pub fn is_remote_host(&self) -> bool {
+        self.remote.as_ref().is_some_and(|r| r.is_websocket())
+    }
     pub fn interaction_queue(
         &self,
     ) -> (

@@ -551,6 +551,7 @@ async fn real_main() -> anyhow::Result<()> {
             .ok()
             .and_then(|s| s.selected_model().map(|(p, _)| p.to_owned()))
             .is_some_and(|p| loop_app_core::agents::subscription_ids(&agent_dir).contains(&p));
+    let mut fallback_notice: Option<String> = None;
     if interactive && pending_agent.is_none() && !saved_subscription_default {
         let opts = BootstrapOpts {
             cwd: std::fs::canonicalize(&cwd)?,
@@ -601,10 +602,27 @@ async fn real_main() -> anyhow::Result<()> {
                 print_mode::shutdown_telemetry(&telemetry).await;
                 return result;
             }
-            Err(error) => eprintln!(
-                "loop: {error}; using in-process mode for this run (Runtime log: {})",
-                agent_dir.join("logs/runtime.log").display()
-            ),
+            // An explicit target is what the user asked for; running somewhere
+            // else would silently use a different provider and machine.
+            Err(error) if cli.connect.is_some() => {
+                eprintln!("loop: {error}");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                let line = format!(
+                    "{error}; using in-process mode for this run (Runtime log: {})",
+                    agent_dir.join("logs/runtime.log").display()
+                );
+                // A terminal UI takes the screen next, so it shows the line
+                // as its first notice; scripts and pipes get it on stderr.
+                if std::io::IsTerminal::is_terminal(&std::io::stderr())
+                    && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                {
+                    fallback_notice = Some(line);
+                } else {
+                    eprintln!("loop: {line}");
+                }
+            }
         }
     }
     let mut runtime = bootstrap_cli(BootstrapOpts {
@@ -644,6 +662,7 @@ async fn real_main() -> anyhow::Result<()> {
         .flatten();
     runtime.pending_agent = pending_agent.or(saved_subscription);
     runtime.startup_sessions = startup_sessions;
+    runtime.startup_notices.extend(fallback_notice);
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
     #[cfg(feature = "telemetry")]

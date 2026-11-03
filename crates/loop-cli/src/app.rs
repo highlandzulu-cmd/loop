@@ -19,7 +19,6 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, Usage};
 use loop_app_core::interaction::{approval_kind, ApprovalReply, PendingInteraction};
 use loop_protocol::rpc::{ForkPoint, TreeEntry};
@@ -1557,29 +1556,24 @@ async fn drain_ui_events(
             UiEvent::Update(envelope) => {
                 // Updates for another session (for example one just left with
                 // /new or a fork) must not leak into this transcript.
-                if envelope.session.as_str() != runtime.session_id()
-                    || !runtime.accept_update(envelope.seq)
-                {
+                if envelope.session.as_str() != runtime.session_id() {
                     continue;
                 }
-                // An approval the backend withdrew (for example on cancel)
-                // must not keep capturing keys.
+                // An approval the backend withdrew (cancel) or another window
+                // answered must not keep capturing keys. This runs before the
+                // ordering check: a withdrawal notice has no stream position.
                 if let SessionUpdate::InteractionResolved { id, .. } = &envelope.update {
-                    if active_approval
-                        .as_ref()
-                        .is_some_and(|a| &a.interaction == id)
-                    {
-                        active_approval.take();
-                        push_before_queued(chat, sys("approval withdrawn"));
-                    }
-                    if pending_setup
-                        .as_ref()
-                        .and_then(SetupPrompt::interaction)
-                        .is_some_and(|open| open == id)
-                    {
-                        pending_setup.take();
-                        input.clear();
-                    }
+                    close_resolved_interaction(
+                        id,
+                        runtime.is_remote(),
+                        active_approval,
+                        pending_setup,
+                        input,
+                        chat,
+                    );
+                }
+                if !runtime.accept_update(envelope.seq) {
+                    continue;
                 }
                 if runtime.is_remote()
                     && matches!(
@@ -1587,9 +1581,13 @@ async fn drain_ui_events(
                         SessionUpdate::ConfigChanged(_) | SessionUpdate::BranchReset { .. }
                     )
                 {
+                    // A status line built from the old snapshot (for example
+                    // right after /effort) follows the refreshed config.
+                    let stale = effort_status(runtime);
                     if let Err(error) = runtime.refresh_remote().await {
                         push_before_queued(chat, error_item(error.to_string()));
                     }
+                    refresh_stale_status(status, &stale, effort_status(runtime));
                     if let SessionUpdate::BranchReset { view_id, .. } = &envelope.update {
                         match runtime.reset_transcript(view_id).await {
                             Ok(updates) => {
@@ -1840,6 +1838,39 @@ async fn drain_ui_events(
         message_queue,
         tx,
     );
+}
+
+/// Close the picker or prompt that was waiting on `id`, and say why.
+fn close_resolved_interaction(
+    id: &loop_protocol::InteractionId,
+    remote: bool,
+    active_approval: &mut Option<ActiveApproval>,
+    pending_setup: &mut Option<SetupPrompt>,
+    input: &mut InputBuffer,
+    chat: &mut Vec<ChatItem>,
+) {
+    if active_approval
+        .as_ref()
+        .is_some_and(|a| &a.interaction == id)
+    {
+        active_approval.take();
+        push_before_queued(
+            chat,
+            sys(if remote {
+                "answered in another window"
+            } else {
+                "approval withdrawn"
+            }),
+        );
+    }
+    if pending_setup
+        .as_ref()
+        .and_then(SetupPrompt::interaction)
+        .is_some_and(|open| open == id)
+    {
+        pending_setup.take();
+        input.clear();
+    }
 }
 
 /// Forward `backend`'s updates to the UI once per backend instance.
@@ -4183,7 +4214,7 @@ fn endpoint_for(runtime: &SurfaceClient) -> String {
         .as_ref()
         .map(|m| m.base_url.clone())
         .filter(|u| !u.is_empty())
-        .unwrap_or_else(|| SOKET_BASE_URL.to_string())
+        .unwrap_or_default()
 }
 
 /// Apply one protocol update to the transcript.
@@ -5021,6 +5052,23 @@ async fn apply_timeout_command(
     Ok(())
 }
 
+/// The command name when `effect` changes credentials, tracing or saved
+/// defaults, which live on the Runtime's host and never travel over WebSocket.
+fn host_only_command(effect: &CommandEffect) -> Option<&'static str> {
+    match effect {
+        CommandEffect::Login(_) => Some("/login"),
+        CommandEffect::Logout(_) => Some("/logout"),
+        #[cfg(feature = "telemetry")]
+        CommandEffect::Tracing(_) => Some("/tracing"),
+        CommandEffect::Mcp(McpCommand::Login(_)) => Some("/mcp login"),
+        CommandEffect::Mcp(McpCommand::Logout(_)) => Some("/mcp logout"),
+        CommandEffect::SetResponseHeaderTimeout(Some(arg)) if arg.starts_with("default ") => {
+            Some("/ttfb default")
+        }
+        _ => None,
+    }
+}
+
 #[allow(
     clippy::too_many_arguments,
     reason = "pre-existing signature; refactor tracked separately"
@@ -5120,6 +5168,14 @@ async fn try_apply_effect(
     token_bar: &mut TokenBarState,
     refresh_token_bar: &mut bool,
 ) -> anyhow::Result<bool> {
+    if runtime.is_remote_host() {
+        if let Some(command) = host_only_command(&effect) {
+            chat.push(sys(format!(
+                "{command} runs on the Runtime host; run it there"
+            )));
+            return Ok(false);
+        }
+    }
     match effect {
         CommandEffect::Quit => return Ok(true),
         CommandEffect::Status(s) => {
@@ -6119,6 +6175,13 @@ async fn choose_model(
 /// Footer banner while every tool call runs without asking.
 const FULL_ACCESS_BANNER: &str = "⚠ full access · tools run without approval";
 
+/// Replace `status` with `fresh` only when it still shows the `stale` text.
+fn refresh_stale_status(status: &mut String, stale: &str, fresh: String) {
+    if status == stale {
+        *status = fresh;
+    }
+}
+
 fn effort_status(runtime: &SurfaceClient) -> String {
     match runtime.active_model_label() {
         Some(label) if !runtime.is_native() => format!("ready · {label}"),
@@ -6938,3 +7001,108 @@ fn read_import_payload(cwd: &Path, path: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 #[path = "app/command_tests.rs"]
 mod command_tests;
+
+#[cfg(test)]
+mod resolved_interaction_tests {
+    use super::*;
+
+    fn approval() -> (ActiveApproval, loop_protocol::InteractionId) {
+        let request = loop_app_core::interaction::native_permission_request(
+            ApprovalKind::Bash,
+            "bash",
+            "run".into(),
+            "echo ok".into(),
+        );
+        let id = request.id().clone();
+        let (respond, _rx) = tokio::sync::oneshot::channel();
+        let approval =
+            ActiveApproval::from_interaction(PendingInteraction { request, respond }).unwrap();
+        (approval, id)
+    }
+
+    #[test]
+    fn another_windows_answer_closes_the_dialog_with_one_line() {
+        let (open, id) = approval();
+        let mut active = Some(open);
+        let mut setup = None;
+        let mut input = InputBuffer::new();
+        let mut chat = Vec::new();
+        close_resolved_interaction(&id, true, &mut active, &mut setup, &mut input, &mut chat);
+        assert!(active.is_none());
+        assert_eq!(chat.len(), 1);
+        assert!(format!("{:?}", chat[0]).contains("answered in another window"));
+    }
+
+    #[test]
+    fn an_unrelated_resolution_leaves_the_dialog_open() {
+        let (open, _) = approval();
+        let (_, other) = approval();
+        let mut active = Some(open);
+        let mut chat = Vec::new();
+        close_resolved_interaction(
+            &other,
+            true,
+            &mut active,
+            &mut None,
+            &mut InputBuffer::new(),
+            &mut chat,
+        );
+        assert!(active.is_some());
+        assert!(chat.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod host_only_tests {
+    use super::*;
+
+    #[test]
+    fn credential_tracing_and_default_commands_are_host_only() {
+        assert_eq!(
+            host_only_command(&CommandEffect::Login(None)),
+            Some("/login")
+        );
+        assert_eq!(
+            host_only_command(&CommandEffect::Logout(Some("x".into()))),
+            Some("/logout")
+        );
+        assert_eq!(
+            host_only_command(&CommandEffect::Mcp(McpCommand::Login("a".into()))),
+            Some("/mcp login")
+        );
+        assert_eq!(
+            host_only_command(&CommandEffect::Mcp(McpCommand::Logout("a".into()))),
+            Some("/mcp logout")
+        );
+        assert_eq!(
+            host_only_command(&CommandEffect::SetResponseHeaderTimeout(Some(
+                "default 30s".into()
+            ))),
+            Some("/ttfb default")
+        );
+        assert_eq!(
+            host_only_command(&CommandEffect::SetResponseHeaderTimeout(Some("30s".into()))),
+            None
+        );
+        assert_eq!(host_only_command(&CommandEffect::NewSession), None);
+    }
+}
+
+#[cfg(test)]
+mod stale_status_tests {
+    use super::refresh_stale_status;
+
+    #[test]
+    fn only_the_stale_model_line_is_refreshed() {
+        let mut status = "ready · openrouter/glm · high".to_string();
+        refresh_stale_status(
+            &mut status,
+            "ready · openrouter/glm · high",
+            "ready · openrouter/glm · off".into(),
+        );
+        assert_eq!(status, "ready · openrouter/glm · off");
+        let mut busy = "compacting…".to_string();
+        refresh_stale_status(&mut busy, "ready · x", "ready · y".into());
+        assert_eq!(busy, "compacting…");
+    }
+}

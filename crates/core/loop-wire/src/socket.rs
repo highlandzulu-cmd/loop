@@ -141,10 +141,22 @@ pub async fn websocket_connect(url: &str, token: &str) -> io::Result<Transport> 
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket connection timed out"))?
-    .map_err(|_| {
-        io::Error::other("WebSocket connection failed; check the Runtime URL and bearer token")
-    })?;
+    .map_err(handshake_error)?;
     Ok(websocket(ws))
+}
+
+/// Tell a rejected token from an unreachable Runtime so callers can say which.
+fn handshake_error(error: tokio_tungstenite::tungstenite::Error) -> io::Error {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        Error::Http(response) if matches!(response.status().as_u16(), 401 | 403) => {
+            io::Error::new(io::ErrorKind::PermissionDenied, "unauthorized")
+        }
+        Error::Io(_) => io::Error::new(io::ErrorKind::ConnectionRefused, "not reachable"),
+        _ => {
+            io::Error::other("WebSocket connection failed; check the Runtime URL and bearer token")
+        }
+    }
 }
 
 fn ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
@@ -329,6 +341,30 @@ mod tests {
             let server = server.await.unwrap();
             assert!((0..1024).any(|_| server.outgoing.send("queued".into()).is_err()));
             assert!(client.incoming.recv().await.is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_connect_names_a_wrong_token_and_an_unreachable_runtime() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = websocket_accept(stream, "secret").await;
+            });
+            let error = websocket_connect(&format!("ws://{addr}/"), "wrong")
+                .await
+                .expect_err("wrong token is refused");
+            assert_eq!(error.to_string(), "unauthorized");
+            server.await.unwrap();
+            // The listener is gone now, so the port refuses connections.
+            let error = websocket_connect(&format!("ws://{addr}/"), "secret")
+                .await
+                .expect_err("nothing listens");
+            assert_eq!(error.to_string(), "not reachable");
         })
         .await
         .unwrap();

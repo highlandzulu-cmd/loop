@@ -111,6 +111,17 @@ fn websocket_token(token_file: Option<&Path>, env_token: Option<&str>) -> anyhow
     }
 }
 
+/// One plain sentence for an explicit `--connect` target that cannot be used.
+pub fn explicit_connect_error(target: &Target, error: &anyhow::Error) -> anyhow::Error {
+    let reason = error.to_string();
+    let reason = if reason.contains("LOOP_RUNTIME_TOKEN") {
+        "missing token, pass --token-file or set LOOP_RUNTIME_TOKEN".to_owned()
+    } else {
+        reason
+    };
+    anyhow::anyhow!("could not connect to {}: {reason}", target.label())
+}
+
 pub async fn connect(
     target: &Target,
     token_file: Option<&Path>,
@@ -333,7 +344,9 @@ pub async fn launch(
     };
     let executable = std::env::current_exe()?;
     let remote = match &target {
-        Some(target) => connect(target, token_file, host.clone()).await?,
+        Some(target) => connect(target, token_file, host.clone())
+            .await
+            .map_err(|error| explicit_connect_error(target, &error))?,
         None => {
             start_and_connect(
                 &executable,
@@ -674,6 +687,21 @@ mod tests {
             "file-token"
         );
     }
+    #[test]
+    fn explicit_connect_errors_name_the_target_and_the_reason() {
+        let target = Target::parse("ws://127.0.0.1:9");
+        let missing = websocket_token(None, None).unwrap_err();
+        assert_eq!(
+            explicit_connect_error(&target, &missing).to_string(),
+            "could not connect to ws://127.0.0.1:9: missing token, pass --token-file or set LOOP_RUNTIME_TOKEN"
+        );
+        let denied = anyhow::anyhow!("unauthorized");
+        assert_eq!(
+            explicit_connect_error(&target, &denied).to_string(),
+            "could not connect to ws://127.0.0.1:9: unauthorized"
+        );
+    }
+
     #[test]
     fn only_a_known_auto_started_empty_owner_can_be_version_replaced() {
         let mut status: loop_protocol::rpc::RuntimeStatus = serde_json::from_value(serde_json::json!({
