@@ -28,7 +28,7 @@ pub use compaction::{
     default_compaction_settings, find_cut_point, prepare_compaction, should_compact,
     CompactionSettings,
 };
-pub use env::HostExecutionEnv;
+pub use env::{HostExecutionEnv, SessionExecutionEnv};
 pub use hooks::{
     HarnessHookEvent, HookOutcome, HookRegistry, ToolCallInfo, ToolDecision, ToolSource,
 };

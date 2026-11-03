@@ -292,6 +292,7 @@ impl AgentManager {
             .new_session(SessionSpec {
                 cwd: Some(self.cwd.clone()),
                 name: None,
+                ..Default::default()
             })
             .await?;
         self.refresh_models(id, backend.as_ref(), &probe).await
@@ -369,6 +370,7 @@ impl AgentManager {
             .new_session(SessionSpec {
                 cwd: Some(self.cwd.clone()),
                 name: None,
+                ..Default::default()
             })
             .await?;
         // Keep the cache current; a failure here is not worth failing the session.
@@ -427,6 +429,7 @@ impl AgentManager {
                 SessionSpec {
                     cwd: Some(record.cwd.clone()),
                     name: None,
+                    ..Default::default()
                 },
             )
             .await

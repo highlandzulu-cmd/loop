@@ -470,8 +470,18 @@ impl SessionFactory {
         workspace: Arc<WorkspaceResources>,
         opts: &BootstrapOpts,
     ) -> anyhow::Result<OpenedSession> {
+        self.open_with_environment(workspace, opts, None).await
+    }
+
+    /// Open with a Surface's tool environment, without changing process globals.
+    pub async fn open_with_environment(
+        &self,
+        workspace: Arc<WorkspaceResources>,
+        opts: &BootstrapOpts,
+        env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> anyhow::Result<OpenedSession> {
         let mut leased = None;
-        let result = self.open_leased(workspace, opts, &mut leased).await;
+        let result = self.open_leased(workspace, opts, &mut leased, env).await;
         // A standalone open that fails after taking its lease must not leave
         // it to a Drop that may never run before the process exits.
         if let (Err(_), Some(store)) = (&result, leased) {
@@ -487,6 +497,7 @@ impl SessionFactory {
         workspace: Arc<WorkspaceResources>,
         opts: &BootstrapOpts,
         leased: &mut Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+        env: Option<&std::collections::BTreeMap<String, String>>,
     ) -> anyhow::Result<OpenedSession> {
         if absolute_workspace(&opts.cwd)? != workspace.cwd {
             bail!("Session cwd does not match workspace");
@@ -549,7 +560,12 @@ impl SessionFactory {
 
         let (sandbox, tool_env, disabled) = workspace.execution().await?;
         let sandbox = sandbox.clone();
-        let tool_env = Arc::clone(tool_env);
+        let tool_env = match env {
+            Some(values) => {
+                loop_agent::harness::SessionExecutionEnv::wrap(Arc::clone(tool_env), values)
+            }
+            None => Arc::clone(tool_env),
+        };
         if *disabled {
             settings.sandbox.mode = "off".into();
         }
@@ -647,6 +663,7 @@ impl SessionFactory {
                 prompt_templates: workspace.resources.prompts.clone(),
             },
         }));
+        harness.set_session_environment(env.cloned());
         harness.set_thinking_level(effort).await;
         harness.set_bash_limits(bash_limits);
         harness

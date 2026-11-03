@@ -299,6 +299,9 @@ pub struct Settings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettings {
+    /// Idle minutes for auto-started owners; zero disables shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_shutdown_minutes: Option<u64>,
     /// Most Sessions loaded at once (default 16).
     #[serde(
         default,
@@ -322,7 +325,9 @@ fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::
 
 impl RuntimeSettings {
     fn is_empty(&self) -> bool {
-        self.max_sessions.is_none() && self.max_active_turns.is_none()
+        self.max_sessions.is_none()
+            && self.max_active_turns.is_none()
+            && self.idle_shutdown_minutes.is_none()
     }
     /// `runtime.maxSessions`, when set.
     pub fn max_sessions(&self) -> anyhow::Result<Option<usize>> {

@@ -1,5 +1,5 @@
-//! Every way a terminal `loop` process ends must leave no Session lease row
-//! behind in `sessions.db`. Each test runs the real binary against a fake
+//! In-process exits release their leases; default TUI exits leave the Runtime
+//! owning its Session until it stops. Each test runs the real binary against a fake
 //! OpenAI-compatible model with an isolated agent directory.
 
 use loop_agent::harness::session::sqlite::SqliteSessionStore;
@@ -135,6 +135,15 @@ impl Fixture {
     /// `(session, owner, pid)` of every lease row.
     async fn leases(&self) -> Vec<(String, String, u32)> {
         leases(&self.db()).await
+    }
+    async fn assert_runtime_lease_survives_detach(&self, surface_pid: u32) {
+        let leases = self.leases().await;
+        assert_eq!(leases.len(), 1, "{leases:?}");
+        assert_eq!(leases[0].1, "runtime");
+        assert_ne!(leases[0].2, surface_pid);
+        let stopped = output(self.command(&["runtime", "stop"])).await;
+        assert!(stopped.status.success(), "{stopped:?}");
+        assert_eq!(self.leases().await, []);
     }
     /// Wait until the process has written its Session's lease.
     async fn wait_for_lease(&self) {
@@ -395,7 +404,7 @@ impl Pty {
 
 #[tokio::test]
 
-async fn quitting_the_tui_leaves_no_lease() {
+async fn quitting_the_tui_keeps_the_runtime_lease_until_the_owner_stops() {
     bounded(async {
         let fx = Fixture::new(Model::Answer);
         let pty = Pty::open();
@@ -405,6 +414,7 @@ async fn quitting_the_tui_leaves_no_lease() {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let surface_pid = child.id().unwrap();
         let screen = pty.drain();
         fx.wait_for_lease().await;
         // Let the TUI take the terminal before sending keys.
@@ -430,14 +440,14 @@ async fn quitting_the_tui_leaves_no_lease() {
         });
         let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
         assert!(status.success(), "{status}\n{shown}");
-        assert_eq!(fx.leases().await, []);
+        fx.assert_runtime_lease_survives_detach(surface_pid).await;
     })
     .await
 }
 
 #[tokio::test]
 
-async fn a_tui_ended_by_sighup_leaves_no_lease() {
+async fn a_tui_ended_by_sighup_keeps_the_runtime_lease_until_the_owner_stops() {
     bounded(async {
         let fx = Fixture::new(Model::Answer);
         let pty = Pty::open();
@@ -447,6 +457,7 @@ async fn a_tui_ended_by_sighup_leaves_no_lease() {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let surface_pid = child.id().unwrap();
         let _screen = pty.drain();
         fx.wait_for_lease().await;
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -455,9 +466,48 @@ async fn a_tui_ended_by_sighup_leaves_no_lease() {
             .await
             .expect("the TUI ignored SIGHUP")
             .unwrap();
-        assert_eq!(fx.leases().await, []);
+        fx.assert_runtime_lease_survives_detach(surface_pid).await;
     })
     .await
+}
+
+#[tokio::test]
+async fn a_failed_runtime_connection_falls_back_and_releases_the_native_lease() {
+    bounded(async {
+        let fx = Fixture::new(Model::Answer);
+        let pty = Pty::open();
+        let mut cmd = fx.command(&["--connect", "/does/not/exist/runtime.sock"]);
+        pty.attach(&mut cmd);
+        let mut child = tokio::process::Command::from(cmd)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let screen = pty.drain();
+        fx.wait_for_lease().await;
+        let leases = fx.leases().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].1, "standalone");
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if String::from_utf8_lossy(&screen.lock().unwrap()).contains("/help for commands") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fallback TUI did not become ready");
+        pty.keys(b"\x04");
+        assert!(tokio::time::timeout(WAIT, child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success());
+        assert_eq!(fx.leases().await, []);
+        assert!(String::from_utf8_lossy(&screen.lock().unwrap())
+            .contains("using in-process mode for this run"));
+    })
+    .await;
 }
 
 #[tokio::test]

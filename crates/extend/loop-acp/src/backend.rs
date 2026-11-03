@@ -420,6 +420,7 @@ impl AcpBackend {
         let spec = SessionSpec {
             cwd: Some(cwd),
             name: None,
+            ..Default::default()
         };
         self.load(&conn, session, &spec, false).await?;
         Ok(conn)

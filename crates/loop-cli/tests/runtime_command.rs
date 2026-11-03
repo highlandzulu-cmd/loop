@@ -120,6 +120,16 @@ async fn websocket_publishes_only_its_url_and_keeps_a_private_fresh_token() {
                 .await
                 .unwrap();
             drop(transport);
+            let remote = loop_cli::runtime_launch::connect(
+                &loop_cli::runtime_launch::Target::WebSocket(url.into()),
+                Some(&token_file),
+                std::sync::Arc::new(loop_cli::surface_client::RemoteHost::default()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(remote.server().version, env!("CARGO_PKG_VERSION"));
+            assert_eq!(remote.status().await.unwrap().pid, child.id().unwrap());
+            drop(remote);
             signal(&child, "-TERM");
             assert!(child.wait().await.unwrap().success());
             assert!(!token_file.exists(), "remove the token on clean shutdown");

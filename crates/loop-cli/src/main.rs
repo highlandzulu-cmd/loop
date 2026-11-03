@@ -42,7 +42,7 @@ struct Cli {
     append_system_prompt: Option<String>,
 
     /// Do not load AGENTS.md / CLAUDE.md context files.
-    #[arg(long, short = 'c', global = true)]
+    #[arg(long, global = true)]
     no_context_files: bool,
 
     /// Resume a session by id (Loop's own or an external agent's). With no
@@ -51,7 +51,12 @@ struct Cli {
     resume: Option<String>,
 
     /// Resume the most recent session in this folder.
-    #[arg(long = "continue", global = true, conflicts_with = "resume")]
+    #[arg(
+        long = "continue",
+        short = 'c',
+        global = true,
+        conflicts_with = "resume"
+    )]
     continue_last: bool,
 
     /// Run without the web_search and web_fetch tools.
@@ -61,6 +66,14 @@ struct Cli {
     /// Permission mode: read-only, ask (default), accept-edits or full-access.
     #[arg(long, global = true, value_name = "MODE")]
     permission_mode: Option<String>,
+
+    /// Runtime socket path or authenticated ws:// URL.
+    #[arg(long, global = true)]
+    connect: Option<String>,
+
+    /// Private WebSocket token file; otherwise use LOOP_RUNTIME_TOKEN.
+    #[arg(long, global = true, requires = "connect")]
+    token_file: Option<PathBuf>,
 
     /// Print mode: send one prompt and exit (non-interactive).
     #[arg(long, global = true)]
@@ -148,6 +161,8 @@ enum RuntimeCommand {
     /// effect only through that flag, never from settings. The global
     /// `--cwd` sets the folder for Sessions that name none.
     Start {
+        #[arg(long, hide = true)]
+        auto_started: bool,
         /// Also serve WebSocket clients on a loopback IP address and port.
         #[arg(long)]
         listen: Option<std::net::SocketAddr>,
@@ -167,6 +182,12 @@ enum RuntimeCommand {
     /// 10 s for it to go. Never signals a process.
     Stop {
         /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Restart as a detached owner without an idle timeout.
+    Restart {
+        /// Runtime socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -344,6 +365,7 @@ async fn real_main() -> anyhow::Result<()> {
                 use loop_cli::runtime_cmd;
                 return match command {
                     RuntimeCommand::Start {
+                        auto_started,
                         listen,
                         socket,
                         max_sessions,
@@ -354,6 +376,7 @@ async fn real_main() -> anyhow::Result<()> {
                             None => std::env::current_dir()?,
                         };
                         runtime_cmd::start(runtime_cmd::StartArgs {
+                            auto_started: *auto_started,
                             listen: *listen,
                             socket: socket.clone(),
                             max_sessions: *max_sessions,
@@ -364,6 +387,10 @@ async fn real_main() -> anyhow::Result<()> {
                         .await
                     }
                     RuntimeCommand::Stop { socket } => runtime_cmd::stop(socket.clone()).await,
+                    RuntimeCommand::Restart { socket } => {
+                        let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                        loop_cli::runtime_launch::restart(socket.clone(), &cwd).await
+                    }
                     RuntimeCommand::Status { socket, json } => {
                         if !runtime_cmd::status(socket.clone(), *json).await? {
                             std::process::exit(1);
@@ -523,6 +550,71 @@ async fn real_main() -> anyhow::Result<()> {
     ) {
         tracing::warn!(%error, "could not register signal handlers");
     }
+    // Subscription admission stays in-process, including a saved default.
+    let saved_subscription_default = (!explicit_model || startup_sessions.is_some())
+        && config::Settings::load_file(&config::paths::settings_path(&agent_dir))
+            .ok()
+            .and_then(|s| s.selected_model().map(|(p, _)| p.to_owned()))
+            .is_some_and(|p| loop_app_core::agents::subscription_ids(&agent_dir).contains(&p));
+    if interactive && pending_agent.is_none() && !saved_subscription_default {
+        let opts = BootstrapOpts {
+            cwd: std::fs::canonicalize(&cwd)?,
+            provider: provider.clone(),
+            model: model.clone(),
+            theme: cli.theme.clone(),
+            system_prompt: cli.system_prompt.clone(),
+            append_system_prompt: cli.append_system_prompt.clone(),
+            no_context_files: cli.no_context_files,
+            no_web: cli.no_web,
+            permission_mode: cli.permission_mode.clone(),
+            interactive: true,
+            session_id: cli.resume.clone(),
+            agent: None,
+        };
+        let connected =
+            async {
+                // Trust must be recorded on the host before the daemon loads any
+                // project settings or hooks for a newly opened local workspace.
+                if cli.connect.as_ref().is_none_or(|target| {
+                    !target.starts_with("ws://") && !target.starts_with("wss://")
+                }) {
+                    let mut trust =
+                        config::trust::TrustStore::load(config::paths::trust_path(&agent_dir))?;
+                    let settings =
+                        config::Settings::load_file(&config::paths::settings_path(&agent_dir))?;
+                    loop_app_core::runtime::resolve_trust(&mut trust, &opts.cwd, &settings, true)?;
+                }
+                let host = std::sync::Arc::new(loop_cli::surface_client::RemoteHost::default());
+                let remote = loop_cli::runtime_launch::launch(
+                    cli.connect.as_deref(),
+                    cli.token_file.as_deref(),
+                    &agent_dir,
+                    &opts.cwd,
+                    host.clone(),
+                )
+                .await?;
+                Ok::<_, anyhow::Error>((remote, host))
+            }
+            .await;
+        match connected {
+            Ok((remote, host)) => {
+                let resume = match startup_sessions {
+                    Some(loop_cli::StartupSessions::Pick) => Some(""),
+                    _ => cli.resume.as_deref(),
+                };
+                let mut client =
+                    loop_cli::runtime_launch::open(remote, host, &opts, resume, cli.continue_last)
+                        .await?;
+                client.debug = debug;
+                client.debug_log_path = debug_log_path;
+                let result = loop_cli::app::run(client).await;
+                #[cfg(feature = "telemetry")]
+                print_mode::shutdown_telemetry(&telemetry).await;
+                return result;
+            }
+            Err(error) => eprintln!("loop: {error}; using in-process mode for this run"),
+        }
+    }
     let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
         provider,
@@ -632,6 +724,29 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?} still parses");
         }
+    }
+
+    #[test]
+    fn interactive_connection_and_continue_flags_parse() {
+        let cli = parse(&["loop", "-c", "--connect", "/tmp/runtime.sock"]);
+        assert!(cli.continue_last);
+        assert!(!cli.no_context_files);
+        assert_eq!(cli.connect.as_deref(), Some("/tmp/runtime.sock"));
+        let cli = parse(&[
+            "loop",
+            "--resume",
+            "session",
+            "--connect",
+            "ws://127.0.0.1:9",
+            "--token-file",
+            "/tmp/token",
+        ]);
+        assert_eq!(cli.resume.as_deref(), Some("session"));
+        assert_eq!(cli.token_file, Some("/tmp/token".into()));
+        assert!(matches!(
+            parse(&["loop", "runtime", "restart"]).command,
+            Some(Commands::Runtime(RuntimeCommand::Restart { .. }))
+        ));
     }
 
     #[test]

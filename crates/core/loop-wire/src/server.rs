@@ -254,6 +254,7 @@ async fn run(
                             capabilities.host_mcp_auth = offered.host_mcp_auth && host;
                             capabilities.host_usage = offered.host_usage && host;
                             capabilities.host_defaults = offered.host_defaults && host;
+                            capabilities.runtime_stop_empty = offered.runtime_stop_empty && host;
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
@@ -507,6 +508,13 @@ async fn handle(
         }
         methods::RUNTIME_STATUS if runtime.is_some() => {
             runtime.unwrap().status().await.map(|s| to_value(&s))
+        }
+        methods::RUNTIME_STOP_EMPTY if runtime.is_some() => {
+            if !admin_offered(runtime).runtime_stop_empty {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                runtime.unwrap().stop_empty().await.map(|()| json!({}))
+            }
         }
         methods::RUNTIME_STOP if runtime.is_some() => {
             runtime.unwrap().stop().await.map(|()| json!({}))

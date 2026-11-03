@@ -1599,6 +1599,7 @@ async fn closed_session_in(rt: &Arc<Runtime>, cwd: &std::path::Path, name: &str)
         .new_session(SessionSpec {
             cwd: Some(cwd.into()),
             name: Some(name.into()),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1623,6 +1624,7 @@ async fn the_default_list_is_loaded_sessions_and_this_folder_newest_first() {
             .new_session(SessionSpec {
                 cwd: Some(elsewhere.clone()),
                 name: Some("Loaded".into()),
+                ..Default::default()
             })
             .await
             .unwrap()

@@ -12,6 +12,8 @@ pub const STOP_WAIT: Duration = Duration::from_secs(10);
 /// Options of `loop runtime start`.
 #[derive(Debug, Clone)]
 pub struct StartArgs {
+    /// Started by an interactive client; enables idle shutdown.
+    pub auto_started: bool,
     /// Optional loopback WebSocket listener, in addition to the Unix socket.
     pub listen: Option<std::net::SocketAddr>,
     /// Socket path; default is the agent directory's Runtime socket.
@@ -190,12 +192,25 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         name: "loop".into(),
         version: env!("CARGO_PKG_VERSION").into(),
     };
+    let idle_timeout = idle_timeout(args.auto_started, &settings.runtime);
+    let mut idle_since = tokio::time::Instant::now();
+    let mut idle_epoch = runtime.idle_activity();
+    let mut idle_check = tokio::time::interval(Duration::from_secs(1));
     let mut connections = tokio::task::JoinSet::new();
     while !shutdown_ready {
         let Some(pending) = signal.as_mut() else {
             break;
         };
         tokio::select! {
+            _ = idle_check.tick(), if idle_timeout.is_some() => {
+                let activity = runtime.idle_activity();
+                if activity != idle_epoch || !runtime.is_idle().await { idle_since = tokio::time::Instant::now(); }
+                idle_epoch = activity;
+                if idle_since.elapsed() >= idle_timeout.unwrap() && runtime.shutdown_if_idle().await {
+                    tracing::info!("Auto-started Runtime idle timeout reached");
+                    shutdown_ready = true;
+                }
+            }
             result = pending => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "shutdown signal failed");
@@ -267,6 +282,18 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     drop(lock);
     Ok(())
 }
+fn idle_timeout(auto_started: bool, settings: &crate::config::RuntimeSettings) -> Option<Duration> {
+    auto_started
+        .then(|| {
+            settings
+                .idle_shutdown_minutes
+                .unwrap_or(10)
+                .saturating_mul(60)
+        })
+        .filter(|seconds| *seconds != 0)
+        .map(Duration::from_secs)
+}
+
 use std::sync::Arc;
 struct TokenFile(PathBuf);
 impl Drop for TokenFile {
@@ -352,6 +379,7 @@ impl loop_wire::RuntimeAdmin for Control {
         loop_protocol::Capabilities {
             host_usage: cfg!(feature = "usage"),
             host_defaults: true,
+            runtime_stop_empty: true,
             ..self.runtime.offered()
         }
     }
@@ -610,6 +638,13 @@ impl loop_wire::RuntimeControl for Control {
         status.max_active_turns_from = Some(self.limits.max_active_turns.1.into());
         Ok(status)
     }
+    async fn stop_empty(&self) -> loop_protocol::BackendResult<()> {
+        if !self.runtime.shutdown_if_empty().await {
+            return Err(loop_protocol::BackendError::Busy);
+        }
+        self.stop.cancel();
+        Ok(())
+    }
     async fn stop(&self) -> loop_protocol::BackendResult<()> {
         // Only request it: the accept loop tears down after this answer.
         self.stop.cancel();
@@ -774,6 +809,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_auto_started_owners_have_an_idle_deadline() {
+        let mut settings = crate::config::RuntimeSettings::default();
+        assert_eq!(
+            idle_timeout(true, &settings),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(idle_timeout(false, &settings), None);
+        settings.idle_shutdown_minutes = Some(0);
+        assert_eq!(idle_timeout(true, &settings), None);
+        settings.idle_shutdown_minutes = Some(2);
+        assert_eq!(
+            idle_timeout(true, &settings),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(idle_timeout(false, &settings), None);
+    }
 
     #[tokio::test]
     async fn a_shutdown_ready_during_registration_is_kept() {

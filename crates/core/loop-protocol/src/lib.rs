@@ -23,8 +23,9 @@ pub use backend::shell_timeout;
 pub use backend::{
     AgentBackend, BackendError, BackendResult, Compaction, CompactionReport, HostFileSystem,
     HostServices, HostTerminals, LocalShell, ModelChoice, ModelChoices, ModelControl,
-    MutationResult, SessionRef, SessionSpec, SessionStats, ShellResult, StatsSummary, TerminalExit,
-    TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome, SHELL_OUTPUT_LIMIT,
+    MutationResult, SessionOptions, SessionRef, SessionSpec, SessionStats, ShellResult,
+    StatsSummary, TerminalExit, TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome,
+    SHELL_OUTPUT_LIMIT,
 };
 pub use capabilities::Capabilities;
 pub use content::ContentBlock;

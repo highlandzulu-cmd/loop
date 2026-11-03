@@ -141,11 +141,23 @@ pub(crate) async fn append_label(client: &SurfaceClient, label: String) {
 pub(crate) fn plan_shell_task(client: &SurfaceClient) {
     let provider = loop_ai::providers::faux_provider_fn(Arc::new(|_| {
         Box::pin(async {
-            loop_ai::providers::FauxResponse::Text(serde_json::json!({"tasks":[{"id":"inspect","description":"Inspect","kind":"shell_command","command":"printf workflow-output"}]}).to_string())
+            loop_ai::providers::FauxResponse::Text(serde_json::json!({"tasks":[{"id":"inspect","description":"Inspect","kind":"shell_command","command":"printf \"workflow-output:$LOOP_WORKFLOW_ENV\""}]}).to_string())
         })
     }));
     provider.set_models(client.host.inner.models.get_models(Some("faux")));
     client.host.inner.models.set_provider(provider);
+}
+
+#[cfg(feature = "orchestration")]
+pub(crate) fn set_workflow_environment(client: &SurfaceClient) {
+    client
+        .host
+        .inner
+        .harness
+        .set_session_environment(Some(std::collections::BTreeMap::from([(
+            "LOOP_WORKFLOW_ENV".into(),
+            "caller".into(),
+        )])));
 }
 
 /// A subscription-like backend that reports usage through updates, without stats

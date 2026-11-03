@@ -573,6 +573,11 @@ async fn cancelling_the_parent_cancels_its_descendants() {
             "sleep 30",
         )
         .await;
+        assert!(
+            !rt.is_idle().await,
+            "running descendants prevent idle shutdown"
+        );
+        assert!(!rt.shutdown_if_idle().await);
         let list = rt.list().await.unwrap();
         let middle = children(&list, &root).pop().unwrap().r#ref.key;
 

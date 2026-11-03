@@ -72,6 +72,7 @@ fn sessions_and_prompts() {
         &SessionSpec {
             cwd: Some("/work".into()),
             name: Some("x".into()),
+            ..Default::default()
         },
         json!({"cwd": "/work", "name": "x"}),
     );
@@ -538,6 +539,7 @@ fn config_changed_and_attach_snapshot_wire() {
         latest_seq: 8,
         generation: 2,
         snapshot: Some(SessionSnapshot {
+            notices: vec![],
             session: session(),
             at_seq: 8,
             revision: 3,
@@ -955,4 +957,42 @@ fn host_credentials_have_redacted_debug_and_explicit_wire_actions() {
     assert!(!format!("{tracing:?}").contains("secret-value"));
     let flags: loop_protocol::Capabilities = serde_json::from_value(json!({})).unwrap();
     assert!(!flags.host_providers && !flags.host_tracing && !flags.host_mcp_auth);
+}
+
+#[test]
+fn caller_environment_is_optional_roundtrips_and_is_redacted_in_debug() {
+    let spec: SessionSpec = serde_json::from_value(
+        json!({"cwd":"/work", "env":{"TASK_ENV":"caller", "OPENAI_API_KEY":"secret-value"}}),
+    )
+    .unwrap();
+    assert_eq!(spec.env.as_ref().unwrap()["TASK_ENV"], "caller");
+    assert!(!format!("{spec:?}").contains("secret-value"));
+    assert_eq!(
+        serde_json::to_value(&spec).unwrap(),
+        json!({"cwd":"/work", "env":{"TASK_ENV":"caller", "OPENAI_API_KEY":"secret-value"}})
+    );
+    let capabilities = Capabilities {
+        session_environment: true,
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(capabilities).unwrap()["session_environment"],
+        true
+    );
+    assert!(!Capabilities::default().session_environment);
+}
+
+#[test]
+fn empty_owner_stop_is_an_optional_host_only_capability() {
+    assert!(loop_protocol::rpc::methods::HOST_ONLY.contains(&"runtime/stop_empty"));
+    let offered = Capabilities {
+        runtime_stop_empty: true,
+        ..Default::default()
+    };
+    let value = serde_json::to_value(offered).unwrap();
+    assert_eq!(value["runtime_stop_empty"], true);
+    assert!(serde_json::to_value(Capabilities::default())
+        .unwrap()
+        .get("runtime_stop_empty")
+        .is_none());
 }

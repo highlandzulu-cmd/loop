@@ -311,6 +311,22 @@ impl RemoteBackend {
         call(&self.conn, methods::RUNTIME_STATUS, &serde_json::json!({})).await
     }
 
+    /// Stop an empty owner without racing a new Session admission.
+    pub async fn stop_empty(&self) -> BackendResult<()> {
+        if !self.capabilities.runtime_stop_empty {
+            return Err(BackendError::Unsupported(
+                methods::RUNTIME_STOP_EMPTY.into(),
+            ));
+        }
+        call::<Value>(
+            &self.conn,
+            methods::RUNTIME_STOP_EMPTY,
+            &serde_json::json!({}),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Ask the Runtime to shut down (`runtime/stop`). It answers first, then
     /// closes every connection; send nothing more on this one.
     pub async fn stop(&self) -> BackendResult<()> {

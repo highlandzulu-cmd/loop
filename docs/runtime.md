@@ -8,6 +8,47 @@ an Event Log so any Surface can catch up later.
 Loop supports **Linux and macOS** only (on Windows, use WSL). The Runtime
 listens on a Unix socket.
 
+## Plain `loop` uses the Runtime
+
+Interactive `loop` connects to the Runtime for the current agent directory and
+opens a new Session in the caller's working directory. If none is reachable,
+it starts a detached owner and waits for its socket. A second terminal reuses
+that owner. Discovery currently checks one agent directory; when discovery
+returns several reachable owners, Loop asks you to select one.
+
+```bash
+loop                                # new Session, auto-start if needed
+loop -c                             # attach to this folder's latest Session
+loop --resume                       # choose an existing Session
+loop --resume SESSION_ID             # attach by id or unique prefix
+loop --connect /path/to/runtime.sock # choose a particular owner
+loop --connect ws://127.0.0.1:8765 --token-file /private/runtime.token
+```
+
+WebSockets require `LOOP_RUNTIME_TOKEN` or a private `--token-file`. For another
+host, tunnel its loopback listener over SSH. WebSocket clients have no host-only
+credential or telemetry access.
+
+Each new Session receives the caller's cwd and environment for tools and
+`!shell`. Provider credentials resolve in the Runtime. A notice warns when an
+exported provider API key differs; it never shows the key. Runtime bearer tokens
+and built-in provider key variables are removed from tool environments.
+
+Quitting detaches the TUI. It keeps the Session, running work and parked
+approvals alive. Another Surface can attach and answer a parked request.
+
+An auto-started owner stops after ten idle minutes. Set the global
+`runtime.idleShutdownMinutes` to change this; `0` disables it. Attached Surfaces,
+active turns, parked approvals and running Subagents prevent idle shutdown.
+An owner started explicitly with `loop runtime start` never idles out.
+
+Loop checks the owner's application version before creating or attaching a
+Session. It restarts an empty local owner from this agent directory when the
+versions differ. With live Sessions, it reports both versions and uses the
+in-process path for this run. A startup or connection failure also prints one
+warning and falls back. Subscription/ACP agents and ordinary `--print` runs
+continue to use the in-process path.
+
 ## Start the Runtime
 
 ```bash
@@ -56,6 +97,7 @@ Session database is shared.
 loop runtime status          # pid, socket, generation, loaded and busy Sessions
 loop runtime status --json   # the same as one JSON object, for scripts
 loop runtime stop            # ask the Runtime to shut down, then wait for it
+loop runtime restart         # stop, then start a detached explicit owner
 ```
 
 Both talk to the Runtime through its socket, and both take `--socket PATH`.

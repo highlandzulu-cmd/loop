@@ -169,8 +169,16 @@
           "description": "Lists loaded Sessions for the Runtime panel (`runtime/sessions`).",
           "type": "boolean"
         },
+        "runtime_stop_empty": {
+          "description": "Host-local, atomic stop only when no Sessions are loaded.",
+          "type": "boolean"
+        },
         "session_config": {
           "description": "Returns the current Session snapshot without attaching.",
+          "type": "boolean"
+        },
+        "session_environment": {
+          "description": "Accepts a caller environment in session/new.",
           "type": "boolean"
         },
         "session_fork": {
@@ -2710,6 +2718,62 @@
       },
       "type": "object"
     },
+    "SessionOptions": {
+      "description": "Startup overrides for a native Runtime Session.",
+      "properties": {
+        "append_system_prompt": {
+          "default": null,
+          "description": "Append to the system prompt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "description": "Model override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "no_context_files": {
+          "default": false,
+          "description": "Skip context discovery.",
+          "type": "boolean"
+        },
+        "no_web": {
+          "default": false,
+          "description": "Disable web tools for this Session.",
+          "type": "boolean"
+        },
+        "permission_mode": {
+          "default": null,
+          "description": "Explicit permission mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "default": null,
+          "description": "Provider override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "system_prompt": {
+          "default": null,
+          "description": "Replace the system prompt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "SessionParams": {
       "description": "Params naming one session.",
       "properties": {
@@ -2796,6 +2860,13 @@
           "default": {},
           "description": "Session metadata."
         },
+        "notices": {
+          "description": "Public startup notices, including credential-environment differences.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "pending": {
           "default": false,
           "description": "Part of `config` waits for the running turn to end.",
@@ -2857,12 +2928,33 @@
             "null"
           ]
         },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Caller environment for tools; omitted means use the host defaults.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "name": {
           "description": "Display name.",
           "type": [
             "string",
             "null"
           ]
+        },
+        "options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionOptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-run startup choices; ignored by legacy backends."
         }
       },
       "type": "object"
@@ -4977,6 +5069,17 @@
       }
     },
     "runtime/stop": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "runtime/stop_empty": {
       "direction": "client_to_server",
       "host_only": true,
       "kind": "request",
