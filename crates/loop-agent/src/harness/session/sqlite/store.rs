@@ -1172,7 +1172,9 @@ mod tests {
 
 /// Owns an unadmitted destination; cancellation removes its row and lease.
 pub struct DestinationCreation {
+    /// The destination Session id.
     pub id: String,
+    /// The retry receipt committed with it.
     pub receipt: String,
     store: SqliteSessionStore,
     identity: super::leases::LeaseIdentity,

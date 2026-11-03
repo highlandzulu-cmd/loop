@@ -94,7 +94,7 @@ pub struct Runtime {
     /// Escalations. A watched Session is never unloaded.
     watchers: Mutex<HashMap<SessionKey, HashSet<u64>>>,
     views: Mutex<HashMap<String, tree::BranchView>>,
-    destinations: AsyncMutex<()>,
+    destinations: Arc<AsyncMutex<()>>,
     pauses: Arc<pause::Pauses>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
@@ -297,7 +297,7 @@ impl Runtime {
             unloaded: Mutex::new(HashSet::new()),
             watchers: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
-            destinations: AsyncMutex::new(()),
+            destinations: Arc::default(),
             pauses: Arc::default(),
         })
     }

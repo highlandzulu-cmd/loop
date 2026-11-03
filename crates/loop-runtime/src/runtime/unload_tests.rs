@@ -990,3 +990,55 @@ async fn navigation_at_the_view_limit_changes_nothing() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn a_dropped_destination_request_settles_before_any_retry_answers() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_protocol::rpc::CloneParams;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 8).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        run(&rt, &source, "copy me").await;
+        for fail in [true, false] {
+            let params = CloneParams {
+                session: source.clone(),
+                name: None,
+                request_id: format!("dropped-{fail}"),
+            };
+            let (reached, release) = rt.pauses.arm("destination_admit");
+            let request = tokio::spawn({
+                let (rt, params) = (rt.clone(), params.clone());
+                async move { rt.clone_session(params).await }
+            });
+            reached.notified().await;
+            // The connection that asked goes away mid-admission.
+            request.abort();
+            assert!(request.await.unwrap_err().is_cancelled());
+            let waiting = rt.pauses.watch("destination_retry_wait");
+            let mut retry = tokio::spawn({
+                let (rt, params) = (rt.clone(), params.clone());
+                async move { rt.clone_session(params).await }
+            });
+            tokio::select! {
+                result = &mut retry => panic!("a retry answered before admission settled: {result:?}"),
+                () = waiting.notified() => {}
+            }
+            assert!(
+                release.send(fail).is_ok(),
+                "the Runtime, not the dropped request, owns admission"
+            );
+            let retried = retry.await.unwrap().unwrap();
+            assert!(rt.route(&retried.session).is_ok());
+            assert!(rt
+                .store
+                .list(None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|meta| meta.id == retried.session.native_id));
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

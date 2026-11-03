@@ -84,6 +84,27 @@ fn destination_result(id: &str, receipt: &str) -> BackendResult<DestinationResul
         draft: receipt["draft"].as_str().map(str::to_owned),
     })
 }
+/// A destination created but not yet admitted. Dropped early, it rolls back
+/// before releasing the destination lock, so no retry reads its receipt first.
+struct Unadmitted {
+    created: Option<loop_agent::harness::session::sqlite::DestinationCreation>,
+    lock: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+impl Drop for Unadmitted {
+    fn drop(&mut self) {
+        if let (Some(mut created), Some(lock)) = (self.created.take(), self.lock.take()) {
+            tokio::spawn(async move {
+                if let Err(error) = created.rollback().await {
+                    eprintln!(
+                        "could not remove unadmitted Session {}: {error}",
+                        created.id
+                    );
+                }
+                drop(lock);
+            });
+        }
+    }
+}
 fn validate_file(file: &SessionFile) -> BackendResult<()> {
     let mut ids = HashSet::new();
     let mut last = None;
@@ -646,8 +667,21 @@ impl Runtime {
         serde_json::to_writer(SizeLimit(SESSION_RESPONSE_LIMIT), &result).map_err(failed)?;
         Ok(result)
     }
+    /// The shared handle, so destination creation runs as a Runtime-owned
+    /// task: a dropped request never interrupts admission or its rollback.
+    fn shared(&self) -> Option<Arc<Runtime>> {
+        self.me.get().and_then(Weak::upgrade)
+    }
     /// Fork before a user message. Its text is returned to the initiating draft.
     pub async fn fork(&self, params: ForkParams) -> BackendResult<DestinationResult> {
+        match self.shared() {
+            Some(me) => tokio::spawn(async move { me.fork_owned(params).await })
+                .await
+                .map_err(failed)?,
+            None => self.fork_owned(params).await,
+        }
+    }
+    async fn fork_owned(&self, params: ForkParams) -> BackendResult<DestinationResult> {
         let fingerprint = fingerprint(&params)?;
         if let Some(result) = self
             .retry_destination("copy", &params.request_id, &fingerprint)
@@ -666,6 +700,14 @@ impl Runtime {
     }
     /// Copy a full committed branch into another leased Session.
     pub async fn clone_session(&self, params: CloneParams) -> BackendResult<DestinationResult> {
+        match self.shared() {
+            Some(me) => tokio::spawn(async move { me.clone_session_owned(params).await })
+                .await
+                .map_err(failed)?,
+            None => self.clone_session_owned(params).await,
+        }
+    }
+    async fn clone_session_owned(&self, params: CloneParams) -> BackendResult<DestinationResult> {
         let fingerprint = fingerprint(&params)?;
         if let Some(result) = self
             .retry_destination("copy", &params.request_id, &fingerprint)
@@ -734,6 +776,14 @@ impl Runtime {
     }
     /// Validate a bounded payload and import into a known workspace.
     pub async fn import(&self, params: ImportParams) -> BackendResult<DestinationResult> {
+        match self.shared() {
+            Some(me) => tokio::spawn(async move { me.import_owned(params).await })
+                .await
+                .map_err(failed)?,
+            None => self.import_owned(params).await,
+        }
+    }
+    async fn import_owned(&self, params: ImportParams) -> BackendResult<DestinationResult> {
         if params.jsonl.len() > SESSION_TRANSFER_LIMIT {
             return Err(failed("Session transfer exceeds 8 MiB"));
         }
@@ -801,7 +851,7 @@ impl Runtime {
         if request_id.trim().is_empty() || request_id.len() > 256 {
             return Err(failed("request id must contain 1 to 256 bytes"));
         }
-        let _destinations = self.destinations.lock().await;
+        let destinations = self.destinations.clone().lock_owned().await;
         let kind = if parent.is_some() { "copy" } else { "import" };
         if let Some(result) = self.receipt(kind, &request_id, &fingerprint).await? {
             return Ok(result);
@@ -816,7 +866,7 @@ impl Runtime {
             "{}:{request_id}",
             if parent.is_some() { "copy" } else { "import" }
         );
-        let mut created = self
+        let created = self
             .store
             .create_destination(
                 file,
@@ -830,6 +880,10 @@ impl Runtime {
             .await
             .map_err(failed)?;
         let id = created.id.clone();
+        let mut unadmitted = Unadmitted {
+            created: Some(created),
+            lock: Some(destinations),
+        };
         let session = reference(&id);
         let injected = self.pauses.wait("destination_admit").await;
         let admitted = if injected {
@@ -838,6 +892,7 @@ impl Runtime {
             self.open(Some(&session), SessionSpec::default(), None)
                 .await
         };
+        let mut created = unadmitted.created.take().unwrap();
         if let Err(error) = admitted {
             created.rollback().await.map_err(failed)?;
             return Err(error);
