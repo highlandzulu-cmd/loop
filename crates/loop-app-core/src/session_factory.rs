@@ -79,6 +79,9 @@ impl GlobalResources {
     }
 }
 
+/// A workspace's sandbox, its tool env and whether the sandbox is off.
+type Execution = (SandboxMode, Arc<dyn ExecutionEnv>, bool);
+
 /// Immutable workspace definitions and shared connections, cached by absolute cwd.
 /// Gates, hooks registries, selected tools and grants belong to each Session.
 pub struct WorkspaceResources {
@@ -98,7 +101,8 @@ pub struct WorkspaceResources {
     agent_dir: PathBuf,
     hooks: crate::hooks_load::LoadedHooks,
     web: crate::web_tools::WebTools,
-    sandbox: OnceCell<(SandboxMode, Arc<dyn ExecutionEnv>, bool)>,
+    // Shared with the workspace's reloads, so a reload never starts a second sandbox.
+    sandbox: Arc<OnceCell<Execution>>,
     standalone: bool,
 }
 
@@ -110,6 +114,11 @@ fn absolute_workspace(cwd: &Path) -> anyhow::Result<PathBuf> {
 }
 
 impl WorkspaceResources {
+    /// Status of Loop's web tools in this workspace; never contains keys.
+    pub fn web_status(&self) -> String {
+        self.web.status()
+    }
+
     /// Load without prompting. Only an explicitly remembered trust decision enables project input.
     pub async fn load(globals: &GlobalResources, opts: &BootstrapOpts) -> anyhow::Result<Self> {
         let cwd = absolute_workspace(&opts.cwd)?;
@@ -202,7 +211,7 @@ impl WorkspaceResources {
             prompt_cwd,
             agent_dir: globals.agent_dir.clone(),
             hooks,
-            sandbox: OnceCell::new(),
+            sandbox: Arc::new(OnceCell::new()),
             standalone,
         })
     }
@@ -295,6 +304,74 @@ pub struct OpenedSession {
     /// The standalone Surface's own Session store, which holds its leases.
     /// `None` when the Runtime owns ownership (and non-Unix standalone).
     pub session_store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    /// The workspace hooks this Session runs, replaced on reload.
+    pub hooks: crate::hooks_load::HookSlot,
+}
+
+impl OpenedSession {
+    /// Point this Session at `workspace`, a reload of its own: skills and
+    /// templates, tools (web, bash limits), system prompt, hooks, MCP
+    /// tools and timeouts, as a Session opened there now would have them.
+    /// Its execution env, model, effort, permission mode and grants stay.
+    pub async fn apply_workspace(
+        &self,
+        workspace: &WorkspaceResources,
+    ) -> anyhow::Result<Vec<String>> {
+        let harness = &self.harness;
+        let settings = &workspace.settings;
+        harness
+            .set_resources(AgentHarnessResources {
+                skills: workspace.resources.skills.clone(),
+                prompt_templates: workspace.resources.prompts.clone(),
+            })
+            .await;
+        let env = harness
+            .tool_env()
+            .await
+            .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
+        let bash_limits = settings.bash.unwrap_or_default().limits();
+        harness.set_bash_limits(bash_limits);
+        let mut tools = build_tools(
+            env,
+            &workspace.web,
+            bash_limits,
+            self.tool_gate.search_filter(),
+        );
+        let snippets = default_tool_snippets();
+        let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        let system_prompt = build_system_prompt(BuildSystemPromptOptions {
+            custom_prompt: workspace.custom_system_prompt.as_deref(),
+            append_system_prompt: workspace.append_system_prompt.as_deref(),
+            cwd: &workspace.prompt_cwd,
+            selected_tools: &selected,
+            tool_snippets: &snippets,
+            context_files: &workspace.context_files,
+        });
+        tools.extend(
+            loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
+                workspace.mcp_client.connections(),
+            )
+            .await,
+        );
+        harness
+            .set_tools(tools)
+            .await
+            .map_err(|e| anyhow::anyhow!("set tools: {e}"))?;
+        harness.set_system_prompt(system_prompt).await;
+        harness
+            .set_timeouts(
+                settings.timeouts.clone(),
+                settings.timeout_overrides.clone(),
+            )
+            .await;
+        self.native
+            .set_default_response_timeout(settings.response_header_timeout_ms)
+            .await;
+        self.tool_gate.set_mcp(Arc::clone(&workspace.mcp_client));
+        let mut notices = self.hooks.replace(workspace.hooks.clone(), &workspace.cwd);
+        notices.extend(workspace.startup_notices.iter().cloned());
+        Ok(notices)
+    }
 }
 
 impl SessionFactory {
@@ -461,6 +538,7 @@ impl SessionFactory {
         let default_model = model.clone();
         let default_effort = loop_agent::effort::parse_thinking(&settings.default_thinking_level);
         let mut effort = default_effort;
+        let mut recorded_mode = None;
         if resumed {
             let recorded = async {
                 let reader = session.reader();
@@ -489,6 +567,10 @@ impl SessionFactory {
                 if let Some(level) = recorded.thinking_level {
                     effort = level;
                 }
+                recorded_mode = recorded
+                    .permission_mode
+                    .as_deref()
+                    .and_then(crate::permissions::PermissionMode::parse);
             }
         }
 
@@ -549,17 +631,20 @@ impl SessionFactory {
 
         tool_gate.install(&harness);
         let mut startup_notices = workspace.startup_notices.clone();
-        startup_notices.extend(crate::hooks_load::register_workspace_hooks(
+        let (hook_notices, hooks) = crate::hooks_load::register_reloadable_hooks(
             &harness,
             workspace.hooks.clone(),
             &workspace.cwd,
-        ));
+        );
+        startup_notices.extend(hook_notices);
         let (mode, mode_notice) = startup_permission_mode(
             opts.permission_mode.as_deref(),
             settings.permission_mode.as_deref(),
             &settings.file_edit_review,
             opts.interactive,
         )?;
+        // A mode the Session recorded wins over the startup default.
+        let mode = recorded_mode.unwrap_or(mode);
         tool_gate.set_mode(mode);
         startup_notices.extend(mode_notice);
         if mode == crate::permissions::PermissionMode::FullAccess {
@@ -618,7 +703,39 @@ impl SessionFactory {
             model_note,
             startup_notices,
             session_store,
+            hooks,
         })
+    }
+
+    /// Reread `opts.cwd`'s workspace (trust, settings, skills, templates,
+    /// hooks, context, MCP connections) and cache it for new Sessions.
+    /// Returns the new resources and the ones they replace, whose MCP
+    /// connections the caller closes once no Session uses them. The
+    /// workspace's sandbox is kept.
+    pub async fn reload_workspace(
+        &self,
+        opts: &BootstrapOpts,
+    ) -> anyhow::Result<(Arc<WorkspaceResources>, Option<Arc<WorkspaceResources>>)> {
+        let cwd = absolute_workspace(&opts.cwd)?;
+        let old = {
+            let workspaces = self.workspaces.lock().await;
+            workspaces.get(&cwd).and_then(|slot| slot.get().cloned())
+        };
+        let trust = TrustStore::load(trust_path(&self.globals.agent_dir))?;
+        let trusted = trust.get(&cwd) == Some(true);
+        let settings = load_settings(&self.globals.agent_dir, &cwd, trusted)?;
+        let mut fresh =
+            WorkspaceResources::load_resolved(&self.globals, opts, trusted, settings, false)
+                .await?;
+        if let Some(old) = &old {
+            fresh.sandbox = Arc::clone(&old.sandbox);
+        }
+        let fresh = Arc::new(fresh);
+        self.workspaces
+            .lock()
+            .await
+            .insert(cwd, Arc::new(OnceCell::new_with(Some(Arc::clone(&fresh)))));
+        Ok((fresh, old))
     }
 }
 

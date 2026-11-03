@@ -630,6 +630,9 @@ async fn read(
 /// one on a remote connection comes back Forbidden.
 #[async_trait]
 impl crate::control::RuntimeAdmin for RemoteBackend {
+    fn offered(&self) -> Capabilities {
+        self.capabilities()
+    }
     async fn mcp(&self, params: admin::McpParams) -> BackendResult<admin::McpResult> {
         self.admin_call(|c| c.workspace_mcp, methods::WORKSPACE_MCP, &params)
             .await

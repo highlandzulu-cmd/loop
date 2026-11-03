@@ -63,6 +63,9 @@ mod subagent_tests;
 #[cfg(test)]
 mod unload_tests;
 
+mod admin;
+#[cfg(test)]
+mod admin_tests;
 mod pause;
 mod tree;
 
@@ -99,6 +102,11 @@ pub struct Runtime {
     views: Mutex<HashMap<String, tree::BranchView>>,
     destinations: Arc<AsyncMutex<()>>,
     pauses: Arc<pause::Pauses>,
+    /// Serializes workspace admin changes (settings and trust writes, reloads).
+    admin: AsyncMutex<()>,
+    /// Replaced workspace resources whose MCP connections close at shutdown
+    /// if no Session released them first.
+    retiring: Mutex<Vec<Arc<admin::Retiring>>>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -180,6 +188,8 @@ impl Drop for OpeningLease {
 struct WorkspaceState {
     resources: Arc<WorkspaceResources>,
     sandbox: Option<Arc<dyn Sandbox>>,
+    /// Counts committed admin changes and reloads of this workspace.
+    revision: u64,
 }
 struct LiveSession {
     /// Serializes the decisions that change who may use this Session:
@@ -216,6 +226,10 @@ struct LiveSession {
     turn_epoch: std::sync::atomic::AtomicU64,
     /// The Session's config as last committed to the Event Log.
     announced: Mutex<Announced>,
+    /// A workspace reload waiting for the current turn or command to end.
+    pending_workspace: Mutex<Option<admin::PendingWorkspace>>,
+    /// The sandbox the Session runs in (`session/sandbox`).
+    sandbox_choice: Mutex<loop_protocol::admin::SandboxChoice>,
 }
 /// What the pump has committed and published of one Session. The pump is
 /// the only writer of a loaded Session's updates, so `published` and
@@ -351,6 +365,8 @@ impl Runtime {
             views: Mutex::new(HashMap::new()),
             destinations: Arc::default(),
             pauses: Arc::default(),
+            admin: AsyncMutex::new(()),
+            retiring: Mutex::new(Vec::new()),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -645,13 +661,22 @@ impl Runtime {
                 .ensure_sandbox_ready()
                 .await
                 .map_err(failed)?;
-            self.workspaces.lock().unwrap().insert(
-                opened.workspace.cwd.clone(),
-                WorkspaceState {
-                    resources: opened.workspace.clone(),
-                    sandbox,
-                },
-            );
+            let sandbox_choice = Self::sandbox_choice(&opened.settings, sandbox.is_some());
+            {
+                let mut workspaces = self.workspaces.lock().unwrap();
+                let state = workspaces
+                    .entry(opened.workspace.cwd.clone())
+                    .or_insert_with(|| WorkspaceState {
+                        resources: opened.workspace.clone(),
+                        sandbox: None,
+                        revision: 0,
+                    });
+                // A reload keeps its revision; a Session opened meanwhile
+                // brings the resources it was opened with.
+                if state.sandbox.is_none() {
+                    state.sandbox = sandbox;
+                }
+            }
             let reference = opened.native.current_session().await;
             if !created && child.is_none() {
                 // The Session's own model and effort win over the Runtime's
@@ -760,6 +785,8 @@ impl Runtime {
                     latest: initial_config.clone(),
                     receipts: HashMap::new(),
                 }),
+                pending_workspace: Mutex::new(None),
+                sandbox_choice: Mutex::new(sandbox_choice),
             });
             if unannounced {
                 publish(
@@ -1271,6 +1298,10 @@ impl Runtime {
             .drain()
             .map(|(_, value)| value)
             .collect();
+        let retiring: Vec<_> = self.retiring.lock().unwrap().drain(..).collect();
+        for retiring in retiring {
+            retiring.close().await;
+        }
         for workspace in workspaces {
             workspace.resources.mcp_client.disconnect_all().await;
             if let Some(sandbox) = workspace.sandbox {
@@ -1543,6 +1574,9 @@ impl loop_wire::RuntimeControl for Runtime {
 
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         Runtime::list(self).await
+    }
+    fn admin(&self) -> Option<&dyn loop_wire::RuntimeAdmin> {
+        Some(self)
     }
     async fn status(&self) -> BackendResult<loop_protocol::rpc::RuntimeStatus> {
         Ok(Runtime::status(self))
@@ -1854,6 +1888,7 @@ impl Runtime {
             };
             let _lifecycle = live.lifecycle.lock().await;
             live.busy.store(false, Ordering::Release);
+            live.apply_pending().await;
             result
         });
         task.await.map_err(failed)?
@@ -2154,6 +2189,7 @@ impl AgentBackend for Runtime {
                 // that holds it sees one consistent busy state.
                 let _lifecycle = live.lifecycle.lock().await;
                 live.busy.store(false, Ordering::Release);
+                live.apply_pending().await;
             }
             let outcome = match result {
                 Ok(outcome) => outcome,

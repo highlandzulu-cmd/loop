@@ -237,18 +237,18 @@ async fn run(
                                 capabilities.efforts = false;
                                 capabilities.modes = false;
                             }
-                            let admin = runtime.as_ref().is_some_and(|r| r.admin().is_some());
-                            let host = admin && options.authority == Authority::HostLocal;
-                            capabilities.workspace_mcp &= admin;
-                            capabilities.workspace_web_search &= admin;
-                            capabilities.workspace_skills &= admin;
-                            capabilities.workspace_templates &= admin;
-                            capabilities.workspace_reload &= admin;
-                            capabilities.workspace_trust &= admin;
-                            capabilities.session_sandbox &= admin;
-                            capabilities.permission_mode &= admin;
-                            capabilities.host_usage &= host;
-                            capabilities.host_defaults &= host;
+                            let offered = admin_offered(runtime.as_deref());
+                            let host = options.authority == Authority::HostLocal;
+                            capabilities.workspace_mcp = offered.workspace_mcp;
+                            capabilities.workspace_web_search = offered.workspace_web_search;
+                            capabilities.workspace_skills = offered.workspace_skills;
+                            capabilities.workspace_templates = offered.workspace_templates;
+                            capabilities.workspace_reload = offered.workspace_reload;
+                            capabilities.workspace_trust = offered.workspace_trust;
+                            capabilities.session_sandbox = offered.session_sandbox;
+                            capabilities.permission_mode = offered.permission_mode;
+                            capabilities.host_usage = offered.host_usage && host;
+                            capabilities.host_defaults = offered.host_defaults && host;
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
@@ -585,7 +585,7 @@ async fn handle(
         | methods::SESSION_PERMISSION_MODE
         | methods::RUNTIME_USAGE
         | methods::RUNTIME_DEFAULTS => {
-            match admin(backend.capabilities(), runtime, method, params).await {
+            match admin(admin_offered(runtime), runtime, method, params).await {
                 Ok(result) => result,
                 Err(error) => return conn.respond(id, Err(error)),
             }
@@ -750,6 +750,14 @@ async fn session_services(
                 .map(|r| to_value(&r))
         }
     })
+}
+
+/// The admin flags the Runtime's admin service offers; none without one.
+fn admin_offered(runtime: Option<&dyn RuntimeControl>) -> loop_protocol::Capabilities {
+    runtime
+        .and_then(|r| r.admin())
+        .map(|a| a.offered())
+        .unwrap_or_default()
 }
 
 /// Workspace admin and host-only services. Host-local authority was

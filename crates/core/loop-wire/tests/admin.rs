@@ -126,6 +126,9 @@ fn known(workspace_id: &str) -> BackendResult<()> {
 
 #[async_trait]
 impl RuntimeAdmin for Fake {
+    fn offered(&self) -> Capabilities {
+        admin_flags()
+    }
     async fn mcp(&self, params: McpParams) -> BackendResult<McpResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         known(&params.workspace_id)?;

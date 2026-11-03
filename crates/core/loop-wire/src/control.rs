@@ -160,6 +160,10 @@ pub trait RuntimeControl: Send + Sync {
 /// host-only calls without host-local authority before calling these.
 #[async_trait]
 pub trait RuntimeAdmin: Send + Sync {
+    /// The admin and host-only capability flags this service serves; the
+    /// server advertises these (host-only ones only host-locally) and
+    /// ignores the backend's own admin flags.
+    fn offered(&self) -> loop_protocol::Capabilities;
     /// `workspace/mcp`.
     async fn mcp(&self, _params: admin::McpParams) -> BackendResult<admin::McpResult> {
         Err(BackendError::Unsupported("workspace/mcp".into()))
