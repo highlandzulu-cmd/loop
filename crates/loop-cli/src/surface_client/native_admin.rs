@@ -316,13 +316,21 @@ impl RuntimeAdmin for NativeAdmin<'_> {
             } else {
                 totals.unknown_tokens += 1;
             }
+            let model = if session == native {
+                r.native.config().config.model
+            } else {
+                r.active_agent
+                    .as_ref()
+                    .zip(r.agent_model.as_ref())
+                    .map(|(agent, model)| format!("{agent}/{model}"))
+            };
             sessions.push(RuntimeSessionRow {
                 session,
                 workspace_id: loop_runtime::workspace_id(
                     &r.cwd.canonicalize().unwrap_or_else(|_| r.cwd.clone()),
                 ),
                 state,
-                model: r.selected_model_spec(),
+                model,
                 tokens,
             });
         }
@@ -505,13 +513,16 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         if p.session != r.session_ref() {
             return Err(failed("unknown Session"));
         }
+        let mut mutation = None;
         if let Some(mode) = p.mode {
             let mode = loop_app_core::permissions::PermissionMode::parse(&mode)
                 .ok_or_else(|| failed("unknown permission mode"))?;
             if r.is_native() {
-                r.native
-                    .record_permission_mode(&p.session, mode.as_str(), p.expected_revision)
-                    .await?;
+                mutation = Some(
+                    r.native
+                        .record_permission_mode(&p.session, mode.as_str(), p.expected_revision)
+                        .await?,
+                );
             }
             r.set_permission_mode(mode).await;
         }
@@ -519,7 +530,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
         Ok(PermissionModeResult {
             mode: mode.as_str().into(),
             effective_policy: mode.description().into(),
-            ..Default::default()
+            revision: r.native.config().revision,
+            seq: mutation.as_ref().map(|m| m.seq),
+            pending: mutation.as_ref().is_some_and(|m| m.pending),
         })
     }
     async fn trust(&self, p: TrustParams) -> BackendResult<TrustResult> {

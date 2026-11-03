@@ -177,6 +177,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         socket: std::path::absolute(&socket).unwrap_or_else(|_| socket.clone()),
         stop: stop.clone(),
         limits,
+        #[cfg(feature = "usage")]
         agent_dir: agent_dir.clone(),
     });
 
@@ -299,7 +300,8 @@ struct Control {
     socket: PathBuf,
     stop: tokio_util::sync::CancellationToken,
     limits: Limits,
-    /// The host's agent directory: settings and the usage log.
+    /// The host's usage log directory.
+    #[cfg(feature = "usage")]
     agent_dir: PathBuf,
 }
 
@@ -365,7 +367,7 @@ impl loop_wire::RuntimeAdmin for Control {
 #[cfg(unix)]
 use loop_protocol::{admin, BackendResult};
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "usage"))]
 fn failed(error: impl std::fmt::Display) -> loop_protocol::BackendError {
     loop_protocol::BackendError::failed(loop_protocol::ErrorCategory::Internal, error.to_string())
 }

@@ -697,54 +697,32 @@ lock-based recovery privilege. WebSockets require tokens on loopback and cannot
 bind remotely before TLS. These boundaries are part of the proposed decision,
 not incidental details for each implementation slice to redefine.
 
-## S3.5 implementation TODO: temporary native escape hatch
+## S3.5 implementation TODO: completed groups 1–6
 
-The first S3.5 branch migrates groups 1 and 2. `app::run`, its helpers and the
-usage dashboard take `loop_cli::SurfaceClient`. The facade owns a private native
-adapter; neither it nor `LegacyHost` dereferences to the application Runtime.
-Compile-fail tests enforce that boundary. Model/effort use `ModelControl`.
-Session operations use the S3.3 `RuntimeControl` request/result types through a
-native service adapter. The adapter reuses S3.3's atomic destination creation,
-including separate leases, fresh entry ids and approval-grant filtering.
-Export/import filesystem access is in the TUI; services exchange bounded payloads.
+All six groups use SurfaceClient services or immutable views. The temporary
+escape hatch and LegacyHost are removed. The UI imports a view namespace that
+exposes no CliRuntime or application Runtime; compile-fail tests cover both
+owner types, private owner access, Deref and the removed escape-hatch methods.
+Approval setup, credentials, mutable host settings and native execution stay
+inside the adapter. Surface preferences have narrow local persistence methods.
 
-These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
-`legacy_mut()` and must move one group at a time after S3.4:
+- Groups 1–2 use ModelControl and typed Session operations.
+- Group 3 uses sandbox/permission/MCP/trust services, with native OAuth browser
+  callbacks kept behind the facade.
+- Group 4 uses workspace skills/templates/reload, Session skill/workflow methods
+  and ordered WorkflowProgress updates, including cancellation during planning.
+- Group 5 uses Session stats/config, redacted workspace settings, host-only usage
+  history and a Runtime panel of loaded Sessions. Host-fed dashboards do not
+  read the Surface filesystem; history is hidden when unavailable.
+- Group 6 uses typed provider, tracing, web-search and default services. `/ttfb`
+  changes the Session; `/ttfb default <duration>` requires a repeated command to
+  save the host default. Credentials are absent from result and Debug payloads.
 
-- Group 3 migrated: sandbox and permissions use typed RuntimeAdmin requests;
-  trust reloads resources through the native admin adapter. MCP list/connect/
-  toggle and OAuth use facade services. Approval setup and grants stay private
-  to the native owner. Settings diagnostics move with group 5; web search and
-  timeout/default handling move with group 6. Characterization covers the
-  full-access confirmation, review help, sandbox validation, MCP picker
-  toggles and failed connections, missing OAuth servers, and trust choices.
-- Group 4 migrated: immutable resource views supply skills, templates and
-  autocomplete; workspace changes use RuntimeAdmin. Skill activation and
-  workflows use Session services, with ordered WorkflowProgress updates.
-  Planning reserves the Session; cancellation drains task execution.
-- Group 5 migrated: dashboards read Session stats and typed RuntimeAdmin
-  history/loaded-Session data. Host-fed dashboards never open local log files
-  and hide history when it is unavailable. Settings and Session diagnostics
-  use public config/settings views and label Surface-local preferences.
-- Group 6 migrated: provider login/logout, web search, tracing and host defaults
-  use RuntimeAdmin requests. Subscription startup/sign-in stays in the private
-  native adapter until S3.7, exposed as typed operations and immutable choices.
-  `/ttfb` changes only this Session; `/ttfb default <duration>` saves new-Session
-  defaults after repeating the command to confirm. Host-only services advertise
-  their capabilities only on host-local connections.
-- Local theme/preferences still use the old settings persistence while the
-  workspace/local settings split is completed with these groups.
-- Also behind the escape hatch until their groups move: starting a
-  subscription agent from `/model` or the picker (`legacy().agents()`, group 6
-  with ACP startup, although it is a model choice) and `/default` saving
-  model/effort through the host settings (group 6; over a Runtime it is the
-  host-only `runtime/defaults`).
-- Facade getters still return host-shaped data that a remote Runtime cannot
-  serve as is: `selected_model()` (a `loop_ai::Model`), `agent_dir()`,
-  `sessions_db()` and `native_effort()` (reads the harness). S3.6 replaces them
-  with view types (spec strings, choice ids) rather than a second migration.
-- `LegacyHost` no longer exposes the native backend or model catalog, so
-  migrated groups 1–2 cannot be reached around the facade.
+ACP admission remains native until S3.7. The S3.6 adapter still replaces native
+model/path getters with remote view identities, and adds connected attachment,
+replay and immutable transcript paging. Services advertise only support their
+owner actually provides; unsupported host services stay unavailable on a daemon
+that does not own those facilities.
 
 The native adapter serves one active harness. It has no Event Log attachment or
 immutable transcript paging; those remain S3.6 work. Its direct Session service

@@ -1,7 +1,7 @@
 //! The TUI's typed client boundary over today's in-process native backend.
 //!
-//! The host is private and there is no Deref to CliRuntime or Runtime. Deferred
-//! groups have an explicit, temporary `legacy` escape hatch (see the design TODO).
+//! The native owner is private. Surfaces receive typed services and immutable views;
+//! neither the host nor mutable settings can be reached through this boundary.
 use loop_protocol::{rpc::*, session_services::*, AgentBackend, SessionRef, SessionSpec};
 use loop_wire::RuntimeControl;
 use std::sync::Arc;
@@ -9,8 +9,8 @@ mod native_admin;
 mod native_sessions;
 use crate::theme::Theme;
 use crate::{keybindings, CliRuntime, PendingAgent, StartupSessions, ToolApprovalBridge};
-mod legacy;
-pub use legacy::LegacyHost;
+mod native_host;
+use native_host::NativeHost;
 
 /// A Surface's client services and local terminal state.
 ///
@@ -26,8 +26,15 @@ pub use legacy::LegacyHost;
 ///     let _ = &client.host.inner;
 /// }
 /// ```
+/// The removed host escape hatch is not part of the Surface API:
+/// ```compile_fail
+/// fn host(client: &loop_cli::SurfaceClient) { let _ = client.legacy(); }
+/// ```
+/// ```compile_fail
+/// fn host(client: &mut loop_cli::SurfaceClient) { let _ = client.legacy_mut(); }
+/// ```
 pub struct SurfaceClient {
-    host: LegacyHost,
+    host: NativeHost,
     confirm_timeout_default: Option<u64>,
     sessions: Arc<dyn RuntimeControl>,
     native_sessions: Arc<native_sessions::NativeSessions>,
@@ -120,7 +127,7 @@ impl From<CliRuntime> for SurfaceClient {
             native_sessions: native.clone(),
             native_backend: native,
             workspace_id,
-            host: LegacyHost { inner },
+            host: NativeHost { inner },
             confirm_timeout_default: None,
             keybindings,
             debug,
@@ -139,14 +146,6 @@ impl From<CliRuntime> for SurfaceClient {
 }
 
 impl SurfaceClient {
-    /// Temporary access for the unmigrated groups 3–6 only.
-    pub fn legacy(&self) -> &LegacyHost {
-        &self.host
-    }
-    /// Temporary mutation access for the unmigrated groups 3–6 only.
-    pub fn legacy_mut(&mut self) -> &mut LegacyHost {
-        &mut self.host
-    }
     pub fn backend(&self) -> &Arc<dyn AgentBackend> {
         if self.is_native() {
             &self.native_backend
@@ -1148,7 +1147,7 @@ impl SurfaceClient {
     pub async fn install_interactions(
         &mut self,
         host: loop_app_core::interaction::InteractionQueue,
-    ) -> anyhow::Result<Arc<ToolApprovalBridge>> {
+    ) -> anyhow::Result<()> {
         let r = &mut self.host.inner;
         let env = r.harness.tool_env().await?;
         let grants = r
@@ -1175,7 +1174,7 @@ impl SurfaceClient {
         }));
         r.tool_gate.set_approver(Some(bridge.clone()));
         r.tool_approval = Some(bridge.clone());
-        Ok(bridge)
+        Ok(())
     }
     pub fn review_grants(&self) -> std::collections::HashSet<String> {
         self.host
@@ -1651,8 +1650,7 @@ impl SurfaceClient {
         &self,
         pending: PendingAgent,
         forward: impl FnOnce(&dyn AgentBackend) + Send + 'static,
-    ) -> SubscriptionStart
-    {
+    ) -> SubscriptionStart {
         let agents = self.host.inner.agents.clone();
         let forwarded = self.forwarded.clone();
         Box::pin(async move {
@@ -1825,3 +1823,17 @@ pub type SubscriptionSession = (Arc<dyn AgentBackend>, SessionRef);
 /// Subscription admission, with updates forwarded before the Session opens.
 pub type SubscriptionStart =
     futures::future::BoxFuture<'static, Result<SubscriptionSession, String>>;
+
+/// The application UI imports this view namespace. It deliberately exposes no
+/// native owner, bootstrap Runtime, credential store, or mutable host settings.
+/// ```compile_fail
+/// use loop_cli::surface_client::ui_api as loop_app_core;
+/// fn host(_: loop_app_core::Runtime) {}
+/// ```
+/// ```compile_fail
+/// use loop_cli::surface_client::ui_api;
+/// fn host(_: ui_api::CliRuntime) {}
+/// ```
+pub mod ui_api {
+    pub use loop_app_core::{interaction, permissions, sessions};
+}

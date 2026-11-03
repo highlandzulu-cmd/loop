@@ -1,5 +1,7 @@
 //! Interactive inline CLI (Pi-style): transcript in scrollback, footer redrawn in place.
 
+use crate::surface_client::ui_api as loop_app_core;
+
 use std::collections::VecDeque;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
@@ -321,7 +323,7 @@ pub async fn run(mut runtime: SurfaceClient) -> anyhow::Result<()> {
     // Clear the inline footer so the shell prompt lands cleanly.
     let _ = terminal.clear();
     terminal.show_cursor()?;
-    // This function owns the Runtime: end its work and release the Session
+    // End the native owner’s work and release the Session
     // leases before the process exits; nothing after this does it reliably.
     if let Err(error) = runtime.shutdown().run().await {
         eprintln!("loop: {error:#}");
@@ -3750,6 +3752,10 @@ fn start_mcp_login(
     tx: &mpsc::UnboundedSender<UiEvent>,
     name: &str,
 ) {
+    if runtime.mcp_enabled(name).is_none() {
+        chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
+        return;
+    }
     let tx_url = tx.clone();
     let server_name = name.to_string();
     let login = runtime.mcp_login(name, move |auth_url| {
@@ -3833,6 +3839,10 @@ async fn logout_mcp(
     status: &mut String,
     name: &str,
 ) {
+    if runtime.mcp_enabled(name).is_none() {
+        chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
+        return;
+    }
     match runtime.mcp_logout(name).await {
         Ok(true) => {
             chat.push(sys(format!(
@@ -3853,6 +3863,10 @@ async fn set_mcp_enabled(
     status: &mut String,
 ) {
     use loop_protocol::admin::AdminAction;
+    if runtime.mcp_enabled(name).is_none() {
+        chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
+        return;
+    }
     let state = if enabled { "enabled" } else { "disabled" };
     match runtime
         .mcp(
@@ -6248,8 +6262,8 @@ mod reasoning_notice_tests {
 
 #[cfg(test)]
 mod session_picker_tests {
+    use self::loop_app_core::sessions::SessionChoice;
     use super::*;
-    use loop_app_core::sessions::SessionChoice;
 
     fn choice(id: &str, title: &str, source: Option<&str>) -> SessionChoice {
         SessionChoice {

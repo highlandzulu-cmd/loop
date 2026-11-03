@@ -1,6 +1,6 @@
 //! Commands and keys through the same handlers as the terminal loop.
 use super::*;
-use crate::surface_client::test_support::fixture;
+use crate::surface_client::test_support::{self, fixture};
 
 #[derive(Default)]
 struct Driver {
@@ -84,7 +84,7 @@ async fn model_command_changes_this_session_and_offers_to_save_defaults() {
             runtime.selected_model_spec().as_deref(),
             Some("faux/second")
         );
-        assert!(runtime.legacy().settings().selected_model().is_none());
+        assert!(test_support::settings(&runtime).selected_model().is_none());
         assert!(!crate::config::paths::settings_path(dir.path()).exists());
         ui.effect(&mut runtime, CommandEffect::NewSession).await;
         assert_eq!(
@@ -194,7 +194,7 @@ async fn model_picker_and_cycle_keys_share_the_session_selection() {
             Some("faux/second")
         );
         assert_eq!(ui.text().matches(SAVE_DEFAULT_HINT).count(), 3);
-        assert!(runtime.legacy().settings().selected_model().is_none());
+        assert!(test_support::settings(&runtime).selected_model().is_none());
         let before = runtime.selected_model_spec();
         ui.effect(
             &mut runtime,
@@ -213,7 +213,9 @@ async fn effort_command_cycle_and_status_keep_defaults_separate() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = fixture(dir.path()).await;
-        let default = runtime.legacy().settings().default_thinking_level.clone();
+        let default = test_support::settings(&runtime)
+            .default_thinking_level
+            .clone();
         let mut ui = Driver::default();
         ui.effect(&mut runtime, CommandEffect::Effort(None)).await;
         assert!(ui.text().contains("reasoning effort:"));
@@ -230,7 +232,10 @@ async fn effort_command_cycle_and_status_keep_defaults_separate() {
         assert_eq!(runtime.native_effort(), "off");
         assert!(ui.status.ends_with("faux/faux-model · off"));
         assert_eq!(ui.text().matches(SAVE_DEFAULT_HINT).count(), 2);
-        assert_eq!(runtime.legacy().settings().default_thinking_level, default);
+        assert_eq!(
+            test_support::settings(&runtime).default_thinking_level,
+            default
+        );
         ui.effect(&mut runtime, CommandEffect::Effort(Some("invalid".into())))
             .await;
         assert!(ui.text().contains("unknown effort"));
@@ -403,15 +408,14 @@ async fn clone_keeps_source_approval_grants_out_of_the_destination() {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = fixture(dir.path()).await;
         prompt(&runtime, "source prompt").await;
-        runtime
-            .legacy()
-            .harness()
-            .append_label(format!(
+        test_support::append_label(
+            &runtime,
+            format!(
                 "{}bash",
                 loop_agent::harness::session::TOOL_APPROVAL_LABEL_NAMESPACE
-            ))
-            .await
-            .unwrap();
+            ),
+        )
+        .await;
         let mut ui = Driver::default();
         ui.effect(&mut runtime, CommandEffect::CloneSession).await;
         ui.effect(&mut runtime, CommandEffect::Export(Some("clone".into())))
@@ -515,7 +519,7 @@ async fn model_cycle_respects_enabled_models_without_hiding_picker_choices() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = fixture(dir.path()).await;
-        runtime.legacy_mut().settings_mut().enabled_models = vec!["faux/second".into()];
+        test_support::settings_mut(&mut runtime).enabled_models = vec!["faux/second".into()];
         let mut ui = Driver::default();
         ui.key(&mut runtime, KeyCode::Char('p'), KeyModifiers::CONTROL)
             .await;
@@ -632,7 +636,7 @@ async fn a_logged_out_provider_cannot_be_selected() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = fixture(dir.path()).await;
-        runtime.legacy().credentials().logout("faux").unwrap();
+        test_support::logout(&runtime, "faux");
         let before = runtime.selected_model_spec();
         let error = runtime
             .select_model("faux", "second")
@@ -722,16 +726,13 @@ async fn permissions_require_full_access_confirmation_and_review_keeps_migration
         )
         .await;
         assert!(ui.text().contains("again to confirm"));
-        assert_eq!(runtime.legacy().permission_mode(), PermissionMode::Ask);
+        assert_eq!(runtime.permission_mode(), PermissionMode::Ask);
         ui.effect(
             &mut runtime,
             CommandEffect::Permissions(Some("full-access".into())),
         )
         .await;
-        assert_eq!(
-            runtime.legacy().permission_mode(),
-            PermissionMode::FullAccess
-        );
+        assert_eq!(runtime.permission_mode(), PermissionMode::FullAccess);
         ui.effect(&mut runtime, CommandEffect::SetFileReview(None))
             .await;
         assert!(ui.text().contains("session auto-approve: (none)"));
@@ -793,6 +794,7 @@ async fn mcp_empty_list_reload_and_missing_auth_keep_their_messages() {
                 "{}",
                 ui.text()
             );
+            assert!(matches!(ui.chat.last(), Some(ChatItem::System { .. })));
         }
     })
     .await
@@ -824,7 +826,7 @@ async fn mcp_picker_toggles_a_configured_server_and_reports_connection_failure()
     tokio::time::timeout(Duration::from_secs(15), async {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = fixture(dir.path()).await;
-        runtime.legacy_mut().settings_mut().mcp_servers.insert(
+        test_support::settings_mut(&mut runtime).mcp_servers.insert(
             "broken".into(),
             serde_json::from_value(serde_json::json!({"command": "/nonexistent-loop-mcp-test"}))
                 .unwrap(),
@@ -862,9 +864,7 @@ async fn skills_picker_activation_arguments_and_disabling_preserve_the_composer(
     tokio::time::timeout(Duration::from_secs(15), async {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = fixture(dir.path()).await;
-        runtime
-            .legacy_mut()
-            .resources_mut()
+        test_support::resources_mut(&mut runtime)
             .skills
             .push(loop_agent::harness::types::Skill {
                 name: "inspect".into(),
@@ -873,7 +873,7 @@ async fn skills_picker_activation_arguments_and_disabling_preserve_the_composer(
                 path: dir.path().join("SKILL.md"),
                 disable_model_invocation: false,
             });
-        runtime.legacy().sync_harness_resources().await;
+        test_support::sync_resources(&runtime).await;
         let mut ui = Driver::default();
         ui.effect(&mut runtime, CommandEffect::Skills(SkillsCommand::List))
             .await;
@@ -924,7 +924,7 @@ async fn prompt_template_arguments_are_rendered_and_queued_while_busy() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let dir = tempfile::tempdir().unwrap();
         let mut runtime = fixture(dir.path()).await;
-        runtime.legacy_mut().resources_mut().prompts.push(
+        test_support::resources_mut(&mut runtime).prompts.push(
             loop_agent::harness::types::PromptTemplate {
                 name: "inspect".into(),
                 body: "Check $1 with $2".into(),
@@ -1133,6 +1133,109 @@ async fn timeout_changes_stay_in_session_and_saving_defaults_requires_confirmati
             .await
             .unwrap();
         assert_eq!(value.override_ms, Some(0));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn permission_service_returns_the_committed_session_revision() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        use loop_wire::RuntimeAdmin;
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let params = loop_protocol::admin::PermissionModeParams {
+            session: runtime.session_ref(),
+            mode: Some("read-only".into()),
+            expected_revision: Some(0),
+        };
+        let result = runtime.admin().permission_mode(params).await.unwrap();
+        let snapshot = runtime.session_config().await.unwrap();
+        assert_eq!(result.revision, snapshot.revision);
+        assert!(result.seq.is_some());
+        assert_eq!(result.mode, "read-only");
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "orchestration")]
+#[tokio::test]
+async fn workflow_success_streams_the_plan_tasks_and_output_in_order() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        use loop_protocol::session_services::WorkflowState;
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = fixture(dir.path()).await;
+        test_support::plan_shell_task(&runtime);
+        let mut updates = runtime.backend().subscribe();
+        let result = runtime.workflow("inspect", Some(1)).await.unwrap();
+        let mut states = vec![];
+        loop {
+            if let SessionUpdate::WorkflowProgress(progress) = updates.recv().await.unwrap().update
+            {
+                assert_eq!(progress.workflow_id, result.workflow_id);
+                states.push(progress.state);
+                if progress.state == WorkflowState::Ended {
+                    let completed = progress.completion.unwrap();
+                    assert!(completed.success);
+                    assert_eq!(completed.completed_count, 1);
+                    assert!(completed.output.contains("workflow-output"));
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            states,
+            [
+                WorkflowState::Planned,
+                WorkflowState::TaskStarted,
+                WorkflowState::TaskCompleted,
+                WorkflowState::Ended
+            ]
+        );
+        runtime.shutdown().run().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_panel_labels_native_and_subscription_models_separately() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let subscription = fixture(other.path()).await;
+        let native = runtime.session_ref();
+        let remote = subscription.session_ref();
+        runtime.adopt_agent(
+            "subscription",
+            subscription.backend().clone(),
+            remote.clone(),
+            Some("agent-model".into()),
+        );
+        let rows = runtime.loaded_sessions().await.unwrap();
+        assert_eq!(rows.sessions.len(), 2);
+        assert_eq!(
+            rows.sessions
+                .iter()
+                .find(|row| row.session == native)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("faux/faux-model")
+        );
+        assert_eq!(
+            rows.sessions
+                .iter()
+                .find(|row| row.session == remote)
+                .unwrap()
+                .model
+                .as_deref(),
+            Some("subscription/agent-model")
+        );
+        runtime.shutdown().run().await.unwrap();
+        subscription.shutdown().run().await.unwrap();
     })
     .await
     .unwrap();
