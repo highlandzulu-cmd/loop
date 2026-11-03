@@ -935,3 +935,22 @@ fn skill_and_workflow_requests_and_progress_have_stable_wire_shapes() {
     let flags: loop_protocol::Capabilities = serde_json::from_value(json!({})).unwrap();
     assert!(!flags.workflow && !flags.session_skills);
 }
+
+#[test]
+fn host_credentials_have_redacted_debug_and_explicit_wire_actions() {
+    use loop_protocol::host::*;
+    let request = ProvidersParams {
+        action: HostAction::Connect,
+        provider: None,
+        login: Some(json!({"Preset":{"id":"faux","api_key":"secret-value"}})),
+    };
+    assert!(!format!("{request:?}").contains("secret-value"));
+    assert_eq!(serde_json::to_value(&request).unwrap()["action"], "connect");
+    let tracing = TracingParams {
+        action: HostAction::Setup,
+        config: Some(json!({"authorization":"secret-value"})),
+    };
+    assert!(!format!("{tracing:?}").contains("secret-value"));
+    let flags: loop_protocol::Capabilities = serde_json::from_value(json!({})).unwrap();
+    assert!(!flags.host_providers && !flags.host_tracing && !flags.host_mcp_auth);
+}

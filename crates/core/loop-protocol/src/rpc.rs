@@ -146,11 +146,11 @@ pub mod methods {
     /// Client → server request: `{}` → [`crate::admin::RuntimeSessionsResult`].
     /// Needs `runtime_sessions`.
     pub const RUNTIME_SESSIONS: &str = "runtime/sessions";
-    /// Host-only request: provider login and logout. Reserved.
+    /// Host-only provider login and logout.
     pub const RUNTIME_PROVIDERS: &str = "runtime/providers";
-    /// Host-only request: MCP OAuth login and logout. Reserved.
+    /// Host-only MCP OAuth login and logout.
     pub const RUNTIME_MCP_AUTH: &str = "runtime/mcp_auth";
-    /// Host-only request: Runtime tracing. Reserved.
+    /// Host-only Runtime tracing.
     pub const RUNTIME_TRACING: &str = "runtime/tracing";
 
     /// Methods served only with host-local authority (the Runtime's 0600
@@ -786,8 +786,24 @@ pub fn json_schema() -> Value {
     let snapshot = reference(generator.subschema_for::<SessionSnapshot>());
     let admin = {
         use crate::admin::*;
+        use crate::host::*;
         let r = |schema| reference(schema);
         vec![
+            (
+                methods::RUNTIME_PROVIDERS,
+                r(generator.subschema_for::<ProvidersParams>()),
+                r(generator.subschema_for::<ProvidersResult>()),
+            ),
+            (
+                methods::RUNTIME_TRACING,
+                r(generator.subschema_for::<TracingParams>()),
+                r(generator.subschema_for::<TracingResult>()),
+            ),
+            (
+                methods::RUNTIME_MCP_AUTH,
+                r(generator.subschema_for::<McpAuthParams>()),
+                r(generator.subschema_for::<McpAuthResult>()),
+            ),
             (
                 methods::WORKSPACE_SETTINGS,
                 r(generator.subschema_for::<SettingsParams>()),

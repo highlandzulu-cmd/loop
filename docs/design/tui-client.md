@@ -726,8 +726,12 @@ These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
   history/loaded-Session data. Host-fed dashboards never open local log files
   and hide history when it is unavailable. Settings and Session diagnostics
   use public config/settings views and label Surface-local preferences.
-- Group 6: provider login/logout, catalog refresh, ACP startup/sign-in and tracing
-  setup. ACP keeps its existing in-process startup path until S3.7.
+- Group 6 migrated: provider login/logout, web search, tracing and host defaults
+  use RuntimeAdmin requests. Subscription startup/sign-in stays in the private
+  native adapter until S3.7, exposed as typed operations and immutable choices.
+  `/ttfb` changes only this Session; `/ttfb default <duration>` saves new-Session
+  defaults after repeating the command to confirm. Host-only services advertise
+  their capabilities only on host-local connections.
 - Local theme/preferences still use the old settings persistence while the
   workspace/local settings split is completed with these groups.
 - Also behind the escape hatch until their groups move: starting a

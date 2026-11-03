@@ -18,7 +18,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 use loop_ai::providers::SOKET_BASE_URL;
-use loop_ai::{calculate_context_tokens, CredentialStore, Usage};
+use loop_ai::{calculate_context_tokens, Usage};
 use loop_app_core::interaction::{
     approval_kind, ApprovalReply, InteractionQueue, PendingInteraction,
 };
@@ -35,9 +35,6 @@ pub mod dashboard;
 #[cfg(feature = "telemetry")]
 use crate::commands::TracingCommand;
 use crate::commands::{self, AutocompleteEntry, CommandEffect, McpCommand, SkillsCommand};
-#[cfg(feature = "telemetry")]
-use crate::config::describe_tracing_status;
-use crate::config::ProviderLoginRequest;
 use crate::keybindings::{
     hotkey_help, multiline_paste_text, normalize_pasted_text, paste_burst_pending,
     pasted_single_line, Action,
@@ -45,7 +42,7 @@ use crate::keybindings::{
 use crate::provider_setup::{LoginChoice, ProviderSetup};
 use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
-use crate::tool_approval::{ApprovalDecision, ApprovalKind, GROUP_BASH, GROUP_FILE, GROUP_WEB};
+use crate::tool_approval::{ApprovalDecision, ApprovalKind};
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
 use crate::tui::attachments::{
@@ -392,7 +389,7 @@ async fn run_loop(
             PendingAgent::New { id, .. } => id.clone(),
             PendingAgent::Resume(record) => record.agent.clone(),
         };
-        if runtime.legacy().agents().is_signed_in(&id) {
+        if runtime.agent_signed_in(&id) {
             chat.push(sys(start_agent(runtime, pending, false, &tx)));
         } else {
             chat.push(sys(format!(
@@ -429,20 +426,16 @@ async fn run_loop(
     let mut redraw_request = false;
     let mut purge_ui_events = false;
     let mut last_width = terminal.size()?.width;
-    let mut hide_thinking = runtime.legacy().settings().hide_thinking_block;
+    let mut hide_thinking = runtime.local_preferences().hide_thinking;
     let mut pending_setup: Option<SetupPrompt> = if runtime.needs_provider_setup() {
-        ProviderSetup::start(
-            None,
-            login_agents(runtime),
-            runtime.legacy().connected_providers(),
-        )
-        .ok()
-        .map(SetupPrompt::Provider)
+        ProviderSetup::start(None, login_agents(runtime), runtime.connected_providers())
+            .ok()
+            .map(SetupPrompt::Provider)
     } else if let Some(id) = &sign_in_first {
         ProviderSetup::start(
             Some(id),
             login_agents(runtime),
-            runtime.legacy().connected_providers(),
+            runtime.connected_providers(),
         )
         .ok()
         .map(SetupPrompt::Provider)
@@ -1803,37 +1796,19 @@ fn start_agent(
         Some(model) => format!("{id}/{model}"),
         None => id.clone(),
     });
-    let agents = Arc::clone(runtime.legacy().agents());
-    let forwarded = Arc::clone(&runtime.forwarded);
     let debug_log = runtime.debug_log_path.clone();
+    let tx_forward = tx.clone();
+    let start = runtime.subscription_start(pending, move |backend| {
+        forward_updates(backend.subscribe(), tx_forward, debug_log)
+    });
     let tx = tx.clone();
     let task_id = id.clone();
     tokio::spawn(async move {
-        let result = async {
-            // Subscribe before the session opens, so no update is missed.
-            let backend = agents.backend(&task_id).await?;
-            if forwarded
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(task_id.clone())
-            {
-                forward_updates(backend.subscribe(), tx.clone(), debug_log);
-            }
-            match pending {
-                PendingAgent::New { model, .. } => {
-                    agents.new_session(&task_id, model.as_deref()).await
-                }
-                PendingAgent::Resume(record) => agents.resume(&record).await,
-            }
-        }
-        .await
-        .map(|(backend, session)| (backend as Arc<dyn AgentBackend>, session))
-        .map_err(|e| format!("{e:#}"));
         let _ = tx.send(UiEvent::AgentReady {
             id: task_id,
             model,
             explicit,
-            result,
+            result: start.await,
         });
     });
     format!("starting {id}… (the first start can take a while)")
@@ -1841,37 +1816,10 @@ fn start_agent(
 
 /// `provider/model` specs for every signed-in subscription's models.
 fn subscription_models(runtime: &SurfaceClient) -> Vec<String> {
-    runtime
-        .legacy()
-        .agents()
-        .entries()
-        .iter()
-        .filter(|entry| runtime.legacy().agents().is_signed_in(&entry.id))
-        .flat_map(|entry| {
-            runtime
-                .legacy()
-                .agents()
-                .models(&entry.id)
-                .into_iter()
-                .map(move |model| format!("{}/{}", entry.id, model.id))
-        })
-        .collect()
+    runtime.subscription_models()
 }
-
-/// Subscriptions offered in the `/login` wizard.
 fn login_agents(runtime: &SurfaceClient) -> Vec<crate::provider_setup::AgentRow> {
-    runtime
-        .legacy()
-        .agents()
-        .entries()
-        .iter()
-        .filter(|entry| entry.needs_sign_in())
-        .map(|entry| crate::provider_setup::AgentRow {
-            id: entry.id.clone(),
-            label: entry.login_label().to_owned(),
-            configured: runtime.legacy().agents().is_signed_in(&entry.id),
-        })
-        .collect()
+    runtime.login_agents()
 }
 
 /// Forward the backend's updates into the UI loop, logging each when debug
@@ -2985,7 +2933,8 @@ async fn handle_key(
                         input,
                         chat,
                         status,
-                    );
+                    )
+                    .await;
                 }
                 SetupPrompt::Question(step) => {
                     let done = step_wizard(
@@ -3089,7 +3038,7 @@ async fn handle_key(
                         "interrupted".into()
                     };
                 } else if last_escape.elapsed() < Duration::from_millis(500) {
-                    match runtime.legacy().settings().double_escape_action.as_str() {
+                    match runtime.local_preferences().double_escape_action.as_str() {
                         "tree" => {
                             open_tree_picker(runtime, tree_picker, chat, status, *working).await;
                         }
@@ -4597,11 +4546,7 @@ fn finish_thinking(chat: &mut [ChatItem], streaming_thinking: &mut Option<usize>
 }
 
 fn active_agent_name(runtime: &SurfaceClient) -> Option<&str> {
-    runtime
-        .active_agent()
-        .as_deref()
-        .and_then(|id| runtime.legacy().agents().entry(id))
-        .map(|agent| agent.display_name())
+    runtime.active_agent_name()
 }
 
 fn take_reasoning_notice(
@@ -4738,7 +4683,7 @@ fn step_wizard<Step, Request>(
 
 /// Feed one answer to the `/tracing setup` wizard and apply the result.
 #[cfg(feature = "telemetry")]
-fn advance_tracing_setup(
+async fn advance_tracing_setup(
     step: TracingSetup,
     value: &str,
     runtime: &mut SurfaceClient,
@@ -4747,7 +4692,7 @@ fn advance_tracing_setup(
     chat: &mut Vec<ChatItem>,
     status: &mut String,
 ) {
-    let transition = step.submit(value, &runtime.legacy().settings().tracing);
+    let transition = step.submit(value, &runtime.tracing_settings());
     let Some(request) = step_wizard(
         transition,
         SetupPrompt::Tracing,
@@ -4758,10 +4703,15 @@ fn advance_tracing_setup(
     ) else {
         return;
     };
-    chat.push(match runtime.legacy_mut().setup_tracing(&request) {
-        Ok(state) => sys(format!("✓ {}", describe_tracing_status(&state))),
-        Err(err) => error_item(format!("tracing setup failed: {err:#}")),
-    });
+    chat.push(
+        match runtime
+            .tracing(loop_protocol::host::HostAction::Setup, Some(&request))
+            .await
+        {
+            Ok(state) => sys(format!("✓ {state}")),
+            Err(err) => error_item(format!("tracing setup failed: {err:#}")),
+        },
+    );
     *status = "ready".into();
 }
 
@@ -4800,10 +4750,10 @@ async fn advance_provider_setup(
                 "signing in to {} · finish in the browser that opens (the first start can take a while)",
                 agent.label
             )));
-            let agents = Arc::clone(runtime.legacy().agents());
+            let login = runtime.subscription_login(agent.id.clone());
             let tx = tx.clone();
             tokio::spawn(async move {
-                let note = match agents.sign_in(&agent.id).await {
+                let note = match login.await {
                     Ok(count) => Ok(format!(
                         "✓ Connected {} · {count} models — /model to choose one",
                         agent.label
@@ -4816,25 +4766,15 @@ async fn advance_provider_setup(
         }
     };
     *status = format!("login · connecting {}…", request.display_name());
-    let connected = match &request {
-        ProviderLoginRequest::WebSearch { id, api_key } => runtime
-            .legacy_mut()
-            .connect_web_search(id, api_key)
-            .await
-            .map(|name| {
-                chat.push(sys(format!("✓ Connected {name} · web_search enabled")));
-            }),
-        _ => runtime
-            .legacy_mut()
-            .connect_provider(&request)
-            .await
-            .map(|connected| {
-                chat.push(sys(format!(
-                    "✓ Connected {} · {} models — /model to choose one",
-                    connected.name, connected.model_count
-                )));
-            }),
-    };
+    let connected = runtime.connect_provider(&request).await.map(|connected| {
+        chat.push(sys(match connected.model_count {
+            Some(count) => format!(
+                "✓ Connected {} · {count} models — /model to choose one",
+                connected.name
+            ),
+            None => format!("✓ Connected {} · web_search enabled", connected.name),
+        }));
+    });
     match connected {
         Ok(()) => {
             *status = "ready · /help for commands".into();
@@ -4851,19 +4791,7 @@ async fn advance_provider_setup(
 /// `/logout [provider]`: returns the line to show in the transcript.
 async fn apply_logout(provider: Option<String>, runtime: &mut SurfaceClient) -> String {
     let Some(provider) = provider else {
-        let mut connected = runtime.legacy().connected_providers();
-        if let Some(provider) = runtime
-            .legacy()
-            .settings()
-            .web_search
-            .as_ref()
-            .and_then(|web| web.provider.clone())
-            .filter(|provider| !runtime.legacy().credentials().is_logged_out(provider))
-        {
-            if !connected.contains(&provider) {
-                connected.push(provider);
-            }
-        }
+        let connected = runtime.logout_choices();
         return if connected.is_empty() {
             "Usage: /logout <provider> · no providers are connected".into()
         } else {
@@ -4875,45 +4803,50 @@ async fn apply_logout(provider: Option<String>, runtime: &mut SurfaceClient) -> 
     };
     let provider = provider.trim().to_ascii_lowercase();
     if runtime.is_subscription(&provider) {
-        if runtime.active_agent().as_deref() == Some(provider.as_str()) {
-            runtime.use_native().await;
-        }
-        return match runtime.legacy().agents().sign_out(&provider).await {
+        return match runtime.subscription_logout(&provider).await {
             Ok(()) => format!("logged out: {provider}"),
             Err(err) => format!("logout: {err:#}"),
         };
     }
-    match runtime.legacy_mut().logout_provider(&provider).await {
-        Ok(name) => format!("logged out: {name} · {}", runtime.legacy().web_status()),
+    match runtime.logout_provider(&provider).await {
+        Ok((name, status)) => format!("logged out: {name} · {status}"),
         Err(err) => format!("logout: {err:#}"),
     }
 }
 
 /// `/tracing …`: returns the line to show in the transcript.
 #[cfg(feature = "telemetry")]
-fn apply_tracing_command(
+async fn apply_tracing_command(
     command: TracingCommand,
     runtime: &mut SurfaceClient,
     pending_setup: &mut Option<SetupPrompt>,
     input: &mut InputBuffer,
 ) -> String {
     let result = match command {
-        TracingCommand::Status => runtime
-            .legacy()
-            .tracing_status()
-            .ok_or_else(|| anyhow::anyhow!("tracing is not available in this mode")),
-        TracingCommand::Enable => runtime.legacy_mut().set_tracing_enabled(true),
-        TracingCommand::Disable => runtime.legacy_mut().set_tracing_enabled(false),
+        TracingCommand::Status => {
+            runtime
+                .tracing(loop_protocol::host::HostAction::Status, None)
+                .await
+        }
+        TracingCommand::Enable => {
+            runtime
+                .tracing(loop_protocol::host::HostAction::Enable, None)
+                .await
+        }
+        TracingCommand::Disable => {
+            runtime
+                .tracing(loop_protocol::host::HostAction::Disable, None)
+                .await
+        }
         TracingCommand::Setup { backend } => {
-            let (step, prefill) =
-                TracingSetup::start(backend, &runtime.legacy().settings().tracing);
+            let (step, prefill) = TracingSetup::start(backend, &runtime.tracing_settings());
             input.set(prefill);
             *pending_setup = Some(SetupPrompt::Tracing(step));
             return "tracing setup — follow the prompts below · esc cancels".into();
         }
     };
     match result {
-        Ok(state) => describe_tracing_status(&state),
+        Ok(state) => state,
         Err(err) => format!("tracing: {err:#}"),
     }
 }
@@ -4954,7 +4887,6 @@ async fn apply_effect(
                 let dirs = crate::theme::theme_search_dirs(
                     runtime.agent_dir(),
                     runtime
-                        .legacy()
                         .project_trusted()
                         .then_some(crate::config::paths::get_project_dir(runtime.cwd()))
                         .as_deref(),
@@ -4969,7 +4901,6 @@ async fn apply_effect(
             let dirs = crate::theme::theme_search_dirs(
                 runtime.agent_dir(),
                 runtime
-                    .legacy()
                     .project_trusted()
                     .then_some(crate::config::paths::get_project_dir(runtime.cwd()))
                     .as_deref(),
@@ -4977,8 +4908,7 @@ async fn apply_effect(
             match Theme::load(&name, &dirs) {
                 Ok(t) => {
                     runtime.set_theme(t);
-                    runtime.legacy_mut().settings_mut().theme = name.clone();
-                    let _ = runtime.legacy().save_settings();
+                    let _ = runtime.save_theme_preference(&name);
                     chat.push(sys(format!("theme → {name}")));
                     // Reprint scrollback so already-flushed messages pick up the new colors.
                     *redraw_request = true;
@@ -5066,12 +4996,7 @@ async fn apply_effect(
             ))),
         },
         CommandEffect::WebSearch(arg) => {
-            let result = match arg.as_deref() {
-                None => Ok(runtime.legacy().web_status()),
-                Some("on") => runtime.legacy_mut().set_web_enabled(true).await,
-                Some("off") => runtime.legacy_mut().set_web_enabled(false).await,
-                Some(provider) => runtime.legacy_mut().set_web_provider(provider).await,
-            };
+            let result = runtime.web_search(arg.as_deref()).await;
             match result {
                 Ok(line) => chat.push(sys(line)),
                 Err(err) => chat.push(error_item(format!("{err:#}"))),
@@ -5212,13 +5137,14 @@ async fn apply_effect(
                 runtime,
                 pending_setup,
                 input,
-            )));
+            )
+            .await));
         }
         CommandEffect::Login(provider) => {
             match ProviderSetup::start(
                 provider.as_deref(),
                 login_agents(runtime),
-                runtime.legacy().connected_providers(),
+                runtime.connected_providers(),
             ) {
                 Ok(step) => {
                     *pending_setup = Some(SetupPrompt::Provider(step));
@@ -5255,28 +5181,7 @@ async fn apply_effect(
         }
         CommandEffect::SetFileReview(arg) => match arg {
             None => {
-                let groups = runtime.review_grants();
-                let grants = [GROUP_FILE, GROUP_BASH, GROUP_WEB]
-                    .into_iter()
-                    .filter(|group| groups.contains(*group))
-                    .collect::<Vec<_>>();
-                let grants = if grants.is_empty() {
-                    "(none)".into()
-                } else {
-                    grants.join(", ")
-                };
-                let mut perms = String::new();
-                for (k, v) in &runtime.legacy().settings().tool_permissions {
-                    perms.push_str(&format!("\n    {k}: {v}"));
-                }
-                chat.push(sys(format!(
-                        "permission mode: {} (change it with /permissions)\n  session auto-approve: {grants}\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}",
-                        runtime.permission_mode().as_str(),
-                        runtime.legacy().settings()
-                            .diff_editor
-                            .as_deref()
-                            .unwrap_or("(auto: cursor|code)"),
-                    )));
+                chat.push(sys(runtime.review_report().await?));
             }
             Some(_) => {
                 chat.push(sys(
@@ -5285,47 +5190,45 @@ async fn apply_effect(
                 ));
             }
         },
-        CommandEffect::SetResponseHeaderTimeout(arg) => match arg {
+        CommandEffect::SetResponseHeaderTimeout(arg) => match arg.as_deref() {
             None => {
-                let ms = runtime
-                    .legacy()
-                    .harness()
-                    .response_header_timeout_ms()
-                    .await;
-                let label = if ms == 0 {
-                    "off (unlimited)".into()
-                } else if ms % 1000 == 0 {
-                    format!("{}s", ms / 1000)
-                } else {
-                    format!("{ms}ms")
-                };
-                chat.push(sys(format!(
-                        "response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000\n  settings.responseHeaderTimeoutMs: {} (0 = unlimited)",
-                        runtime.legacy().settings().response_header_timeout_ms
-                    )));
+                let timeout = runtime.ttfb(None).await?;
+                let ms = timeout.effective_ms;
+                let label = timeout_label(ms);
+                let default = runtime.timeout_default(None).await?;
+                chat.push(sys(format!("response header timeout (TTFB): {label}\n  /ttfb off|on|60s|120000|inherit\n  settings.responseHeaderTimeoutMs: {default} (0 = unlimited)\n  /ttfb default <duration> saves for new Sessions after confirmation")));
             }
-            Some(raw) => match parse_response_header_timeout(&raw) {
-                Ok(ms) => {
-                    runtime
-                        .legacy_mut()
-                        .settings_mut()
-                        .response_header_timeout_ms = ms;
-                    // The saved default; a Session override still wins.
-                    runtime.legacy().set_default_response_timeout(ms).await;
-                    let _ = runtime.legacy().save_settings();
-                    let label = if ms == 0 {
-                        "off (unlimited — for long-running workflows)".into()
-                    } else if ms % 1000 == 0 {
-                        format!("{}s", ms / 1000)
-                    } else {
-                        format!("{ms}ms")
-                    };
-                    chat.push(sys(format!("response header timeout → {label}")));
+            Some("inherit") => {
+                runtime.ttfb(Some(None)).await?;
+                chat.push(sys("response header timeout → inherited default"));
+            }
+            Some(raw) => {
+                let saving = raw.strip_prefix("default ");
+                match parse_response_header_timeout(saving.unwrap_or(raw)) {
+                    Ok(ms) if saving.is_some() => {
+                        if runtime.confirm_timeout_default(ms) {
+                            runtime.timeout_default(Some(ms)).await?;
+                            chat.push(sys(format!(
+                                "response header timeout default for new Sessions → {}",
+                                timeout_label(ms)
+                            )));
+                        } else {
+                            chat.push(sys(format!(
+                                "Run /ttfb default {} again to save this for new Sessions.",
+                                saving.unwrap()
+                            )));
+                        }
+                    }
+                    Ok(ms) => {
+                        runtime.ttfb(Some(Some(ms))).await?;
+                        chat.push(sys(format!(
+                            "response header timeout → {}",
+                            timeout_label(ms)
+                        )));
+                    }
+                    Err(error) => chat.push(sys(error)),
                 }
-                Err(e) => {
-                    chat.push(sys(e));
-                }
-            },
+            }
         },
         CommandEffect::Compact(instructions) => {
             if runtime.backend().compaction().is_none() {
@@ -5998,6 +5901,16 @@ fn external_edit(current: &str) -> anyhow::Result<String> {
         anyhow::bail!("editor exited with error");
     }
     Ok(std::fs::read_to_string(path)?)
+}
+
+fn timeout_label(ms: u64) -> String {
+    if ms == 0 {
+        "off (unlimited)".into()
+    } else if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 /// Parse `/ttfb` args: `off`/`0` → unlimited; `on` → 120s; `60s` / `120000` → ms.

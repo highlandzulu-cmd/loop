@@ -662,6 +662,28 @@ async fn read(
 /// one on a remote connection comes back Forbidden.
 #[async_trait]
 impl crate::control::RuntimeAdmin for RemoteBackend {
+    async fn providers(
+        &self,
+        p: loop_protocol::host::ProvidersParams,
+    ) -> BackendResult<loop_protocol::host::ProvidersResult> {
+        self.admin_call(|c| c.host_providers, methods::RUNTIME_PROVIDERS, &p)
+            .await
+    }
+    async fn tracing(
+        &self,
+        p: loop_protocol::host::TracingParams,
+    ) -> BackendResult<loop_protocol::host::TracingResult> {
+        self.admin_call(|c| c.host_tracing, methods::RUNTIME_TRACING, &p)
+            .await
+    }
+    async fn mcp_auth(
+        &self,
+        p: loop_protocol::host::McpAuthParams,
+    ) -> BackendResult<loop_protocol::host::McpAuthResult> {
+        self.admin_call(|c| c.host_mcp_auth, methods::RUNTIME_MCP_AUTH, &p)
+            .await
+    }
+
     async fn settings(&self, p: admin::SettingsParams) -> BackendResult<admin::SettingsResult> {
         self.admin_call(|c| c.workspace_settings, methods::WORKSPACE_SETTINGS, &p)
             .await

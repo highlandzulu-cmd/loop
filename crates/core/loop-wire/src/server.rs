@@ -249,6 +249,9 @@ async fn run(
                             capabilities.session_sandbox = offered.session_sandbox;
                             capabilities.permission_mode = offered.permission_mode;
                             capabilities.runtime_sessions = offered.runtime_sessions;
+                            capabilities.host_providers = offered.host_providers && host;
+                            capabilities.host_tracing = offered.host_tracing && host;
+                            capabilities.host_mcp_auth = offered.host_mcp_auth && host;
                             capabilities.host_usage = offered.host_usage && host;
                             capabilities.host_defaults = offered.host_defaults && host;
                             let result = InitializeResult {
@@ -607,11 +610,10 @@ async fn handle(
                 Err(error) => return conn.respond(id, Err(error)),
             }
         }
-        // Reserved host-only names; refused remotely before dispatch.
-        methods::RUNTIME_PROVIDERS | methods::RUNTIME_MCP_AUTH | methods::RUNTIME_TRACING => {
-            Err(loop_protocol::BackendError::Unsupported(method.into()))
-        }
-        methods::WORKSPACE_SETTINGS
+        methods::RUNTIME_PROVIDERS
+        | methods::RUNTIME_TRACING
+        | methods::RUNTIME_MCP_AUTH
+        | methods::WORKSPACE_SETTINGS
         | methods::WORKSPACE_MCP
         | methods::WORKSPACE_WEB_SEARCH
         | methods::WORKSPACE_SKILLS
@@ -809,6 +811,9 @@ async fn admin(
     params: Value,
 ) -> Result<BackendResult<Value>, (i64, String)> {
     let offered = match method {
+        methods::RUNTIME_PROVIDERS => capabilities.host_providers,
+        methods::RUNTIME_TRACING => capabilities.host_tracing,
+        methods::RUNTIME_MCP_AUTH => capabilities.host_mcp_auth,
         methods::WORKSPACE_SETTINGS => capabilities.workspace_settings,
         methods::WORKSPACE_MCP => capabilities.workspace_mcp,
         methods::WORKSPACE_WEB_SEARCH => capabilities.workspace_web_search,
@@ -826,6 +831,9 @@ async fn admin(
         return Ok(Err(loop_protocol::BackendError::Unsupported(method.into())));
     };
     Ok(match method {
+        methods::RUNTIME_PROVIDERS => admin.providers(parse(params)?).await.map(|r| to_value(&r)),
+        methods::RUNTIME_TRACING => admin.tracing(parse(params)?).await.map(|r| to_value(&r)),
+        methods::RUNTIME_MCP_AUTH => admin.mcp_auth(parse(params)?).await.map(|r| to_value(&r)),
         methods::WORKSPACE_SETTINGS => admin.settings(parse(params)?).await.map(|r| to_value(&r)),
         methods::WORKSPACE_MCP => admin.mcp(parse(params)?).await.map(|r| to_value(&r)),
         methods::WORKSPACE_WEB_SEARCH => {

@@ -1,5 +1,6 @@
 //! Native implementation of the same typed admin requests used by a Runtime.
 use super::*;
+use loop_protocol::host::*;
 use loop_protocol::{admin::*, BackendError, BackendResult, Capabilities, ErrorCategory};
 use loop_wire::RuntimeAdmin;
 
@@ -26,6 +27,11 @@ impl NativeAdmin<'_> {
 impl RuntimeAdmin for NativeAdmin<'_> {
     fn offered(&self) -> Capabilities {
         Capabilities {
+            host_providers: true,
+            host_mcp_auth: true,
+            host_tracing: cfg!(feature = "telemetry"),
+            host_defaults: true,
+            workspace_web_search: true,
             workspace_mcp: true,
             workspace_settings: true,
             runtime_sessions: true,
@@ -37,6 +43,231 @@ impl RuntimeAdmin for NativeAdmin<'_> {
             permission_mode: true,
             ..Default::default()
         }
+    }
+    async fn providers(&self, p: ProvidersParams) -> BackendResult<ProvidersResult> {
+        let mut guard = self.0.lock().await;
+        let r = &mut **guard;
+        let mut result = ProvidersResult::default();
+        match p.action {
+            HostAction::List => {
+                result.providers = r
+                    .connected_providers()
+                    .into_iter()
+                    .map(|id| ProviderInfo {
+                        name: id.clone(),
+                        id,
+                        connected: true,
+                        model_count: None,
+                    })
+                    .collect();
+            }
+            HostAction::Connect => {
+                let login: crate::config::ProviderLoginRequest = serde_json::from_value(
+                    p.login.ok_or_else(|| failed("missing provider login"))?,
+                )
+                .map_err(failed)?;
+                let (id, name, count) = match &login {
+                    crate::config::ProviderLoginRequest::WebSearch { id, api_key } => (
+                        id.clone(),
+                        r.connect_web_search(id, api_key).await.map_err(failed)?,
+                        None,
+                    ),
+                    _ => {
+                        let connected = r.connect_provider(&login).await.map_err(failed)?;
+                        (
+                            login.provider_id(),
+                            connected.name,
+                            Some(connected.model_count),
+                        )
+                    }
+                };
+                result.providers.push(ProviderInfo {
+                    id,
+                    name,
+                    connected: true,
+                    model_count: count,
+                });
+            }
+            HostAction::Disconnect => {
+                let id = p.provider.ok_or_else(|| failed("missing provider name"))?;
+                let name = r.logout_provider(&id).await.map_err(failed)?;
+                result.providers.push(ProviderInfo {
+                    id,
+                    name,
+                    connected: false,
+                    model_count: None,
+                });
+                result.notices.push(r.web_status());
+            }
+            _ => return Err(failed("use list, connect or disconnect")),
+        }
+        Ok(result)
+    }
+    #[cfg(feature = "telemetry")]
+    async fn tracing(&self, p: TracingParams) -> BackendResult<TracingResult> {
+        let mut guard = self.0.lock().await;
+        let r = &mut **guard;
+        let state = match p.action {
+            HostAction::Status => r
+                .tracing_status()
+                .ok_or_else(|| failed("tracing is not available in this mode"))?,
+            HostAction::Enable => r.set_tracing_enabled(true).map_err(failed)?,
+            HostAction::Disable => r.set_tracing_enabled(false).map_err(failed)?,
+            HostAction::Setup => {
+                let setup = serde_json::from_value(
+                    p.config.ok_or_else(|| failed("missing tracing setup"))?,
+                )
+                .map_err(failed)?;
+                r.setup_tracing(&setup).map_err(failed)?
+            }
+            _ => return Err(failed("use status, enable, disable or setup")),
+        };
+        Ok(TracingResult {
+            enabled: r.settings.tracing.enabled,
+            backend: format!("{:?}", r.settings.tracing.backend),
+            status: crate::config::describe_tracing_status(&state),
+        })
+    }
+    async fn mcp_auth(&self, p: McpAuthParams) -> BackendResult<McpAuthResult> {
+        let guard = self.0.lock().await;
+        let r = &**guard;
+        Self::workspace(r, &p.workspace_id)?;
+        let cfg =
+            r.settings.mcp_servers.get(&p.name).ok_or_else(|| {
+                failed(format!("mcp server not found: {} (see /mcp list)", p.name))
+            })?;
+        let status = match p.action {
+            HostAction::Logout => {
+                if r.mcp_client
+                    .clear_oauth_credentials(&p.name)
+                    .await
+                    .map_err(failed)?
+                {
+                    r.mcp_client.disconnect(&p.name).await;
+                    r.refresh_mcp_tools().await.map_err(failed)?;
+                    "removed"
+                } else {
+                    "absent"
+                }
+            }
+            HostAction::Login => {
+                let url = cfg
+                    .url
+                    .as_deref()
+                    .ok_or_else(|| failed("local command servers do not use OAuth"))?;
+                let result = r
+                    .mcp_client
+                    .oauth_login(&p.name, url, |url| {
+                        let _ = crate::app::open_link(url);
+                    })
+                    .await
+                    .map_err(failed)?;
+                match result {
+                    loop_mcp::OAuthLoginOutcome::Authorized => "authorized",
+                    loop_mcp::OAuthLoginOutcome::NotRequired => "not_required",
+                }
+            }
+            _ => return Err(failed("use login or logout")),
+        };
+        Ok(McpAuthResult {
+            status: status.into(),
+            notices: vec![],
+        })
+    }
+    async fn web_search(&self, p: WebSearchParams) -> BackendResult<WebSearchResult> {
+        let mut guard = self.0.lock().await;
+        let r = &mut **guard;
+        Self::workspace(r, &p.workspace_id)?;
+        let status = if let Some(provider) = p.provider {
+            r.set_web_provider(&provider).await.map_err(failed)?
+        } else if let Some(enabled) = p.enabled {
+            r.set_web_enabled(enabled).await.map_err(failed)?
+        } else {
+            r.web_status()
+        };
+        Ok(WebSearchResult {
+            enabled: !r.web_disabled_for_run,
+            provider: r
+                .settings
+                .web_search
+                .as_ref()
+                .and_then(|w| w.provider.clone()),
+            status,
+            ..Default::default()
+        })
+    }
+    async fn defaults(&self, p: DefaultsParams) -> BackendResult<DefaultsResult> {
+        let mut guard = self.0.lock().await;
+        let r = &mut **guard;
+        if let Some(id) = p.workspace_id {
+            Self::workspace(r, &id)?;
+        }
+        let path = crate::config::paths::settings_path(&r.agent_dir);
+        let mut global = crate::config::Settings::load_file(&path).map_err(failed)?;
+        if let Some(patch) = p.patch {
+            let mut native_model = None;
+            if let Some(spec) = &patch.model {
+                let (provider, id) = spec
+                    .split_once('/')
+                    .ok_or_else(|| failed("choose a model as provider/model"))?;
+                if r.is_subscription(provider) {
+                    if !r.agents.models(provider).iter().any(|m| m.id == id) {
+                        return Err(failed("subscription model not found"));
+                    }
+                } else {
+                    use loop_ai::CredentialStore;
+                    if r.credentials.is_logged_out(provider) {
+                        return Err(failed(format!(
+                            "{provider} is logged out; run /login {provider}"
+                        )));
+                    }
+                    native_model = Some(
+                        r.models
+                            .get_model(provider, id)
+                            .ok_or_else(|| failed("model not found"))?,
+                    );
+                }
+                global.set_selected_model(provider, id);
+            }
+            if let Some(effort) = &patch.effort {
+                if r.active_agent.is_none()
+                    && !loop_agent::effort::NATIVE_EFFORTS.contains(&effort.as_str())
+                {
+                    return Err(failed("unknown effort"));
+                }
+                global.default_thinking_level = effort.clone();
+            }
+            if let Some(ms) = patch.response_header_timeout_ms {
+                global.response_header_timeout_ms = ms;
+            }
+            global.save_file(&path).map_err(failed)?;
+            r.settings.default_provider = global.default_provider.clone();
+            r.settings.default_model = global.default_model.clone();
+            r.settings.default_thinking_level = global.default_thinking_level.clone();
+            r.settings.response_header_timeout_ms = global.response_header_timeout_ms;
+            if let Some(model) = native_model {
+                r.native.set_default_model(Some(model));
+            }
+            if let Some(effort) = patch.effort {
+                if let Some(agent) = &r.active_agent {
+                    if !effort.is_empty() {
+                        r.agents.remember_effort(agent, &effort).map_err(failed)?;
+                    }
+                } else {
+                    r.native
+                        .set_default_effort(loop_agent::effort::parse_thinking(&effort));
+                }
+            }
+            if let Some(ms) = patch.response_header_timeout_ms {
+                r.native.set_default_response_timeout(ms).await;
+            }
+        }
+        Ok(DefaultsResult {
+            model: global.selected_model().map(|(p, m)| format!("{p}/{m}")),
+            effort: Some(global.default_thinking_level),
+            response_header_timeout_ms: Some(global.response_header_timeout_ms),
+            ..Default::default()
+        })
     }
     async fn settings(&self, p: SettingsParams) -> BackendResult<SettingsResult> {
         let guard = self.0.lock().await;

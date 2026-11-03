@@ -12,6 +12,7 @@ pub mod backend;
 mod capabilities;
 mod content;
 mod error;
+pub mod host;
 mod ids;
 mod interaction;
 pub mod rpc;

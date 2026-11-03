@@ -45,6 +45,9 @@ fn admin_flags() -> Capabilities {
         workspace_trust: true,
         session_sandbox: true,
         permission_mode: true,
+        host_providers: true,
+        host_tracing: true,
+        host_mcp_auth: true,
         host_usage: true,
         host_defaults: true,
         ..Capabilities::default()
@@ -150,6 +153,45 @@ fn known(workspace_id: &str) -> BackendResult<()> {
 
 #[async_trait]
 impl RuntimeAdmin for Fake {
+    async fn providers(
+        &self,
+        p: loop_protocol::host::ProvidersParams,
+    ) -> BackendResult<loop_protocol::host::ProvidersResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(p.action, loop_protocol::host::HostAction::List);
+        Ok(loop_protocol::host::ProvidersResult {
+            providers: vec![loop_protocol::host::ProviderInfo {
+                id: "faux".into(),
+                name: "Faux".into(),
+                connected: true,
+                model_count: Some(2),
+            }],
+            notices: vec![],
+        })
+    }
+    async fn tracing(
+        &self,
+        _p: loop_protocol::host::TracingParams,
+    ) -> BackendResult<loop_protocol::host::TracingResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(loop_protocol::host::TracingResult {
+            enabled: false,
+            backend: "otlp".into(),
+            status: "disabled".into(),
+        })
+    }
+    async fn mcp_auth(
+        &self,
+        p: loop_protocol::host::McpAuthParams,
+    ) -> BackendResult<loop_protocol::host::McpAuthResult> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        known(&p.workspace_id)?;
+        Ok(loop_protocol::host::McpAuthResult {
+            status: "absent".into(),
+            notices: vec![],
+        })
+    }
+
     fn offered(&self) -> Capabilities {
         admin_flags()
     }
@@ -327,7 +369,7 @@ async fn admin_is_the_same_over_the_wire_on_a_host_local_connection() {
             .await
             .unwrap();
         assert_eq!(saved.response_header_timeout_ms, Some(0));
-        // Reserved host-only names are not served, even host-locally.
+        // Offered host methods validate their typed parameters.
         let conn = raw(served(&fake, Authority::HostLocal)).await;
         for method in [
             methods::RUNTIME_PROVIDERS,
@@ -336,10 +378,47 @@ async fn admin_is_the_same_over_the_wire_on_a_host_local_connection() {
         ] {
             assert!(
                 matches!(conn.request(method, json!({})).await, Err(RpcError::Remote { code, .. })
-                    if code == loop_protocol::rpc::error_codes::UNSUPPORTED),
+                    if code == -32602),
                 "{method}"
             );
         }
+        use loop_protocol::host::*;
+        assert_eq!(
+            remote
+                .providers(ProvidersParams {
+                    action: HostAction::List,
+                    provider: None,
+                    login: None
+                })
+                .await
+                .unwrap()
+                .providers[0]
+                .id,
+            "faux"
+        );
+        assert_eq!(
+            remote
+                .tracing(TracingParams {
+                    action: HostAction::Status,
+                    config: None
+                })
+                .await
+                .unwrap()
+                .status,
+            "disabled"
+        );
+        assert_eq!(
+            remote
+                .mcp_auth(McpAuthParams {
+                    workspace_id: "w1".into(),
+                    action: HostAction::Logout,
+                    name: "test".into()
+                })
+                .await
+                .unwrap()
+                .status,
+            "absent"
+        );
         // A service the owner does not serve answers Unsupported.
         assert!(matches!(
             remote
@@ -394,7 +473,13 @@ async fn a_remote_connection_is_refused_host_only_methods_before_any_service_run
         .unwrap();
         // Host-only flags are not advertised remotely; workspace ones are.
         let offered = remote.capabilities();
-        assert!(!offered.host_usage && !offered.host_defaults);
+        assert!(
+            !offered.host_usage
+                && !offered.host_defaults
+                && !offered.host_providers
+                && !offered.host_tracing
+                && !offered.host_mcp_auth
+        );
         assert!(offered.workspace_reload && offered.workspace_trust);
 
         let conn = raw(served(&fake, Authority::Remote)).await;

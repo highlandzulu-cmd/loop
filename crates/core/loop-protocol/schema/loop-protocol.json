@@ -116,6 +116,18 @@
           "description": "Reads and saves new-Session defaults (`runtime/defaults`); host-local only.",
           "type": "boolean"
         },
+        "host_mcp_auth": {
+          "description": "MCP OAuth credentials; host-local only.",
+          "type": "boolean"
+        },
+        "host_providers": {
+          "description": "Provider credentials; host-local only.",
+          "type": "boolean"
+        },
+        "host_tracing": {
+          "description": "Telemetry configuration; host-local only.",
+          "type": "boolean"
+        },
         "host_usage": {
           "description": "Pages the host's usage log (`runtime/usage`); host-local only.",
           "type": "boolean"
@@ -862,6 +874,56 @@
       ],
       "type": "object"
     },
+    "HostAction": {
+      "description": "Requested host operation; each service validates its own allowed actions.",
+      "oneOf": [
+        {
+          "const": "list",
+          "description": "Read connected providers.",
+          "type": "string"
+        },
+        {
+          "const": "connect",
+          "description": "Verify and connect a provider.",
+          "type": "string"
+        },
+        {
+          "const": "disconnect",
+          "description": "Disconnect a provider.",
+          "type": "string"
+        },
+        {
+          "const": "status",
+          "description": "Read telemetry state.",
+          "type": "string"
+        },
+        {
+          "const": "enable",
+          "description": "Enable telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "disable",
+          "description": "Disable telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "setup",
+          "description": "Configure telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "login",
+          "description": "Start MCP OAuth.",
+          "type": "string"
+        },
+        {
+          "const": "logout",
+          "description": "Remove MCP OAuth credentials.",
+          "type": "string"
+        }
+      ]
+    },
     "ImportParams": {
       "description": "Import bytes into a known host workspace, never a supplied host path.",
       "properties": {
@@ -1389,6 +1451,50 @@
       },
       "required": [
         "session"
+      ],
+      "type": "object"
+    },
+    "McpAuthParams": {
+      "description": "Host MCP OAuth request.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Login or logout."
+        },
+        "name": {
+          "description": "Configured server name.",
+          "type": "string"
+        },
+        "workspace_id": {
+          "description": "Opaque workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "action",
+        "name"
+      ],
+      "type": "object"
+    },
+    "McpAuthResult": {
+      "description": "Host MCP OAuth result.",
+      "properties": {
+        "notices": {
+          "description": "Public status messages.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "description": "Authorized, not_required, removed or absent.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "notices"
       ],
       "type": "object"
     },
@@ -1928,6 +2034,85 @@
       },
       "required": [
         "stop"
+      ],
+      "type": "object"
+    },
+    "ProviderInfo": {
+      "description": "A provider's public connection state.",
+      "properties": {
+        "connected": {
+          "description": "Credentials are connected.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Stable provider id.",
+          "type": "string"
+        },
+        "model_count": {
+          "description": "Models found during connect, when known.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "connected"
+      ],
+      "type": "object"
+    },
+    "ProvidersParams": {
+      "description": "Provider request. Login payloads are never part of Session history or Debug output.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Operation."
+        },
+        "login": {
+          "description": "Validated provider setup payload; may contain secrets."
+        },
+        "provider": {
+          "description": "Provider identity for disconnect.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "ProvidersResult": {
+      "description": "Redacted provider result.",
+      "properties": {
+        "notices": {
+          "description": "Status notices, without credentials.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "providers": {
+          "description": "Public provider rows.",
+          "items": {
+            "$ref": "#/$defs/ProviderInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "providers",
+        "notices"
       ],
       "type": "object"
     },
@@ -3834,6 +4019,45 @@
       ],
       "type": "object"
     },
+    "TracingParams": {
+      "description": "Host telemetry operation; setup payloads may contain credentials.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Operation."
+        },
+        "config": {
+          "description": "Validated setup payload."
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "TracingResult": {
+      "description": "Redacted telemetry state.",
+      "properties": {
+        "backend": {
+          "description": "Chosen backend.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Enabled preference.",
+          "type": "boolean"
+        },
+        "status": {
+          "description": "Human-readable redacted status.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "enabled",
+        "backend",
+        "status"
+      ],
+      "type": "object"
+    },
     "TreeEntry": {
       "description": "One tree row, including its branch membership and editable user text.",
       "properties": {
@@ -4703,6 +4927,28 @@
         "$ref": "#/$defs/DefaultsResult"
       }
     },
+    "runtime/mcp_auth": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/McpAuthParams"
+      },
+      "result": {
+        "$ref": "#/$defs/McpAuthResult"
+      }
+    },
+    "runtime/providers": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ProvidersParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProvidersResult"
+      }
+    },
     "runtime/sessions": {
       "direction": "client_to_server",
       "kind": "request",
@@ -4732,6 +4978,17 @@
       },
       "result": {
         "type": "object"
+      }
+    },
+    "runtime/tracing": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TracingParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TracingResult"
       }
     },
     "runtime/usage": {

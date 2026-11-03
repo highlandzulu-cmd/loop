@@ -182,6 +182,28 @@ pub trait RuntimeControl: Send + Sync {
 /// host-only calls without host-local authority before calling these.
 #[async_trait]
 pub trait RuntimeAdmin: Send + Sync {
+    /// Host-only provider credential management.
+    async fn providers(
+        &self,
+        _p: loop_protocol::host::ProvidersParams,
+    ) -> BackendResult<loop_protocol::host::ProvidersResult> {
+        Err(BackendError::Unsupported("runtime/providers".into()))
+    }
+    /// Host-only telemetry configuration.
+    async fn tracing(
+        &self,
+        _p: loop_protocol::host::TracingParams,
+    ) -> BackendResult<loop_protocol::host::TracingResult> {
+        Err(BackendError::Unsupported("runtime/tracing".into()))
+    }
+    /// Host-only MCP OAuth.
+    async fn mcp_auth(
+        &self,
+        _p: loop_protocol::host::McpAuthParams,
+    ) -> BackendResult<loop_protocol::host::McpAuthResult> {
+        Err(BackendError::Unsupported("runtime/mcp_auth".into()))
+    }
+
     /// Redacted workspace settings.
     async fn settings(
         &self,

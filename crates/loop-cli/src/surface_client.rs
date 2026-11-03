@@ -28,6 +28,7 @@ pub use legacy::LegacyHost;
 /// ```
 pub struct SurfaceClient {
     host: LegacyHost,
+    confirm_timeout_default: Option<u64>,
     sessions: Arc<dyn RuntimeControl>,
     native_sessions: Arc<native_sessions::NativeSessions>,
     native_backend: Arc<dyn AgentBackend>,
@@ -120,6 +121,7 @@ impl From<CliRuntime> for SurfaceClient {
             native_backend: native,
             workspace_id,
             host: LegacyHost { inner },
+            confirm_timeout_default: None,
             keybindings,
             debug,
             debug_log_path,
@@ -615,34 +617,28 @@ impl SurfaceClient {
     /// Today this writes the host settings in process. Over a Runtime it is
     /// `runtime/defaults` ([`save_defaults_on`]), which is host-only.
     pub async fn save_defaults(&mut self) -> anyhow::Result<String> {
+        use loop_wire::RuntimeAdmin;
         let effort = self.session_effort().await?;
-        let label = match self.active_agent().clone() {
-            None => {
-                let model = self
-                    .selected_model()
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("choose a model first: /model"))?;
-                let inner = &mut self.host.inner;
-                inner.settings.default_thinking_level = effort.clone();
-                inner
-                    .native
-                    .set_default_effort(loop_agent::effort::parse_thinking(&effort));
-                // Saves the settings file too.
-                inner.remember_model(&model.provider, &model.id)?;
-                format!("{}/{}", model.provider, model.id)
-            }
-            Some(id) => {
-                let model = self.agent_model().clone();
-                let inner = &mut self.host.inner;
-                if let Some(model) = &model {
-                    inner.remember_model(&id, model)?;
-                }
-                if !effort.is_empty() {
-                    inner.agents.remember_effort(&id, &effort)?;
-                }
-                model.map_or(id.clone(), |m| format!("{id}/{m}"))
-            }
+        let model = match self.active_agent() {
+            Some(id) => self.agent_model().as_ref().map(|m| format!("{id}/{m}")),
+            None => self.selected_model_spec(),
         };
+        if model.is_none() && self.active_agent().is_none() {
+            anyhow::bail!("choose a model first: /model");
+        }
+        self.admin()
+            .defaults(loop_protocol::admin::DefaultsParams {
+                patch: Some(loop_protocol::admin::DefaultsPatch {
+                    model: model.clone(),
+                    effort: Some(effort.clone()),
+                    response_header_timeout_ms: None,
+                }),
+                ..Default::default()
+            })
+            .await?;
+        let label = model
+            .or_else(|| self.active_agent().clone())
+            .unwrap_or_default();
         Ok(if effort.is_empty() {
             label
         } else {
@@ -1572,3 +1568,260 @@ impl SurfaceClient {
         Ok(format!("settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  permissionMode: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}\n  Theme and UI preferences are Surface-local.", crate::config::paths::settings_path(self.agent_dir()).display(), config.config.model.unwrap_or_else(|| "none".into()), self.theme().name, config.config.effort.unwrap_or(settings.default_thinking_level), settings.sandbox.display(), self.permission_mode().as_str(), settings.diff_editor.as_deref().unwrap_or("(auto)"), settings.response_header_timeout_ms, if settings.response_header_timeout_ms == 0 { " (off)" } else { "" }, self.host.inner.settings.ui_mode))
     }
 }
+
+/// Surface-owned preferences, kept apart from effective host settings.
+#[derive(Clone)]
+pub struct UiPreferences {
+    pub hide_thinking: bool,
+    pub double_escape_action: String,
+}
+impl SurfaceClient {
+    pub fn local_preferences(&self) -> UiPreferences {
+        UiPreferences {
+            hide_thinking: self.host.inner.settings.hide_thinking_block,
+            double_escape_action: self.host.inner.settings.double_escape_action.clone(),
+        }
+    }
+    pub fn save_theme_preference(&mut self, name: &str) -> anyhow::Result<()> {
+        let path = crate::config::paths::settings_path(self.agent_dir());
+        let mut local = crate::config::Settings::load_file(&path)?;
+        local.theme = name.into();
+        local.save_file(&path)?;
+        self.host.inner.settings.theme = name.into();
+        Ok(())
+    }
+    pub fn agent_signed_in(&self, id: &str) -> bool {
+        self.host.inner.agents.is_signed_in(id)
+    }
+    pub fn active_agent_name(&self) -> Option<&str> {
+        self.active_agent()
+            .as_deref()
+            .and_then(|id| self.host.inner.agents.entry(id))
+            .map(|e| e.display_name())
+    }
+    pub fn subscription_models(&self) -> Vec<String> {
+        let agents = &self.host.inner.agents;
+        agents
+            .entries()
+            .iter()
+            .filter(|e| agents.is_signed_in(&e.id))
+            .flat_map(|e| {
+                agents
+                    .models(&e.id)
+                    .into_iter()
+                    .map(move |m| format!("{}/{}", e.id, m.id))
+            })
+            .collect()
+    }
+    pub fn login_agents(&self) -> Vec<crate::provider_setup::AgentRow> {
+        let agents = &self.host.inner.agents;
+        agents
+            .entries()
+            .iter()
+            .filter(|e| e.needs_sign_in())
+            .map(|e| crate::provider_setup::AgentRow {
+                id: e.id.clone(),
+                label: e.login_label().into(),
+                configured: agents.is_signed_in(&e.id),
+            })
+            .collect()
+    }
+    pub fn connected_providers(&self) -> Vec<String> {
+        self.host.inner.connected_providers()
+    }
+    pub fn logout_choices(&self) -> Vec<String> {
+        use loop_ai::CredentialStore;
+        let mut connected = self.connected_providers();
+        if let Some(provider) = self
+            .host
+            .inner
+            .settings
+            .web_search
+            .as_ref()
+            .and_then(|w| w.provider.clone())
+            .filter(|p| !self.host.inner.credentials.is_logged_out(p))
+        {
+            if !connected.contains(&provider) {
+                connected.push(provider);
+            }
+        }
+        connected
+    }
+    pub fn subscription_start(
+        &self,
+        pending: PendingAgent,
+        forward: impl FnOnce(&dyn AgentBackend) + Send + 'static,
+    ) -> SubscriptionStart
+    {
+        let agents = self.host.inner.agents.clone();
+        let forwarded = self.forwarded.clone();
+        Box::pin(async move {
+            let id = match &pending {
+                PendingAgent::New { id, .. } => id.clone(),
+                PendingAgent::Resume(r) => r.agent.clone(),
+            };
+            let backend = agents.backend(&id).await.map_err(|e| format!("{e:#}"))?;
+            if forwarded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.clone())
+            {
+                forward(backend.as_ref());
+            }
+            let result = match pending {
+                PendingAgent::New { model, .. } => agents.new_session(&id, model.as_deref()).await,
+                PendingAgent::Resume(r) => agents.resume(&r).await,
+            };
+            result
+                .map(|(backend, session)| (backend as Arc<dyn AgentBackend>, session))
+                .map_err(|e| format!("{e:#}"))
+        })
+    }
+    pub fn subscription_login(
+        &self,
+        id: String,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<usize>> {
+        let agents = self.host.inner.agents.clone();
+        Box::pin(async move { agents.sign_in(&id).await })
+    }
+    pub async fn subscription_logout(&mut self, id: &str) -> anyhow::Result<()> {
+        if self.active_agent().as_deref() == Some(id) {
+            self.use_native().await;
+        }
+        self.host.inner.agents.sign_out(id).await
+    }
+    pub async fn connect_provider(
+        &mut self,
+        request: &crate::config::ProviderLoginRequest,
+    ) -> anyhow::Result<loop_protocol::host::ProviderInfo> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::host::ProvidersParams {
+            action: loop_protocol::host::HostAction::Connect,
+            provider: None,
+            login: Some(serde_json::to_value(request)?),
+        };
+        self.admin()
+            .providers(p)
+            .await?
+            .providers
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("provider returned no connection state"))
+    }
+    pub async fn logout_provider(&mut self, id: &str) -> anyhow::Result<(String, String)> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::host::ProvidersParams {
+            action: loop_protocol::host::HostAction::Disconnect,
+            provider: Some(id.into()),
+            login: None,
+        };
+        let result = self.admin().providers(p).await?;
+        Ok((
+            result
+                .providers
+                .into_iter()
+                .next()
+                .map_or_else(|| id.into(), |p| p.name),
+            result.notices.join(" · "),
+        ))
+    }
+    pub async fn web_search(&mut self, arg: Option<&str>) -> anyhow::Result<String> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::admin::WebSearchParams {
+            workspace_id: self.workspace_id.clone(),
+            enabled: match arg {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                _ => None,
+            },
+            provider: arg
+                .filter(|a| *a != "on" && *a != "off")
+                .map(str::to_string),
+            expected_revision: None,
+        };
+        Ok(self.admin().web_search(p).await?.status)
+    }
+    #[cfg(feature = "telemetry")]
+    pub fn tracing_settings(&self) -> crate::config::TracingSettings {
+        self.host.inner.settings.tracing.clone()
+    }
+    #[cfg(feature = "telemetry")]
+    pub async fn tracing(
+        &mut self,
+        action: loop_protocol::host::HostAction,
+        config: Option<&crate::config::TracingSetupRequest>,
+    ) -> anyhow::Result<String> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::host::TracingParams {
+            action,
+            config: config.map(serde_json::to_value).transpose()?,
+        };
+        Ok(self.admin().tracing(p).await?.status)
+    }
+    pub async fn ttfb(
+        &self,
+        change: Option<Option<u64>>,
+    ) -> anyhow::Result<loop_protocol::rpc::TtfbResult> {
+        let control = self
+            .backend()
+            .model_control()
+            .ok_or_else(|| anyhow::anyhow!("this agent does not offer response-timeout control"))?;
+        Ok(control.ttfb(&self.session_ref(), change, None).await?)
+    }
+    pub async fn timeout_default(&mut self, value: Option<u64>) -> anyhow::Result<u64> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::admin::DefaultsParams {
+            patch: value.map(|ms| loop_protocol::admin::DefaultsPatch {
+                response_header_timeout_ms: Some(ms),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(self
+            .admin()
+            .defaults(p)
+            .await?
+            .response_header_timeout_ms
+            .unwrap_or(0))
+    }
+    pub async fn review_report(&mut self) -> anyhow::Result<String> {
+        let view = self.effective_settings().await?;
+        let settings: crate::config::Settings = serde_json::from_value(view.effective)?;
+        let groups = self.review_grants();
+        let grants = [
+            crate::tool_approval::GROUP_FILE,
+            crate::tool_approval::GROUP_BASH,
+            crate::tool_approval::GROUP_WEB,
+        ]
+        .into_iter()
+        .filter(|g| groups.contains(*g))
+        .collect::<Vec<_>>();
+        let grants = if grants.is_empty() {
+            "(none)".into()
+        } else {
+            grants.join(", ")
+        };
+        let mut perms = String::new();
+        for (k, v) in settings.tool_permissions {
+            perms.push_str(&format!("\n    {k}: {v}"));
+        }
+        Ok(format!("permission mode: {} (change it with /permissions)\n  session auto-approve: {grants}\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}", self.permission_mode().as_str(), settings.diff_editor.as_deref().unwrap_or("(auto: cursor|code)")))
+    }
+}
+
+impl SurfaceClient {
+    pub fn confirm_timeout_default(&mut self, ms: u64) -> bool {
+        if self.confirm_timeout_default.take() == Some(ms) {
+            true
+        } else {
+            self.confirm_timeout_default = Some(ms);
+            false
+        }
+    }
+}
+
+/// An in-process subscription backend and its opened Session.
+pub type SubscriptionSession = (Arc<dyn AgentBackend>, SessionRef);
+/// Subscription admission, with updates forwarded before the Session opens.
+pub type SubscriptionStart =
+    futures::future::BoxFuture<'static, Result<SubscriptionSession, String>>;

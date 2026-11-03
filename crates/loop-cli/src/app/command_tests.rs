@@ -1050,3 +1050,90 @@ async fn session_settings_and_usage_commands_keep_their_reports_and_local_state(
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn login_logout_websearch_and_timeout_keep_their_help_and_status() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::Login(Some("custom".into())))
+            .await;
+        assert!(matches!(ui.setup, Some(SetupPrompt::Provider(_))));
+        ui.effect(&mut runtime, CommandEffect::Logout(None)).await;
+        assert!(ui.text().contains("Usage: /logout <provider>"));
+        ui.effect(&mut runtime, CommandEffect::WebSearch(None))
+            .await;
+        assert!(ui.text().contains("web"));
+        ui.effect(&mut runtime, CommandEffect::WebSearch(Some("off".into())))
+            .await;
+        assert!(ui.text().contains("off"));
+        ui.effect(&mut runtime, CommandEffect::SetResponseHeaderTimeout(None))
+            .await;
+        assert!(ui.text().contains("response header timeout (TTFB):"));
+        #[cfg(feature = "telemetry")]
+        {
+            ui.effect(&mut runtime, CommandEffect::Tracing(TracingCommand::Status))
+                .await;
+            assert!(ui.text().contains("tracing is not available"));
+            ui.effect(
+                &mut runtime,
+                CommandEffect::Tracing(TracingCommand::Setup { backend: None }),
+            )
+            .await;
+            assert!(matches!(ui.setup, Some(SetupPrompt::Tracing(_))));
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn timeout_changes_stay_in_session_and_saving_defaults_requires_confirmation() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SetResponseHeaderTimeout(Some("off".into())),
+        )
+        .await;
+        let value = runtime
+            .backend()
+            .model_control()
+            .unwrap()
+            .ttfb(&runtime.session_ref(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(value.override_ms, Some(0));
+        assert!(!crate::config::paths::settings_path(dir.path()).exists());
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SetResponseHeaderTimeout(Some("default 60s".into())),
+        )
+        .await;
+        assert!(ui.text().contains("again to save"));
+        assert!(!crate::config::paths::settings_path(dir.path()).exists());
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SetResponseHeaderTimeout(Some("default 60s".into())),
+        )
+        .await;
+        let saved: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(crate::config::paths::settings_path(dir.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["responseHeaderTimeoutMs"], 60000);
+        let value = runtime
+            .backend()
+            .model_control()
+            .unwrap()
+            .ttfb(&runtime.session_ref(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(value.override_ms, Some(0));
+    })
+    .await
+    .unwrap();
+}
