@@ -1501,7 +1501,7 @@ impl loop_wire::RuntimeControl for Runtime {
         p: loop_protocol::session_services::SkillParams,
     ) -> BackendResult<MutationResult> {
         let session = p.session.clone();
-        self.set_config(&session, true, |live| async move {
+        self.set_config(&session, false, |live| async move {
             live.opened.native.skill(p).await
         })
         .await

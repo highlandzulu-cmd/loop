@@ -326,7 +326,13 @@ impl App {
         }
         lines.push(Line::from(vec![
             Span::from("Session tokens ").fg(p.muted),
-            Span::from(thousands(live.session_tokens)).fg(p.text).bold(),
+            Span::from(
+                live.session_tokens
+                    .map(thousands)
+                    .unwrap_or_else(|| "unknown".into()),
+            )
+            .fg(p.text)
+            .bold(),
         ]));
         frame.render_widget(Paragraph::new(lines), inner);
     }

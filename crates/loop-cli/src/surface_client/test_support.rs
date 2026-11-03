@@ -147,3 +147,96 @@ pub(crate) fn plan_shell_task(client: &SurfaceClient) {
     provider.set_models(client.host.inner.models.get_models(Some("faux")));
     client.host.inner.models.set_provider(provider);
 }
+
+/// A subscription-like backend that reports usage through updates, without stats
+/// or native sandbox/timeout services.
+pub(crate) struct SubscriptionBackend {
+    instance: loop_protocol::BackendInstanceId,
+    updates: tokio::sync::broadcast::Sender<loop_protocol::UpdateEnvelope>,
+}
+impl SubscriptionBackend {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            instance: "subscription".into(),
+            updates: tokio::sync::broadcast::channel(16).0,
+        })
+    }
+    pub(crate) fn session(&self) -> SessionRef {
+        SessionRef {
+            instance: self.instance.clone(),
+            key: "subscription-session".into(),
+            native_id: "subscription-session".into(),
+        }
+    }
+    pub(crate) fn usage(&self, usage: loop_protocol::Usage) {
+        self.updates
+            .send(loop_protocol::UpdateEnvelope::live(
+                self.instance.clone(),
+                1,
+                self.session().key,
+                None,
+                1,
+                loop_protocol::SessionUpdate::Usage(usage),
+            ))
+            .unwrap();
+    }
+}
+#[async_trait::async_trait]
+impl AgentBackend for SubscriptionBackend {
+    fn instance(&self) -> &loop_protocol::BackendInstanceId {
+        &self.instance
+    }
+    fn capabilities(&self) -> loop_protocol::Capabilities {
+        Default::default()
+    }
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<loop_protocol::UpdateEnvelope> {
+        self.updates.subscribe()
+    }
+    async fn new_session(&self, _: SessionSpec) -> loop_protocol::BackendResult<SessionRef> {
+        Ok(self.session())
+    }
+    async fn load_session(
+        &self,
+        _: &SessionRef,
+        _: SessionSpec,
+    ) -> loop_protocol::BackendResult<SessionRef> {
+        Ok(self.session())
+    }
+    async fn prompt(
+        &self,
+        _: &SessionRef,
+        _: Vec<loop_protocol::ContentBlock>,
+    ) -> loop_protocol::BackendResult<loop_protocol::TurnHandle> {
+        Err(loop_protocol::BackendError::Unsupported(
+            "test prompt".into(),
+        ))
+    }
+    fn cancel(&self, _: &SessionRef) {}
+    fn is_busy(&self, _: &SessionRef) -> bool {
+        false
+    }
+    async fn shutdown(&self) {}
+}
+
+pub(crate) fn capture_system_prompt(
+    client: &SurfaceClient,
+    observed: Arc<std::sync::Mutex<String>>,
+) {
+    let provider = loop_ai::providers::faux_provider_fn(Arc::new(move |request| {
+        *observed.lock().unwrap() = format!("{request:?}");
+        Box::pin(async { loop_ai::providers::FauxResponse::Text("done".into()) })
+    }));
+    provider.set_models(client.host.inner.models.get_models(Some("faux")));
+    client.host.inner.models.set_provider(provider);
+}
+
+pub(crate) async fn install_read_tool(client: &SurfaceClient) {
+    let env = client.host.inner.harness.tool_env().await.unwrap();
+    client
+        .host
+        .inner
+        .harness
+        .set_tools(vec![loop_agent::harness::tools::create_read_tool(env)])
+        .await
+        .unwrap();
+}

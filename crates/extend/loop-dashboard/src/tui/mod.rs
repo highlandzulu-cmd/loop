@@ -96,7 +96,7 @@ pub struct LiveStatus {
     /// Context window of the model (0 when unknown).
     pub context_window: u64,
     /// Tokens used by this session so far.
-    pub session_tokens: u64,
+    pub session_tokens: Option<u64>,
     /// Whether the chat's agent is working on a turn.
     pub main_agent_working: bool,
     /// What it is doing right now, e.g. `tool · bash` (empty when unknown).

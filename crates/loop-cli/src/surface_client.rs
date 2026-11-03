@@ -1128,6 +1128,12 @@ impl SurfaceClient {
         self.admin().trust(params).await?;
         Ok(())
     }
+    pub fn supports_sandbox(&self) -> bool {
+        self.is_native()
+    }
+    pub fn supports_ttfb(&self) -> bool {
+        self.backend().capabilities().session_ttfb && self.backend().model_control().is_some()
+    }
     pub fn sandbox_service(&self) -> Arc<dyn loop_wire::RuntimeAdmin> {
         let r = &self.host.inner;
         Arc::new(native_admin::NativeSandbox {
