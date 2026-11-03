@@ -1320,7 +1320,7 @@ impl Runtime {
             let _lifecycle = live.lifecycle.lock().await;
             self.check_tree_live(&live)?;
             barrier(&live).await?;
-            self.announce_control(&live).await?;
+            self.announce_control(&live, None).await?;
             let mut attachment =
                 loop_wire::RuntimeControl::attach(self, session, after_seq).await?;
             attachment.snapshot = Some(self.snapshot_locked(&live, attachment.latest_seq).await?);
@@ -1573,7 +1573,7 @@ impl AgentBackend for Runtime {
                 return Err(failed(error));
             }
             if !live.busy.load(Ordering::Acquire) {
-                self.announce_control(&live).await?;
+                self.announce_control(&live, None).await?;
                 barrier(&live).await?;
                 live.turn_start_seq.store(
                     self.log
@@ -1651,7 +1651,12 @@ impl AgentBackend for Runtime {
             .await;
             live.permit.lock().await.take();
             live.pauses.signal("turn_settling");
-            live.busy.store(false, Ordering::Release);
+            {
+                // Settle under the lifecycle lock: a snapshot or tree read
+                // that holds it sees one consistent busy state.
+                let _lifecycle = live.lifecycle.lock().await;
+                live.busy.store(false, Ordering::Release);
+            }
             let outcome = match result {
                 Ok(outcome) => outcome,
                 Err(BackendError::Failed(info)) => TurnOutcome::Failed(info),

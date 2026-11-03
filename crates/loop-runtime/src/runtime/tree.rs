@@ -13,6 +13,40 @@ pub(super) struct BranchView {
     at_seq: u64,
     expires: std::time::Instant,
 }
+/// Most unexpired views a Runtime holds for Surfaces.
+pub(super) const VIEW_LIMIT: usize = 128;
+const VIEW_TTL: Duration = Duration::from_secs(300);
+
+/// A reserved view id. Dropped before it is filled, it frees its slot.
+pub(super) struct ViewSlot<'a> {
+    views: &'a Mutex<HashMap<String, BranchView>>,
+    session: SessionRef,
+    id: String,
+    filled: bool,
+}
+impl ViewSlot<'_> {
+    fn fill(mut self, updates: Vec<SessionUpdate>, branch_revision: u64, at_seq: u64) -> String {
+        self.views.lock().unwrap().insert(
+            self.id.clone(),
+            BranchView {
+                session: self.session.clone(),
+                updates,
+                branch_revision,
+                at_seq,
+                expires: std::time::Instant::now() + VIEW_TTL,
+            },
+        );
+        self.filled = true;
+        self.id.clone()
+    }
+}
+impl Drop for ViewSlot<'_> {
+    fn drop(&mut self) {
+        if !self.filled {
+            self.views.lock().unwrap().remove(&self.id);
+        }
+    }
+}
 
 fn page(cursor: Option<&str>, limit: Option<u32>, length: usize) -> BackendResult<(usize, usize)> {
     let start = cursor
@@ -83,10 +117,12 @@ impl Runtime {
         }
         Ok(())
     }
-    /// Capture only settled turn output. Caller holds the lifecycle lock.
-    async fn committed_file(&self, live: &LiveSession) -> BackendResult<SessionFile> {
+    /// Capture settled turn output, reading `busy` once. Caller holds the
+    /// lifecycle lock, which also holds turn settlement, so `busy` stays as read.
+    async fn capture(&self, live: &LiveSession) -> BackendResult<(SessionFile, bool)> {
         self.check_tree_live(live)?;
-        let mut file = if live.busy.load(Ordering::Acquire) {
+        let busy = live.busy.load(Ordering::Acquire);
+        let mut file = if busy {
             live.committed
                 .lock()
                 .await
@@ -104,16 +140,21 @@ impl Runtime {
             .metadata()
             .name
             .clone();
-        Ok(file)
+        Ok((file, busy))
+    }
+    /// Settled turn output only. Caller holds the lifecycle lock.
+    async fn committed_file(&self, live: &LiveSession) -> BackendResult<SessionFile> {
+        Ok(self.capture(live).await?.0)
     }
 
-    async fn save_view(
+    /// The transcript of a captured `file` through high-water mark `at_seq`.
+    async fn transcript(
         &self,
         live: &LiveSession,
-        branch_revision: u64,
+        file: &SessionFile,
+        busy: bool,
         at_seq: u64,
-    ) -> BackendResult<String> {
-        let file = self.committed_file(live).await?;
+    ) -> BackendResult<Vec<SessionUpdate>> {
         self.pauses.wait("view_capture").await;
         let entries = match file
             .entries
@@ -137,7 +178,7 @@ impl Runtime {
         };
         let context = loop_agent::harness::session::default_context_from_entries(entries);
         let mut updates = loop_agent::protocol_events::replay(&context.messages);
-        if live.busy.load(Ordering::Acquire) {
+        if busy {
             // Source copies exclude an unfinished turn. A Surface view also needs
             // that turn's already durable output through its exact high-water mark.
             let baseline = live.turn_start_seq.load(Ordering::Acquire);
@@ -156,23 +197,36 @@ impl Runtime {
                 }
             }
         }
+        Ok(updates)
+    }
+
+    /// Reserve a view before changing any state, so a full Runtime refuses the
+    /// change rather than committing a branch it cannot announce. Unbounded
+    /// reservations reconcile an already committed change: one per Session.
+    fn reserve_view(&self, session: &SessionRef, bounded: bool) -> BackendResult<ViewSlot<'_>> {
         let id = loop_ai::new_id();
+        let now = std::time::Instant::now();
         let mut views = self.views.lock().unwrap();
-        views.retain(|_, view| view.expires > std::time::Instant::now());
-        if views.len() >= 128 {
+        views.retain(|_, view| view.expires > now);
+        if bounded && views.len() >= VIEW_LIMIT {
             return Err(BackendError::Busy);
         }
         views.insert(
             id.clone(),
             BranchView {
-                session: live.reference.clone(),
-                updates,
-                branch_revision,
-                at_seq,
-                expires: std::time::Instant::now() + Duration::from_secs(300),
+                session: session.clone(),
+                updates: Vec::new(),
+                branch_revision: 0,
+                at_seq: 0,
+                expires: now + VIEW_TTL,
             },
         );
-        Ok(id)
+        Ok(ViewSlot {
+            views: &self.views,
+            session: session.clone(),
+            id,
+            filled: false,
+        })
     }
     pub(super) async fn snapshot_locked(
         &self,
@@ -184,15 +238,17 @@ impl Runtime {
             .control_state(&live.reference.native_id)
             .await
             .map_err(failed)?;
-        let file = self.committed_file(live).await?;
+        let (file, busy) = self.capture(live).await?;
         let config = self.public_config(live).await?;
+        let slot = self.reserve_view(&live.reference, true)?;
+        let updates = self.transcript(live, &file, busy, at_seq).await?;
         Ok(SessionSnapshot {
             session: live.reference.clone(),
             workspace_id: workspace_id(&live.opened.workspace.cwd),
             at_seq,
             revision: state.revision,
             branch_revision: state.branch_revision,
-            view_id: self.save_view(live, state.branch_revision, at_seq).await?,
+            view_id: slot.fill(updates, state.branch_revision, at_seq),
             metadata: SessionMetadataView { name: file.name },
             config: config.clone(),
             effective: config,
@@ -200,7 +256,7 @@ impl Runtime {
             capabilities: self.capabilities(),
             turn_state: if live.escalations.has_pending().await {
                 "parked"
-            } else if live.busy.load(Ordering::Acquire) {
+            } else if busy {
                 "busy"
             } else {
                 "idle"
@@ -229,8 +285,8 @@ impl Runtime {
     pub async fn tree(&self, params: TreeParams) -> BackendResult<TreeResult> {
         let live = self.route(&params.session)?;
         let _guard = live.lifecycle.lock().await;
-        let file = self.committed_file(&live).await?;
-        let entries = if live.busy.load(Ordering::Acquire) {
+        let (file, busy) = self.capture(&live).await?;
+        let entries = if busy {
             file.entries.clone()
         } else {
             self.store
@@ -373,7 +429,7 @@ impl Runtime {
             )
             .await
             .map_err(failed)?;
-        let seq = self.announce_control(&live).await?;
+        let seq = self.announce_control(&live, None).await?;
         Ok(MutationResult {
             revision: state.revision,
             seq,
@@ -392,6 +448,7 @@ impl Runtime {
         barrier(&live).await?;
         self.check_revision(&params.session, params.expected_revision)
             .await?;
+        let slot = self.reserve_view(&params.session, true)?;
         // Deterministic fallback summary, matching the native tree navigation.
         let summary = if params.summarize {
             Some(format!(
@@ -417,14 +474,19 @@ impl Runtime {
             )
             .await
             .map_err(failed)?;
-        let seq = self.announce_control(&live).await?;
+        let seq = self.announce_control(&live, Some(slot)).await?;
         Ok(NavigateResult {
             branch_revision: state.branch_revision,
             seq,
         })
     }
     /// Finish an unannounced committed tree write before admitting work or snapshots.
-    pub(super) async fn announce_control(&self, live: &LiveSession) -> BackendResult<u64> {
+    /// A navigation passes the view it reserved; recovery reserves its own.
+    pub(super) async fn announce_control(
+        &self,
+        live: &LiveSession,
+        slot: Option<ViewSlot<'_>>,
+    ) -> BackendResult<u64> {
         let state = self
             .store
             .control_state(&live.reference.native_id)
@@ -457,9 +519,13 @@ impl Runtime {
                 workspace_revision: 0,
             }
         } else {
-            let view_id = self
-                .save_view(live, state.branch_revision, at_seq + 1)
-                .await?;
+            let slot = match slot {
+                Some(slot) => slot,
+                None => self.reserve_view(&live.reference, false)?,
+            };
+            let (file, busy) = self.capture(live).await?;
+            let updates = self.transcript(live, &file, busy, at_seq + 1).await?;
+            let view_id = slot.fill(updates, state.branch_revision, at_seq + 1);
             SessionUpdate::BranchReset {
                 branch_revision: state.branch_revision,
                 view_id,

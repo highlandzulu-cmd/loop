@@ -885,3 +885,54 @@ async fn a_retry_never_answers_with_a_destination_admission_will_roll_back() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn an_attach_snapshot_holds_turn_settlement_until_it_is_captured() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_protocol::rpc::ViewParams;
+        use loop_wire::RuntimeControl;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 2).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&source, vec![ContentBlock::text("park race")])
+            .await
+            .unwrap();
+        parked(&rt, &source).await;
+        let (reached, release) = rt.pauses.arm("view_capture");
+        let settling = rt.pauses.watch("turn_settling");
+        let attach = tokio::spawn({
+            let (rt, source) = (rt.clone(), source.clone());
+            async move { rt.attach_snapshot_watching(91, &source, 0).await }
+        });
+        reached.notified().await;
+        rt.cancel(&source);
+        settling.notified().await;
+        // Single-threaded: a settlement that does not wait for the snapshot
+        // has already cleared busy by the time this task runs again.
+        assert!(rt.is_busy(&source), "turn settled during a snapshot capture");
+        release.send(false).unwrap();
+        let attachment = attach.await.unwrap().unwrap();
+        let snapshot = attachment.snapshot.unwrap();
+        assert_eq!(snapshot.at_seq, attachment.latest_seq);
+        let view = rt
+            .view(ViewParams {
+                session: source.clone(),
+                view_id: snapshot.view_id,
+                cursor: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let prompts = view
+            .updates
+            .iter()
+            .filter(|update| matches!(update, SessionUpdate::MessageChunk { content, .. } if content.as_text() == Some("park race")))
+            .count();
+        assert_eq!(prompts, 1, "{:?}", view.updates);
+        turn.outcome().await;
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
