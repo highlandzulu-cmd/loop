@@ -21,16 +21,7 @@ pub struct SessionArgs {
     /// With `close`: cancel a running turn, and its Subagents, first.
     pub force: bool,
 }
-
-#[cfg(not(unix))]
-pub async fn run(_: SessionArgs) -> anyhow::Result<()> {
-    anyhow::bail!("`loop session` is unsupported on this platform; Linux and macOS are supported")
-}
-
-#[cfg(unix)]
 pub use unix::{connect, drive, AttachClient, Input, Terminal};
-
-#[cfg(unix)]
 pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
     let mut terminal = unix::StdioTerminal::new()?;
     let transport = if let Some(url) = &args.url {
@@ -70,8 +61,6 @@ pub async fn run(args: SessionArgs) -> anyhow::Result<()> {
             .map_err(|_| anyhow::anyhow!("Runtime connection timed out"))??;
     drive(backend, events, args, &mut terminal).await
 }
-
-#[cfg(unix)]
 mod unix {
     use super::*;
     use loop_protocol::{

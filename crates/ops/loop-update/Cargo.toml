@@ -19,12 +19,6 @@ semver.workspace = true
 self-replace.workspace = true
 percent-encoding.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-zip.workspace = true
-# Enable the Rust backend for zip's optional flate2 reader.
-flate2.workspace = true
-
-[target.'cfg(not(windows))'.dependencies]
 flate2.workspace = true
 tar.workspace = true
 

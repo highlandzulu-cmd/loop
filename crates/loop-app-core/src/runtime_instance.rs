@@ -9,56 +9,43 @@ use std::{io, path::Path};
 /// socket (`loop_wire::socket::unix_listen`); the socket path alone does not serialize starters.
 #[derive(Debug)]
 pub struct RuntimeInstanceLock {
-    #[cfg(unix)]
     _file: std::fs::File,
-    #[cfg(unix)]
     pid_path: std::path::PathBuf,
 }
 
 impl RuntimeInstanceLock {
     /// Acquire without waiting and publish this process's diagnostic pid.
     pub fn acquire(agent_dir: &Path) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            use crate::config::paths::{run_dir, runtime_lock_path, runtime_pid_path};
-            use std::io::Write;
-            use std::os::fd::AsRawFd;
+        use crate::config::paths::{run_dir, runtime_lock_path, runtime_pid_path};
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
 
-            run_dir(agent_dir)?;
-            let file = private_file(&runtime_lock_path(agent_dir))?;
-            // SAFETY: the fd is valid for this call; flock does not retain it.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::WouldBlock {
-                    return Err(error);
-                }
-                let pid = std::fs::read_to_string(runtime_pid_path(agent_dir))
-                    .ok()
-                    .and_then(|pid| pid.trim().parse::<u32>().ok())
-                    .map(|pid| pid.to_string())
-                    .unwrap_or_else(|| "unknown".into());
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!("a Runtime is already running (pid {pid})"),
-                ));
+        run_dir(agent_dir)?;
+        let file = private_file(&runtime_lock_path(agent_dir))?;
+        // SAFETY: the fd is valid for this call; flock does not retain it.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
             }
-            let pid_path = runtime_pid_path(agent_dir);
-            let mut pid_file = private_file(&pid_path)?;
-            pid_file.set_len(0)?;
-            writeln!(pid_file, "{}", std::process::id())?;
-            Ok(Self {
-                _file: file,
-                pid_path,
-            })
+            let pid = std::fs::read_to_string(runtime_pid_path(agent_dir))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .map(|pid| pid.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!("a Runtime is already running (pid {pid})"),
+            ));
         }
-        #[cfg(not(unix))]
-        {
-            let _ = agent_dir;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Runtime single-instance locking is unsupported on this platform",
-            ))
-        }
+        let pid_path = runtime_pid_path(agent_dir);
+        let mut pid_file = private_file(&pid_path)?;
+        pid_file.set_len(0)?;
+        writeln!(pid_file, "{}", std::process::id())?;
+        Ok(Self {
+            _file: file,
+            pid_path,
+        })
     }
 }
 
@@ -69,7 +56,6 @@ impl RuntimeInstanceLock {
 #[derive(Debug)]
 pub struct SessionDatabaseLock {
     sessions_db: std::path::PathBuf,
-    #[cfg(unix)]
     _file: std::fs::File,
 }
 
@@ -77,39 +63,28 @@ impl SessionDatabaseLock {
     /// Lock without waiting. Fails when another Runtime owns the database.
     pub fn acquire(sessions_db: &Path) -> io::Result<Self> {
         let sessions_db = std::path::absolute(sessions_db)?;
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let dir = sessions_db.parent().unwrap_or(Path::new("/"));
-            std::fs::create_dir_all(dir)?;
-            let file = private_file(&dir.join("runtime.lock"))?;
-            // SAFETY: the fd is valid for this call; flock does not retain it.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::WouldBlock {
-                    return Err(error);
-                }
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "another Runtime already owns the Session database at {}",
-                        sessions_db.display()
-                    ),
-                ));
+        use std::os::fd::AsRawFd;
+        let dir = sessions_db.parent().unwrap_or(Path::new("/"));
+        std::fs::create_dir_all(dir)?;
+        let file = private_file(&dir.join("runtime.lock"))?;
+        // SAFETY: the fd is valid for this call; flock does not retain it.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::WouldBlock {
+                return Err(error);
             }
-            Ok(Self {
-                sessions_db,
-                _file: file,
-            })
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "another Runtime already owns the Session database at {}",
+                    sessions_db.display()
+                ),
+            ));
         }
-        #[cfg(not(unix))]
-        {
-            let _ = sessions_db;
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Session database locking is unsupported on this platform",
-            ))
-        }
+        Ok(Self {
+            sessions_db,
+            _file: file,
+        })
     }
 
     /// The absolute path of the locked Session database.
@@ -118,7 +93,6 @@ impl SessionDatabaseLock {
     }
 }
 
-#[cfg(unix)]
 fn private_file(path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let file = std::fs::OpenOptions::new()
@@ -145,7 +119,6 @@ fn private_file(path: &Path) -> io::Result<std::fs::File> {
 impl Drop for RuntimeInstanceLock {
     fn drop(&mut self) {
         // Remove the pid before closing the fd releases the lock.
-        #[cfg(unix)]
         let _ = std::fs::remove_file(&self.pid_path);
     }
 }

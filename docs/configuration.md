@@ -84,7 +84,7 @@ directory; environment overrides cannot replace it. Network
 settings apply to shell subprocesses; host web/MCP services remain separate
 capabilities. See [the macOS sandbox decision](design/macos-sandbox.md).
 
-On unsupported platforms, or if sandbox preflight fails, standalone Loop leaves
+Loop supports Linux and macOS only. If sandbox preflight fails, standalone Loop leaves
 the sandbox off with a warning, while a Runtime started with `loop runtime start`
 refuses to admit the Session with `required workspace sandbox failed`. Runtime
 Sessions require the configured sandbox to start successfully.

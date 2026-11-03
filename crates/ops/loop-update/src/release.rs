@@ -41,7 +41,6 @@ pub fn platform_target() -> Result<&'static str> {
         ("linux", "aarch64") if cfg!(target_env = "gnu") => Ok("aarch64-unknown-linux-gnu"),
         ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
-        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
         _ => Err(Error::Invalid(
             "No release build for this platform; build from source".into(),
         )),
@@ -267,8 +266,7 @@ impl ReleaseClient {
         mut progress: impl FnMut(u64, Option<u64>),
     ) -> Result<std::path::PathBuf> {
         let target = platform_target()?;
-        let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
-        let asset = format!("loop-{target}.{ext}");
+        let asset = format!("loop-{target}.tar.gz");
         let url = self.endpoint(&self.downloads, &format!("{}/{asset}", release.tag))?;
         let hash_url =
             self.endpoint(&self.downloads, &format!("{}/{asset}.sha256", release.tag))?;
@@ -298,15 +296,14 @@ impl ReleaseClient {
                 "Release archive checksum mismatch; current binary kept".into(),
             ));
         }
-        let binary = dir.join(if cfg!(windows) { "loop.exe" } else { "loop" });
+        let binary = dir.join("loop");
         extract_binary(&archive, &binary, target)?;
         Ok(binary)
     }
 }
 
 fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
-    let name = if cfg!(windows) { "loop.exe" } else { "loop" };
-    let expected = format!("loop-{target}/{name}");
+    let expected = format!("loop-{target}/loop");
     let mut found = false;
     let mut copy = |reader: &mut dyn std::io::Read, size: u64| -> Result<()> {
         if found || size > MAX_BINARY {
@@ -324,23 +321,6 @@ fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
         Ok(())
     };
     let file = std::fs::File::open(archive)?;
-    #[cfg(windows)]
-    {
-        let mut zip = zip::ZipArchive::new(file)?;
-        for index in 0..zip.len() {
-            let mut entry = zip.by_index(index)?;
-            if entry.name()? == expected && entry.is_file() {
-                if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
-                    return Err(Error::Invalid(
-                        "Release executable must not be a symlink".into(),
-                    ));
-                }
-                let size = entry.size();
-                copy(&mut entry, size)?;
-            }
-        }
-    }
-    #[cfg(not(windows))]
     {
         let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
         for entry in tar.entries()? {
@@ -361,7 +341,6 @@ fn extract_binary(archive: &Path, binary: &Path, target: &str) -> Result<()> {
             "Release archive does not contain the expected executable".into(),
         ));
     }
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))?;

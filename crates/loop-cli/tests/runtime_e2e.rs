@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! Runtime end to end: the real `loop runtime start` and `loop session` binaries against
 //! a fake OpenAI-compatible model, with isolated agent and Session directories.
 

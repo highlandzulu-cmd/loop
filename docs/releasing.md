@@ -15,7 +15,6 @@ Supported release targets:
 | `loop-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 |
 | `loop-x86_64-apple-darwin.tar.gz` | macOS Intel |
 | `loop-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
-| `loop-x86_64-pc-windows-msvc.zip` | Windows x64 |
 
 ## Cut a release
 
@@ -29,9 +28,9 @@ git push origin v0.3.4
 ```
 
 That starts the Release workflow, builds all targets, and creates a GitHub Release
-with archives, `.sha256` checksums, `install.sh` and `install.ps1`.
+with archives, `.sha256` checksums, and `install.sh`.
 
-Before tagging, require the Linux, macOS and Windows lifecycle tests in CI to
+Before tagging, require the Linux and macOS lifecycle tests in CI to
 pass (`cargo test -p loop-update --locked`). They check running-binary updates,
 rollback, uninstall and preservation of user data. See
 [Install and update](install-update.md) and the incremental

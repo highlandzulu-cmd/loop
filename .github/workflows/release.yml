@@ -67,9 +67,6 @@ jobs:
             target: x86_64-apple-darwin
             archive: tar.gz
             sign: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -203,19 +200,6 @@ jobs:
           echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
           echo "CHECKSUM=${staging}.tar.gz.sha256" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $staging = "loop-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/loop.exe" "$staging/loop.exe"
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "$staging.zip.sha256" -Value "$hash  $staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CHECKSUM=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -247,9 +231,6 @@ jobs:
             target: x86_64-apple-darwin
             archive: tar.gz
             sign: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
 
     steps:
       - uses: actions/checkout@v4
@@ -369,19 +350,6 @@ jobs:
           echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
           echo "CHECKSUM=${staging}.tar.gz.sha256" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $staging = "loop-desktop-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/loop-desktop.exe" "$staging/loop-desktop.exe"
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "$staging.zip.sha256" -Value "$hash  $staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CHECKSUM=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -453,6 +421,5 @@ jobs:
           files: |
             dist/*
             install.sh
-            install.ps1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

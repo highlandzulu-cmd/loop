@@ -23,9 +23,6 @@ pub enum Error {
     Version(#[from] semver::Error),
     #[error("Update cancelled; current binary kept")]
     Cancelled,
-    #[cfg(windows)]
-    #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

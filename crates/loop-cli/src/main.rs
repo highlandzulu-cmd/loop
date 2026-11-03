@@ -1,5 +1,8 @@
 //! Loop — interactive coding agent CLI by Soket AI.
 
+#[cfg(not(unix))]
+compile_error!("Loop supports Linux and macOS only");
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};

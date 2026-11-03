@@ -20,7 +20,7 @@ workspace administration and usage queries over the wire. ACP startup moves to
 the Runtime. The macOS sandbox and custom-provider reasoning fixes run in named
 parallel lanes. Their contracts are included here; their implementation is separate.
 
-Not in S3: the desktop migration, the S4 Policy gate, cloud hosting, Windows,
+Not in S3: the desktop migration, the S4 Policy gate, cloud hosting,
 Event Log retention or timed idle unloading. S2 already unloads unneeded Sessions
 at capacity. Non-loopback WebSocket serving and URL/QR control wait for S3.8b with
 TLS. They are not part of S3.8's loopback listener.
