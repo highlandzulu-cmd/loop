@@ -14,24 +14,38 @@ const LIMIT: Duration = Duration::from_secs(60);
 
 /// A prompt starting `park` asks for an approval nobody answers.
 async fn runtime(dir: &std::path::Path) -> (Arc<Runtime>, Arc<MemoryEventLog>) {
+    runtime_with(dir, "ask", RuntimeLimits::default()).await
+}
+
+/// The same Runtime in another permission mode and with other limits. Its
+/// provider offers a second model, `faux-two`. Every prompt asks for one
+/// `echo parked` command and then finishes.
+async fn runtime_with(
+    dir: &std::path::Path,
+    permission_mode: &str,
+    limits: RuntimeLimits,
+) -> (Arc<Runtime>, Arc<MemoryEventLog>) {
     let models = Arc::new(loop_ai::Models::create(Default::default()));
-    models.set_provider(faux_provider_fn(Arc::new(|context: &Context| {
-        let answered = context
-            .messages
-            .iter()
-            .any(|m| matches!(m, Message::Assistant(_)));
-        let response = if answered {
-            FauxResponse::Text("finished".into())
-        } else {
+    let provider = faux_provider_fn(Arc::new(|context: &Context| {
+        let asked = matches!(context.messages.last(), Some(Message::User(_)));
+        let response = if asked {
             FauxResponse::ToolCalls(vec![ToolCall {
-                id: "park".into(),
+                id: format!("park{}", context.messages.len()),
                 name: "bash".into(),
                 arguments: json!({"command": "echo parked"}),
                 thought_signature: None,
             }])
+        } else {
+            FauxResponse::Text("finished".into())
         };
         Box::pin(std::future::ready(response))
-    })));
+    }));
+    let first = provider.get_model("faux-model").unwrap();
+    let mut second = first.clone();
+    second.id = "faux-two".into();
+    second.name = "Faux Two".into();
+    provider.set_models(vec![first, second]);
+    models.set_provider(provider);
     let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
     let opts = BootstrapOpts {
         cwd: dir.into(),
@@ -44,11 +58,11 @@ async fn runtime(dir: &std::path::Path) -> (Arc<Runtime>, Arc<MemoryEventLog>) {
         interactive: false,
         session_id: None,
         no_web: true,
-        permission_mode: Some("ask".into()),
+        permission_mode: Some(permission_mode.into()),
         agent: None,
     };
     let log = Arc::new(MemoryEventLog::new());
-    let rt = Runtime::new(globals, opts, log.clone(), RuntimeLimits::default())
+    let rt = Runtime::new(globals, opts, log.clone(), limits)
         .await
         .unwrap()
         .with_close_grace(Duration::from_millis(500))
@@ -1029,4 +1043,349 @@ async fn credential_warnings_follow_only_the_selected_provider_and_refresh_on_re
     })
     .await
     .unwrap();
+}
+
+mod next_turn {
+    use super::*;
+    use loop_agent::harness::{SandboxMode, TaggedSandbox};
+    use loop_protocol::{ConfigChanged, SessionUpdate};
+    use tokio::sync::broadcast::Receiver;
+
+    fn local(tag: &str) -> SandboxChoice {
+        SandboxChoice {
+            mode: "local".into(),
+            isolation: None,
+            runtime: Some(tag.into()),
+        }
+    }
+
+    /// Start the fake sandboxes a choice names by its runtime tag.
+    fn use_sandboxes(rt: &Runtime, boxes: &[&TaggedSandbox]) {
+        let boxes: std::collections::HashMap<String, TaggedSandbox> = boxes
+            .iter()
+            .map(|b| (b.tag().to_owned(), (*b).clone()))
+            .collect();
+        *rt.sandbox_starter.lock().unwrap() = Some(Arc::new(move |choice| {
+            if choice.mode == "off" {
+                return Ok(SandboxMode::Disabled);
+            }
+            let tag = choice.runtime.clone().unwrap_or_default();
+            boxes
+                .get(&tag)
+                .map(|b| SandboxMode::Enabled {
+                    sandbox: Arc::new(b.clone()),
+                })
+                .ok_or_else(|| failed(format!("no sandbox `{tag}`")))
+        }));
+    }
+
+    async fn set_sandbox(
+        rt: &Runtime,
+        session: &SessionRef,
+        choice: SandboxChoice,
+    ) -> BackendResult<SandboxResult> {
+        rt.sandbox(SandboxParams {
+            session: session.clone(),
+            action: SandboxAction::Set,
+            config: Some(choice),
+            expected_revision: None,
+        })
+        .await
+    }
+
+    async fn sandbox_status(rt: &Runtime, session: &SessionRef) -> SandboxResult {
+        rt.sandbox(SandboxParams {
+            session: session.clone(),
+            action: SandboxAction::Status,
+            config: None,
+            expected_revision: None,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Wait for an outcome the test cannot await directly.
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        while !done() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = what;
+    }
+
+    async fn next_config(rx: &mut Receiver<UpdateEnvelope>, key: &SessionKey) -> ConfigChanged {
+        loop {
+            let envelope = rx.recv().await.unwrap();
+            if let SessionUpdate::ConfigChanged(changed) = envelope.update {
+                if &envelope.session == key {
+                    return changed;
+                }
+            }
+        }
+    }
+
+    /// Config events as `(pending, chosen, effective)` sandbox labels, up to
+    /// the first one whose effective sandbox is `until`.
+    async fn sandbox_events(
+        rx: &mut Receiver<UpdateEnvelope>,
+        key: &SessionKey,
+        until: &str,
+    ) -> Vec<(bool, Option<String>, Option<String>)> {
+        let mut seen = vec![];
+        loop {
+            let changed = next_config(rx, key).await;
+            let step = (
+                changed.pending,
+                changed.config.sandbox.clone(),
+                changed.effective.sandbox.clone(),
+            );
+            let done = step.2.as_deref() == Some(until);
+            seen.push(step);
+            if done {
+                return seen;
+            }
+        }
+    }
+
+    fn ran(sandbox: &TaggedSandbox) -> usize {
+        sandbox
+            .commands()
+            .iter()
+            .filter(|c| c.contains("echo parked"))
+            .count()
+    }
+
+    async fn go(rt: &Runtime, session: &SessionRef) -> TurnHandle {
+        rt.prompt(session, vec![ContentBlock::text("go")])
+            .await
+            .unwrap()
+    }
+
+    /// A choice made while a tool call runs in the old sandbox leaves that
+    /// call there, is announced as pending to every watcher, and takes over
+    /// for the next turn once the old sandbox has been released.
+    #[tokio::test]
+    async fn a_sandbox_chosen_in_a_tool_call_is_used_by_the_next_turn() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let (rt, _log) = runtime_with(dir.path(), "full-access", Default::default()).await;
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let (old, new) = (
+                TaggedSandbox::gated("old", gate.clone()),
+                TaggedSandbox::new("new"),
+            );
+            use_sandboxes(&rt, &[&old, &new]);
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            let (mut first, mut second) = (rt.subscribe(), rt.subscribe());
+            set_sandbox(&rt, &session, local("old")).await.unwrap();
+
+            let turn = go(&rt, &session).await;
+            until("a command in the old sandbox", || ran(&old) == 1).await;
+            let result = set_sandbox(&rt, &session, local("new")).await.unwrap();
+            assert!(result.info.contains("next turn"), "{}", result.info);
+            assert!(result.seq.is_some());
+            assert_eq!(sandbox_status(&rt, &session).await.config, local("new"));
+            // Nothing has changed under the running call.
+            assert_eq!(old.destroy_count(), 0);
+            assert_eq!(new.commands().len(), 0);
+
+            gate.add_permits(1);
+            turn.outcome().await;
+            let waiting = (
+                true,
+                Some("local/new".to_owned()),
+                Some("local/old".to_owned()),
+            );
+            let applied = (
+                false,
+                Some("local/new".to_owned()),
+                Some("local/new".to_owned()),
+            );
+            for rx in [&mut first, &mut second] {
+                let seen = sandbox_events(rx, &session.key, "local/new").await;
+                // Both watchers see the pending change, then the effective
+                // one, in that order.
+                let pending = seen.iter().position(|e| e.0).expect("a pending event");
+                let effective = seen.len() - 1;
+                assert!(pending < effective, "{seen:?}");
+                assert_eq!(seen[pending], waiting);
+                assert_eq!(seen[effective], applied);
+            }
+            until("the old sandbox released", || old.destroy_count() == 1).await;
+
+            let turn = go(&rt, &session).await;
+            turn.outcome().await;
+            assert_eq!(ran(&new), 1, "the next turn runs in the new sandbox");
+            assert_eq!(ran(&old), 1);
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Of two choices made during one turn only the later one is installed;
+    /// the earlier one is released unused.
+    #[tokio::test]
+    async fn the_latest_sandbox_choice_wins_and_the_stale_one_is_released() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let (rt, _log) = runtime_with(dir.path(), "full-access", Default::default()).await;
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let old = TaggedSandbox::gated("old", gate.clone());
+            let (stale, latest) = (TaggedSandbox::new("stale"), TaggedSandbox::new("latest"));
+            use_sandboxes(&rt, &[&old, &stale, &latest]);
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            set_sandbox(&rt, &session, local("old")).await.unwrap();
+            let turn = go(&rt, &session).await;
+            until("a command in the old sandbox", || ran(&old) == 1).await;
+
+            set_sandbox(&rt, &session, local("stale")).await.unwrap();
+            set_sandbox(&rt, &session, local("latest")).await.unwrap();
+            assert_eq!(stale.destroy_count(), 1, "released as soon as replaced");
+            gate.add_permits(1);
+            turn.outcome().await;
+            until("the old sandbox released", || old.destroy_count() == 1).await;
+            assert_eq!(sandbox_status(&rt, &session).await.config, local("latest"));
+
+            go(&rt, &session).await.outcome().await;
+            assert_eq!(ran(&latest), 1);
+            assert_eq!(ran(&stale), 0);
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Closing a Session that still has a sandbox waiting releases it once
+    /// and never applies it to another Session.
+    #[tokio::test]
+    async fn closing_with_a_sandbox_waiting_releases_it_and_it_stays_with_its_session() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let (rt, _log) = runtime_with(dir.path(), "full-access", Default::default()).await;
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let old = TaggedSandbox::gated("old", gate.clone());
+            let waiting = TaggedSandbox::new("waiting");
+            use_sandboxes(&rt, &[&old, &waiting]);
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            let other = rt.new_session(SessionSpec::default()).await.unwrap();
+            set_sandbox(&rt, &session, local("old")).await.unwrap();
+            let turn = go(&rt, &session).await;
+            until("a command in the old sandbox", || ran(&old) == 1).await;
+            set_sandbox(&rt, &session, local("waiting")).await.unwrap();
+
+            gate.add_permits(1);
+            rt.close(&session.key, true).await.unwrap();
+            let _ = turn.outcome().await;
+            assert_eq!(waiting.destroy_count(), 1);
+            // The other Session never ran in it.
+            go(&rt, &other).await.outcome().await;
+            assert_eq!(ran(&waiting), 0);
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A sandbox choice, applied or still waiting, is in the Session's
+    /// record: a reopened Session runs its tools in it.
+    #[tokio::test]
+    async fn a_sandbox_choice_survives_reopening_the_session() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let (rt, _log) = runtime_with(dir.path(), "full-access", Default::default()).await;
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let old = TaggedSandbox::gated("old", gate.clone());
+            let (applied, waiting) = (TaggedSandbox::new("applied"), TaggedSandbox::new("waiting"));
+            use_sandboxes(&rt, &[&old, &applied, &waiting]);
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            set_sandbox(&rt, &session, local("applied")).await.unwrap();
+            rt.close(&session.key, false).await.unwrap();
+            let reopened = rt
+                .load_session(&session, SessionSpec::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                sandbox_status(&rt, &reopened).await.config,
+                local("applied")
+            );
+            go(&rt, &reopened).await.outcome().await;
+            assert_eq!(ran(&applied), 1, "restored, not the workspace default");
+
+            // A choice still waiting when the Session closes is the one
+            // that comes back.
+            set_sandbox(&rt, &reopened, local("old")).await.unwrap();
+            let turn = go(&rt, &reopened).await;
+            until("a command in the old sandbox", || ran(&old) == 1).await;
+            set_sandbox(&rt, &reopened, local("waiting")).await.unwrap();
+            gate.add_permits(1);
+            rt.close(&reopened.key, true).await.unwrap();
+            let _ = turn.outcome().await;
+            let again = rt
+                .load_session(&session, SessionSpec::default())
+                .await
+                .unwrap();
+            assert_eq!(sandbox_status(&rt, &again).await.config, local("waiting"));
+            go(&rt, &again).await.outcome().await;
+            assert_eq!(ran(&waiting), 1);
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A model chosen while a tool call runs, or while the turn waits for a
+    /// turn permit, is accepted: the running turn keeps its model and the
+    /// next one starts on the new one.
+    #[tokio::test]
+    async fn a_model_chosen_mid_turn_is_accepted_and_used_next_turn() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let limits = RuntimeLimits {
+                max_active_turns: 1,
+                ..Default::default()
+            };
+            let (rt, _log) = runtime_with(dir.path(), "full-access", limits).await;
+            let gate = Arc::new(tokio::sync::Semaphore::new(0));
+            let held = TaggedSandbox::gated("held", gate.clone());
+            use_sandboxes(&rt, &[&held]);
+            let running = rt.new_session(SessionSpec::default()).await.unwrap();
+            let waiting = rt.new_session(SessionSpec::default()).await.unwrap();
+            set_sandbox(&rt, &running, local("held")).await.unwrap();
+            let mut rx = rt.subscribe();
+
+            let first = go(&rt, &running).await;
+            until("a command in the held sandbox", || ran(&held) == 1).await;
+            // The second Session's turn waits for the only permit.
+            let second = go(&rt, &waiting).await;
+            let live = rt.route(&waiting).unwrap();
+            until("the second turn reserved", || {
+                live.busy.load(Ordering::Acquire)
+            })
+            .await;
+
+            for session in [&running, &waiting] {
+                let result = rt.set_model(session, "faux/faux-two", None).await.unwrap();
+                assert!(result.seq > 0);
+            }
+            let changed = loop {
+                let changed = next_config(&mut rx, &running.key).await;
+                if changed.config.model.as_deref() == Some("faux/faux-two") {
+                    break changed;
+                }
+            };
+            assert!(changed.pending);
+            assert_eq!(changed.effective.model.as_deref(), Some("faux/faux-model"));
+            let live = rt.route(&running).unwrap();
+            assert_eq!(live.opened.harness.model().await.unwrap().id, "faux-model");
+
+            gate.add_permits(8);
+            first.outcome().await;
+            second.outcome().await;
+            go(&rt, &running).await.outcome().await;
+            assert_eq!(live.opened.harness.model().await.unwrap().id, "faux-two");
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
 }

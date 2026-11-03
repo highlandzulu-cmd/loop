@@ -361,7 +361,7 @@ async fn model_and_explicit_off_survive_a_runtime_restart() {
 }
 
 #[tokio::test]
-async fn during_a_turn_the_model_is_refused_and_the_effort_waits() {
+async fn during_a_turn_the_model_and_the_effort_wait_for_the_next_turn() {
     tokio::time::timeout(Duration::from_secs(30), async {
         use loop_ai::providers::{FauxResponse, FauxScript};
         let script = FauxScript::new();
@@ -393,12 +393,14 @@ async fn during_a_turn_the_model_is_refused_and_the_effort_waits() {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert_eq!(
-            rt.set_model(&session, "faux/second", None)
-                .await
-                .unwrap_err(),
-            BackendError::Busy
-        );
+        let model = rt.set_model(&session, "faux/second", None).await.unwrap();
+        assert!(model.pending);
+        assert!(model.applies_after_turn.is_some());
+        let (seq, changed) = config_changed(&mut rx, &session.key).await;
+        assert_eq!(seq, model.seq);
+        assert!(changed.pending);
+        assert_eq!(changed.config.model.as_deref(), Some("faux/second"));
+        assert_ne!(changed.effective.model.as_deref(), Some("faux/second"));
         let result = rt.set_effort(&session, "high", None).await.unwrap();
         assert!(result.pending);
         assert!(result.applies_after_turn.is_some());
@@ -414,8 +416,10 @@ async fn during_a_turn_the_model_is_refused_and_the_effort_waits() {
         assert!(!applied.pending);
         assert_eq!(applied.revision, result.revision);
         assert_eq!(applied.effective.effort.as_deref(), Some("high"));
-        // Now idle: the model can change.
-        rt.set_model(&session, "faux/second", None).await.unwrap();
+        assert_eq!(applied.effective.model.as_deref(), Some("faux/second"));
+        // Now idle: a model choice is no longer pending.
+        let idle = rt.set_model(&session, "faux/second", None).await.unwrap();
+        assert!(!idle.pending);
         rt.shutdown().await;
     })
     .await

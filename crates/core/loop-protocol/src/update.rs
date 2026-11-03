@@ -228,6 +228,11 @@ pub struct SessionConfig {
     /// absent inherits the default, 0 waits indefinitely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_timeout_ms: Option<u64>,
+    /// The sandbox chosen for the Session: `off`, or `local` followed by
+    /// its isolation and runtime when set (`local/full/krun`). Absent uses
+    /// the workspace default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
 }
 
 /// Who wrote a message.

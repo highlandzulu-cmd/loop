@@ -87,6 +87,9 @@ pub struct Runtime {
     idle_epoch: std::sync::atomic::AtomicU64,
     /// In-memory only: caller environments must never enter persistent logs or settings.
     launch_specs: Mutex<HashMap<SessionKey, SessionSpec>>,
+    /// Tests start their own sandboxes instead of a platform one.
+    #[cfg(test)]
+    sandbox_starter: Mutex<Option<admin::SandboxStarter>>,
     log: Arc<dyn EventLog>,
     generation: u64,
     limits: RuntimeLimits,
@@ -245,6 +248,9 @@ struct LiveSession {
     generation: Mutex<Option<Arc<admin::Generation>>>,
     /// The sandbox the Session runs in (`session/sandbox`).
     sandbox_choice: Mutex<loop_protocol::admin::SandboxChoice>,
+    /// A sandbox chosen during a turn, started and waiting for the turn to
+    /// end; the running tool calls keep the one they started in.
+    pending_sandbox: Mutex<Option<admin::PendingSandbox>>,
 }
 /// What the pump has committed and published of one Session. The pump is
 /// the only writer of a loaded Session's updates, so `published` and
@@ -365,6 +371,8 @@ impl Runtime {
             stopped: AtomicBool::new(false),
             idle_epoch: std::sync::atomic::AtomicU64::new(0),
             launch_specs: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            sandbox_starter: Mutex::new(None),
             log,
             generation,
             limits,
@@ -824,6 +832,31 @@ impl Runtime {
                 // startup defaults.
                 opened.native.restore_config().await?;
             }
+            let mut sandbox_choice = sandbox_choice;
+            if !created && child.is_none() {
+                // The sandbox the Session last chose outlives a restart.
+                let recorded = opened
+                    .native
+                    .recorded_sandbox()
+                    .and_then(|v| {
+                        serde_json::from_value::<loop_protocol::admin::SandboxChoice>(v).ok()
+                    })
+                    .filter(|choice| *choice != sandbox_choice);
+                if let Some(choice) = recorded {
+                    match self.restore_sandbox(&opened, &choice).await {
+                        Ok(()) => {
+                            sandbox_choice = if choice.mode == "local" {
+                                choice
+                            } else {
+                                Self::sandbox_choice(&opened.settings, false)
+                            };
+                        }
+                        Err(error) => opened
+                            .startup_notices
+                            .push(format!("Could not restore this Session's sandbox: {error}")),
+                    }
+                }
+            }
             if !created {
                 // Turn ids stay unique per Session across Runtime generations.
                 let turns = self.log.turn_ids(&reference.key).await.map_err(failed)?;
@@ -930,6 +963,7 @@ impl Runtime {
                 credential_notice: Mutex::new(credential_notice),
                 generation: Mutex::new(None),
                 sandbox_choice: Mutex::new(sandbox_choice),
+                pending_sandbox: Mutex::new(None),
             });
             if unannounced {
                 publish(
@@ -2061,7 +2095,7 @@ impl Runtime {
     }
     /// Run a config setter under the Session's lifecycle lock and return
     /// once its `config_changed` update is committed (outside the lock). A setter that cannot
-    /// wait for the next turn refuses a busy Session.
+    /// wait for the next turn refuses a busy Session by passing `refuse_busy`.
     async fn set_config<F, Fut>(
         &self,
         session: &SessionRef,
@@ -2225,8 +2259,8 @@ impl ModelControl for Runtime {
         model: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
-        // A model change never lands in the middle of a turn.
-        self.set_config(session, true, |live| async move {
+        // During a turn the choice waits: the running turn keeps its model.
+        self.set_config(session, false, |live| async move {
             Self::control(&live)?
                 .set_model(session, model, expected_revision)
                 .await
