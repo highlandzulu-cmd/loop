@@ -1,6 +1,6 @@
 # Phase 0 Lane B · loop-protocol on the wire: design draft
 
-Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model control comes in S3. All five PRs in §9 are built. User docs: [Running Loop from scripts](../print-mode.md).
+Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model control and the other TUI methods arrived in S3 (§12). All five PRs in §9 are built. User docs: [Running Loop from scripts](../print-mode.md).
 
 Goal: `loop-protocol` runs over a real connection. This is S1, the first step
 of the spine: the Runtime (S2) and the TUI as a Runtime client (S3) build on
