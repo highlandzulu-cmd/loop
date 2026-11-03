@@ -1,18 +1,19 @@
 //! Read-only search tools: `grep`, `glob` and `ls`.
 //!
-//! They walk the host filesystem under a path the [`ExecutionEnv`] resolves,
-//! so a jailed env still refuses paths outside its root. `grep` and `glob`
+//! Every directory walk, ignore rule and file read goes through [`ExecutionEnv`],
+//! so filesystem confinement also applies to search. `grep` and `glob`
 //! respect `.gitignore` (in a git repo or not) and skip hidden files unless
 //! asked; `.git/` is never searched. A [`SearchFilter`] hides the files the
 //! host's permission rules would not let the tool read.
 
-use std::cell::Cell;
-use std::io::Read as _;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use futures::{Stream, StreamExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -122,17 +123,13 @@ fn grep_tool(env: Arc<dyn ExecutionEnv>, filter: Option<SearchFilter>) -> AgentT
                         ))
                     }
                 };
-                let walk = Walk::from_args(env.as_ref(), &args, "grep", filter).await?;
+                let walk = Walk::from_args(Arc::clone(&env), &args, "grep", filter).await?;
                 let glob = match args.get("glob").and_then(|v| v.as_str()) {
                     Some(glob) => Some(glob_matcher(&walk.root, glob)?),
                     None => None,
                 };
-                let (search, hidden) = tokio::task::spawn_blocking(move || {
-                    let search = grep_files(&walk, &regex, mode, cancel.as_ref(), glob.as_ref());
-                    (search, walk.hidden_by_rules.get())
-                })
-                .await
-                .map_err(|e| e.to_string())?;
+                let search = grep_files(&walk, &regex, mode, cancel.as_ref(), glob.as_ref()).await;
+                let hidden = walk.hidden_by_rules.load(Ordering::Relaxed);
                 let matches = search.matches;
                 Ok(text_result(
                     search.lines,
@@ -177,26 +174,24 @@ fn glob_tool(env: Arc<dyn ExecutionEnv>, filter: Option<SearchFilter>) -> AgentT
             let filter = filter.clone();
             async move {
                 let pattern = arg_str(&args, "pattern")?;
-                let walk = Walk::from_args(env.as_ref(), &args, "glob", filter).await?;
+                let walk = Walk::from_args(Arc::clone(&env), &args, "glob", filter).await?;
                 let matcher = glob_matcher(&walk.root, &pattern)?;
-                let (lines, truncated, hidden) = tokio::task::spawn_blocking(move || {
-                    let mut lines = Vec::new();
-                    let mut truncated = false;
-                    for path in walk.files(cancel.as_ref()) {
-                        if !matches_glob(&matcher, &walk.root, &path) {
-                            continue;
-                        }
-                        if lines.len() == SEARCH_MAX_RESULTS {
-                            truncated = true;
-                            break;
-                        }
-                        lines.push(walk.display(&path));
+                let mut lines = Vec::new();
+                let mut truncated = false;
+                let files = walk.files(cancel.as_ref());
+                futures::pin_mut!(files);
+                while let Some(path) = files.next().await {
+                    if !matches_glob(&matcher, &walk.root, &path) {
+                        continue;
                     }
-                    lines.sort();
-                    (lines, truncated, walk.hidden_by_rules.get())
-                })
-                .await
-                .map_err(|e| e.to_string())?;
+                    if lines.len() == SEARCH_MAX_RESULTS {
+                        truncated = true;
+                        break;
+                    }
+                    lines.push(walk.display(&path));
+                }
+                lines.sort();
+                let hidden = walk.hidden_by_rules.load(Ordering::Relaxed);
                 let files = lines.len();
                 Ok(text_result(
                     lines,
@@ -290,12 +285,13 @@ struct Walk {
     tool: &'static str,
     filter: Option<SearchFilter>,
     /// Files `filter` hid.
-    hidden_by_rules: Cell<usize>,
+    hidden_by_rules: AtomicUsize,
+    env: Arc<dyn ExecutionEnv>,
 }
 
 impl Walk {
     async fn from_args(
-        env: &dyn ExecutionEnv,
+        env: Arc<dyn ExecutionEnv>,
         args: &serde_json::Value,
         tool: &'static str,
         filter: Option<SearchFilter>,
@@ -316,7 +312,8 @@ impl Walk {
                 .unwrap_or(false),
             tool,
             filter,
-            hidden_by_rules: Cell::new(0),
+            hidden_by_rules: AtomicUsize::new(0),
+            env,
         })
     }
 
@@ -324,7 +321,7 @@ impl Walk {
     fn allowed(&self, path: &Path) -> bool {
         let allowed = self.filter.as_ref().is_none_or(|f| f(self.tool, path));
         if !allowed {
-            self.hidden_by_rules.set(self.hidden_by_rules.get() + 1);
+            self.hidden_by_rules.fetch_add(1, Ordering::Relaxed);
         }
         allowed
     }
@@ -333,18 +330,38 @@ impl Walk {
     fn files<'a>(
         &'a self,
         cancel: Option<&'a CancellationToken>,
-    ) -> impl Iterator<Item = PathBuf> + 'a {
-        WalkBuilder::new(&self.root)
-            .hidden(!self.hidden)
-            .require_git(false)
-            .sort_by_file_path(|a, b| a.cmp(b))
-            .filter_entry(|entry| entry.file_name() != ".git")
-            .build()
-            .take_while(move |_| !cancel.is_some_and(|c| c.is_cancelled()))
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
-            .map(ignore::DirEntry::into_path)
-            .filter(move |path| self.allowed(path))
+    ) -> impl Stream<Item = PathBuf> + 'a {
+        async_stream::stream! {
+            let mut stack = vec![(self.root.clone(), Vec::<Arc<Gitignore>>::new())];
+            let mut visited = HashSet::new();
+            while let Some((path, mut ignores)) = stack.pop() {
+                if cancel.is_some_and(|c| c.is_cancelled()) { break; }
+                if !self.allowed(&path) { continue; }
+                let Ok(info) = self.env.file_info(&path).await else { continue; };
+                if info.is_file { yield path; continue; }
+                if !info.is_dir { continue; }
+                let Ok(canonical) = self.env.canonical_path(&path).await else { continue; };
+                if !visited.insert(canonical) { continue; }
+                // Read ignore rules through the capability too: the host walker
+                // would otherwise read a symlinked .gitignore outside the jail.
+                for name in [".gitignore", ".ignore"] {
+                    if let Ok(text) = self.env.read_text_file(&path.join(name)).await {
+                        let mut builder = GitignoreBuilder::new(&path);
+                        for line in text.lines() { let _ = builder.add_line(None, line); }
+                        if let Ok(rules) = builder.build() { ignores.push(Arc::new(rules)); }
+                    }
+                }
+                let Ok(mut entries) = self.env.list_dir(&path).await else { continue; };
+                entries.sort_by(|a, b| b.path.cmp(&a.path));
+                for entry in entries {
+                    let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
+                    if name == ".git" || (!self.hidden && name.starts_with('.')) { continue; }
+                    let matched = ignores.iter().rev().map(|rules| rules.matched_path_or_any_parents(&entry.path, entry.is_dir)).find(|m| !m.is_none());
+                    if matched.is_some_and(|m| m.is_ignore()) { continue; }
+                    stack.push((entry.path, ignores.clone()));
+                }
+            }
+        }
     }
 
     /// `path` relative to the working directory when inside it, with `/`
@@ -377,7 +394,7 @@ struct GrepOutput {
     truncated: bool,
 }
 
-fn grep_files(
+async fn grep_files(
     walk: &Walk,
     regex: &regex::Regex,
     mode: GrepMode,
@@ -389,11 +406,13 @@ fn grep_files(
         matches: 0,
         truncated: false,
     };
-    'files: for path in walk.files(cancel) {
+    let files = walk.files(cancel);
+    futures::pin_mut!(files);
+    'files: while let Some(path) = files.next().await {
         if glob.is_some_and(|g| !matches_glob(g, &walk.root, &path)) {
             continue;
         }
-        let Some(text) = read_text(&path) else {
+        let Some(text) = read_text(walk.env.as_ref(), &path).await else {
             continue;
         };
         let shown = walk.display(&path);
@@ -432,16 +451,12 @@ fn grep_files(
 }
 
 /// A file's text, or `None` for binary files and files that cannot be read.
-fn read_text(path: &Path) -> Option<String> {
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut head = vec![0; BINARY_SNIFF_BYTES];
-    let read = file.read(&mut head).ok()?;
-    if head[..read].contains(&0) {
+async fn read_text(env: &dyn ExecutionEnv, path: &Path) -> Option<String> {
+    let bytes = env.read_binary_file(path).await.ok()?;
+    if bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0) {
         return None;
     }
-    head.truncate(read);
-    file.read_to_end(&mut head).ok()?;
-    Some(String::from_utf8_lossy(&head).into_owned())
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The tool result for `lines`, with notes when they were cut short or

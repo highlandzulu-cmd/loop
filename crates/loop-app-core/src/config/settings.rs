@@ -70,6 +70,15 @@ pub struct SandboxSettings {
     /// home directory. Not yet enforced by the Linux Podman sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_write: Vec<String>,
+    /// Deny sandboxed commands and file tools reads under the home directory,
+    /// except the project, `allowWrite`, `allowRead` and git/Rust toolchain
+    /// settings (default off; macOS Seatbelt only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_home_reads: Option<bool>,
+    /// Paths under the home directory that stay readable with
+    /// `denyHomeReads`. `~` is the home directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_read: Vec<String>,
 }
 
 fn default_sandbox_mode() -> String {
@@ -84,6 +93,8 @@ impl Default for SandboxSettings {
             runtime: None,
             network: None,
             allow_write: Vec::new(),
+            deny_home_reads: None,
+            allow_read: Vec::new(),
         }
     }
 }
@@ -115,6 +126,11 @@ impl SandboxSettings {
         self.network.unwrap_or(false)
     }
 
+    /// Whether reads under the home directory are denied.
+    pub fn deny_home_reads(&self) -> bool {
+        self.deny_home_reads.unwrap_or(false)
+    }
+
     /// Human-readable short status (settings only; prefer harness `sandbox_info` for live details).
     pub fn display(&self) -> String {
         match self.mode.as_str() {
@@ -131,11 +147,18 @@ impl SandboxSettings {
         }
     }
 
-    /// Overlay project sandbox settings. `mode` comes from the project; isolation and
+    /// Overlay project sandbox settings. A project may enable the sandbox, never
+    /// disable it. Isolation and
     /// runtime only when the project sets them. A project may turn network access off
-    /// but not on, and cannot add writable paths.
+    /// but not on, and cannot add writable paths. Likewise it may turn
+    /// `denyHomeReads` on but not off, and cannot add readable paths.
     fn overlay_project(&mut self, project: SandboxSettings) {
-        self.mode = project.mode;
+        if project.deny_home_reads == Some(true) {
+            self.deny_home_reads = Some(true);
+        }
+        if project.mode == "local" {
+            self.mode = project.mode;
+        }
         if project.isolation.is_some() {
             self.isolation = project.isolation;
         }
@@ -697,6 +720,41 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["sandbox"], serde_json::json!({"mode": "off"}));
+    }
+
+    #[test]
+    fn project_may_tighten_home_reads_but_never_loosen_them() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"sandbox":{"denyHomeReads":true,"allowRead":["~/.npm"]}}"#)
+                .unwrap();
+        global.merge_project(
+            serde_json::from_str(r#"{"sandbox":{"denyHomeReads":false,"allowRead":["~/.ssh"]}}"#)
+                .unwrap(),
+        );
+        assert!(global.sandbox.deny_home_reads());
+        assert_eq!(global.sandbox.allow_read, ["~/.npm"]);
+        let mut global = Settings::default();
+        assert!(!global.sandbox.deny_home_reads());
+        global
+            .merge_project(serde_json::from_str(r#"{"sandbox":{"denyHomeReads":true}}"#).unwrap());
+        assert!(global.sandbox.deny_home_reads());
+    }
+
+    #[test]
+    fn project_cannot_disable_a_required_sandbox() {
+        for project in [
+            r#"{}"#,
+            r#"{"sandbox":{"mode":"off"}}"#,
+            r#"{"sandbox":{"mode":"unknown"}}"#,
+        ] {
+            let mut global: Settings =
+                serde_json::from_str(r#"{"sandbox":{"mode":"local"}}"#).unwrap();
+            global.merge_project(serde_json::from_str(project).unwrap());
+            assert_eq!(global.sandbox.mode, "local");
+        }
+        let mut global = Settings::default();
+        global.merge_project(serde_json::from_str(r#"{"sandbox":{"mode":"local"}}"#).unwrap());
+        assert_eq!(global.sandbox.mode, "local");
     }
 
     #[test]

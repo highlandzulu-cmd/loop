@@ -5327,7 +5327,8 @@ async fn apply_effect(
                             return Ok(false);
                         }
                     };
-                    let builder = SandboxBuilder::for_current_platform();
+                    let builder =
+                        SandboxBuilder::for_current_platform().with_agent_dir(&runtime.agent_dir);
                     let request = SandboxRequest::for_flags(&runtime.settings.sandbox, flags);
                     let plan = match builder.resolve(&request) {
                         Ok(v) => v,

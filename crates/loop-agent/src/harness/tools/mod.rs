@@ -128,8 +128,9 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             Ok(text) => (false, text),
                             Err(_) => (true, String::new()),
                         };
-                        let previous_path =
-                            write_review_snapshot(&abs, &previous).map_err(|e| e.to_string())?;
+                        let previous_path = write_review_snapshot(env.as_ref(), &abs, &previous)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         let diff = unified_diff(&previous, &content, &abs);
                         env.write_file(&abs, content.as_bytes())
                             .await
@@ -198,8 +199,9 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         } else {
                             fuzzy_replace(&original, &old_text, &new_text)?
                         };
-                        let previous_path =
-                            write_review_snapshot(&abs, &original).map_err(|e| e.to_string())?;
+                        let previous_path = write_review_snapshot(env.as_ref(), &abs, &original)
+                            .await
+                            .map_err(|e| e.to_string())?;
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
@@ -228,13 +230,15 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
 }
 
 /// Persist pre-edit contents so the CLI can open a diff and revert on reject.
-fn write_review_snapshot(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("loop-file-review");
-    std::fs::create_dir_all(&dir)?;
+async fn write_review_snapshot(
+    env: &dyn ExecutionEnv,
+    path: &Path,
+    contents: &str,
+) -> Result<PathBuf, crate::harness::types::FileError> {
+    let dir = env.create_temp_dir(".loop-file-review").await?;
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-    let id = loop_ai::new_id();
-    let out = dir.join(format!("{id}-{stem}.before"));
-    std::fs::write(&out, contents)?;
+    let out = dir.join(format!("{stem}.before"));
+    env.write_file(&out, contents.as_bytes()).await?;
     Ok(out)
 }
 

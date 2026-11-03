@@ -2,7 +2,7 @@
 //!
 //! Both `/sandbox local` and the Session factory go through [`SandboxBuilder`]. The
 //! builder picks the platform's sandbox from a [`SandboxRegistry`]: on Linux that is
-//! the Podman sandbox ([`KrunSandboxFactory`]); macOS has none yet. A new platform
+//! the Podman sandbox ([`KrunSandboxFactory`]); macOS uses Seatbelt. A new platform
 //! sandbox only needs a factory registered in [`platform_registry`] under
 //! [`LOCAL_SANDBOX_KIND`].
 //!
@@ -29,7 +29,7 @@ pub const LOCAL_SANDBOX_KIND: &str = "local";
 pub enum SandboxPlatform {
     /// Linux: Podman containers.
     Linux,
-    /// macOS: Seatbelt (not available yet).
+    /// macOS: Seatbelt partial isolation.
     MacOs,
     /// Anything else: no local sandbox.
     Other,
@@ -128,6 +128,10 @@ pub struct SandboxRequest {
     pub network: bool,
     /// Extra writable paths (`~` expanded; relative paths are under the workspace).
     pub allow_write: Vec<PathBuf>,
+    /// Deny reads under the home directory except the readable paths.
+    pub deny_home_reads: bool,
+    /// Paths under the home directory that stay readable (`~` expanded).
+    pub allow_read: Vec<PathBuf>,
 }
 
 impl SandboxRequest {
@@ -174,6 +178,8 @@ impl SandboxRequest {
                 .iter()
                 .map(|p| expand_home(p))
                 .collect(),
+            deny_home_reads: settings.deny_home_reads(),
+            allow_read: settings.allow_read.iter().map(|p| expand_home(p)).collect(),
         })
     }
 
@@ -192,6 +198,8 @@ impl SandboxRequest {
                 .iter()
                 .map(|p| expand_home(p))
                 .collect(),
+            deny_home_reads: settings.deny_home_reads(),
+            allow_read: settings.allow_read.iter().map(|p| expand_home(p)).collect(),
         }
     }
 }
@@ -217,6 +225,10 @@ pub struct SandboxPlan {
     pub network: bool,
     /// Extra writable paths.
     pub allow_write: Vec<PathBuf>,
+    /// Deny reads under the home directory except the readable paths.
+    pub deny_home_reads: bool,
+    /// Paths under the home directory that stay readable.
+    pub allow_read: Vec<PathBuf>,
 }
 
 impl SandboxPlan {
@@ -232,6 +244,10 @@ impl SandboxPlan {
     /// the Podman sandbox reads `isolation` and `runtime`, and ignores
     /// `network` and `allowWrite` for now.
     pub fn config(&self, workdir: &Path) -> SandboxConfig {
+        self.config_for_agent(workdir, &crate::config::paths::get_agent_dir())
+    }
+
+    fn config_for_agent(&self, workdir: &Path, agent_dir: &Path) -> SandboxConfig {
         let allow_write: Vec<String> = self
             .allow_write
             .iter()
@@ -241,7 +257,23 @@ impl SandboxPlan {
             "isolation": self.isolation.as_str(),
             "network": self.network,
             "allowWrite": allow_write,
+            "denyHomeReads": self.deny_home_reads,
+            "allowRead": self
+                .allow_read
+                .iter()
+                .map(|p| workdir.join(p).display().to_string())
+                .collect::<Vec<_>>(),
+            "homeDir": dirs::home_dir(),
+            "agentDir": agent_dir,
         });
+        // Cover Runtime's short-path socket fallback without creating any
+        // Runtime directories while merely preparing a sandbox config.
+        #[cfg(unix)]
+        {
+            // SAFETY: geteuid has no arguments or preconditions.
+            let uid = unsafe { libc::geteuid() };
+            options["runtimePaths"] = json!([format!("/tmp/loop-{uid}")]);
+        }
         if let Some(runtime) = self.runtime {
             options["runtime"] = json!(runtime.as_str());
         }
@@ -332,7 +364,10 @@ pub fn platform_registry() -> SandboxRegistry {
     let registry = SandboxRegistry::new();
     #[cfg(target_os = "linux")]
     registry.register(Arc::new(loop_agent::harness::KrunSandboxFactory));
-    // macOS: the Seatbelt factory registers here under LOCAL_SANDBOX_KIND.
+    #[cfg(target_os = "macos")]
+    registry.register(Arc::new(
+        loop_agent::harness::sandbox::seatbelt::SeatbeltSandboxFactory,
+    ));
     registry
 }
 
@@ -340,17 +375,28 @@ pub fn platform_registry() -> SandboxRegistry {
 pub struct SandboxBuilder {
     platform: SandboxPlatform,
     registry: SandboxRegistry,
+    agent_dir: PathBuf,
 }
 
 impl SandboxBuilder {
     /// Builder for `platform` over `registry` (tests inject both).
     pub fn new(platform: SandboxPlatform, registry: SandboxRegistry) -> Self {
-        Self { platform, registry }
+        Self {
+            platform,
+            registry,
+            agent_dir: crate::config::paths::get_agent_dir(),
+        }
     }
 
     /// Builder for the platform this binary runs on.
     pub fn for_current_platform() -> Self {
         Self::new(SandboxPlatform::current(), platform_registry())
+    }
+
+    /// Use the actual agent directory owned by this Runtime or standalone app.
+    pub fn with_agent_dir(mut self, agent_dir: impl Into<PathBuf>) -> Self {
+        self.agent_dir = agent_dir.into();
+        self
     }
 
     /// Platform this builder targets.
@@ -376,6 +422,8 @@ impl SandboxBuilder {
             runtime: request.runtime.or_else(|| platform.default_runtime()),
             network: request.network,
             allow_write: request.allow_write.clone(),
+            deny_home_reads: request.deny_home_reads,
+            allow_read: request.allow_read.clone(),
         })
     }
 
@@ -398,7 +446,10 @@ impl SandboxBuilder {
         }
         let sandbox = self
             .registry
-            .create(LOCAL_SANDBOX_KIND, plan.config(workdir))
+            .create(
+                LOCAL_SANDBOX_KIND,
+                plan.config_for_agent(workdir, &self.agent_dir),
+            )
             .await
             .map_err(|e| SandboxBuildError::Start(e.to_string()))?;
         if let Err(e) = sandbox.start().await {
@@ -785,10 +836,40 @@ mod tests {
         assert!(err.to_string().contains("podman missing"), "{err}");
     }
 
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn platform_builder_starts_seatbelt_with_the_actual_agent_dir() {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let root = tempfile::tempdir().unwrap();
+            let agent = root.path().join("custom-agent");
+            std::fs::create_dir(&agent).unwrap();
+            std::fs::write(agent.join("auth.json"), "private").unwrap();
+            let builder = SandboxBuilder::for_current_platform().with_agent_dir(&agent);
+            let (sandbox, plan) = builder
+                .start(root.path(), &SandboxRequest::default())
+                .await
+                .unwrap();
+            assert_eq!(plan.isolation, KrunIsolation::Partial);
+            assert!(sandbox.info().format_box().contains("seatbelt"));
+            assert!(sandbox
+                .env()
+                .read_text_file(&agent.join("auth.json"))
+                .await
+                .is_err());
+            sandbox.destroy().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn platform_registry_matches_the_build_target() {
         let kinds = platform_registry().kinds();
         let has_local = kinds.iter().any(|k| k == LOCAL_SANDBOX_KIND);
-        assert_eq!(has_local, cfg!(target_os = "linux"), "{kinds:?}");
+        assert_eq!(
+            has_local,
+            cfg!(any(target_os = "linux", target_os = "macos")),
+            "{kinds:?}"
+        );
     }
 }
