@@ -208,7 +208,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
                         control,
                         loop_wire::socket::unix(stream),
                         info.clone(),
-                        ServeOptions { owns_backend: false },
+                        ServeOptions { owns_backend: false, authority: loop_wire::Authority::HostLocal, },
                     );
                     connections.spawn(async move {
                         let _ = served.done.await;

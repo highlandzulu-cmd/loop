@@ -2,6 +2,7 @@
 //! owner, so `loop-wire` does not depend on the Runtime crate.
 
 use async_trait::async_trait;
+use loop_protocol::admin;
 use loop_protocol::rpc::{RuntimeStatus, SessionInfo};
 use loop_protocol::{BackendError, BackendResult, ErrorCategory, SessionRef, UpdateEnvelope};
 
@@ -146,6 +147,71 @@ pub trait RuntimeControl: Send + Sync {
     /// still answer.
     async fn stop(&self) -> BackendResult<()> {
         Err(unsupported("runtime/stop"))
+    }
+    /// Workspace admin and host-only services, when this Runtime serves them.
+    fn admin(&self) -> Option<&dyn RuntimeAdmin> {
+        None
+    }
+}
+
+/// Workspace admin, Session sandbox and permission mode, and host-only
+/// methods (design `tui-client.md` §3). Each answers Unsupported unless the
+/// owner serves it and advertises its capability. The server refuses
+/// host-only calls without host-local authority before calling these.
+#[async_trait]
+pub trait RuntimeAdmin: Send + Sync {
+    /// `workspace/mcp`.
+    async fn mcp(&self, _params: admin::McpParams) -> BackendResult<admin::McpResult> {
+        Err(BackendError::Unsupported("workspace/mcp".into()))
+    }
+    /// `workspace/web_search`.
+    async fn web_search(
+        &self,
+        _params: admin::WebSearchParams,
+    ) -> BackendResult<admin::WebSearchResult> {
+        Err(BackendError::Unsupported("workspace/web_search".into()))
+    }
+    /// `workspace/skills`.
+    async fn skills(&self, _params: admin::SkillsParams) -> BackendResult<admin::SkillsResult> {
+        Err(BackendError::Unsupported("workspace/skills".into()))
+    }
+    /// `workspace/templates`.
+    async fn templates(
+        &self,
+        _params: admin::TemplatesParams,
+    ) -> BackendResult<admin::TemplatesResult> {
+        Err(BackendError::Unsupported("workspace/templates".into()))
+    }
+    /// `workspace/reload`.
+    async fn reload(&self, _params: admin::ReloadParams) -> BackendResult<admin::ReloadResult> {
+        Err(BackendError::Unsupported("workspace/reload".into()))
+    }
+    /// `workspace/trust`. The server only passes a write (`trusted`) on a
+    /// host-local connection.
+    async fn trust(&self, _params: admin::TrustParams) -> BackendResult<admin::TrustResult> {
+        Err(BackendError::Unsupported("workspace/trust".into()))
+    }
+    /// `session/sandbox`.
+    async fn sandbox(&self, _params: admin::SandboxParams) -> BackendResult<admin::SandboxResult> {
+        Err(BackendError::Unsupported("session/sandbox".into()))
+    }
+    /// `session/permission_mode`.
+    async fn permission_mode(
+        &self,
+        _params: admin::PermissionModeParams,
+    ) -> BackendResult<admin::PermissionModeResult> {
+        Err(BackendError::Unsupported("session/permission_mode".into()))
+    }
+    /// `runtime/usage` (host-only).
+    async fn usage(&self, _params: admin::UsageParams) -> BackendResult<admin::UsageResult> {
+        Err(BackendError::Unsupported("runtime/usage".into()))
+    }
+    /// `runtime/defaults` (host-only).
+    async fn defaults(
+        &self,
+        _params: admin::DefaultsParams,
+    ) -> BackendResult<admin::DefaultsResult> {
+        Err(BackendError::Unsupported("runtime/defaults".into()))
     }
 }
 

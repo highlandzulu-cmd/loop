@@ -95,6 +95,7 @@ async fn connect(rt: &Arc<Runtime>) -> (Arc<RemoteBackend>, Served) {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let remote = RemoteBackend::connect(client, info(), Arc::new(Reject))

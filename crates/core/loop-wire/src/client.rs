@@ -8,6 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use loop_protocol::admin;
 use loop_protocol::rpc::{
     methods, AttachParams, AttachResult, ChoicesResult, ClientCapabilities, CloseParams,
     InitializeParams, InitializeResult, LoadParams, ModelsResult, PeerInfo, PromptParams,
@@ -622,4 +623,89 @@ async fn read(
         }
     }
     conn.fail_pending().await;
+}
+
+/// Workspace admin and host-only methods over the wire. A method the server
+/// did not advertise answers Unsupported without a round trip; a host-only
+/// one on a remote connection comes back Forbidden.
+#[async_trait]
+impl crate::control::RuntimeAdmin for RemoteBackend {
+    async fn mcp(&self, params: admin::McpParams) -> BackendResult<admin::McpResult> {
+        self.admin_call(|c| c.workspace_mcp, methods::WORKSPACE_MCP, &params)
+            .await
+    }
+    async fn web_search(
+        &self,
+        params: admin::WebSearchParams,
+    ) -> BackendResult<admin::WebSearchResult> {
+        self.admin_call(
+            |c| c.workspace_web_search,
+            methods::WORKSPACE_WEB_SEARCH,
+            &params,
+        )
+        .await
+    }
+    async fn skills(&self, params: admin::SkillsParams) -> BackendResult<admin::SkillsResult> {
+        self.admin_call(|c| c.workspace_skills, methods::WORKSPACE_SKILLS, &params)
+            .await
+    }
+    async fn templates(
+        &self,
+        params: admin::TemplatesParams,
+    ) -> BackendResult<admin::TemplatesResult> {
+        self.admin_call(
+            |c| c.workspace_templates,
+            methods::WORKSPACE_TEMPLATES,
+            &params,
+        )
+        .await
+    }
+    async fn reload(&self, params: admin::ReloadParams) -> BackendResult<admin::ReloadResult> {
+        self.admin_call(|c| c.workspace_reload, methods::WORKSPACE_RELOAD, &params)
+            .await
+    }
+    async fn trust(&self, params: admin::TrustParams) -> BackendResult<admin::TrustResult> {
+        self.admin_call(|c| c.workspace_trust, methods::WORKSPACE_TRUST, &params)
+            .await
+    }
+    async fn sandbox(&self, params: admin::SandboxParams) -> BackendResult<admin::SandboxResult> {
+        self.admin_call(|c| c.session_sandbox, methods::SESSION_SANDBOX, &params)
+            .await
+    }
+    async fn permission_mode(
+        &self,
+        params: admin::PermissionModeParams,
+    ) -> BackendResult<admin::PermissionModeResult> {
+        self.admin_call(
+            |c| c.permission_mode,
+            methods::SESSION_PERMISSION_MODE,
+            &params,
+        )
+        .await
+    }
+    async fn usage(&self, params: admin::UsageParams) -> BackendResult<admin::UsageResult> {
+        self.admin_call(|c| c.host_usage, methods::RUNTIME_USAGE, &params)
+            .await
+    }
+    async fn defaults(
+        &self,
+        params: admin::DefaultsParams,
+    ) -> BackendResult<admin::DefaultsResult> {
+        self.admin_call(|c| c.host_defaults, methods::RUNTIME_DEFAULTS, &params)
+            .await
+    }
+}
+
+impl RemoteBackend {
+    async fn admin_call<T: DeserializeOwned>(
+        &self,
+        flag: fn(&Capabilities) -> bool,
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> BackendResult<T> {
+        if !flag(&self.capabilities()) {
+            return Err(BackendError::Unsupported(method.into()));
+        }
+        call(&self.conn, method, params).await
+    }
 }

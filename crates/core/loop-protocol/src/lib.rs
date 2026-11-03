@@ -7,6 +7,7 @@
 
 #![deny(missing_docs)]
 
+pub mod admin;
 pub mod backend;
 mod capabilities;
 mod content;

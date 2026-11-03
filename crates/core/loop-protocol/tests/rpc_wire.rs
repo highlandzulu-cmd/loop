@@ -748,3 +748,151 @@ fn ttfb_method_wire() {
         json!({"response_timeout_ms":0})
     );
 }
+
+#[test]
+fn workspace_admin_and_host_only_methods_wire() {
+    use loop_protocol::admin::*;
+    use loop_protocol::rpc::methods;
+    assert_eq!(methods::WORKSPACE_MCP, "workspace/mcp");
+    assert_eq!(methods::WORKSPACE_WEB_SEARCH, "workspace/web_search");
+    assert_eq!(methods::WORKSPACE_SKILLS, "workspace/skills");
+    assert_eq!(methods::WORKSPACE_TEMPLATES, "workspace/templates");
+    assert_eq!(methods::WORKSPACE_RELOAD, "workspace/reload");
+    assert_eq!(methods::WORKSPACE_TRUST, "workspace/trust");
+    assert_eq!(methods::SESSION_SANDBOX, "session/sandbox");
+    assert_eq!(methods::SESSION_PERMISSION_MODE, "session/permission_mode");
+    assert_eq!(methods::RUNTIME_USAGE, "runtime/usage");
+    assert_eq!(methods::RUNTIME_DEFAULTS, "runtime/defaults");
+    for method in [
+        methods::RUNTIME_STOP,
+        methods::RUNTIME_USAGE,
+        methods::RUNTIME_DEFAULTS,
+        methods::RUNTIME_PROVIDERS,
+        methods::RUNTIME_MCP_AUTH,
+        methods::RUNTIME_TRACING,
+    ] {
+        assert!(methods::HOST_ONLY.contains(&method), "{method}");
+    }
+    assert!(!methods::HOST_ONLY.contains(&methods::WORKSPACE_TRUST));
+
+    let list: McpParams = serde_json::from_value(json!({"workspace_id":"w"})).unwrap();
+    assert_eq!(list.action, AdminAction::List);
+    roundtrip(
+        &McpParams {
+            workspace_id: "w".into(),
+            action: AdminAction::Disable,
+            name: Some("docs".into()),
+            expected_revision: Some(2),
+        },
+        json!({"workspace_id":"w","action":"disable","name":"docs","expected_revision":2}),
+    );
+    roundtrip(
+        &McpResult {
+            revision: 3,
+            servers: vec![McpServerStatus {
+                name: "docs".into(),
+                enabled: true,
+                connected: false,
+                tools: 0,
+                error: Some("refused".into()),
+            }],
+            pending_sessions: 1,
+        },
+        json!({"revision":3,"servers":[{"name":"docs","enabled":true,"connected":false,
+            "tools":0,"error":"refused"}],"pending_sessions":1}),
+    );
+    roundtrip(
+        &TrustParams {
+            workspace_id: "w".into(),
+            trusted: None,
+            expected_revision: None,
+        },
+        json!({"workspace_id":"w"}),
+    );
+    roundtrip(
+        &TemplatesResult {
+            revision: 1,
+            templates: None,
+            text: Some("Review x".into()),
+        },
+        json!({"revision":1,"text":"Review x"}),
+    );
+    roundtrip(
+        &ReloadResult {
+            revision: 4,
+            notices: vec!["reloaded".into()],
+            pending_sessions: 0,
+        },
+        json!({"revision":4,"notices":["reloaded"],"pending_sessions":0}),
+    );
+    let reference = json!({"instance":"native","key":"s1","native_id":"n1"});
+    let session: loop_protocol::SessionRef = serde_json::from_value(reference.clone()).unwrap();
+    roundtrip(
+        &SandboxParams {
+            session: session.clone(),
+            action: SandboxAction::Set,
+            config: Some(SandboxChoice {
+                mode: "local".into(),
+                isolation: Some("partial".into()),
+                runtime: None,
+            }),
+            expected_revision: None,
+        },
+        json!({"session":reference,"action":"set","config":{"mode":"local","isolation":"partial"}}),
+    );
+    roundtrip(
+        &PermissionModeResult {
+            mode: "ask".into(),
+            effective_policy: "asks".into(),
+            revision: 5,
+            seq: Some(9),
+            pending: false,
+        },
+        json!({"mode":"ask","effective_policy":"asks","revision":5,"seq":9,"pending":false}),
+    );
+    roundtrip(
+        &UsageParams {
+            days: Some(7),
+            cursor: None,
+            limit: Some(10),
+        },
+        json!({"days":7,"limit":10}),
+    );
+    roundtrip(
+        &DefaultsParams {
+            workspace_id: None,
+            patch: Some(DefaultsPatch {
+                response_header_timeout_ms: Some(0),
+            }),
+            expected_revision: None,
+        },
+        json!({"patch":{"response_header_timeout_ms":0}}),
+    );
+}
+
+#[test]
+fn forbidden_error_and_admin_capabilities_wire() {
+    use loop_protocol::rpc::{error_codes, RpcErrorBody};
+    use loop_protocol::{BackendError, Capabilities};
+    let error = BackendError::Forbidden("runtime/usage".into());
+    let body = RpcErrorBody::from(&error);
+    assert_eq!(error_codes::FORBIDDEN, -32006);
+    assert_eq!(
+        serde_json::to_value(&body).unwrap(),
+        json!({"code":-32006,
+            "message":"runtime/usage is only available on the Runtime host; run it there",
+            "data":"runtime/usage"})
+    );
+    assert_eq!(body.into_backend_error(), error);
+    // New flags are left out until offered, so older goldens are unchanged.
+    let none = serde_json::to_value(Capabilities::default()).unwrap();
+    assert!(none.get("workspace_reload").is_none());
+    let some = serde_json::to_value(Capabilities {
+        workspace_reload: true,
+        host_usage: true,
+        ..Capabilities::default()
+    })
+    .unwrap();
+    assert_eq!(some["workspace_reload"], json!(true));
+    assert_eq!(some["host_usage"], json!(true));
+}

@@ -133,6 +133,7 @@ async fn peer(rt: &Arc<loop_runtime::Runtime>, interactive: bool) -> loop_wire::
         },
         loop_wire::server::ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     client.outgoing.send(serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{"protocol_version":1, "client_info":{"name":"test", "version":"1"}, "client_capabilities":{"interact":interactive}}}).to_string()).unwrap();

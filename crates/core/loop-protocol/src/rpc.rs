@@ -104,6 +104,54 @@ pub mod methods {
     /// Client → server request: [`super::TtfbParams`] →
     /// [`super::TtfbResult`]. Needs the `session_ttfb` capability.
     pub const SESSION_TTFB: &str = "session/ttfb";
+    /// Client → server request: [`crate::admin::McpParams`] →
+    /// [`crate::admin::McpResult`]. Needs `workspace_mcp`.
+    pub const WORKSPACE_MCP: &str = "workspace/mcp";
+    /// Client → server request: [`crate::admin::WebSearchParams`] →
+    /// [`crate::admin::WebSearchResult`]. Needs `workspace_web_search`.
+    pub const WORKSPACE_WEB_SEARCH: &str = "workspace/web_search";
+    /// Client → server request: [`crate::admin::SkillsParams`] →
+    /// [`crate::admin::SkillsResult`]. Needs `workspace_skills`.
+    pub const WORKSPACE_SKILLS: &str = "workspace/skills";
+    /// Client → server request: [`crate::admin::TemplatesParams`] →
+    /// [`crate::admin::TemplatesResult`]. Needs `workspace_templates`.
+    pub const WORKSPACE_TEMPLATES: &str = "workspace/templates";
+    /// Client → server request: [`crate::admin::ReloadParams`] →
+    /// [`crate::admin::ReloadResult`]. Needs `workspace_reload`.
+    pub const WORKSPACE_RELOAD: &str = "workspace/reload";
+    /// Client → server request: [`crate::admin::TrustParams`] →
+    /// [`crate::admin::TrustResult`]. Needs `workspace_trust`; a write is
+    /// host-only.
+    pub const WORKSPACE_TRUST: &str = "workspace/trust";
+    /// Client → server request: [`crate::admin::SandboxParams`] →
+    /// [`crate::admin::SandboxResult`]. Needs `session_sandbox`.
+    pub const SESSION_SANDBOX: &str = "session/sandbox";
+    /// Client → server request: [`crate::admin::PermissionModeParams`] →
+    /// [`crate::admin::PermissionModeResult`]. Needs `permission_mode`.
+    pub const SESSION_PERMISSION_MODE: &str = "session/permission_mode";
+    /// Host-only request: [`crate::admin::UsageParams`] →
+    /// [`crate::admin::UsageResult`]. Needs `host_usage`.
+    pub const RUNTIME_USAGE: &str = "runtime/usage";
+    /// Host-only request: [`crate::admin::DefaultsParams`] →
+    /// [`crate::admin::DefaultsResult`]. Needs `host_defaults`.
+    pub const RUNTIME_DEFAULTS: &str = "runtime/defaults";
+    /// Host-only request: provider login and logout. Reserved.
+    pub const RUNTIME_PROVIDERS: &str = "runtime/providers";
+    /// Host-only request: MCP OAuth login and logout. Reserved.
+    pub const RUNTIME_MCP_AUTH: &str = "runtime/mcp_auth";
+    /// Host-only request: Runtime tracing. Reserved.
+    pub const RUNTIME_TRACING: &str = "runtime/tracing";
+
+    /// Methods served only with host-local authority (the Runtime's 0600
+    /// Unix socket or an embedded adapter), never over a WebSocket.
+    pub const HOST_ONLY: &[&str] = &[
+        RUNTIME_STOP,
+        RUNTIME_USAGE,
+        RUNTIME_DEFAULTS,
+        RUNTIME_PROVIDERS,
+        RUNTIME_MCP_AUTH,
+        RUNTIME_TRACING,
+    ];
 }
 
 /// Who is on the other end, for logs. Never used for feature checks.
@@ -582,6 +630,8 @@ pub mod error_codes {
     pub const FAILED: i64 = -32004;
     /// [`crate::BackendError::Conflict`]; data is `{"revision": n}`.
     pub const CONFLICT: i64 = -32005;
+    /// [`crate::BackendError::Forbidden`]; data is the method name.
+    pub const FORBIDDEN: i64 = -32006;
 }
 
 /// A JSON-RPC error: code, message and optional data.
@@ -613,6 +663,9 @@ impl From<&BackendError> for RpcErrorBody {
                 Some(serde_json::json!({ "revision": revision })),
             ),
             BackendError::Failed(info) => (error_codes::FAILED, serde_json::to_value(info).ok()),
+            BackendError::Forbidden(method) => {
+                (error_codes::FORBIDDEN, Some(Value::from(method.as_str())))
+            }
         };
         Self {
             code,
@@ -644,6 +697,9 @@ impl RpcErrorBody {
                 serde_json::from_value(data)
                     .unwrap_or_else(|_| ErrorInfo::new(ErrorCategory::Agent, self.message)),
             ),
+            error_codes::FORBIDDEN => {
+                BackendError::Forbidden(data.as_str().unwrap_or(&self.message).to_owned())
+            }
             _ => BackendError::failed(ErrorCategory::Protocol, self.message),
         }
     }
@@ -712,6 +768,62 @@ pub fn json_schema() -> Value {
     let shell_result = reference(generator.subschema_for::<crate::ShellResult>());
     let ttfb = reference(generator.subschema_for::<TtfbParams>());
     let ttfb_result = reference(generator.subschema_for::<TtfbResult>());
+    let admin = {
+        use crate::admin::*;
+        let r = |schema| reference(schema);
+        vec![
+            (
+                methods::WORKSPACE_MCP,
+                r(generator.subschema_for::<McpParams>()),
+                r(generator.subschema_for::<McpResult>()),
+            ),
+            (
+                methods::WORKSPACE_WEB_SEARCH,
+                r(generator.subschema_for::<WebSearchParams>()),
+                r(generator.subschema_for::<WebSearchResult>()),
+            ),
+            (
+                methods::WORKSPACE_SKILLS,
+                r(generator.subschema_for::<SkillsParams>()),
+                r(generator.subschema_for::<SkillsResult>()),
+            ),
+            (
+                methods::WORKSPACE_TEMPLATES,
+                r(generator.subschema_for::<TemplatesParams>()),
+                r(generator.subschema_for::<TemplatesResult>()),
+            ),
+            (
+                methods::WORKSPACE_RELOAD,
+                r(generator.subschema_for::<ReloadParams>()),
+                r(generator.subschema_for::<ReloadResult>()),
+            ),
+            (
+                methods::WORKSPACE_TRUST,
+                r(generator.subschema_for::<TrustParams>()),
+                r(generator.subschema_for::<TrustResult>()),
+            ),
+            (
+                methods::SESSION_SANDBOX,
+                r(generator.subschema_for::<SandboxParams>()),
+                r(generator.subschema_for::<SandboxResult>()),
+            ),
+            (
+                methods::SESSION_PERMISSION_MODE,
+                r(generator.subschema_for::<PermissionModeParams>()),
+                r(generator.subschema_for::<PermissionModeResult>()),
+            ),
+            (
+                methods::RUNTIME_USAGE,
+                r(generator.subschema_for::<UsageParams>()),
+                r(generator.subschema_for::<UsageResult>()),
+            ),
+            (
+                methods::RUNTIME_DEFAULTS,
+                r(generator.subschema_for::<DefaultsParams>()),
+                r(generator.subschema_for::<DefaultsResult>()),
+            ),
+        ]
+    };
     let empty = serde_json::json!({"type": "object"});
     let method = |direction: &str, kind: &str, params: &Value, result: Option<&Value>| {
         let mut method = serde_json::json!({
@@ -807,6 +919,14 @@ pub fn json_schema() -> Value {
     for (name, entry) in s3_methods {
         schema["methods"][name] = entry;
     }
+    for (name, params, result) in admin {
+        let mut entry = method(up, "request", &params, Some(&result));
+        if methods::HOST_ONLY.contains(&name) {
+            entry["host_only"] = Value::Bool(true);
+        }
+        schema["methods"][name] = entry;
+    }
+    schema["methods"][methods::RUNTIME_STOP]["host_only"] = Value::Bool(true);
     schema
 }
 
