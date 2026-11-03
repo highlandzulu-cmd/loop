@@ -12,9 +12,11 @@ pub mod backend;
 mod capabilities;
 mod content;
 mod error;
+pub mod host;
 mod ids;
 mod interaction;
 pub mod rpc;
+pub mod session_services;
 mod update;
 
 pub use backend::shell_timeout;

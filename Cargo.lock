@@ -4671,6 +4671,7 @@ version = "0.6.0"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
+ "loop-protocol",
  "loop-telemetry",
  "ratatui",
  "serde",

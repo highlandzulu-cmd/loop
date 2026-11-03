@@ -456,3 +456,18 @@ fn formatting() {
     assert_eq!(nice_max(7.3), 10.0);
     assert_eq!(nice_max(0.0), 1.0);
 }
+
+#[test]
+fn served_dashboard_hides_host_history_and_lists_loaded_sessions() {
+    let mut app = app(Summary::default(), Some(live()));
+    app.served = true;
+    app.history_available = false;
+    app.runtime = Some(loop_protocol::admin::RuntimeSessionsResult::default());
+    assert_eq!(app.views(), vec![View::Now, View::Runtime]);
+    app.set_view(View::Runtime);
+    assert_shows(
+        &draw(&mut app, 140, 35),
+        &["Runtime", "loaded", "State", "Tokens"],
+    );
+    assert!(!app.reload());
+}

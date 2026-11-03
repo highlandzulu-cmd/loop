@@ -2,7 +2,6 @@
 //! the chat loop keeps draining agent events and hands it a fresh live status, so turns
 //! and sub-agents carry on and the **Now** view stays current. Nothing runs while closed.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +11,7 @@ use loop_dashboard::{
     Dashboard, LiveStatus, McpServerStatus, Options, Palette, SubAgent, SubAgentState,
 };
 
-use super::{CardStatus, ChatItem, SurfaceClient, Theme, TokenBarState};
+use super::{CardStatus, ChatItem, SurfaceClient, Theme};
 
 /// How often the Now view is rebuilt from the chat's in-memory state.
 const LIVE_EVERY: Duration = Duration::from_millis(500);
@@ -49,7 +48,6 @@ pub(super) struct ChatState<'a> {
     pub items: &'a [ChatItem],
     pub working: bool,
     pub turn_step: &'a str,
-    pub token_bar: &'a TokenBarState,
 }
 
 /// The open dashboard.
@@ -59,29 +57,29 @@ pub(super) struct Screen {
     slow: Slow,
     live_at: Instant,
     slow_at: Instant,
+    period: Option<u32>,
 }
 
 impl Screen {
-    pub async fn open(runtime: &SurfaceClient, chat: ChatState<'_>) -> io::Result<Self> {
+    pub async fn open(runtime: &mut SurfaceClient, chat: ChatState<'_>) -> io::Result<Self> {
         let slow = Slow::query(runtime).await;
-        let usage_log = runtime.legacy().usage_log();
-        let dir = usage_log
-            .as_ref()
-            .and_then(|log| log.path.parent().map(PathBuf::from))
-            .unwrap_or_else(|| loop_app_core::config::paths::usage_dir(runtime.agent_dir()));
-        let notice = usage_log
-            .and_then(|log| log.last_error)
-            .map(|err| format!("The usage log could not be written: {err}"));
-        let mut options = options(runtime.theme(), dir, notice);
+        let summary = runtime
+            .usage_history(Some(30))
+            .await
+            .ok()
+            .and_then(|r| r.summary)
+            .and_then(|s| serde_json::from_value(s).ok());
+        let rows = runtime.loaded_sessions().await.unwrap_or_default();
+        let mut options = options(runtime.theme(), PathBuf::new(), None);
         options.live = Some(live_status(runtime, &chat, &slow));
-        // Include this session's latest spans; they show up on the next reload.
-        runtime.legacy().flush_usage_log();
+        let board = Dashboard::open_served(options, summary, rows)?;
         Ok(Self {
-            board: Dashboard::open(options)?,
+            board,
             size: crossterm::terminal::size().ok(),
             slow,
             live_at: Instant::now(),
             slow_at: Instant::now(),
+            period: Some(30),
         })
     }
 
@@ -100,15 +98,25 @@ impl Screen {
     /// Refresh the live status when due and redraw.
     pub async fn refresh(
         &mut self,
-        runtime: &SurfaceClient,
+        runtime: &mut SurfaceClient,
         chat: ChatState<'_>,
     ) -> io::Result<()> {
-        if self.slow_at.elapsed() >= SLOW_EVERY {
+        let period = self.board.period_days();
+        if self.slow_at.elapsed() >= SLOW_EVERY || self.period != period {
             self.slow = Slow::query(runtime).await;
-            runtime.legacy().flush_usage_log();
+            let summary = runtime
+                .usage_history(period)
+                .await
+                .ok()
+                .and_then(|r| r.summary)
+                .and_then(|s| serde_json::from_value(s).ok());
+            let rows = runtime.loaded_sessions().await.unwrap_or_default();
+            self.board.set_host_data(summary, rows);
+            self.period = period;
             self.slow_at = Instant::now();
         }
         if self.live_at.elapsed() >= LIVE_EVERY {
+            self.slow.stats = runtime.stats().await.ok();
             self.board.set_live(live_status(runtime, &chat, &self.slow));
             self.live_at = Instant::now();
         }
@@ -129,69 +137,50 @@ impl Screen {
 struct Slow {
     sandbox: String,
     mcp_servers: Vec<McpServerStatus>,
+    stats: Option<loop_protocol::StatsSummary>,
 }
-
 impl Slow {
-    async fn query(runtime: &SurfaceClient) -> Self {
-        let sandbox = runtime.legacy().harness().sandbox_info().await;
-        let sandbox = sandbox
-            .fields
-            .iter()
-            .map(|(_, value)| value.as_str())
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let connected: HashMap<String, usize> = runtime
-            .legacy()
-            .mcp_client()
-            .list_connections()
+    async fn query(runtime: &mut SurfaceClient) -> Self {
+        let sandbox = runtime
+            .sandbox_service()
+            .sandbox(loop_protocol::admin::SandboxParams {
+                session: runtime.session_ref(),
+                action: loop_protocol::admin::SandboxAction::Status,
+                config: None,
+                expected_revision: None,
+            })
             .await
-            .into_iter()
-            .collect();
-        let mut mcp_servers: Vec<McpServerStatus> = runtime
-            .legacy()
-            .settings()
-            .mcp_servers
-            .keys()
-            .filter(|name| {
-                !runtime
-                    .legacy()
-                    .settings()
-                    .disabled_mcp_servers
-                    .contains(name)
+            .map(|s| s.info)
+            .unwrap_or_default();
+        let mcp_servers = runtime
+            .mcp(loop_protocol::admin::AdminAction::List, None)
+            .await
+            .map(|r| {
+                r.servers
+                    .into_iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| McpServerStatus {
+                        name: s.name,
+                        tools: s.tools as usize,
+                        connected: s.connected,
+                    })
+                    .collect()
             })
-            .map(|name| McpServerStatus {
-                name: name.clone(),
-                tools: connected.get(name).copied().unwrap_or(0),
-                connected: connected.contains_key(name),
-            })
-            .collect();
-        for (name, tools) in &connected {
-            if !mcp_servers.iter().any(|s| &s.name == name) {
-                mcp_servers.push(McpServerStatus {
-                    name: name.clone(),
-                    tools: *tools,
-                    connected: true,
-                });
-            }
-        }
+            .unwrap_or_default();
         Self {
             sandbox,
             mcp_servers,
+            stats: runtime.stats().await.ok(),
         }
     }
 }
 
 /// The Now view's status, from in-memory state only.
 fn live_status(runtime: &SurfaceClient, chat: &ChatState<'_>, slow: &Slow) -> LiveStatus {
-    let subscription =
-        runtime
-            .active_agent()
-            .as_deref()
-            .map(|id| match runtime.legacy().agents().entry(id) {
-                Some(entry) => entry.display_name().to_string(),
-                None => id.to_string(),
-            });
+    let subscription = runtime
+        .active_agent()
+        .as_deref()
+        .map(|id| runtime.agent_label(id).unwrap_or_else(|| id.to_string()));
     let (model, effort) = match &subscription {
         Some(agent) => (
             runtime
@@ -232,14 +221,18 @@ fn live_status(runtime: &SurfaceClient, chat: &ChatState<'_>, slow: &Slow) -> Li
         taken_at: chrono::Local::now(),
         model,
         effort,
-        permission_mode: runtime.legacy().permission_mode().label().to_string(),
+        permission_mode: runtime.permission_mode().label().to_string(),
         sandbox: slow.sandbox.clone(),
-        web: runtime.legacy().web_tools().status(),
+        web: runtime.web_label(),
         cwd: runtime.cwd().display().to_string(),
         session_id: runtime.session_id().clone(),
-        context_tokens: chat.token_bar.context_tokens,
-        context_window: chat.token_bar.context_window,
-        session_tokens: chat.token_bar.total_tokens,
+        context_tokens: slow.stats.as_ref().and_then(|s| s.context_tokens),
+        context_window: slow
+            .stats
+            .as_ref()
+            .and_then(|s| s.context_window)
+            .unwrap_or(0),
+        session_tokens: slow.stats.as_ref().map_or(0, |s| s.total_tokens),
         main_agent_working: chat.working,
         main_agent_step: if chat.working {
             chat.turn_step.to_string()
@@ -249,21 +242,23 @@ fn live_status(runtime: &SurfaceClient, chat: &ChatState<'_>, slow: &Slow) -> Li
         external_agent: subscription.map(|agent| format!("{agent} · subscription agent")),
         sub_agents,
         skills_loaded: runtime
-            .legacy()
-            .resources()
+            .resource_view()
+            .skills
+            .into_iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.name)
+            .collect(),
+        skills_active: runtime.resource_view().active_skills,
+        skills_disabled: runtime
+            .resource_view()
             .skills
             .iter()
-            .map(|s| s.name.clone())
-            .collect(),
-        skills_active: runtime.legacy().active_skills().clone(),
-        skills_disabled: runtime.legacy().resources().disabled_skills.len(),
+            .filter(|s| !s.enabled)
+            .count(),
         mcp_servers: slow.mcp_servers.clone(),
-        extensions: runtime.legacy().resources().extension_paths.len(),
-        hooks: runtime.legacy().resources().hook_paths.len(),
-        usage_log: runtime
-            .legacy()
-            .usage_log()
-            .map(|log| log.path.display().to_string()),
+        extensions: runtime.resource_view().extensions,
+        hooks: runtime.resource_view().hooks,
+        usage_log: runtime.usage_log_status().map(|s| s.0),
     }
 }
 
@@ -303,5 +298,52 @@ mod tests {
             .map(|agent| agent.id)
             .collect();
         assert_eq!(ids, ["100", "3", "4", "5", "6", "7"]);
+    }
+}
+
+#[cfg(test)]
+mod session_stats_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dashboard_uses_attached_session_stats_and_lists_only_loaded_sessions() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runtime = crate::surface_client::test_support::fixture(dir.path()).await;
+            runtime.new_session().await.unwrap();
+            let slow = Slow {
+                sandbox: "off".into(),
+                mcp_servers: vec![],
+                stats: Some(loop_protocol::StatsSummary {
+                    total_tokens: 321,
+                    context_tokens: Some(123),
+                    context_window: Some(4096),
+                    ..Default::default()
+                }),
+            };
+            let state = live_status(
+                &runtime,
+                &ChatState {
+                    items: &[],
+                    working: false,
+                    turn_step: "",
+                },
+                &slow,
+            );
+            assert_eq!(
+                (
+                    state.session_tokens,
+                    state.context_tokens,
+                    state.context_window
+                ),
+                (321, Some(123), 4096)
+            );
+            let loaded = runtime.loaded_sessions().await.unwrap();
+            assert_eq!(loaded.totals.sessions, 1);
+            assert_eq!(loaded.sessions[0].session, runtime.session_ref());
+            let history = runtime.usage_history(None).await.unwrap();
+            assert!(history.summary.is_some());
+        })
+        .await
+        .unwrap();
     }
 }

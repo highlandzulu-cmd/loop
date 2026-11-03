@@ -117,3 +117,33 @@ pub(crate) fn pause_provider(
     provider.set_models(client.host.inner.models.get_models(Some("faux")));
     client.host.inner.models.set_provider(provider);
 }
+
+pub(crate) fn settings(client: &SurfaceClient) -> &crate::config::Settings {
+    &client.host.inner.settings
+}
+pub(crate) fn settings_mut(client: &mut SurfaceClient) -> &mut crate::config::Settings {
+    &mut client.host.inner.settings
+}
+pub(crate) fn resources_mut(client: &mut SurfaceClient) -> &mut crate::resources::LoadedResources {
+    &mut client.host.inner.resources
+}
+pub(crate) async fn sync_resources(client: &SurfaceClient) {
+    client.host.inner.sync_harness_resources().await;
+}
+pub(crate) fn logout(client: &SurfaceClient, provider: &str) {
+    client.host.inner.credentials.logout(provider).unwrap();
+}
+pub(crate) async fn append_label(client: &SurfaceClient, label: String) {
+    client.host.inner.harness.append_label(label).await.unwrap();
+}
+
+#[cfg(feature = "orchestration")]
+pub(crate) fn plan_shell_task(client: &SurfaceClient) {
+    let provider = loop_ai::providers::faux_provider_fn(Arc::new(|_| {
+        Box::pin(async {
+            loop_ai::providers::FauxResponse::Text(serde_json::json!({"tasks":[{"id":"inspect","description":"Inspect","kind":"shell_command","command":"printf workflow-output"}]}).to_string())
+        })
+    }));
+    provider.set_models(client.host.inner.models.get_models(Some("faux")));
+    client.host.inner.models.set_provider(provider);
+}

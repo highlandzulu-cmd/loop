@@ -17,6 +17,14 @@ use crate::update::StopReason;
 
 /// Method names.
 pub mod methods {
+    /// Current Session snapshot.
+    pub const SESSION_CONFIG: &str = "session/config";
+    /// Redacted workspace settings.
+    pub const WORKSPACE_SETTINGS: &str = "workspace/settings";
+    /// Session skill activation.
+    pub const SESSION_SKILL: &str = "session/skill";
+    /// Start a workflow; progress is streamed.
+    pub const SESSION_WORKFLOW: &str = "session/workflow";
     // Session-tree operations.
     /// Session-tree RPC method.
     pub const SESSION_TREE: &str = "session/tree";
@@ -138,11 +146,11 @@ pub mod methods {
     /// Client → server request: `{}` → [`crate::admin::RuntimeSessionsResult`].
     /// Needs `runtime_sessions`.
     pub const RUNTIME_SESSIONS: &str = "runtime/sessions";
-    /// Host-only request: provider login and logout. Reserved.
+    /// Host-only provider login and logout.
     pub const RUNTIME_PROVIDERS: &str = "runtime/providers";
-    /// Host-only request: MCP OAuth login and logout. Reserved.
+    /// Host-only MCP OAuth login and logout.
     pub const RUNTIME_MCP_AUTH: &str = "runtime/mcp_auth";
-    /// Host-only request: Runtime tracing. Reserved.
+    /// Host-only Runtime tracing.
     pub const RUNTIME_TRACING: &str = "runtime/tracing";
 
     /// Methods served only with host-local authority (the Runtime's 0600
@@ -774,10 +782,36 @@ pub fn json_schema() -> Value {
     let shell_result = reference(generator.subschema_for::<crate::ShellResult>());
     let ttfb = reference(generator.subschema_for::<TtfbParams>());
     let ttfb_result = reference(generator.subschema_for::<TtfbResult>());
+    let skill = reference(generator.subschema_for::<crate::session_services::SkillParams>());
+    let workflow = reference(generator.subschema_for::<crate::session_services::WorkflowParams>());
+    let workflow_result =
+        reference(generator.subschema_for::<crate::session_services::WorkflowResult>());
+    let snapshot = reference(generator.subschema_for::<SessionSnapshot>());
     let admin = {
         use crate::admin::*;
+        use crate::host::*;
         let r = |schema| reference(schema);
         vec![
+            (
+                methods::RUNTIME_PROVIDERS,
+                r(generator.subschema_for::<ProvidersParams>()),
+                r(generator.subschema_for::<ProvidersResult>()),
+            ),
+            (
+                methods::RUNTIME_TRACING,
+                r(generator.subschema_for::<TracingParams>()),
+                r(generator.subschema_for::<TracingResult>()),
+            ),
+            (
+                methods::RUNTIME_MCP_AUTH,
+                r(generator.subschema_for::<McpAuthParams>()),
+                r(generator.subschema_for::<McpAuthResult>()),
+            ),
+            (
+                methods::WORKSPACE_SETTINGS,
+                r(generator.subschema_for::<SettingsParams>()),
+                r(generator.subschema_for::<SettingsResult>()),
+            ),
             (
                 methods::WORKSPACE_MCP,
                 r(generator.subschema_for::<McpParams>()),
@@ -886,6 +920,18 @@ pub fn json_schema() -> Value {
     });
     // Added separately: one `json!` this large exceeds the macro recursion limit.
     let s3_methods = [
+        (
+            methods::SESSION_CONFIG,
+            method(up, "request", &session_params, Some(&snapshot)),
+        ),
+        (
+            methods::SESSION_SKILL,
+            method(up, "request", &skill, Some(&mutation)),
+        ),
+        (
+            methods::SESSION_WORKFLOW,
+            method(up, "request", &workflow, Some(&workflow_result)),
+        ),
         (
             methods::SESSION_MODELS,
             method(up, "request", &session_params, Some(&models)),

@@ -80,6 +80,38 @@ impl RemoteBackend {
         })?
     }
 
+    /// Current public Session snapshot.
+    pub async fn config(
+        &self,
+        p: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::SessionSnapshot> {
+        if !self.capabilities.session_config {
+            return Err(BackendError::Unsupported(methods::SESSION_CONFIG.into()));
+        }
+        call(&self.conn, methods::SESSION_CONFIG, &p).await
+    }
+
+    /// Activate a Session skill.
+    pub async fn skill(
+        &self,
+        params: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        if !self.capabilities.session_skills {
+            return Err(BackendError::Unsupported(methods::SESSION_SKILL.into()));
+        }
+        call(&self.conn, methods::SESSION_SKILL, &params).await
+    }
+    /// Start a workflow; progress arrives through subscribe.
+    pub async fn workflow(
+        &self,
+        params: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        if !self.capabilities.workflow {
+            return Err(BackendError::Unsupported(methods::SESSION_WORKFLOW.into()));
+        }
+        call(&self.conn, methods::SESSION_WORKFLOW, &params).await
+    }
+
     /// Connect over `transport` and agree on a version. `host` answers the
     /// server's `host/interact` requests.
     pub async fn connect(
@@ -663,6 +695,33 @@ async fn read(
 /// one on a remote connection comes back Forbidden.
 #[async_trait]
 impl crate::control::RuntimeAdmin for RemoteBackend {
+    async fn providers(
+        &self,
+        p: loop_protocol::host::ProvidersParams,
+    ) -> BackendResult<loop_protocol::host::ProvidersResult> {
+        self.admin_call(|c| c.host_providers, methods::RUNTIME_PROVIDERS, &p)
+            .await
+    }
+    async fn tracing(
+        &self,
+        p: loop_protocol::host::TracingParams,
+    ) -> BackendResult<loop_protocol::host::TracingResult> {
+        self.admin_call(|c| c.host_tracing, methods::RUNTIME_TRACING, &p)
+            .await
+    }
+    async fn mcp_auth(
+        &self,
+        p: loop_protocol::host::McpAuthParams,
+    ) -> BackendResult<loop_protocol::host::McpAuthResult> {
+        self.admin_call(|c| c.host_mcp_auth, methods::RUNTIME_MCP_AUTH, &p)
+            .await
+    }
+
+    async fn settings(&self, p: admin::SettingsParams) -> BackendResult<admin::SettingsResult> {
+        self.admin_call(|c| c.workspace_settings, methods::WORKSPACE_SETTINGS, &p)
+            .await
+    }
+
     fn offered(&self) -> Capabilities {
         self.capabilities()
     }

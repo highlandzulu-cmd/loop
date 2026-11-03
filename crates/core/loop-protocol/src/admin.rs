@@ -343,6 +343,9 @@ pub struct UsageParams {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UsageResult {
+    /// Full dashboard aggregates for the selected period, when offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<Value>,
     /// Session rows, most recent first.
     pub rows: Vec<Value>,
     /// Totals over the whole period.
@@ -448,4 +451,25 @@ pub struct RuntimeSessionsResult {
     pub totals: RuntimeSessionTotals,
     /// When the rows were read, in ms since the epoch.
     pub taken_at_ms: u64,
+}
+
+/// Read the effective, redacted workspace settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SettingsParams {
+    /// Opaque host workspace id.
+    pub workspace_id: String,
+}
+/// Public workspace settings and resource counts.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SettingsResult {
+    /// Workspace generation.
+    pub revision: u64,
+    /// Explicitly whitelisted effective settings; credentials are excluded.
+    pub effective: Value,
+    /// Model cycle filter.
+    pub enabled_models: Vec<String>,
+    /// Resource counts by kind.
+    pub resource_counts: std::collections::BTreeMap<String, u32>,
 }

@@ -1,15 +1,16 @@
 //! The TUI's typed client boundary over today's in-process native backend.
 //!
-//! The host is private and there is no Deref to CliRuntime or Runtime. Deferred
-//! groups have an explicit, temporary `legacy` escape hatch (see the design TODO).
-use loop_protocol::{rpc::*, AgentBackend, SessionRef, SessionSpec};
+//! The native owner is private. Surfaces receive typed services and immutable views;
+//! neither the host nor mutable settings can be reached through this boundary.
+use loop_protocol::{rpc::*, session_services::*, AgentBackend, SessionRef, SessionSpec};
 use loop_wire::RuntimeControl;
 use std::sync::Arc;
+mod native_admin;
 mod native_sessions;
 use crate::theme::Theme;
 use crate::{keybindings, CliRuntime, PendingAgent, StartupSessions, ToolApprovalBridge};
-mod legacy;
-pub use legacy::LegacyHost;
+mod native_host;
+use native_host::NativeHost;
 
 /// A Surface's client services and local terminal state.
 ///
@@ -25,8 +26,16 @@ pub use legacy::LegacyHost;
 ///     let _ = &client.host.inner;
 /// }
 /// ```
+/// The removed host escape hatch is not part of the Surface API:
+/// ```compile_fail
+/// fn host(client: &loop_cli::SurfaceClient) { let _ = client.legacy(); }
+/// ```
+/// ```compile_fail
+/// fn host(client: &mut loop_cli::SurfaceClient) { let _ = client.legacy_mut(); }
+/// ```
 pub struct SurfaceClient {
-    host: LegacyHost,
+    host: NativeHost,
+    confirm_timeout_default: Option<u64>,
     sessions: Arc<dyn RuntimeControl>,
     native_sessions: Arc<native_sessions::NativeSessions>,
     native_backend: Arc<dyn AgentBackend>,
@@ -118,7 +127,8 @@ impl From<CliRuntime> for SurfaceClient {
             native_sessions: native.clone(),
             native_backend: native,
             workspace_id,
-            host: LegacyHost { inner },
+            host: NativeHost { inner },
+            confirm_timeout_default: None,
             keybindings,
             debug,
             debug_log_path,
@@ -136,14 +146,6 @@ impl From<CliRuntime> for SurfaceClient {
 }
 
 impl SurfaceClient {
-    /// Temporary access for the unmigrated groups 3–6 only.
-    pub fn legacy(&self) -> &LegacyHost {
-        &self.host
-    }
-    /// Temporary mutation access for the unmigrated groups 3–6 only.
-    pub fn legacy_mut(&mut self) -> &mut LegacyHost {
-        &mut self.host
-    }
     pub fn backend(&self) -> &Arc<dyn AgentBackend> {
         if self.is_native() {
             &self.native_backend
@@ -307,6 +309,7 @@ impl SurfaceClient {
             self.host.inner.models.get_model(provider, id)
         });
         self.host.inner.model_note = None;
+        self.host.inner.active_skills = config.config.active_skills;
     }
 
     pub async fn new_session(&mut self) -> anyhow::Result<()> {
@@ -613,34 +616,28 @@ impl SurfaceClient {
     /// Today this writes the host settings in process. Over a Runtime it is
     /// `runtime/defaults` ([`save_defaults_on`]), which is host-only.
     pub async fn save_defaults(&mut self) -> anyhow::Result<String> {
+        use loop_wire::RuntimeAdmin;
         let effort = self.session_effort().await?;
-        let label = match self.active_agent().clone() {
-            None => {
-                let model = self
-                    .selected_model()
-                    .clone()
-                    .ok_or_else(|| anyhow::anyhow!("choose a model first: /model"))?;
-                let inner = &mut self.host.inner;
-                inner.settings.default_thinking_level = effort.clone();
-                inner
-                    .native
-                    .set_default_effort(loop_agent::effort::parse_thinking(&effort));
-                // Saves the settings file too.
-                inner.remember_model(&model.provider, &model.id)?;
-                format!("{}/{}", model.provider, model.id)
-            }
-            Some(id) => {
-                let model = self.agent_model().clone();
-                let inner = &mut self.host.inner;
-                if let Some(model) = &model {
-                    inner.remember_model(&id, model)?;
-                }
-                if !effort.is_empty() {
-                    inner.agents.remember_effort(&id, &effort)?;
-                }
-                model.map_or(id.clone(), |m| format!("{id}/{m}"))
-            }
+        let model = match self.active_agent() {
+            Some(id) => self.agent_model().as_ref().map(|m| format!("{id}/{m}")),
+            None => self.selected_model_spec(),
         };
+        if model.is_none() && self.active_agent().is_none() {
+            anyhow::bail!("choose a model first: /model");
+        }
+        self.admin()
+            .defaults(loop_protocol::admin::DefaultsParams {
+                patch: Some(loop_protocol::admin::DefaultsPatch {
+                    model: model.clone(),
+                    effort: Some(effort.clone()),
+                    response_header_timeout_ms: None,
+                }),
+                ..Default::default()
+            })
+            .await?;
+        let label = model
+            .or_else(|| self.active_agent().clone())
+            .unwrap_or_default();
         Ok(if effort.is_empty() {
             label
         } else {
@@ -1088,4 +1085,755 @@ mod runtime_default_tests {
         .await
         .unwrap();
     }
+}
+
+impl SurfaceClient {
+    /// S3.4 admin request service for the native owner. The borrow prevents the
+    /// UI from changing host state during an administrative operation.
+    pub fn admin(&mut self) -> impl loop_wire::RuntimeAdmin + '_ {
+        native_admin::NativeAdmin(tokio::sync::Mutex::new(&mut self.host.inner))
+    }
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn permission_mode(&self) -> loop_app_core::permissions::PermissionMode {
+        self.host.inner.permission_mode()
+    }
+    pub async fn set_permission_mode(
+        &mut self,
+        mode: loop_app_core::permissions::PermissionMode,
+    ) -> anyhow::Result<()> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::PermissionModeParams {
+            session: self.session_ref(),
+            mode: Some(mode.as_str().into()),
+            expected_revision: None,
+        };
+        self.admin().permission_mode(params).await?;
+        Ok(())
+    }
+    pub async fn sync_agent_mode(&mut self) -> Option<String> {
+        self.host.inner.sync_agent_mode().await
+    }
+    pub fn project_trusted(&self) -> bool {
+        self.host.inner.project_trusted
+    }
+    pub async fn set_trust(&mut self, trusted: bool) -> anyhow::Result<()> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::TrustParams {
+            workspace_id: self.workspace_id.clone(),
+            trusted: Some(trusted),
+            expected_revision: None,
+        };
+        self.admin().trust(params).await?;
+        Ok(())
+    }
+    pub fn sandbox_service(&self) -> Arc<dyn loop_wire::RuntimeAdmin> {
+        let r = &self.host.inner;
+        Arc::new(native_admin::NativeSandbox {
+            native: r.native.clone(),
+            harness: r.harness.clone(),
+            cwd: r.cwd.clone(),
+            agent_dir: r.agent_dir.clone(),
+            settings: r.settings.sandbox.clone(),
+            web: r.web_tools(),
+            search: r.tool_gate.search_filter(),
+            bash: r.bash_limits(),
+        })
+    }
+    pub fn clear_session_approvals(&self) {
+        self.host.clear_session_approvals();
+    }
+    pub async fn install_interactions(
+        &mut self,
+        host: loop_app_core::interaction::InteractionQueue,
+    ) -> anyhow::Result<()> {
+        let r = &mut self.host.inner;
+        let env = r.harness.tool_env().await?;
+        let grants = r
+            .harness
+            .read_session_entries()
+            .await
+            .map(|entries| crate::tool_approval::auto_approve_from_entries(&entries))
+            .unwrap_or_default();
+        r.agents.set_host(Arc::new(host.clone()));
+        let bridge = Arc::new(ToolApprovalBridge::with_host(
+            env,
+            r.settings.diff_editor.clone(),
+            grants,
+            Arc::new(host),
+        ));
+        let harness = r.harness.clone();
+        bridge.set_persist(Arc::new(move |label| {
+            let harness = harness.clone();
+            Box::pin(async move {
+                if let Err(error) = harness.append_label(label).await {
+                    tracing::warn!(%error, "persist tool approval label");
+                }
+            })
+        }));
+        r.tool_gate.set_approver(Some(bridge.clone()));
+        r.tool_approval = Some(bridge.clone());
+        Ok(())
+    }
+    pub fn review_grants(&self) -> std::collections::HashSet<String> {
+        self.host
+            .inner
+            .tool_approval
+            .as_ref()
+            .map(|b| b.auto_approve_groups())
+            .unwrap_or_default()
+    }
+    pub fn mcp_configured(&self) -> bool {
+        !self.host.inner.settings.mcp_servers.is_empty()
+    }
+    pub fn mcp_enabled(&self, name: &str) -> Option<bool> {
+        self.host
+            .inner
+            .settings
+            .mcp_servers
+            .contains_key(name)
+            .then(|| {
+                !self
+                    .host
+                    .inner
+                    .settings
+                    .disabled_mcp_servers
+                    .iter()
+                    .any(|n| n == name)
+            })
+    }
+    pub fn mcp_choices(&self) -> Vec<(String, String)> {
+        self.host
+            .inner
+            .settings
+            .mcp_servers
+            .iter()
+            .map(|(name, cfg)| {
+                let hint = cfg
+                    .url
+                    .clone()
+                    .or_else(|| {
+                        cfg.command.as_ref().map(|command| {
+                            format!("{command} {}", cfg.args.join(" "))
+                                .trim()
+                                .to_string()
+                        })
+                    })
+                    .unwrap_or_else(|| "not configured".into());
+                (name.clone(), hint)
+            })
+            .collect()
+    }
+    pub async fn mcp(
+        &mut self,
+        action: loop_protocol::admin::AdminAction,
+        name: Option<String>,
+    ) -> anyhow::Result<loop_protocol::admin::McpResult> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::McpParams {
+            workspace_id: self.workspace_id.clone(),
+            action,
+            name,
+            expected_revision: None,
+        };
+        Ok(self.admin().mcp(params).await?)
+    }
+    pub async fn mcp_tools(&self) -> Vec<(String, Vec<String>)> {
+        self.host.inner.mcp_client.list_connection_tools().await
+    }
+}
+
+impl SurfaceClient {
+    pub fn note_sandbox(&mut self, mode: &str, isolation: Option<String>, runtime: Option<String>) {
+        let settings = &mut self.host.inner.settings.sandbox;
+        settings.mode = mode.into();
+        settings.isolation = isolation;
+        settings.runtime = runtime;
+    }
+    pub fn mcp_login(
+        &self,
+        name: &str,
+        on_url: impl FnOnce(&str) + Send + 'static,
+    ) -> anyhow::Result<
+        futures::future::BoxFuture<'static, Result<loop_mcp::OAuthLoginOutcome, String>>,
+    > {
+        let r = &self.host.inner;
+        let cfg = r
+            .settings
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("mcp server not found: {name} (see /mcp list)"))?;
+        let url = cfg.url.clone().ok_or_else(|| {
+            anyhow::anyhow!("mcp `{name}` is a local command server and does not use OAuth")
+        })?;
+        if r.mcp_client
+            .oauth_credential_path(name)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .is_none()
+        {
+            anyhow::bail!("OAuth credential storage is not configured for this session");
+        }
+        let client = r.mcp_client.clone();
+        let name = name.to_string();
+        Ok(Box::pin(async move {
+            client.oauth_login(&name, &url, on_url).await
+        }))
+    }
+    pub async fn finish_mcp_login(&self, name: &str) -> anyhow::Result<Option<usize>> {
+        let r = &self.host.inner;
+        if self.mcp_enabled(name) == Some(false) {
+            return Ok(None);
+        }
+        let cfg = r
+            .settings
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("it is no longer configured"))?;
+        let entry = loop_app_core::runtime::mcp_server_entries(&std::collections::BTreeMap::from(
+            [(name.into(), cfg.clone())],
+        ))
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("it is no longer configured"))?;
+        r.mcp_client.disconnect(name).await;
+        let count = r
+            .mcp_client
+            .connect(&entry)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        r.refresh_mcp_tools().await?;
+        Ok(Some(count))
+    }
+    pub async fn mcp_logout(&self, name: &str) -> anyhow::Result<bool> {
+        let r = &self.host.inner;
+        if self.mcp_enabled(name).is_none() {
+            anyhow::bail!("mcp server not found: {name} (see /mcp list)");
+        }
+        let removed = r
+            .mcp_client
+            .clear_oauth_credentials(name)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if removed {
+            r.mcp_client.disconnect(name).await;
+            r.refresh_mcp_tools().await?;
+        }
+        Ok(removed)
+    }
+}
+
+impl SurfaceClient {
+    pub fn sandbox_plan(
+        &self,
+        flags: loop_app_core::sandbox_builder::LocalSandboxFlags,
+    ) -> anyhow::Result<(loop_protocol::admin::SandboxChoice, String)> {
+        use loop_app_core::sandbox_builder::{SandboxBuilder, SandboxRequest};
+        let request = SandboxRequest::for_flags(&self.host.inner.settings.sandbox, flags);
+        let plan = SandboxBuilder::for_current_platform()
+            .with_agent_dir(self.agent_dir())
+            .resolve(&request)?;
+        Ok((
+            loop_protocol::admin::SandboxChoice {
+                mode: "local".into(),
+                isolation: flags.isolation.map(|i| i.as_str().into()),
+                runtime: flags.runtime.map(|r| r.as_str().into()),
+            },
+            plan.label(),
+        ))
+    }
+}
+
+/// Immutable workspace definitions for local pickers and autocomplete.
+#[derive(Default)]
+pub struct ResourceView {
+    pub skills: Vec<loop_protocol::admin::SkillStatus>,
+    pub templates: Vec<loop_protocol::admin::TemplateInfo>,
+    pub active_skills: Vec<String>,
+    pub extensions: usize,
+    pub hooks: usize,
+}
+impl SurfaceClient {
+    pub fn resource_view(&self) -> ResourceView {
+        let r = &self.host.inner;
+        ResourceView {
+            skills: r
+                .resources
+                .all_skills()
+                .into_iter()
+                .map(|(skill, enabled)| loop_protocol::admin::SkillStatus {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    enabled,
+                })
+                .collect(),
+            templates: r
+                .resources
+                .prompts
+                .iter()
+                .map(|p| loop_protocol::admin::TemplateInfo {
+                    name: p.name.clone(),
+                    description: p.argument_hint.as_ref().map_or_else(
+                        || "prompt template".into(),
+                        |h| format!("{h} — prompt template"),
+                    ),
+                })
+                .collect(),
+            active_skills: r.active_skills.clone(),
+            extensions: r.resources.extension_paths.len(),
+            hooks: r.resources.hook_paths.len(),
+        }
+    }
+    pub async fn set_skill_enabled(&mut self, name: &str, enabled: bool) -> anyhow::Result<bool> {
+        use loop_protocol::admin::*;
+        use loop_wire::RuntimeAdmin;
+        if !self.resource_view().skills.iter().any(|s| s.name == name) {
+            return Ok(false);
+        }
+        let params = SkillsParams {
+            workspace_id: self.workspace_id.clone(),
+            action: if enabled {
+                AdminAction::Enable
+            } else {
+                AdminAction::Disable
+            },
+            name: Some(name.into()),
+            expected_revision: None,
+        };
+        self.admin().skills(params).await?;
+        Ok(true)
+    }
+    pub async fn render_template(
+        &mut self,
+        name: &str,
+        args: &str,
+    ) -> anyhow::Result<Option<String>> {
+        use loop_protocol::admin::*;
+        use loop_wire::RuntimeAdmin;
+        if !self
+            .resource_view()
+            .templates
+            .iter()
+            .any(|s| s.name == name)
+        {
+            return Ok(None);
+        }
+        let params = TemplatesParams {
+            workspace_id: self.workspace_id.clone(),
+            name: Some(name.into()),
+            args: loop_agent::harness::prompt_templates::parse_command_args(args),
+        };
+        Ok(self.admin().templates(params).await?.text)
+    }
+    pub async fn reload(&mut self) -> anyhow::Result<()> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::ReloadParams {
+            workspace_id: self.workspace_id.clone(),
+            expected_revision: None,
+        };
+        self.admin().reload(params).await?;
+        Ok(())
+    }
+    pub async fn activate_skill(&mut self, name: &str) -> anyhow::Result<bool> {
+        if !self
+            .resource_view()
+            .skills
+            .iter()
+            .any(|s| s.name == name && s.enabled)
+        {
+            return Ok(false);
+        }
+        self.sessions
+            .skill(SkillParams {
+                session: self.host.inner.native.current_session().await,
+                name: name.into(),
+                active: true,
+                expected_revision: None,
+            })
+            .await?;
+        if !self.host.inner.active_skills.iter().any(|n| n == name) {
+            self.host.inner.active_skills.push(name.into());
+        }
+        Ok(true)
+    }
+    #[cfg(feature = "orchestration")]
+    pub async fn workflow(
+        &self,
+        goal: &str,
+        concurrency: Option<usize>,
+    ) -> anyhow::Result<WorkflowResult> {
+        if !self.is_native() {
+            anyhow::bail!(
+                "workflows run with Loop's own agent · pick a Loop model with /model first"
+            );
+        }
+        Ok(self
+            .sessions
+            .workflow(WorkflowParams {
+                session: self.session_ref(),
+                goal: goal.into(),
+                concurrency: concurrency.map(|n| n as u32),
+                request_id: loop_ai::new_id(),
+            })
+            .await?)
+    }
+}
+
+impl SurfaceClient {
+    pub fn skill_source(&self, name: &str) -> Option<String> {
+        self.host
+            .inner
+            .resources
+            .all_skills()
+            .into_iter()
+            .find(|(s, _)| s.name == name)
+            .map(|(s, _)| s.path.display().to_string())
+    }
+}
+
+impl SurfaceClient {
+    pub async fn effective_settings(
+        &mut self,
+    ) -> anyhow::Result<loop_protocol::admin::SettingsResult> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::admin::SettingsParams {
+            workspace_id: self.workspace_id.clone(),
+        };
+        Ok(self.admin().settings(p).await?)
+    }
+    pub async fn session_config(&self) -> anyhow::Result<SessionSnapshot> {
+        Ok(self
+            .sessions
+            .config(SessionParams {
+                session: self.host.inner.native.current_session().await,
+            })
+            .await?)
+    }
+    pub async fn stats(&self) -> anyhow::Result<loop_protocol::StatsSummary> {
+        let service = self
+            .backend()
+            .session_stats()
+            .ok_or_else(|| anyhow::anyhow!("this agent does not report session statistics"))?;
+        Ok(service.stats(&self.session_ref()).await?)
+    }
+    #[cfg(feature = "usage")]
+    pub async fn usage_history(
+        &mut self,
+        days: Option<u32>,
+    ) -> anyhow::Result<loop_protocol::admin::UsageResult> {
+        use loop_wire::RuntimeAdmin;
+        Ok(self
+            .admin()
+            .usage(loop_protocol::admin::UsageParams {
+                days,
+                ..Default::default()
+            })
+            .await?)
+    }
+    pub async fn loaded_sessions(
+        &mut self,
+    ) -> anyhow::Result<loop_protocol::admin::RuntimeSessionsResult> {
+        use loop_wire::RuntimeAdmin;
+        Ok(self.admin().sessions().await?)
+    }
+}
+
+impl SurfaceClient {
+    pub fn agent_label(&self, id: &str) -> Option<String> {
+        self.host
+            .inner
+            .agents
+            .entry(id)
+            .map(|e| e.display_name().to_string())
+    }
+    pub fn web_label(&self) -> String {
+        self.host.inner.web_tools().status()
+    }
+    #[cfg(feature = "telemetry")]
+    pub fn usage_log_status(&self) -> Option<(String, Option<String>)> {
+        self.host
+            .inner
+            .usage_log()
+            .map(|log| (log.path.display().to_string(), log.last_error))
+    }
+    pub async fn settings_report(&mut self) -> anyhow::Result<String> {
+        let view = self.effective_settings().await?;
+        let config = self.session_config().await?;
+        let settings: crate::config::Settings = serde_json::from_value(view.effective)?;
+        let mut perms = String::new();
+        for (k, v) in &settings.tool_permissions {
+            perms.push_str(&format!("\n    {k}: {v}"));
+        }
+        Ok(format!("settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  permissionMode: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}\n  Theme and UI preferences are Surface-local.", crate::config::paths::settings_path(self.agent_dir()).display(), config.config.model.unwrap_or_else(|| "none".into()), self.theme().name, config.config.effort.unwrap_or(settings.default_thinking_level), settings.sandbox.display(), self.permission_mode().as_str(), settings.diff_editor.as_deref().unwrap_or("(auto)"), settings.response_header_timeout_ms, if settings.response_header_timeout_ms == 0 { " (off)" } else { "" }, self.host.inner.settings.ui_mode))
+    }
+}
+
+/// Surface-owned preferences, kept apart from effective host settings.
+#[derive(Clone)]
+pub struct UiPreferences {
+    pub hide_thinking: bool,
+    pub double_escape_action: String,
+}
+impl SurfaceClient {
+    pub fn local_preferences(&self) -> UiPreferences {
+        UiPreferences {
+            hide_thinking: self.host.inner.settings.hide_thinking_block,
+            double_escape_action: self.host.inner.settings.double_escape_action.clone(),
+        }
+    }
+    pub fn save_theme_preference(&mut self, name: &str) -> anyhow::Result<()> {
+        let path = crate::config::paths::settings_path(self.agent_dir());
+        let mut local = crate::config::Settings::load_file(&path)?;
+        local.theme = name.into();
+        local.save_file(&path)?;
+        self.host.inner.settings.theme = name.into();
+        Ok(())
+    }
+    pub fn agent_signed_in(&self, id: &str) -> bool {
+        self.host.inner.agents.is_signed_in(id)
+    }
+    pub fn active_agent_name(&self) -> Option<&str> {
+        self.active_agent()
+            .as_deref()
+            .and_then(|id| self.host.inner.agents.entry(id))
+            .map(|e| e.display_name())
+    }
+    pub fn subscription_models(&self) -> Vec<String> {
+        let agents = &self.host.inner.agents;
+        agents
+            .entries()
+            .iter()
+            .filter(|e| agents.is_signed_in(&e.id))
+            .flat_map(|e| {
+                agents
+                    .models(&e.id)
+                    .into_iter()
+                    .map(move |m| format!("{}/{}", e.id, m.id))
+            })
+            .collect()
+    }
+    pub fn login_agents(&self) -> Vec<crate::provider_setup::AgentRow> {
+        let agents = &self.host.inner.agents;
+        agents
+            .entries()
+            .iter()
+            .filter(|e| e.needs_sign_in())
+            .map(|e| crate::provider_setup::AgentRow {
+                id: e.id.clone(),
+                label: e.login_label().into(),
+                configured: agents.is_signed_in(&e.id),
+            })
+            .collect()
+    }
+    pub fn connected_providers(&self) -> Vec<String> {
+        self.host.inner.connected_providers()
+    }
+    pub fn logout_choices(&self) -> Vec<String> {
+        use loop_ai::CredentialStore;
+        let mut connected = self.connected_providers();
+        if let Some(provider) = self
+            .host
+            .inner
+            .settings
+            .web_search
+            .as_ref()
+            .and_then(|w| w.provider.clone())
+            .filter(|p| !self.host.inner.credentials.is_logged_out(p))
+        {
+            if !connected.contains(&provider) {
+                connected.push(provider);
+            }
+        }
+        connected
+    }
+    pub fn subscription_start(
+        &self,
+        pending: PendingAgent,
+        forward: impl FnOnce(&dyn AgentBackend) + Send + 'static,
+    ) -> SubscriptionStart {
+        let agents = self.host.inner.agents.clone();
+        let forwarded = self.forwarded.clone();
+        Box::pin(async move {
+            let id = match &pending {
+                PendingAgent::New { id, .. } => id.clone(),
+                PendingAgent::Resume(r) => r.agent.clone(),
+            };
+            let backend = agents.backend(&id).await.map_err(|e| format!("{e:#}"))?;
+            if forwarded
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(id.clone())
+            {
+                forward(backend.as_ref());
+            }
+            let result = match pending {
+                PendingAgent::New { model, .. } => agents.new_session(&id, model.as_deref()).await,
+                PendingAgent::Resume(r) => agents.resume(&r).await,
+            };
+            result
+                .map(|(backend, session)| (backend as Arc<dyn AgentBackend>, session))
+                .map_err(|e| format!("{e:#}"))
+        })
+    }
+    pub fn subscription_login(
+        &self,
+        id: String,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<usize>> {
+        let agents = self.host.inner.agents.clone();
+        Box::pin(async move { agents.sign_in(&id).await })
+    }
+    pub async fn subscription_logout(&mut self, id: &str) -> anyhow::Result<()> {
+        if self.active_agent().as_deref() == Some(id) {
+            self.use_native().await;
+        }
+        self.host.inner.agents.sign_out(id).await
+    }
+    pub async fn connect_provider(
+        &mut self,
+        request: &crate::config::ProviderLoginRequest,
+    ) -> anyhow::Result<loop_protocol::host::ProviderInfo> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::host::ProvidersParams {
+            action: loop_protocol::host::HostAction::Connect,
+            provider: None,
+            login: Some(serde_json::to_value(request)?),
+        };
+        self.admin()
+            .providers(p)
+            .await?
+            .providers
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("provider returned no connection state"))
+    }
+    pub async fn logout_provider(&mut self, id: &str) -> anyhow::Result<(String, String)> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::host::ProvidersParams {
+            action: loop_protocol::host::HostAction::Disconnect,
+            provider: Some(id.into()),
+            login: None,
+        };
+        let result = self.admin().providers(p).await?;
+        Ok((
+            result
+                .providers
+                .into_iter()
+                .next()
+                .map_or_else(|| id.into(), |p| p.name),
+            result.notices.join(" · "),
+        ))
+    }
+    pub async fn web_search(&mut self, arg: Option<&str>) -> anyhow::Result<String> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::admin::WebSearchParams {
+            workspace_id: self.workspace_id.clone(),
+            enabled: match arg {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                _ => None,
+            },
+            provider: arg
+                .filter(|a| *a != "on" && *a != "off")
+                .map(str::to_string),
+            expected_revision: None,
+        };
+        Ok(self.admin().web_search(p).await?.status)
+    }
+    #[cfg(feature = "telemetry")]
+    pub fn tracing_settings(&self) -> crate::config::TracingSettings {
+        self.host.inner.settings.tracing.clone()
+    }
+    #[cfg(feature = "telemetry")]
+    pub async fn tracing(
+        &mut self,
+        action: loop_protocol::host::HostAction,
+        config: Option<&crate::config::TracingSetupRequest>,
+    ) -> anyhow::Result<String> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::host::TracingParams {
+            action,
+            config: config.map(serde_json::to_value).transpose()?,
+        };
+        Ok(self.admin().tracing(p).await?.status)
+    }
+    pub async fn ttfb(
+        &self,
+        change: Option<Option<u64>>,
+    ) -> anyhow::Result<loop_protocol::rpc::TtfbResult> {
+        let control = self
+            .backend()
+            .model_control()
+            .ok_or_else(|| anyhow::anyhow!("this agent does not offer response-timeout control"))?;
+        Ok(control.ttfb(&self.session_ref(), change, None).await?)
+    }
+    pub async fn timeout_default(&mut self, value: Option<u64>) -> anyhow::Result<u64> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::admin::DefaultsParams {
+            patch: value.map(|ms| loop_protocol::admin::DefaultsPatch {
+                response_header_timeout_ms: Some(ms),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(self
+            .admin()
+            .defaults(p)
+            .await?
+            .response_header_timeout_ms
+            .unwrap_or(0))
+    }
+    pub async fn review_report(&mut self) -> anyhow::Result<String> {
+        let view = self.effective_settings().await?;
+        let settings: crate::config::Settings = serde_json::from_value(view.effective)?;
+        let groups = self.review_grants();
+        let grants = [
+            crate::tool_approval::GROUP_FILE,
+            crate::tool_approval::GROUP_BASH,
+            crate::tool_approval::GROUP_WEB,
+        ]
+        .into_iter()
+        .filter(|g| groups.contains(*g))
+        .collect::<Vec<_>>();
+        let grants = if grants.is_empty() {
+            "(none)".into()
+        } else {
+            grants.join(", ")
+        };
+        let mut perms = String::new();
+        for (k, v) in settings.tool_permissions {
+            perms.push_str(&format!("\n    {k}: {v}"));
+        }
+        Ok(format!("permission mode: {} (change it with /permissions)\n  session auto-approve: {grants}\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}", self.permission_mode().as_str(), settings.diff_editor.as_deref().unwrap_or("(auto: cursor|code)")))
+    }
+}
+
+impl SurfaceClient {
+    pub fn confirm_timeout_default(&mut self, ms: u64) -> bool {
+        if self.confirm_timeout_default.take() == Some(ms) {
+            true
+        } else {
+            self.confirm_timeout_default = Some(ms);
+            false
+        }
+    }
+}
+
+/// An in-process subscription backend and its opened Session.
+pub type SubscriptionSession = (Arc<dyn AgentBackend>, SessionRef);
+/// Subscription admission, with updates forwarded before the Session opens.
+pub type SubscriptionStart =
+    futures::future::BoxFuture<'static, Result<SubscriptionSession, String>>;
+
+/// The application UI imports this view namespace. It deliberately exposes no
+/// native owner, bootstrap Runtime, credential store, or mutable host settings.
+/// ```compile_fail
+/// use loop_cli::surface_client::ui_api as loop_app_core;
+/// fn host(_: loop_app_core::Runtime) {}
+/// ```
+/// ```compile_fail
+/// use loop_cli::surface_client::ui_api;
+/// fn host(_: ui_api::CliRuntime) {}
+/// ```
+pub mod ui_api {
+    pub use loop_app_core::{interaction, permissions, sessions};
 }

@@ -523,6 +523,8 @@ pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionCont
 /// whole tree rather than only the part since the last compaction.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionConfigEntries {
+    /// Skills explicitly activated on this branch.
+    pub active_skills: Vec<String>,
     /// Provider and model id last chosen on the active branch.
     pub model: Option<(String, String)>,
     /// Effort last chosen on the active branch, including an explicit
@@ -573,15 +575,26 @@ pub fn config_from_entries(
                 config.revision += 1;
                 config.permission_mode = data["mode"].as_str().map(str::to_owned);
             }
+            SessionTreeEntry::Custom { custom_type, .. } if custom_type == "active_skills" => {
+                config.revision += 1;
+            }
             _ => {}
         }
         by_id.insert(entry.id(), entry);
     }
     // Nearest first: the first value found on the way to the root wins.
+    let mut skills_read = false;
     let mut next = head;
     let mut steps = 0;
     while let Some(entry) = next.and_then(|id| by_id.get(id)) {
         match entry {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "active_skills" && !skills_read => {
+                config.active_skills =
+                    serde_json::from_value(data["names"].clone()).unwrap_or_default();
+                skills_read = true;
+            }
             SessionTreeEntry::ModelChange {
                 provider, model_id, ..
             } if config.model.is_none() => {

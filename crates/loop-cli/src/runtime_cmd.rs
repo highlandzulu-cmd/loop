@@ -204,6 +204,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         socket: std::path::absolute(&socket).unwrap_or_else(|_| socket.clone()),
         stop: stop.clone(),
         limits,
+        #[cfg(feature = "usage")]
         agent_dir: agent_dir.clone(),
         listen_url,
     });
@@ -362,7 +363,8 @@ struct Control {
     socket: PathBuf,
     stop: tokio_util::sync::CancellationToken,
     limits: Limits,
-    /// The host's agent directory: settings and the usage log.
+    /// The host's usage log directory.
+    #[cfg(feature = "usage")]
     agent_dir: PathBuf,
     listen_url: Option<String>,
 }
@@ -373,6 +375,10 @@ struct Control {
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_wire::RuntimeAdmin for Control {
+    async fn settings(&self, p: admin::SettingsParams) -> BackendResult<admin::SettingsResult> {
+        self.runtime.settings(p).await
+    }
+
     fn offered(&self) -> loop_protocol::Capabilities {
         loop_protocol::Capabilities {
             host_usage: cfg!(feature = "usage"),
@@ -425,7 +431,7 @@ impl loop_wire::RuntimeAdmin for Control {
 #[cfg(unix)]
 use loop_protocol::{admin, BackendResult};
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "usage"))]
 fn failed(error: impl std::fmt::Display) -> loop_protocol::BackendError {
     loop_protocol::BackendError::failed(loop_protocol::ErrorCategory::Internal, error.to_string())
 }
@@ -433,7 +439,7 @@ fn failed(error: impl std::fmt::Display) -> loop_protocol::BackendError {
 /// One page of the host's usage log, one row per Session, most recently
 /// active first. The cursor is the next row's offset.
 #[cfg(feature = "usage")]
-fn usage_page(
+pub(crate) fn usage_page(
     dir: &std::path::Path,
     params: &admin::UsageParams,
 ) -> BackendResult<admin::UsageResult> {
@@ -452,6 +458,7 @@ fn usage_page(
         return Err(bad());
     }
     let summary = loop_dashboard::summarize_dir(dir, params.days);
+    let dashboard_summary = serde_json::to_value(&summary).map_err(failed)?;
     let mut sessions = summary.sessions;
     sessions.sort_by_key(|row| std::cmp::Reverse(row.last_active));
     if start > sessions.len() {
@@ -471,6 +478,7 @@ fn usage_page(
         )
     };
     Ok(admin::UsageResult {
+        summary: Some(dashboard_summary),
         rows,
         totals: serde_json::to_value(&summary.totals).unwrap_or_default(),
         next_cursor: (end < sessions.len()).then(|| end.to_string()),
@@ -484,6 +492,26 @@ fn usage_page(
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_wire::RuntimeControl for Control {
+    async fn config(
+        &self,
+        p: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::SessionSnapshot> {
+        self.runtime.config(p).await
+    }
+
+    async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        self.runtime.skill(p).await
+    }
+    async fn workflow(
+        &self,
+        p: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        self.runtime.workflow(p).await
+    }
+
     fn admin(&self) -> Option<&dyn loop_wire::RuntimeAdmin> {
         Some(self)
     }

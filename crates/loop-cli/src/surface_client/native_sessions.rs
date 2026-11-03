@@ -232,6 +232,43 @@ impl NativeSessions {
 
 #[async_trait]
 impl RuntimeControl for NativeSessions {
+    async fn config(&self, p: SessionParams) -> BackendResult<SessionSnapshot> {
+        self.check(&p.session).await?;
+        let changed = self.native.config();
+        Ok(SessionSnapshot {
+            session: p.session,
+            workspace_id: self.workspace_id.clone(),
+            at_seq: 0,
+            revision: changed.revision,
+            branch_revision: 0,
+            view_id: None,
+            metadata: changed.metadata,
+            config: changed.config,
+            effective: changed.effective,
+            pending: changed.pending,
+            capabilities: self.capabilities(),
+            turn_state: None,
+            stats: serde_json::Value::Null,
+            workspace_revision: 0,
+        })
+    }
+
+    async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<MutationResult> {
+        let _operation = self.operation.lock().await;
+        self.native.skill(p).await
+    }
+    #[cfg(feature = "orchestration")]
+    async fn workflow(
+        &self,
+        p: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        let _operation = self.operation.lock().await;
+        self.native.workflow(p).await
+    }
+
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         let mut summaries: HashMap<_, _> =
             list_session_summaries(self.store()?.as_ref(), Some(&self.cwd.to_string_lossy()))
@@ -542,6 +579,7 @@ impl AgentBackend for NativeSessions {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            session_config: true,
             session_tree: true,
             session_rename: true,
             session_fork: true,
@@ -554,6 +592,9 @@ impl AgentBackend for NativeSessions {
     }
     async fn new_session(&self, spec: SessionSpec) -> BackendResult<SessionRef> {
         let _operation = self.operation.lock().await;
+        if self.native.is_busy(&self.native.current_session().await) {
+            return Err(BackendError::Busy);
+        }
         self.native.new_session(spec).await
     }
     async fn load_session(

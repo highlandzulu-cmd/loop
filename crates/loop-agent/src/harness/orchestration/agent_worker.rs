@@ -371,10 +371,8 @@ fn extract_output_from_messages(messages: &[AgentMessage]) -> serde_json::Value 
                         texts.push(t.text.clone());
                     }
                 }
-                AssistantContent::Thinking(t) => {
-                    if !t.thinking.trim().is_empty() {
-                        thinking.push(t.thinking.clone());
-                    }
+                AssistantContent::Thinking(t) if !t.thinking.trim().is_empty() => {
+                    thinking.push(t.thinking.clone());
                 }
                 _ => {}
             }

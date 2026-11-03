@@ -1493,6 +1493,52 @@ impl Runtime {
 }
 #[async_trait]
 impl loop_wire::RuntimeControl for Runtime {
+    async fn config(&self, p: loop_protocol::rpc::SessionParams) -> BackendResult<SessionSnapshot> {
+        self.snapshot(&p.session).await
+    }
+
+    async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<MutationResult> {
+        let session = p.session.clone();
+        self.set_config(&session, true, |live| async move {
+            live.opened.native.skill(p).await
+        })
+        .await
+    }
+    #[cfg(feature = "orchestration")]
+    async fn workflow(
+        &self,
+        p: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        let live = self.loaded(&p.session).await?;
+        if let Some(result) = live.opened.native.known_workflow(&p)? {
+            return Ok(result);
+        }
+        let result = {
+            let _lifecycle = live.lifecycle.lock().await;
+            self.check_tree_live(&live)?;
+            self.reserve(&live).await?;
+            match live.opened.native.workflow(p).await {
+                Ok(result) => result,
+                Err(error) => {
+                    live.busy.store(false, Ordering::Release);
+                    return Err(error);
+                }
+            }
+        };
+        let id = result.workflow_id.clone();
+        tokio::spawn(async move {
+            live.opened.native.wait_workflow(&id).await;
+            let _ = barrier(&live).await;
+            let _lifecycle = live.lifecycle.lock().await;
+            live.busy.store(false, Ordering::Release);
+            live.apply_pending().await;
+        });
+        Ok(result)
+    }
+
     async fn tree(
         &self,
         params: loop_protocol::rpc::TreeParams,
@@ -2059,6 +2105,9 @@ impl AgentBackend for Runtime {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            session_config: true,
+            session_skills: true,
+            workflow: cfg!(feature = "orchestration"),
             session_tree: true,
             session_rename: true,
             session_fork: true,

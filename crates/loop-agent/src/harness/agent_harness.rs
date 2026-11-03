@@ -1764,15 +1764,19 @@ impl AgentHarness {
 
         let scheduler = Scheduler::new(Arc::clone(&engine), pool, shared_memory, scheduler_config);
 
-        let result = scheduler
-            .run(&workflow_id)
-            .await
-            .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
+        let cancel = self.cancel.lock().clone().unwrap_or_default();
+        let run = scheduler.run(&workflow_id);
+        tokio::pin!(run);
+        let result = tokio::select! {
+            result = &mut run => result,
+            _ = cancel.cancelled() => { scheduler.cancel(); run.await }
+        }
+        .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
 
         let _ = self
             .hooks
             .emit(HarnessHookEvent::WorkflowCompleted {
-                workflow_id,
+                workflow_id: workflow_id.clone(),
                 success: result.success,
             })
             .await;
@@ -1801,6 +1805,17 @@ impl AgentHarness {
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use loop_orchestration::planner::{LlmPlanner, Planner};
 
+        self.acquire_idle_phase(AgentHarnessPhase::Workflow).await?;
+        struct Phase<'a>(&'a AgentHarness);
+        impl Drop for Phase<'_> {
+            fn drop(&mut self) {
+                self.0.cancel.lock().take();
+                self.0.release_to_idle();
+            }
+        }
+        let _phase = Phase(self);
+        let cancel = CancellationToken::new();
+        *self.cancel.lock() = Some(cancel.clone());
         let model = self.require_model().await?;
         let planner = LlmPlanner::new(Arc::clone(&self.stream_fn), model);
 
@@ -1818,12 +1833,11 @@ impl AgentHarness {
             }
         });
 
-        let graph = planner
-            .decompose(goal, &ctx)
-            .await
-            .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
-
-        self.start_workflow(graph, config, progress_tx).await
+        let graph = tokio::select! {
+            result = planner.decompose(goal, &ctx) => result.map_err(|e| AgentHarnessError::Other(e.to_string()))?,
+            _ = cancel.cancelled() => return Err(AgentHarnessError::Other("workflow cancelled".into())),
+        };
+        self.run_workflow_inner(graph, config, progress_tx).await
     }
 }
 

@@ -1,5 +1,5 @@
 //! The TUI facade records model/effort in the Session and restores explicit off.
-//! Selecting never saves defaults; saving host settings later must not do so
+//! Selecting never saves defaults; saving local preferences later must not do so
 //! either. Separate binary because bootstrap uses process environment variables.
 
 use loop_cli::config::paths::{settings_path, ENV_AGENT_DIR, ENV_SESSION_DIR};
@@ -103,13 +103,13 @@ async fn session_choices_are_recorded_and_restored_without_saving_defaults() {
         assert_eq!(runtime.native_effort(), "off");
 
         // Restoring a Session never saves its choice as the default.
-        runtime.legacy().save_settings().unwrap();
+        runtime.save_theme_preference("dark").unwrap();
         assert_eq!(saved(agent_dir.path())["defaultThinkingLevel"], "medium");
         runtime.shutdown().run().await.unwrap();
         drop(runtime);
-        let runtime = boot(cwd.path(), Some(low_session)).await;
+        let mut runtime = boot(cwd.path(), Some(low_session)).await;
         assert_eq!(runtime.native_effort(), "low");
-        runtime.legacy().save_settings().unwrap();
+        runtime.save_theme_preference("dark").unwrap();
         assert_eq!(saved(agent_dir.path())["defaultThinkingLevel"], "medium");
 
         // A new Session without a choice of its own uses the default.

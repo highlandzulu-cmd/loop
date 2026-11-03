@@ -156,7 +156,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "ttfb",
             description: "Model response-header wait (off for long-running)",
-            args_hint: Some("[off|on|60s|120000]"),
+            args_hint: Some("[off|on|60s|120000|inherit|default <duration>]"),
         },
         SlashCommand {
             name: "compact",

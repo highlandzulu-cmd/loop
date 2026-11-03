@@ -5,6 +5,9 @@
 //! Agent events are translated by [`NativeEventMapper`] and published as
 //! [`UpdateEnvelope`]s on a broadcast stream.
 
+#[cfg(feature = "orchestration")]
+#[path = "native_workflows.rs"]
+mod workflows;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -39,6 +42,8 @@ const UPDATE_BUFFER: usize = 4096;
 
 /// Loop's own agent loop as an [`AgentBackend`].
 pub struct NativeBackend {
+    #[cfg(feature = "orchestration")]
+    workflows: Mutex<std::collections::HashMap<String, workflows::WorkflowRun>>,
     instance: BackendInstanceId,
     harness: Arc<AgentHarness>,
     updates: broadcast::Sender<UpdateEnvelope>,
@@ -134,6 +139,7 @@ pub fn session_config(model: Option<&loop_ai::Model>, level: AgentThinkingLevel)
         effort: Some(effective_effort(model, level)),
         mode: None,
         response_timeout_ms: None,
+        active_skills: vec![],
     }
 }
 
@@ -182,6 +188,8 @@ impl NativeBackend {
         let default_model = harness.model().await;
         let default_response_timeout = harness.response_header_timeout_ms().await;
         let backend = Arc::new(Self {
+            #[cfg(feature = "orchestration")]
+            workflows: Mutex::new(Default::default()),
             instance: BackendInstanceId::from(NATIVE_INSTANCE),
             harness: Arc::clone(&harness),
             updates: updates.clone(),
@@ -294,8 +302,13 @@ impl NativeBackend {
         let recorded = self.harness.session_config().await.unwrap_or_default();
         let model = self.harness.model().await;
         let level = self.harness.thinking_level().await;
+        self.harness.clear_active_skills().await;
+        for name in &recorded.active_skills {
+            self.harness.activate_skill(name).await;
+        }
         let mut config = session_config(model.as_ref(), level);
         config.response_timeout_ms = recorded.response_timeout_ms;
+        config.active_skills = self.harness.active_skills().await;
         let timeout = recorded
             .response_timeout_ms
             .unwrap_or(*self.default_response_timeout.lock());
@@ -326,6 +339,7 @@ impl NativeBackend {
     async fn announce_change(&self) -> MutationResult {
         let model = self.harness.model().await;
         let level = self.harness.thinking_level().await;
+        let skills = self.harness.active_skills().await;
         let running = self.is_busy_now();
         let mut state = self.config.lock();
         state.revision += 1;
@@ -333,6 +347,7 @@ impl NativeBackend {
         let timeout = state.config.response_timeout_ms;
         state.config = session_config(model.as_ref(), level);
         state.config.response_timeout_ms = timeout;
+        state.config.active_skills = skills;
         let current_turn = self.stream.lock().mapper.current_turn().cloned();
         match current_turn.filter(|_| running) {
             Some(turn) => state.pending = Some(turn),
@@ -592,6 +607,8 @@ impl AgentBackend for NativeBackend {
 
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            session_skills: true,
+            workflow: cfg!(feature = "orchestration"),
             load_session: true,
             set_model: true,
             efforts: true,
@@ -1054,5 +1071,40 @@ impl LocalShell for NativeBackend {
             truncated: out.truncated,
         }
         .bounded())
+    }
+}
+
+impl NativeBackend {
+    /// Activate or deactivate a skill under the Session admission lock.
+    pub async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<MutationResult> {
+        let _admission = self.admission.lock().await;
+        let _setting = self.setting.lock().await;
+        self.current_config(&p.session).await?;
+        self.check_revision(p.expected_revision)?;
+        if self.is_busy_now() {
+            return Err(BackendError::Busy);
+        }
+        if p.active {
+            if !self.harness.activate_skill(&p.name).await {
+                return Err(invalid(format!("skill not found: {}", p.name)));
+            }
+        } else {
+            let active = self.harness.active_skills().await;
+            self.harness.clear_active_skills().await;
+            for name in active.into_iter().filter(|n| n != &p.name) {
+                self.harness.activate_skill(&name).await;
+            }
+        }
+        self.harness
+            .record_config(PendingSessionWrite::Custom {
+                custom_type: "active_skills".into(),
+                data: serde_json::json!({"names": self.harness.active_skills().await}),
+            })
+            .await
+            .map_err(harness_error)?;
+        Ok(self.announce_change().await)
     }
 }

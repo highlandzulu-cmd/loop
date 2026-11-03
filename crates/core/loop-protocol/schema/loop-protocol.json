@@ -116,6 +116,18 @@
           "description": "Reads and saves new-Session defaults (`runtime/defaults`); host-local only.",
           "type": "boolean"
         },
+        "host_mcp_auth": {
+          "description": "MCP OAuth credentials; host-local only.",
+          "type": "boolean"
+        },
+        "host_providers": {
+          "description": "Provider credentials; host-local only.",
+          "type": "boolean"
+        },
+        "host_tracing": {
+          "description": "Telemetry configuration; host-local only.",
+          "type": "boolean"
+        },
         "host_usage": {
           "description": "Pages the host's usage log (`runtime/usage`); host-local only.",
           "type": "boolean"
@@ -157,6 +169,10 @@
           "description": "Lists loaded Sessions for the Runtime panel (`runtime/sessions`).",
           "type": "boolean"
         },
+        "session_config": {
+          "description": "Returns the current Session snapshot without attaching.",
+          "type": "boolean"
+        },
         "session_fork": {
           "description": "Creates separately leased forks and clones.",
           "type": "boolean"
@@ -167,6 +183,10 @@
         },
         "session_sandbox": {
           "description": "Reads and replaces the Session's sandbox (`session/sandbox`).",
+          "type": "boolean"
+        },
+        "session_skills": {
+          "description": "Activates Session skills.",
           "type": "boolean"
         },
         "session_stats": {
@@ -205,12 +225,20 @@
           "description": "Reports token usage.",
           "type": "boolean"
         },
+        "workflow": {
+          "description": "Starts workflows and streams progress.",
+          "type": "boolean"
+        },
         "workspace_mcp": {
           "description": "Lists and toggles workspace MCP servers (`workspace/mcp`).",
           "type": "boolean"
         },
         "workspace_reload": {
           "description": "Rereads workspace definitions (`workspace/reload`).",
+          "type": "boolean"
+        },
+        "workspace_settings": {
+          "description": "Reads redacted effective workspace settings.",
           "type": "boolean"
         },
         "workspace_skills": {
@@ -846,6 +874,56 @@
       ],
       "type": "object"
     },
+    "HostAction": {
+      "description": "Requested host operation; each service validates its own allowed actions.",
+      "oneOf": [
+        {
+          "const": "list",
+          "description": "Read connected providers.",
+          "type": "string"
+        },
+        {
+          "const": "connect",
+          "description": "Verify and connect a provider.",
+          "type": "string"
+        },
+        {
+          "const": "disconnect",
+          "description": "Disconnect a provider.",
+          "type": "string"
+        },
+        {
+          "const": "status",
+          "description": "Read telemetry state.",
+          "type": "string"
+        },
+        {
+          "const": "enable",
+          "description": "Enable telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "disable",
+          "description": "Disable telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "setup",
+          "description": "Configure telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "login",
+          "description": "Start MCP OAuth.",
+          "type": "string"
+        },
+        {
+          "const": "logout",
+          "description": "Remove MCP OAuth credentials.",
+          "type": "string"
+        }
+      ]
+    },
     "ImportParams": {
       "description": "Import bytes into a known host workspace, never a supplied host path.",
       "properties": {
@@ -1373,6 +1451,50 @@
       },
       "required": [
         "session"
+      ],
+      "type": "object"
+    },
+    "McpAuthParams": {
+      "description": "Host MCP OAuth request.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Login or logout."
+        },
+        "name": {
+          "description": "Configured server name.",
+          "type": "string"
+        },
+        "workspace_id": {
+          "description": "Opaque workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "action",
+        "name"
+      ],
+      "type": "object"
+    },
+    "McpAuthResult": {
+      "description": "Host MCP OAuth result.",
+      "properties": {
+        "notices": {
+          "description": "Public status messages.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "description": "Authorized, not_required, removed or absent.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "notices"
       ],
       "type": "object"
     },
@@ -1915,6 +2037,85 @@
       ],
       "type": "object"
     },
+    "ProviderInfo": {
+      "description": "A provider's public connection state.",
+      "properties": {
+        "connected": {
+          "description": "Credentials are connected.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Stable provider id.",
+          "type": "string"
+        },
+        "model_count": {
+          "description": "Models found during connect, when known.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "connected"
+      ],
+      "type": "object"
+    },
+    "ProvidersParams": {
+      "description": "Provider request. Login payloads are never part of Session history or Debug output.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Operation."
+        },
+        "login": {
+          "description": "Validated provider setup payload; may contain secrets."
+        },
+        "provider": {
+          "description": "Provider identity for disconnect.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "ProvidersResult": {
+      "description": "Redacted provider result.",
+      "properties": {
+        "notices": {
+          "description": "Status notices, without credentials.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "providers": {
+          "description": "Public provider rows.",
+          "items": {
+            "$ref": "#/$defs/ProviderInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "providers",
+        "notices"
+      ],
+      "type": "object"
+    },
     "ReloadParams": {
       "description": "`workspace/reload` params.",
       "properties": {
@@ -2328,6 +2529,13 @@
     "SessionConfig": {
       "description": "A Session's public config. Absent fields are not offered by the backend\nor not known yet. Never holds secrets.",
       "properties": {
+        "active_skills": {
+          "description": "Skills activated in this Session.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "effort": {
           "description": "Reasoning effort id, as `session/efforts` names it.",
           "type": [
@@ -2984,6 +3192,20 @@
           "type": "object"
         },
         {
+          "$ref": "#/$defs/WorkflowProgress",
+          "description": "Ordered workflow progress, including its final result.",
+          "properties": {
+            "type": {
+              "const": "workflow_progress",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "An update with a `type` this reader does not know. The raw JSON is kept."
         }
       ],
@@ -3070,6 +3292,56 @@
       ],
       "type": "object"
     },
+    "SettingsParams": {
+      "description": "Read the effective, redacted workspace settings.",
+      "properties": {
+        "workspace_id": {
+          "description": "Opaque host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "SettingsResult": {
+      "description": "Public workspace settings and resource counts.",
+      "properties": {
+        "effective": {
+          "description": "Explicitly whitelisted effective settings; credentials are excluded."
+        },
+        "enabled_models": {
+          "description": "Model cycle filter.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "resource_counts": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Resource counts by kind.",
+          "type": "object"
+        },
+        "revision": {
+          "description": "Workspace generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "effective",
+        "enabled_models",
+        "resource_counts"
+      ],
+      "type": "object"
+    },
     "ShellParams": {
       "description": "`session/shell` params.",
       "properties": {
@@ -3123,6 +3395,39 @@
         "stdout",
         "stderr",
         "exit_code"
+      ],
+      "type": "object"
+    },
+    "SkillParams": {
+      "description": "Activate or deactivate one Session skill.",
+      "properties": {
+        "active": {
+          "default": true,
+          "description": "Activate when true; deactivate when false.",
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "default": null,
+          "description": "Optimistic Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Discovered skill name.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Target Session."
+        }
+      },
+      "required": [
+        "session",
+        "name"
       ],
       "type": "object"
     },
@@ -3721,6 +4026,45 @@
       ],
       "type": "object"
     },
+    "TracingParams": {
+      "description": "Host telemetry operation; setup payloads may contain credentials.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Operation."
+        },
+        "config": {
+          "description": "Validated setup payload."
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "TracingResult": {
+      "description": "Redacted telemetry state.",
+      "properties": {
+        "backend": {
+          "description": "Chosen backend.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Enabled preference.",
+          "type": "boolean"
+        },
+        "status": {
+          "description": "Human-readable redacted status.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "enabled",
+        "backend",
+        "status"
+      ],
+      "type": "object"
+    },
     "TreeEntry": {
       "description": "One tree row, including its branch membership and editable user text.",
       "properties": {
@@ -4176,6 +4520,9 @@
           "items": true,
           "type": "array"
         },
+        "summary": {
+          "description": "Full dashboard aggregates for the selected period, when offered."
+        },
         "taken_at_ms": {
           "description": "When the log was read, in ms since the epoch.",
           "format": "uint64",
@@ -4341,6 +4688,199 @@
         "pending_sessions"
       ],
       "type": "object"
+    },
+    "WorkflowCompletion": {
+      "description": "Final workflow output.",
+      "properties": {
+        "artifacts": {
+          "description": "Written artifacts.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "completed_count": {
+          "description": "Successful task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed_count": {
+          "description": "Failed task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "description": "Combined output.",
+          "type": "string"
+        },
+        "success": {
+          "description": "All tasks succeeded.",
+          "type": "boolean"
+        },
+        "total_count": {
+          "description": "Total task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "success",
+        "completed_count",
+        "failed_count",
+        "total_count",
+        "output",
+        "artifacts"
+      ],
+      "type": "object"
+    },
+    "WorkflowParams": {
+      "description": "Start a workflow. Repeating the same request id returns the same workflow.",
+      "properties": {
+        "concurrency": {
+          "description": "Maximum parallel tasks, from 1 through 64.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "goal": {
+          "description": "Goal to plan and execute.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Caller-generated id for deduplication.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Target Session."
+        }
+      },
+      "required": [
+        "session",
+        "goal",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "WorkflowProgress": {
+      "description": "Progress through the same ordered stream as all Session updates.",
+      "properties": {
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowCompletion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Final result, only on ended."
+        },
+        "description": {
+          "description": "Task description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Failure message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mermaid": {
+          "description": "Mermaid graph.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outline": {
+          "description": "Planned outline.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Task output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/WorkflowState",
+          "description": "Lifecycle state."
+        },
+        "task_id": {
+          "description": "Task identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "description": "Workflow identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "WorkflowResult": {
+      "description": "An accepted workflow; execution reports on the Session update stream.",
+      "properties": {
+        "workflow_id": {
+          "description": "Stable workflow id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id"
+      ],
+      "type": "object"
+    },
+    "WorkflowState": {
+      "description": "Workflow lifecycle state.",
+      "oneOf": [
+        {
+          "const": "planned",
+          "description": "Planning completed.",
+          "type": "string"
+        },
+        {
+          "const": "task_started",
+          "description": "A task started.",
+          "type": "string"
+        },
+        {
+          "const": "task_completed",
+          "description": "A task succeeded.",
+          "type": "string"
+        },
+        {
+          "const": "task_failed",
+          "description": "A task failed.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "Execution ended, including planning errors and cancellation.",
+          "type": "string"
+        }
+      ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4394,6 +4934,28 @@
         "$ref": "#/$defs/DefaultsResult"
       }
     },
+    "runtime/mcp_auth": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/McpAuthParams"
+      },
+      "result": {
+        "$ref": "#/$defs/McpAuthResult"
+      }
+    },
+    "runtime/providers": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ProvidersParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProvidersResult"
+      }
+    },
     "runtime/sessions": {
       "direction": "client_to_server",
       "kind": "request",
@@ -4423,6 +4985,17 @@
       },
       "result": {
         "type": "object"
+      }
+    },
+    "runtime/tracing": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TracingParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TracingResult"
       }
     },
     "runtime/usage": {
@@ -4481,6 +5054,16 @@
       },
       "result": {
         "$ref": "#/$defs/CompactionReport"
+      }
+    },
+    "session/config": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionSnapshot"
       }
     },
     "session/detach": {
@@ -4676,6 +5259,16 @@
         "$ref": "#/$defs/ShellResult"
       }
     },
+    "session/skill": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SkillParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
     "session/stats": {
       "direction": "client_to_server",
       "kind": "request",
@@ -4736,6 +5329,16 @@
         "$ref": "#/$defs/ViewResult"
       }
     },
+    "session/workflow": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/WorkflowParams"
+      },
+      "result": {
+        "$ref": "#/$defs/WorkflowResult"
+      }
+    },
     "shutdown": {
       "direction": "client_to_server",
       "kind": "request",
@@ -4764,6 +5367,16 @@
       },
       "result": {
         "$ref": "#/$defs/ReloadResult"
+      }
+    },
+    "workspace/settings": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SettingsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SettingsResult"
       }
     },
     "workspace/skills": {

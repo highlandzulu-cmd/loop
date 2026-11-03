@@ -76,7 +76,7 @@ impl CustomProviderEntry {
 }
 
 /// What `/login` collected.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderLoginRequest {
     /// A built-in provider (Soket, OpenRouter, OpenAI, Anthropic, Gemini).
     Preset {
