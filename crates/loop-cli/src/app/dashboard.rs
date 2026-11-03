@@ -140,6 +140,16 @@ struct Slow {
     mcp_servers: Vec<McpServerStatus>,
     stats: Option<loop_protocol::StatsSummary>,
 }
+/// One line for the dashboard row; `SandboxResult::info` is the multi-line
+/// `/sandbox status` card.
+fn sandbox_summary(config: loop_protocol::admin::SandboxChoice) -> String {
+    [Some(config.mode), config.isolation, config.runtime]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 impl Slow {
     async fn query(runtime: &mut SurfaceClient) -> Self {
         let sandbox = runtime
@@ -151,7 +161,7 @@ impl Slow {
                 expected_revision: None,
             })
             .await
-            .map(|s| s.info)
+            .map(|s| sandbox_summary(s.config))
             .unwrap_or_default();
         let mcp_servers = runtime
             .mcp(loop_protocol::admin::AdminAction::List, None)
@@ -446,5 +456,27 @@ mod subscription_usage_tests {
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sandbox_summary_tests {
+    use super::sandbox_summary;
+    use loop_protocol::admin::SandboxChoice;
+
+    #[test]
+    fn the_sandbox_row_is_one_line() {
+        let off = SandboxChoice {
+            mode: "off".into(),
+            isolation: None,
+            runtime: None,
+        };
+        assert_eq!(sandbox_summary(off), "off");
+        let local = SandboxChoice {
+            mode: "local".into(),
+            isolation: Some("partial".into()),
+            runtime: Some("seatbelt".into()),
+        };
+        assert_eq!(sandbox_summary(local), "local · partial · seatbelt");
     }
 }
