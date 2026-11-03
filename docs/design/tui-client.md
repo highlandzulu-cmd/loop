@@ -367,8 +367,8 @@ busy state. Close/unload must wait for settlement or cancel it safely.
 
 | Operation | While a turn or exclusive operation runs |
 |---|---|
-| Model selection, sandbox replacement, navigate, compact, workflow start, shell | Refuse Busy. No silent cancellation. |
-| Effort, backend mode, permission mode, skill activation and response-timeout override | Commit desired state as pending for the next turn. Current turn keeps its captured state. Recheck Policy ceilings and Locks. |
+| Navigate, compact, workflow start, shell | Refuse Busy. No silent cancellation. |
+| Model selection, sandbox replacement, effort, backend mode, permission mode, skill activation and response-timeout override | Commit desired state as pending for the next turn. Current turn keeps its captured state. Recheck Policy ceilings and Locks. A model applies when the next turn starts, and a sandbox starts at once but replaces the old one when the turn ends: running tool calls keep the sandbox they started in (a turn's tools are fixed when it starts), and `/sandbox` says the change applies from the next turn. |
 | Rename | Serialize the metadata write and emit ConfigChanged with `metadata.name`; allowed without changing current execution or branch revision. |
 | Tree/export/fork/clone | Read a committed branch snapshot. Do not include uncommitted turn output. Do not interrupt the source turn. |
 | Stats/config/list | Read consistent public state without changing ownership. |

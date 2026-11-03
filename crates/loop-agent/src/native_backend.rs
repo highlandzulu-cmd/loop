@@ -62,10 +62,21 @@ pub struct NativeBackend {
     default_model: Mutex<Option<loop_ai::Model>>,
     /// Response timeout for a Session without an override (0 = unlimited).
     default_response_timeout: Mutex<u64>,
+    /// A model chosen during a turn, for the Session it was chosen in. The
+    /// next turn starts on it; the harness keeps the running turn's model.
+    pending_model: Mutex<Option<(SessionKey, loop_ai::Model)>>,
+    /// Jobs that start with the next turn, by key; a newer job replaces the
+    /// older one of its key.
+    next_turn: Mutex<std::collections::HashMap<&'static str, NextTurnJob>>,
     /// Held while a turn is admitted or the model changes, so a model
     /// change never lands between the busy check and a turn's start.
     admission: tokio::sync::Mutex<()>,
 }
+
+/// Work that waits for the running turn to end. It is called with `true`
+/// when the next turn is about to start, or `false` when a newer job for the
+/// same key replaces it, so it can release what it prepared.
+pub type NextTurnJob = Box<dyn FnOnce(bool) -> futures::future::BoxFuture<'static, ()> + Send>;
 
 /// A Session's config as this backend last announced it.
 #[derive(Debug, Clone)]
@@ -208,6 +219,8 @@ impl NativeBackend {
             default_effort: Mutex::new(level),
             default_model: Mutex::new(default_model),
             default_response_timeout: Mutex::new(default_response_timeout),
+            pending_model: Mutex::new(None),
+            next_turn: Mutex::new(Default::default()),
             admission: tokio::sync::Mutex::new(()),
         });
         backend.read_config().await;
@@ -313,6 +326,7 @@ impl NativeBackend {
             .response_timeout_ms
             .unwrap_or(*self.default_response_timeout.lock());
         self.harness.set_response_header_timeout_ms(timeout).await;
+        *self.pending_model.lock() = None;
         *self.config.lock() = ConfigState {
             session,
             revision: recorded.revision,
@@ -334,10 +348,42 @@ impl NativeBackend {
         Ok(())
     }
 
+    /// Run `job` when the next turn starts if a turn is running now. When
+    /// none is, the job is handed back for the caller to run at once.
+    pub async fn after_turn(&self, key: &'static str, job: NextTurnJob) -> Option<NextTurnJob> {
+        // Holding admission keeps the turn from ending into a new one
+        // between this check and the job being filed.
+        let _admission = self.admission.lock().await;
+        if !self.is_busy_now() {
+            return Some(job);
+        }
+        let replaced = self.next_turn.lock().insert(key, job);
+        if let Some(replaced) = replaced {
+            replaced(false).await;
+        }
+        None
+    }
+
+    /// The model the next turn uses: one chosen during a turn, else the
+    /// harness's.
+    async fn chosen_model(&self) -> Option<loop_ai::Model> {
+        let session = self.config.lock().session.clone();
+        let pending = self
+            .pending_model
+            .lock()
+            .as_ref()
+            .filter(|(key, _)| *key == session)
+            .map(|(_, model)| model.clone());
+        match pending {
+            Some(model) => Some(model),
+            None => self.harness.model().await,
+        }
+    }
+
     /// Announce a change made under [`Self::setting`] and say when it
     /// applies.
     async fn announce_change(&self) -> MutationResult {
-        let model = self.harness.model().await;
+        let model = self.chosen_model().await;
         let level = self.harness.thinking_level().await;
         let skills = self.harness.active_skills().await;
         let running = self.is_busy_now();
@@ -711,6 +757,17 @@ impl AgentBackend for NativeBackend {
             return Err(BackendError::Busy);
         }
         let input = prompt_input(input)?;
+        let jobs: Vec<NextTurnJob> = self.next_turn.lock().drain().map(|(_, job)| job).collect();
+        for job in jobs {
+            job(true).await;
+        }
+        // A model chosen during the last turn starts this one.
+        let chosen = self.pending_model.lock().take();
+        if let Some((key, model)) = chosen {
+            if key == self.config.lock().session {
+                self.harness.set_model(model).await;
+            }
+        }
         let (done, handle) = TurnHandle::channel();
         let harness = Arc::clone(&self.harness);
         let instance = self.instance.clone();
@@ -838,9 +895,6 @@ impl ModelControl for NativeBackend {
         // A model change never lands in the middle of a turn; holding
         // admission keeps a turn from starting until it is done.
         let _admission = self.admission.lock().await;
-        if self.is_busy_now() {
-            return Err(BackendError::Busy);
-        }
         // Recorded first: a choice that cannot be saved is not made.
         self.harness
             .record_config(PendingSessionWrite::ModelChange {
@@ -849,13 +903,20 @@ impl ModelControl for NativeBackend {
             })
             .await
             .map_err(harness_error)?;
-        self.harness.set_model(resolved).await;
+        if self.is_busy_now() {
+            // The running turn keeps its model; the next one starts on this.
+            let key = self.config.lock().session.clone();
+            *self.pending_model.lock() = Some((key, resolved));
+        } else {
+            *self.pending_model.lock() = None;
+            self.harness.set_model(resolved).await;
+        }
         Ok(self.announce_change().await)
     }
 
     async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
         self.current_config(session).await?;
-        let model = self.harness.model().await;
+        let model = self.chosen_model().await;
         let state = self.config.lock();
         Ok(ModelChoices {
             current: Some(effective_effort(model.as_ref(), state.level)),
@@ -880,7 +941,7 @@ impl ModelControl for NativeBackend {
         let _setting = self.setting.lock().await;
         self.current_config(session).await?;
         let level = effort.trim().to_lowercase();
-        let model = self.harness.model().await;
+        let model = self.chosen_model().await;
         let levels = native_efforts(model.as_ref(), &NATIVE_EFFORTS);
         if !levels.contains(&level) {
             return Err(invalid(format!(

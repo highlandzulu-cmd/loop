@@ -6008,14 +6008,22 @@ async fn choose_model(
     chat: &mut Vec<ChatItem>,
 ) {
     match runtime.select_model(provider, id).await {
-        Ok(model) => {
+        Ok((model, pending)) => {
             if !runtime.is_native() {
                 runtime.use_native().await;
                 chat.push(sys("back to Loop's own agent"));
             }
             // The Session's stats name the new model's window.
             token_bar.refresh(runtime).await;
-            chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
+            let note = if pending {
+                " (applies from the next turn)"
+            } else {
+                ""
+            };
+            chat.push(sys(format!(
+                "model → {}/{}{note}",
+                model.provider, model.id
+            )));
             offer_save_default(runtime, chat).await;
         }
         Err(err) => chat.push(error_item(format!("{err:#}"))),

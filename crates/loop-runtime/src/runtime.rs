@@ -241,6 +241,9 @@ struct LiveSession {
     generation: Mutex<Option<Arc<admin::Generation>>>,
     /// The sandbox the Session runs in (`session/sandbox`).
     sandbox_choice: Mutex<loop_protocol::admin::SandboxChoice>,
+    /// A sandbox chosen during a turn, started and waiting for the turn to
+    /// end; the running tool calls keep the one they started in.
+    pending_sandbox: Mutex<Option<admin::PendingSandbox>>,
 }
 /// What the pump has committed and published of one Session. The pump is
 /// the only writer of a loaded Session's updates, so `published` and
@@ -802,6 +805,7 @@ impl Runtime {
                 pending_workspace: Mutex::new(None),
                 generation: Mutex::new(None),
                 sandbox_choice: Mutex::new(sandbox_choice),
+                pending_sandbox: Mutex::new(None),
             });
             if unannounced {
                 publish(

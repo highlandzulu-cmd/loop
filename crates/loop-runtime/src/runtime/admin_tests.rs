@@ -375,6 +375,56 @@ async fn sandbox_status_reports_off_and_a_bad_mode_is_refused() {
     .unwrap();
 }
 
+/// A sandbox chosen during a turn is accepted and waits: the turn keeps the
+/// sandbox it started with, and the choice takes effect when it ends.
+#[tokio::test]
+async fn a_sandbox_chosen_during_a_turn_applies_when_it_ends() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, log) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = park(&rt, &log, &session).await;
+        let live = rt.route(&session).unwrap();
+        let before = live.opened.harness.sandbox_info().await.format_box();
+        let set = rt
+            .sandbox(SandboxParams {
+                session: session.clone(),
+                action: SandboxAction::Set,
+                config: Some(SandboxChoice {
+                    mode: "off".into(),
+                    ..SandboxChoice::default()
+                }),
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert!(set.info.contains("next turn"), "{}", set.info);
+        assert!(live.pending_sandbox.lock().unwrap().is_some());
+        // The running turn is unaffected.
+        assert_eq!(
+            live.opened.harness.sandbox_info().await.format_box(),
+            before
+        );
+
+        rt.cancel(&session);
+        turn.outcome().await;
+        assert!(live.pending_sandbox.lock().unwrap().is_none());
+        let status = rt
+            .sandbox(SandboxParams {
+                session,
+                action: SandboxAction::Status,
+                config: None,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert!(!status.info.contains("next turn"), "{}", status.info);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
 /// The admin service, past `Runtime`'s own `reload`.
 fn admin(rt: &Runtime) -> &dyn RuntimeAdmin {
     rt

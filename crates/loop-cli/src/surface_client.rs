@@ -532,18 +532,19 @@ impl SurfaceClient {
         &mut self,
         provider: &str,
         id: &str,
-    ) -> anyhow::Result<loop_ai::Model> {
+    ) -> anyhow::Result<(loop_ai::Model, bool)> {
         if loop_ai::CredentialStore::is_logged_out(self.host.inner.credentials.as_ref(), provider) {
             anyhow::bail!("{provider} is logged out; run /login {provider}");
         }
         let model = self.resolve_model(&format!("{provider}/{id}")).await?;
         let session = self.host.inner.native.current_session().await;
-        self.native_control()?
+        let changed = self
+            .native_control()?
             .set_model(&session, &format!("{provider}/{id}"), None)
             .await?;
         self.host.inner.selected_model = Some(model.clone());
         self.host.inner.model_note = None;
-        Ok(model)
+        Ok((model, changed.pending))
     }
 
     pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {

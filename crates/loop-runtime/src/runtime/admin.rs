@@ -47,7 +47,62 @@ pub(super) async fn release(generation: Arc<Generation>) {
     }
 }
 
+/// A Session's sandbox choice that waits for its work to end.
+pub(super) struct PendingSandbox {
+    mode: SandboxMode,
+    choice: SandboxChoice,
+    /// The workspace's shared sandbox when it was chosen, never destroyed
+    /// with a Session's own.
+    shared: Option<Arc<dyn loop_agent::harness::Sandbox>>,
+}
+
+impl PendingSandbox {
+    /// Destroy the started sandbox, unused.
+    async fn discard(self) {
+        if let SandboxMode::Enabled { sandbox } = self.mode {
+            if !self
+                .shared
+                .is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox))
+            {
+                let _ = sandbox.destroy().await;
+            }
+        }
+    }
+}
+
 impl LiveSession {
+    /// Switch the Session to `mode` and rebuild its tools in it. The caller
+    /// holds the lifecycle lock and no work is running.
+    async fn install_sandbox(
+        &self,
+        workspace: &WorkspaceResources,
+        pending: PendingSandbox,
+    ) -> BackendResult<()> {
+        let PendingSandbox {
+            mode,
+            choice,
+            shared,
+        } = pending;
+        let previous = self.opened.harness.replace_sandbox(mode).await;
+        // The workspace's own sandbox serves other Sessions; keep it.
+        if let SandboxMode::Enabled { sandbox } = previous {
+            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
+                let _ = sandbox.destroy().await;
+            }
+        }
+        self.opened
+            .apply_workspace(workspace, RUNTIME_TOOLS)
+            .await
+            .map_err(failed)?;
+        let sandboxed = choice.mode == "local";
+        *self.sandbox_choice.lock().unwrap() = if sandboxed {
+            choice
+        } else {
+            Runtime::sandbox_choice(&workspace.settings, false)
+        };
+        Ok(())
+    }
+
     /// Apply a workspace reload that waited for this Session's work to
     /// end. The caller holds the lifecycle lock and has cleared `busy`.
     pub(super) async fn apply_pending(&self) {
@@ -63,6 +118,19 @@ impl LiveSession {
             let previous = self.generation.lock().unwrap().replace(next);
             if let Some(previous) = previous {
                 release(previous).await;
+            }
+        }
+        let sandbox = self.pending_sandbox.lock().unwrap().take();
+        if let Some(sandbox) = sandbox {
+            let workspace = self
+                .generation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|generation| Arc::clone(&generation.resources))
+                .unwrap_or_else(|| Arc::clone(&self.opened.workspace));
+            if let Err(error) = self.install_sandbox(&workspace, sandbox).await {
+                eprintln!("Runtime: could not apply the chosen sandbox: {error}");
             }
         }
     }
@@ -95,6 +163,10 @@ impl Runtime {
     /// Release what admin gave a closing Session: its place in a pending
     /// reload, and a sandbox of its own (never the workspace's shared one).
     pub(super) async fn release_admin(&self, live: &LiveSession) {
+        let sandbox = live.pending_sandbox.lock().unwrap().take();
+        if let Some(sandbox) = sandbox {
+            sandbox.discard().await;
+        }
         let pending = live.pending_workspace.lock().unwrap().take();
         let current = live.generation.lock().unwrap().take();
         for held in pending.into_iter().chain(current) {
@@ -718,9 +790,6 @@ impl RuntimeAdmin for Runtime {
             if live.closing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
                 return Err(failed("Session closing"));
             }
-            if live.busy.load(Ordering::Acquire) {
-                return Err(BackendError::Busy);
-            }
             let native = &live.opened.native;
             if let Some(expected) = params.expected_revision {
                 if expected != native.revision() {
@@ -737,25 +806,36 @@ impl RuntimeAdmin for Runtime {
                 .unwrap()
                 .get(&workspace.cwd)
                 .and_then(|state| state.sandbox.clone());
-            let previous = live.opened.harness.replace_sandbox(mode).await;
-            // The workspace's own sandbox serves other Sessions; keep it.
-            if let SandboxMode::Enabled { sandbox } = previous {
-                if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
-                    let _ = sandbox.destroy().await;
-                }
-            }
-            live.opened
-                .apply_workspace(&workspace, RUNTIME_TOOLS)
-                .await
-                .map_err(failed)?;
-            let sandboxed = choice.mode == "local";
-            *live.sandbox_choice.lock().unwrap() = if sandboxed {
-                choice
-            } else {
-                Self::sandbox_choice(&workspace.settings, false)
+            let chosen = PendingSandbox {
+                mode,
+                choice,
+                shared,
             };
+            if live.busy.load(Ordering::Acquire) {
+                // Running tool calls keep their sandbox; the next turn
+                // starts in this one.
+                let replaced = live.pending_sandbox.lock().unwrap().replace(chosen);
+                if let Some(replaced) = replaced {
+                    replaced.discard().await;
+                }
+            } else {
+                let replaced = live.pending_sandbox.lock().unwrap().take();
+                if let Some(replaced) = replaced {
+                    replaced.discard().await;
+                }
+                live.install_sandbox(&workspace, chosen).await?;
+            }
         }
-        let info = live.opened.harness.sandbox_info().await.format_box();
+        let mut info = live
+            .opened
+            .harness
+            .sandbox_info()
+            .await
+            .format_box()
+            .to_string();
+        if live.pending_sandbox.lock().unwrap().is_some() {
+            info.push_str("\nThe new sandbox applies from the next turn.");
+        }
         let config = live.sandbox_choice.lock().unwrap().clone();
         Ok(SandboxResult {
             config,

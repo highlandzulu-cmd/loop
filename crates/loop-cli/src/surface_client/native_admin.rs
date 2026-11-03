@@ -584,10 +584,8 @@ impl RuntimeAdmin for NativeSandbox {
             isolation: self.settings.isolation.clone(),
             runtime: self.settings.runtime.clone(),
         };
+        let mut note = String::new();
         if p.action == SandboxAction::Set {
-            if self.native.is_busy(&p.session) {
-                return Err(BackendError::Busy);
-            }
             choice = p
                 .config
                 .ok_or_else(|| failed("missing sandbox configuration"))?;
@@ -606,35 +604,83 @@ impl RuntimeAdmin for NativeSandbox {
                 }
                 _ => return Err(failed("unknown sandbox mode")),
             };
-            let previous = self.harness.replace_sandbox(mode).await;
-            let tools = async {
-                let env = self.harness.tool_env().await.map_err(failed)?;
-                self.harness
-                    .set_tools(crate::build_tools(
-                        env,
-                        &self.web,
-                        self.bash,
-                        self.search.clone(),
-                    ))
-                    .await
-                    .map_err(failed)
-            }
-            .await;
-            if let Err(error) = tools {
-                let rejected = self.harness.replace_sandbox(previous).await;
-                if let SandboxMode::Enabled { sandbox } = rejected {
-                    let _ = sandbox.destroy().await;
-                }
-                return Err(error);
-            }
-            if let SandboxMode::Enabled { sandbox } = previous {
-                let _ = sandbox.destroy().await;
+            // A running turn and its tool calls keep the sandbox they
+            // started with; the next turn starts in the new one.
+            let slot = Arc::new(std::sync::Mutex::new(Some(mode)));
+            let deferred = Arc::clone(&slot);
+            let harness = Arc::clone(&self.harness);
+            let web = self.web.clone();
+            let search = self.search.clone();
+            let bash = self.bash;
+            let job: loop_agent::native_backend::NextTurnJob = Box::new(move |apply| {
+                Box::pin(async move {
+                    let mode = deferred.lock().unwrap().take();
+                    match mode {
+                        // A failed rebuild is rolled back inside; nobody
+                        // is waiting to hear about it.
+                        Some(mode) if apply => {
+                            let _ = install_sandbox(&harness, &web, bash, search, mode).await;
+                        }
+                        Some(SandboxMode::Enabled { sandbox }) => {
+                            let _ = sandbox.destroy().await;
+                        }
+                        _ => {}
+                    }
+                })
+            });
+            if self.native.after_turn(SANDBOX_JOB, job).await.is_some() {
+                let mode = slot.lock().unwrap().take().expect("the job did not run");
+                install_sandbox(
+                    &self.harness,
+                    &self.web,
+                    self.bash,
+                    self.search.clone(),
+                    mode,
+                )
+                .await?;
+            } else {
+                note = "\nThe new sandbox applies from the next turn.".into();
             }
         }
         Ok(SandboxResult {
             config: choice,
-            info: self.harness.sandbox_info().await.format_box(),
+            info: format!("{}{note}", self.harness.sandbox_info().await.format_box()),
             ..Default::default()
         })
     }
+}
+
+/// Key of the sandbox change waiting for the next turn.
+const SANDBOX_JOB: &str = "sandbox";
+
+/// Switch the harness to `mode` and rebuild its tools in it. A failed rebuild
+/// puts the previous sandbox back.
+async fn install_sandbox(
+    harness: &loop_agent::harness::AgentHarness,
+    web: &loop_app_core::web_tools::WebTools,
+    bash: loop_agent::harness::BashLimits,
+    search: loop_agent::harness::SearchFilter,
+    mode: loop_agent::harness::SandboxMode,
+) -> BackendResult<()> {
+    use loop_agent::harness::SandboxMode;
+    let previous = harness.replace_sandbox(mode).await;
+    let tools = async {
+        let env = harness.tool_env().await.map_err(failed)?;
+        harness
+            .set_tools(crate::build_tools(env, web, bash, search))
+            .await
+            .map_err(failed)
+    }
+    .await;
+    if let Err(error) = tools {
+        let rejected = harness.replace_sandbox(previous).await;
+        if let SandboxMode::Enabled { sandbox } = rejected {
+            let _ = sandbox.destroy().await;
+        }
+        return Err(error);
+    }
+    if let SandboxMode::Enabled { sandbox } = previous {
+        let _ = sandbox.destroy().await;
+    }
+    Ok(())
 }
