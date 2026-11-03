@@ -47,3 +47,15 @@ fn token_directory_symlinks_and_shared_files_are_refused() {
     assert!(read(&path).is_err());
     assert!(create(dir.path()).is_err());
 }
+
+#[test]
+fn reading_a_token_requires_a_private_parent_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, path) = create(dir.path()).unwrap();
+    std::fs::set_permissions(
+        path.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(read(&path).is_err());
+}
