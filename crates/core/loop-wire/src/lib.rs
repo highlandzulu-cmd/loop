@@ -17,6 +17,8 @@ pub mod connection;
 pub mod control;
 pub mod server;
 pub mod socket;
+#[cfg(unix)]
+pub mod token;
 pub mod transport;
 
 pub use client::RemoteBackend;

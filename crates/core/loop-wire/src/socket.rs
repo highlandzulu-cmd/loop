@@ -12,11 +12,11 @@ use std::io;
 
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderValue, StatusCode};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
+use tokio_util::sync::CancellationToken;
 
 use crate::transport::{Transport, MAX_MESSAGE_BYTES};
 
@@ -97,7 +97,7 @@ where
             .get("authorization")
             .map(HeaderValue::as_bytes)
             .unwrap_or_default();
-        if constant_time_eq(given, expected.as_bytes()) {
+        if !token.is_empty() && constant_time_eq(given, expected.as_bytes()) {
             Ok(response)
         } else {
             let mut refused = ErrorResponse::new(Some("a bearer token is required".into()));
@@ -105,9 +105,13 @@ where
             Err(refused)
         }
     };
-    let ws = tokio_tungstenite::accept_hdr_async_with_config(stream, check, Some(ws_config()))
-        .await
-        .map_err(io::Error::other)?;
+    let ws = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_tungstenite::accept_hdr_async_with_config(stream, check, Some(ws_config())),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket handshake timed out"))?
+    .map_err(io::Error::other)?;
     Ok(websocket(ws))
 }
 
@@ -116,6 +120,14 @@ where
 pub async fn websocket_connect(url: &str, token: &str) -> io::Result<Transport> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut request = url.into_client_request().map_err(io::Error::other)?;
+    let uri = request.uri();
+    if uri.scheme_str() != Some("ws")
+        || uri.authority().is_none_or(|a| a.as_str().contains('@'))
+        || uri.query().is_some()
+    {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput,
+            "use a ws:// Runtime URL without credentials or query parameters; TLS is not yet supported"));
+    }
     let value = HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -123,9 +135,15 @@ pub async fn websocket_connect(url: &str, token: &str) -> io::Result<Transport> 
         )
     })?;
     request.headers_mut().insert("authorization", value);
-    let (ws, _) = tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false)
-        .await
-        .map_err(io::Error::other)?;
+    let (ws, _) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio_tungstenite::connect_async_with_config(request, Some(ws_config()), false),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "WebSocket connection timed out"))?
+    .map_err(|_| {
+        io::Error::other("WebSocket connection failed; check the Runtime URL and bearer token")
+    })?;
     Ok(websocket(ws))
 }
 
@@ -142,39 +160,49 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (mut sink, mut stream) = ws.split();
-    let (incoming_tx, incoming) = mpsc::unbounded_channel();
-    let (outgoing, mut to_send) = mpsc::unbounded_channel::<String>();
+    let closed = CancellationToken::new();
+    let (incoming_tx, incoming) = crate::transport::bounded(closed.clone());
+    let (outgoing, mut to_send) = crate::transport::bounded(closed.clone());
+    let writer_closed = closed.clone();
     tokio::spawn(async move {
-        while let Some(message) = to_send.recv().await {
-            if sink.send(Message::text(message)).await.is_err() {
-                return;
-            }
-        }
-        let _ = sink.close().await;
-    });
-    tokio::spawn(async move {
-        while let Some(frame) = stream.next().await {
-            match frame {
-                Ok(Message::Text(text)) => {
-                    if incoming_tx.send(text.as_str().to_owned()).is_err() {
-                        return;
-                    }
-                }
-                Ok(Message::Close(_)) => return,
-                // Pings are answered by the library; binary isn't ours.
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "websocket read failed");
+        let write = async {
+            while let Some(message) = to_send.recv().await {
+                if sink.send(Message::text(message)).await.is_err() {
                     return;
                 }
             }
-        }
+            let _ = sink.close().await;
+        };
+        tokio::select! { biased; _ = writer_closed.cancelled() => {}, _ = write => {} }
+        writer_closed.cancel();
+    });
+    tokio::spawn(async move {
+        let read = async {
+            while let Some(frame) = stream.next().await {
+                match frame {
+                    Ok(Message::Text(text)) => {
+                        if incoming_tx.send(text.as_str().to_owned()).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(Message::Close(_)) => return,
+                    // Pings are answered by the library; binary isn't ours.
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "websocket read failed");
+                        return;
+                    }
+                }
+            }
+        };
+        tokio::select! { biased; _ = closed.cancelled() => {}, _ = read => {} }
+        closed.cancel();
     });
     Transport { incoming, outgoing }
 }
 
 /// Compare without leaking how many leading bytes matched.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -207,14 +235,18 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_live_runtime_socket_is_never_unlinked() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("run/runtime.sock");
-        let first = unix_listen(&path).unwrap();
-        let error = unix_listen(&path).expect_err("live listener must be refused");
-        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
-        assert!(error.to_string().contains("Runtime already listening"));
-        let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
-        first.accept().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("run/runtime.sock");
+            let first = unix_listen(&path).unwrap();
+            let error = unix_listen(&path).expect_err("live listener must be refused");
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            assert!(error.to_string().contains("Runtime already listening"));
+            let _client = tokio::net::UnixStream::connect(&path).await.unwrap();
+            first.accept().await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]
@@ -247,38 +279,82 @@ mod tests {
 
     #[tokio::test]
     async fn a_websocket_without_the_token_is_refused() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Error};
+        for (expected, given) in [("secret", None), ("secret", Some("wrong")), ("", Some(""))] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            websocket_accept(stream, "secret").await.is_ok()
+            websocket_accept(stream, expected).await.is_ok()
         });
-        let refused = websocket_connect(&format!("ws://{addr}/"), "wrong").await;
-        assert!(refused.is_err());
+        let mut request = format!("ws://{addr}/").into_client_request().unwrap();
+        if let Some(token) = given {
+            request.headers_mut().insert("authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
+        }
+        let refused = tokio_tungstenite::connect_async(request).await.unwrap_err();
+        assert!(matches!(refused, Error::Http(response) if response.status() == StatusCode::UNAUTHORIZED));
         assert!(!server.await.unwrap());
+        }
+        }).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_websocket_handshake_times_out() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let (stream, _silent_peer) = tokio::io::duplex(1024);
+            let error = websocket_accept(stream, "secret").await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_lagging_websocket_is_disconnected_instead_of_queuing_without_limit() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                websocket_accept(stream, "secret").await.unwrap()
+            });
+            let mut client = websocket_connect(&format!("ws://{addr}/"), "secret")
+                .await
+                .unwrap();
+            let server = server.await.unwrap();
+            assert!((0..1024).any(|_| server.outgoing.send("queued".into()).is_err()));
+            assert!(client.incoming.recv().await.is_none());
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
     async fn websocket_messages_cross_both_ways() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut transport = websocket_accept(stream, "secret").await.unwrap();
-            let got = transport.incoming.recv().await.unwrap();
-            transport.outgoing.send(format!("echo {got}")).unwrap();
-            transport
-        });
-        let mut client = websocket_connect(&format!("ws://{addr}/"), "secret")
-            .await
-            .unwrap();
-        client.outgoing.send("hi".into()).unwrap();
-        assert_eq!(client.incoming.recv().await.unwrap(), "echo hi");
-        let server = server.await.unwrap();
-        drop(server);
-        assert!(
-            client.incoming.recv().await.is_none(),
-            "closing ends the stream"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut transport = websocket_accept(stream, "secret").await.unwrap();
+                let got = transport.incoming.recv().await.unwrap();
+                transport.outgoing.send(format!("echo {got}")).unwrap();
+                transport
+            });
+            let mut client = websocket_connect(&format!("ws://{addr}/"), "secret")
+                .await
+                .unwrap();
+            client.outgoing.send("hi".into()).unwrap();
+            assert_eq!(client.incoming.recv().await.unwrap(), "echo hi");
+            let server = server.await.unwrap();
+            drop(server);
+            assert!(
+                client.incoming.recv().await.is_none(),
+                "closing ends the stream"
+            );
+        })
+        .await
+        .unwrap();
     }
 }

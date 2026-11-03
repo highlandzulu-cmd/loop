@@ -31,6 +31,28 @@ fn info(name: &str) -> PeerInfo {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn cancelling_initialization_closes_the_transport() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (mut peer, transport) = memory();
+        let connecting = tokio::spawn(RemoteBackend::connect(
+            transport,
+            info("client"),
+            Arc::new(FirstOption),
+        ));
+        let request = peer.incoming.recv().await.unwrap();
+        assert!(request.contains("initialize"));
+        connecting.abort();
+        assert!(connecting.await.is_err());
+        assert!(
+            peer.incoming.recv().await.is_none(),
+            "abandoned initialization kept the socket open"
+        );
+    })
+    .await
+    .unwrap();
+}
+
 async fn native(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<NativeBackend> {
     let script = FauxScript::new();
     script.extend(responses);

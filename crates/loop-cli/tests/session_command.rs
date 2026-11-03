@@ -358,7 +358,7 @@ async fn numbered_approval_withdrawal_and_interrupts_use_the_wire() {
                 if forward.send(raw).is_err() { break; }
             }
         });
-        let served = serve(rt.clone(), loop_wire::transport::Transport { incoming, outgoing: server.outgoing });
+        let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: incoming.into(), outgoing: server.outgoing });
         let (backend, events) = connect(client).await.unwrap(); let (tx, mut terminal, output) = script();
         let key = session.key.to_string();
         let task = tokio::spawn(async move { drive(backend, events, SessionArgs { id: Some(key), ..Default::default() }, &mut terminal).await });
@@ -563,7 +563,7 @@ async fn connection_loss_reports_error_and_leaves_the_session_running() {
             }
         });
         let (backend, events) = connect(loop_wire::transport::Transport {
-            incoming,
+            incoming: incoming.into(),
             outgoing: client.outgoing,
         })
         .await
@@ -632,7 +632,7 @@ async fn buffered_withdrawn_answer_never_answers_the_next_request_or_becomes_a_p
                 captured.lock().unwrap().push(serde_json::from_str(&raw).unwrap());
                 if forward.send(raw).is_err() { break; }
             }});
-            let served = serve(rt.clone(), loop_wire::transport::Transport { incoming, outgoing: server.outgoing });
+            let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: incoming.into(), outgoing: server.outgoing });
             let (backend, events) = connect(client).await.unwrap(); let (tx, script, output) = script();
             let (enable, enabled) = tokio::sync::watch::channel(false); let mut terminal = PausedInput { script, enabled };
             let key = session.key.to_string();
@@ -692,8 +692,8 @@ async fn runtime_loss_after_detach_request_closes_locally_without_a_shutdown_rpc
             }
             closed_peer.notify_one();
         });
-        let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: server_incoming, outgoing: server.outgoing });
-        let (backend, events) = connect(loop_wire::transport::Transport { incoming, outgoing: client.outgoing }).await.unwrap();
+        let served = serve(rt.clone(), loop_wire::transport::Transport { incoming: server_incoming.into(), outgoing: server.outgoing });
+        let (backend, events) = connect(loop_wire::transport::Transport { incoming: incoming.into(), outgoing: client.outgoing }).await.unwrap();
         let (tx, mut terminal, _) = script(); tx.send(Input::Eof).unwrap();
         let result = tokio::time::timeout(Duration::from_secs(20), drive(backend, events, SessionArgs { id: Some(session.key.to_string()), ..Default::default() }, &mut terminal)).await.expect("cleanup hung after Runtime loss");
         assert!(result.is_err());
@@ -747,7 +747,10 @@ async fn interrupts_cancel_and_detach_before_gated_replay_finishes() {
         });
         let served = serve(
             rt.clone(),
-            loop_wire::transport::Transport { incoming, outgoing },
+            loop_wire::transport::Transport {
+                incoming: incoming.into(),
+                outgoing: outgoing.into(),
+            },
         );
         let (backend, events) = connect(client).await.unwrap();
         let (tx, mut terminal, output) = script();
@@ -918,7 +921,7 @@ async fn a_subagents_escalation_is_labelled_and_withdrawn_by_its_own_session() {
         let served = serve(
             rt.clone(),
             loop_wire::transport::Transport {
-                incoming,
+                incoming: incoming.into(),
                 outgoing: server.outgoing,
             },
         );
@@ -1030,7 +1033,7 @@ async fn a_slow_session_list_never_delays_a_subagents_escalation() {
         let served = serve(
             rt.clone(),
             loop_wire::transport::Transport {
-                incoming,
+                incoming: incoming.into(),
                 outgoing: server.outgoing,
             },
         );
@@ -1773,7 +1776,7 @@ async fn each_approval_is_numbered_from_one_and_ignores_earlier_typing() {
         let served = serve(
             rt.clone(),
             loop_wire::transport::Transport {
-                incoming,
+                incoming: incoming.into(),
                 outgoing: server.outgoing,
             },
         );

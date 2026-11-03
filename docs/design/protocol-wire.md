@@ -42,9 +42,9 @@ A transport sends and receives whole messages (`Stream<Item = String>` + `Sink<S
 | lines | one JSON message per line | stdio, Unix sockets (Linux and macOS) |
 | websocket | one JSON message per text frame | remote Surfaces, later the Web app |
 
-Security, carried over from `mcp serve`:
-- **Unix socket:** created with mode 0600, under `~/.loop/run/`.
-- **WebSocket:** binds to loopback by default and always needs a bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. It refuses to bind to a non-loopback address without `--token`. This lane only adds the transport; the flags come with `loop runtime start` in S2.
+Security (see `tui-client.md` §7):
+- **Unix socket:** created with mode 0600, under the agent directory's private `run/` directory.
+- **WebSocket:** `loop runtime start --listen IP:PORT` accepts loopback binds only until TLS exists. It always requires a freshly generated bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. The token lives in `run/runtime.token` (0600) under a user-owned 0700 directory, outside sandbox-readable paths. WebSocket connections carry Remote authority, including through SSH tunnels. Handshakes have a five-second deadline. Each WebSocket transport queue holds at most 128 messages and 64 MiB; overflow disconnects the client for replay.
 
 ## 4. Methods
 
@@ -150,13 +150,14 @@ sets both.
 | `session/close` | c → s | request | `{session, force?}` → `{}`. `force` (default false) cancels a running turn; without it a busy Session returns Busy |
 | `session/attach` | c → s | request | `{session, after_seq?}` → `{latest_seq, generation}`. The cursor defaults to 0 |
 | `session/detach` | c → s | request | `{session}` → `{}`. Stops this connection's updates and approvals for the Session; the turn keeps running |
-| `runtime/status` | c → s | request | `{}` → `RuntimeStatus{pid, socket, generation, loaded, busy, max_sessions, max_active_turns, max_sessions_from?, max_active_turns_from?}`. The `_from` fields say where a limit came from: `flag`, `settings` or `default` |
+| `runtime/status` | c → s | request | `{}` → `RuntimeStatus{pid, socket, listen_url?, generation, loaded, busy, max_sessions, max_active_turns, max_sessions_from?, max_active_turns_from?}`. `listen_url` contains no credentials. The `_from` fields say where a limit came from: `flag`, `settings` or `default` |
 | `runtime/stop` | c → s | request | `{}` → `{}`. The Runtime answers, then shuts down as on SIGTERM and closes every connection |
 | `host/interact` | s → c | request | `InteractionRequest` plus optional `session` (a `SessionRef`) → `InteractionOutcome` |
 | `host/interact_withdrawn` | s → c | notification | `{session, id}` |
 
-- **Runtime control.** `runtime/status` and `runtime/stop` are served only on
-  a Runtime's socket, which is mode 0600, so only the same user reaches them.
+- **Runtime control.** `runtime/status` is also available over authenticated
+  WebSockets. `runtime/stop` is host-only, served on the Runtime's protected
+  Unix socket.
   `loop runtime status` and `loop runtime stop` use them instead of the pid
   file. A server without them returns an error.
 - **Session references.** `session` is always a full `SessionRef`

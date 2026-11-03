@@ -9,7 +9,11 @@ carry it.
 - `socket`: Unix sockets (`unix_listen` creates the socket with mode 0600 in a
   0700 directory; `unix` wraps a connection) and WebSockets
   (`websocket_accept` refuses any client without the bearer token, even on
-  loopback; `websocket_connect`). One message per line or per text frame.
+  loopback; `websocket_connect`). Handshakes time out after five seconds;
+  bounded queues disconnect slow clients for replay. One message per line or
+  per text frame.
+- `token` (Unix): generate and read private Runtime token files, rejecting
+  symlinks, unsafe ownership and permissions.
 - `connection`: JSON-RPC 2.0 over a transport. Everything the peer sends
   arrives on one ordered channel, responses included, so a request's result is
   seen only after every notification sent before it. Pending requests fail
@@ -19,7 +23,8 @@ carry it.
   answered only after that turn's `turn_ended` has been sent. `host/interact`
   lets the backend ask the client (`Served::host`).
 - `client::RemoteBackend`: the `AgentBackend` on the other end, so a Surface
-  can't tell a served backend from an in-process one.
+  can't tell a served backend from an in-process one. `connect_websocket`
+  accepts a URL and bearer token and initializes the connection.
 
 `loop-acp` uses this connection, over `lines`, to talk to external agents.
 `loop-protocol` itself stays free of transports.

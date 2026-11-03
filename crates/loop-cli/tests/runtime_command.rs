@@ -59,6 +59,79 @@ fn agent_dir() -> (tempfile::TempDir, PathBuf) {
 }
 
 #[tokio::test]
+async fn websocket_refuses_non_loopback_before_starting() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for address in ["0.0.0.0:0", "[::]:0", "192.0.2.1:0"] {
+            let (_dir, agent) = agent_dir();
+            let output = serve(&agent, &["--listen", address])
+                .output()
+                .await
+                .unwrap();
+            assert!(!output.status.success());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                error.contains("non-loopback") && error.contains("TLS"),
+                "{error}"
+            );
+            assert!(!agent.join("run/runtime.pid").exists());
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn websocket_publishes_only_its_url_and_keeps_a_private_fresh_token() {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_dir, agent) = agent_dir();
+        let socket = agent.join("run/runtime.sock");
+        let token_file = agent.join("run/runtime.token");
+        let mut previous = String::new();
+        for _ in 0..2 {
+            let mut child = serve(&agent, &["--listen", "127.0.0.1:0"]).spawn().unwrap();
+            wait_for(&socket, &mut child).await;
+            let token = std::fs::read_to_string(&token_file).expect("WebSocket token file");
+            assert!(token.trim().len() >= 43);
+            assert_ne!(token, previous, "each start generates a fresh token");
+            for (path, mode) in [(&token_file, 0o600), (&agent.join("run"), 0o700)] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
+            let output = Command::new(env!("CARGO_BIN_EXE_loop"))
+                .args([
+                    "runtime",
+                    "status",
+                    "--json",
+                    "--socket",
+                    socket.to_str().unwrap(),
+                ])
+                .output()
+                .await
+                .unwrap();
+            assert!(output.status.success());
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(!text.contains(token.trim()), "status leaks the token");
+            let status: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let url = status["listen_url"].as_str().expect("listen URL");
+            assert!(url.starts_with("ws://127.0.0.1:"), "{url}");
+            let transport = loop_wire::socket::websocket_connect(url, token.trim())
+                .await
+                .unwrap();
+            drop(transport);
+            signal(&child, "-TERM");
+            assert!(child.wait().await.unwrap().success());
+            assert!(!token_file.exists(), "remove the token on clean shutdown");
+            previous = token;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn serve_starts_without_stdin_then_cleans_up_on_sigterm() {
     let (_dir, agent) = agent_dir();
     let socket = agent.join("run/runtime.sock");

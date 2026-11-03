@@ -536,6 +536,7 @@ impl Runtime {
         loop_protocol::rpc::RuntimeStatus {
             pid: std::process::id(),
             socket: PathBuf::new(),
+            listen_url: None,
             generation: self.generation,
             loaded: sessions.len() as u64,
             busy: busy as u64,

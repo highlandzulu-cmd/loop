@@ -23,6 +23,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | Flag | Default | Meaning |
 |---|---|---|
 | `--socket PATH` | `~/.loop/agent/run/runtime.sock` | Where Surfaces connect |
+| `--listen IP:PORT` | off | Also serve authenticated WebSockets on a loopback address |
 | `--max-sessions N` | `runtime.maxSessions`, else 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
 | `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits` or `full-access` |
@@ -67,6 +68,30 @@ its pid may now belong to another program.
   lease released, then the socket is removed. It waits up to 10 seconds for
   the socket to go and fails if it is still there. With no Runtime answering
   it prints `No Runtime running at …` and exits 0.
+
+### WebSocket clients
+
+```bash
+loop runtime start --listen 127.0.0.1:8080
+loop session list --url ws://127.0.0.1:8080/ --token-file ~/.loop/agent/run/runtime.token
+loop session attach SESSION_ID --url ws://127.0.0.1:8080/ --token-file ~/.loop/agent/run/runtime.token
+```
+
+Each start with `--listen` generates a fresh bearer token in the agent directory's
+`run/runtime.token`. The directory is private (0700) and the file is private
+(0600); symlinks, foreign ownership and shared files are refused. A copied
+`--token-file` also needs a private, user-owned directory. The file is removed on
+clean shutdown. `loop runtime status` shows the WebSocket URL, never the token.
+Clients can use `LOOP_RUNTIME_TOKEN` instead of `--token-file`; an explicit file
+takes precedence. Tokens are required even on loopback.
+
+Only loopback binds are supported until TLS is available. For another host, use
+an SSH tunnel to its loopback listener and keep any copied token in a private
+directory. Authenticated WebSocket clients have remote authority: host-only
+methods, including Runtime stop, credentials, saved defaults and usage history,
+and workspace trust writes are refused. The host's protected Unix socket still
+serves those operations. A slow WebSocket client is disconnected when its queues
+fill and can attach again to replay missed events.
 
 ### Permissions and trust
 

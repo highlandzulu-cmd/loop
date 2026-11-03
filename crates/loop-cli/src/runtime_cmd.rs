@@ -12,6 +12,8 @@ pub const STOP_WAIT: Duration = Duration::from_secs(10);
 /// Options of `loop runtime start`.
 #[derive(Debug, Clone)]
 pub struct StartArgs {
+    /// Optional loopback WebSocket listener, in addition to the Unix socket.
+    pub listen: Option<std::net::SocketAddr>,
     /// Socket path; default is the agent directory's Runtime socket.
     pub socket: Option<PathBuf>,
     /// `--max-sessions`: most Sessions the Runtime holds at once.
@@ -59,6 +61,10 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     use loop_protocol::{rpc::PeerInfo, AgentBackend};
     use loop_runtime::{log::SqliteEventLog, Runtime, RuntimeLimits};
     use loop_wire::server::{serve_with_control, ServeOptions};
+
+    if args.listen.is_some_and(|addr| !addr.ip().is_loopback()) {
+        anyhow::bail!("refusing a non-loopback WebSocket bind: TLS is required and is not yet supported; use a loopback address and an SSH tunnel");
+    }
 
     if let Some(mode) = &args.permission_mode {
         if PermissionMode::parse(mode).is_none() {
@@ -158,6 +164,21 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         Some(path) => path.clone(),
         None => paths::runtime_socket_path(&agent_dir)?,
     };
+    let websocket = match args.listen {
+        Some(address) => {
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .context("could not bind the loopback WebSocket listener")?;
+            let (token, path) = loop_wire::token::create(&agent_dir)
+                .context("could not create the private Runtime token file")?;
+            Some((listener, token, TokenFile(path)))
+        }
+        None => None,
+    };
+    let listen_url = websocket
+        .as_ref()
+        .map(|(listener, _, _)| listener.local_addr().map(|addr| format!("ws://{addr}/")))
+        .transpose()?;
     // `unix_listen` probes, and replaces only a socket proven stale.
     let listener = loop_wire::socket::unix_listen(&socket)
         .with_context(|| format!("could not listen on {}", socket.display()))?;
@@ -171,6 +192,12 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         "Runtime listening"
     );
     eprintln!("loop runtime: listening on {}", socket.display());
+    if let Some(url) = &listen_url {
+        eprintln!(
+            "loop runtime: listening on {url}; token file: {}",
+            agent_dir.join("run/runtime.token").display()
+        );
+    }
     let stop = tokio_util::sync::CancellationToken::new();
     let control: Arc<dyn loop_wire::RuntimeControl> = Arc::new(Control {
         runtime: runtime.clone(),
@@ -178,6 +205,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         stop: stop.clone(),
         limits,
         agent_dir: agent_dir.clone(),
+        listen_url,
     });
 
     let info = PeerInfo {
@@ -220,11 +248,36 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             },
+            accepted = async {
+                match &websocket {
+                    Some((listener, _, _)) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => match accepted {
+                Ok((stream, _)) => {
+                    let token = websocket.as_ref().expect("WebSocket listener").1.clone();
+                    let backend: Arc<dyn AgentBackend> = runtime.clone();
+                    let control = control.clone();
+                    let info = info.clone();
+                    connections.spawn(async move {
+                        if let Ok(transport) = loop_wire::socket::websocket_accept(stream, &token).await {
+                            let served = serve_with_control(backend, control, transport, info,
+                                ServeOptions { owns_backend: false, authority: loop_wire::Authority::Remote });
+                            let _ = served.done.await;
+                        }
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "WebSocket accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
     tracing::info!("Runtime shutting down");
     drop(listener);
+    drop(websocket);
     runtime.shutdown().await;
     connections.abort_all();
     // The Lock is still held, so the socket is ours to remove.
@@ -239,6 +292,16 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
 
 #[cfg(unix)]
 use std::sync::Arc;
+
+#[cfg(unix)]
+struct TokenFile(PathBuf);
+
+#[cfg(unix)]
+impl Drop for TokenFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// The Runtime's limits and where each came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,6 +364,7 @@ struct Control {
     limits: Limits,
     /// The host's agent directory: settings and the usage log.
     agent_dir: PathBuf,
+    listen_url: Option<String>,
 }
 
 /// Workspace admin is the Runtime's; the host-only usage history and
@@ -548,6 +612,7 @@ impl loop_wire::RuntimeControl for Control {
     async fn status(&self) -> loop_protocol::BackendResult<loop_protocol::rpc::RuntimeStatus> {
         let mut status = self.runtime.status();
         status.socket = self.socket.clone();
+        status.listen_url = self.listen_url.clone();
         status.max_sessions_from = Some(self.limits.max_sessions.1.into());
         status.max_active_turns_from = Some(self.limits.max_active_turns.1.into());
         Ok(status)
@@ -671,6 +736,9 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
             status.pid, status.generation
         );
         println!("socket:  {}", status.socket.display());
+        if let Some(url) = &status.listen_url {
+            println!("listen:  {url}");
+        }
         let from = |source: &Option<String>| {
             source
                 .as_deref()
