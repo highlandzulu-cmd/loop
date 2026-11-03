@@ -46,7 +46,7 @@ impl Fixture {
         std::fs::write(agent.join("run/token"), "sensitive-sentinel").unwrap();
         let sandbox = SeatbeltSandboxFactory.create(SandboxConfig {
             workdir: project.clone(),
-            options: json!({"homeDir": home, "agentDir": alias, "network": network, "allowWrite": [home, alias]}),
+            options: json!({"homeDir": home, "agentDir": alias, "network": network, "allowWrite": [home, alias], "runtimePaths": [root.path().join("runtime-fallback")]}),
             ..Default::default()
         }).await.unwrap();
         sandbox.start().await.unwrap();
@@ -283,6 +283,14 @@ async fn network_and_runtime_unix_socket_are_denied() {
             .exit_code,
             0
         );
+        let socket = off.project.join("custom.sock");
+        let _off_socket = std::os::unix::net::UnixListener::bind(
+            socket
+                .strip_prefix(std::env::current_dir().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(off.sh("/usr/bin/nc -w 1 -U custom.sock").await.exit_code, 0);
     })
     .await
     .unwrap();
@@ -345,7 +353,9 @@ async fn timeout_kills_descendants_and_environment_drops_secrets() {
 async fn git_commit_and_cargo_build_work() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let f = Fixture::new(false).await;
-        let out = f.sh("git init -q && git -c user.name=Sandbox -c user.email=sandbox@example.invalid -c commit.gpgsign=false commit --allow-empty -qm sandbox").await;
+        let init = tokio::process::Command::new("git").args(["init", "-q"]).current_dir(&f.project).output().await.unwrap();
+        assert!(init.status.success());
+        let out = f.sh("git -c user.name=Sandbox -c user.email=sandbox@example.invalid -c commit.gpgsign=false commit --allow-empty -qm sandbox").await;
         assert_eq!(out.exit_code, 0, "{out:?}");
         std::fs::create_dir_all(f.project.join("src")).unwrap();
         std::fs::write(f.project.join("Cargo.toml"), "[package]\nname='seatbelt-smoke'\nversion='0.1.0'\nedition='2021'\n[workspace]\n").unwrap();
@@ -359,4 +369,267 @@ async fn git_commit_and_cargo_build_work() {
         assert_eq!(out.exit_code, 0, "{out:?}");
         assert!(f.project.join("target/debug/seatbelt-smoke").is_file());
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn configuration_credentials_and_descriptor_aliases_are_confined() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let f = Fixture::new(false).await;
+        for path in [
+            f.project.join(".loop/settings.json"),
+            f.project.join(".git/hooks/pre-commit"),
+            f.project.join(".git/config"),
+            f.agent.join("settings.json"),
+            f.agent.join("trust.json"),
+            f.agent.join("bin/evil"),
+        ] {
+            assert!(
+                f.env().write_file(&path, b"evil").await.is_err(),
+                "{}",
+                path.display()
+            );
+            assert_ne!(
+                f.sh(&format!(
+                    "mkdir -p {} && echo evil > {}",
+                    q(path.parent().unwrap()),
+                    q(&path)
+                ))
+                .await
+                .exit_code,
+                0,
+                "{}",
+                path.display()
+            );
+        }
+        for name in [
+            ".netrc",
+            ".docker/config.json",
+            ".kube/config",
+            ".npmrc",
+            ".pypirc",
+            ".config/gcloud/token",
+            "Library/Cookies/Cookies.binarycookies",
+            ".codex/auth.json",
+            ".claude/.credentials.json",
+            ".gemini/oauth_creds.json",
+        ] {
+            let path = f.home.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "private-token").unwrap();
+            assert!(f.env().read_text_file(&path).await.is_err(), "{name}");
+            assert_ne!(
+                f.sh(&format!("cat {}", q(&path))).await.exit_code,
+                0,
+                "{name}"
+            );
+        }
+        for name in [
+            "mcp-auth/token",
+            "agents/chatgpt/home/auth.json",
+            "sessions.db",
+            "sessions.db-wal",
+            "events.db-shm",
+            "history.json",
+            "logs/runtime.log",
+        ] {
+            let path = f.agent.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "private-token").unwrap();
+            assert!(f.env().read_text_file(&path).await.is_err(), "{name}");
+            assert_ne!(
+                f.sh(&format!("cat {}", q(&path))).await.exit_code,
+                0,
+                "{name}"
+            );
+        }
+        let fallback = f._root.path().join("runtime-fallback/token");
+        std::fs::create_dir_all(fallback.parent().unwrap()).unwrap();
+        std::fs::write(&fallback, "runtime-token").unwrap();
+        assert!(f.env().read_text_file(&fallback).await.is_err());
+        assert_ne!(f.sh(&format!("cat {}", q(&fallback))).await.exit_code, 0);
+        use std::os::fd::AsRawFd;
+        let secret = std::fs::File::open(f.agent.join("auth.json")).unwrap();
+        assert!(f
+            .env()
+            .read_text_file(Path::new(&format!("/dev/fd/{}", secret.as_raw_fd())))
+            .await
+            .is_err());
+        assert!(f
+            .env()
+            .read_binary_file(Path::new("/dev/null"))
+            .await
+            .is_err());
+        let renamed = f.project.join("renamed-auth");
+        std::fs::rename(f.agent.join("auth.json"), &renamed).unwrap();
+        assert!(f.env().read_text_file(&renamed).await.is_err());
+        assert!(f.env().write_file(&renamed, b"evil").await.is_err());
+        std::fs::rename(&renamed, f.agent.join("auth.json")).unwrap();
+        let outside = f.outside.join("ordinary");
+        std::fs::write(&outside, "outside").unwrap();
+        let alias = f.project.join("hardlink");
+        assert_ne!(
+            f.sh(&format!("ln {} {}", q(&outside), q(&alias)))
+                .await
+                .exit_code,
+            0
+        );
+        std::fs::hard_link(&outside, &alias).unwrap();
+        assert!(f.env().read_text_file(&alias).await.is_err());
+        assert!(f.env().write_file(&alias, b"evil").await.is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn temporary_directory_is_private_and_cannot_be_overridden() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let f = Fixture::new(false).await;
+        let other = Fixture::new(false).await;
+        let out = f
+            .env()
+            .exec(
+                "printf '%s' \"$TMPDIR\"",
+                ShellExecOptions {
+                    env: Some([("TMPDIR".into(), "/".into())].into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let path = PathBuf::from(out.stdout);
+        assert_ne!(path, Path::new("/"));
+        assert_ne!(path, std::env::temp_dir());
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_ne!(f.sh("chmod 777 \"$TMPDIR\"").await.exit_code, 0);
+        assert_eq!(f.sh("echo ok > \"$TMPDIR/test\"").await.exit_code, 0);
+        assert_ne!(
+            other
+                .sh(&format!("echo evil > {}", q(&path.join("other"))))
+                .await
+                .exit_code,
+            0
+        );
+        assert_ne!(f.sh("echo injected >/dev/tty").await.exit_code, 0);
+        f.sandbox.destroy().await.unwrap();
+        assert!(!path.exists());
+        assert!(f.env().exec("true", Default::default()).await.is_err());
+    })
+    .await
+    .unwrap();
+}
+
+async fn gone(pid: &str) {
+    loop {
+        let output = tokio::process::Command::new("/bin/ps")
+            .args(["-p", pid.trim(), "-o", "stat="])
+            .output()
+            .await
+            .unwrap();
+        if !output.status.success()
+            || String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .starts_with('Z')
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn detached_descendants_are_killed_on_return_timeout_and_destroy() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        for finish in ["return", "timeout", "cancel", "drop", "stop", "destroy"] {
+            let f = Fixture::new(false).await;
+            // Clear the environment too: cleanup cannot rely on a removable
+            // environment variable or on the child's process group/session.
+            let script = r#"/usr/bin/perl -MPOSIX -e 'setsid() >= 0 or die; my $pid = fork(); defined $pid or die; exit if $pid; setsid() >= 0 or die; exec "/usr/bin/env", "-i", "/bin/sh", "-c", "echo $$ > escaped.pid; exec /bin/sleep 60"' & while [ ! -s escaped.pid ]; do sleep 0.01; done"#;
+            let script = if finish == "return" { script.to_owned() } else { format!("{script}; /bin/sleep 60") };
+            let env = f.env();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let trigger = cancel.clone();
+            let command = tokio::spawn(async move { env.exec(&script, ShellExecOptions { timeout_ms: Some(700), cancel: Some(cancel), ..Default::default() }).await });
+            let pid = loop {
+                if let Ok(pid) = std::fs::read_to_string(f.project.join("escaped.pid")) {
+                    if pid.trim().parse::<u32>().is_ok_and(|p| p > 1) { break pid; }
+                }
+                tokio::task::yield_now().await;
+            };
+            if finish == "cancel" { trigger.cancel(); }
+            if finish == "drop" { command.abort(); }
+            if finish == "stop" { f.sandbox.stop().await.unwrap(); }
+            if finish == "destroy" { f.sandbox.destroy().await.unwrap(); }
+            let result = command.await;
+            if finish == "timeout" { assert_eq!(result.unwrap().unwrap_err().code, ExecutionErrorCode::TimedOut); }
+            else if finish == "drop" { assert!(result.unwrap_err().is_cancelled()); }
+            else if finish == "return" { assert_eq!(result.unwrap().unwrap().exit_code, 0); }
+            else { assert_eq!(result.unwrap().unwrap_err().code, ExecutionErrorCode::Aborted); }
+            gone(&pid).await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn ambient_tmpdir_cannot_widen_writes() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        if std::env::var_os("LOOP_SEATBELT_TMPDIR_TEST").is_some() {
+            let f = Fixture::new(false).await;
+            let actual = f.sh("printf '%s' \"$TMPDIR\"").await.stdout;
+            assert!(actual.starts_with("/private/tmp/loop-seatbelt-"));
+            assert_ne!(
+                f.sh(&format!("echo escape > {}", q(&f.outside.join("escape"))))
+                    .await
+                    .exit_code,
+                0
+            );
+            return;
+        }
+        use std::os::unix::ffi::OsStringExt;
+        for value in [
+            std::ffi::OsString::from("/"),
+            std::ffi::OsString::from_vec(b"/tmp/non-utf8-\xff".to_vec()),
+        ] {
+            let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ambient_tmpdir_cannot_widen_writes",
+                    "--nocapture",
+                ])
+                .env("LOOP_SEATBELT_TMPDIR_TEST", "1")
+                .env("TMPDIR", value)
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn nested_profiles_cannot_hide_cleanup_identity() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let f = Fixture::new(false).await;
+        let out = f
+            .sh("/usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true")
+            .await;
+        assert_ne!(
+            out.exit_code, 0,
+            "a nested profile must not replace the cleanup marker"
+        );
+        assert!(out.stderr.contains("sandbox_apply"), "{out:?}");
+    })
+    .await
+    .unwrap();
 }

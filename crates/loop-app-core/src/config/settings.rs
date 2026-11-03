@@ -131,11 +131,14 @@ impl SandboxSettings {
         }
     }
 
-    /// Overlay project sandbox settings. `mode` comes from the project; isolation and
+    /// Overlay project sandbox settings. A project may enable the sandbox, never
+    /// disable it. Isolation and
     /// runtime only when the project sets them. A project may turn network access off
     /// but not on, and cannot add writable paths.
     fn overlay_project(&mut self, project: SandboxSettings) {
-        self.mode = project.mode;
+        if project.mode == "local" {
+            self.mode = project.mode;
+        }
         if project.isolation.is_some() {
             self.isolation = project.isolation;
         }
@@ -697,6 +700,23 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(raw["sandbox"], serde_json::json!({"mode": "off"}));
+    }
+
+    #[test]
+    fn project_cannot_disable_a_required_sandbox() {
+        for project in [
+            r#"{}"#,
+            r#"{"sandbox":{"mode":"off"}}"#,
+            r#"{"sandbox":{"mode":"unknown"}}"#,
+        ] {
+            let mut global: Settings =
+                serde_json::from_str(r#"{"sandbox":{"mode":"local"}}"#).unwrap();
+            global.merge_project(serde_json::from_str(project).unwrap());
+            assert_eq!(global.sandbox.mode, "local");
+        }
+        let mut global = Settings::default();
+        global.merge_project(serde_json::from_str(r#"{"sandbox":{"mode":"local"}}"#).unwrap());
+        assert_eq!(global.sandbox.mode, "local");
     }
 
     #[test]

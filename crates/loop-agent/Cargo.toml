@@ -19,6 +19,7 @@ orchestration = ["dep:loop-orchestration"]
 telemetry = ["dep:loop-telemetry"]
 
 [dependencies]
+tempfile = { workspace = true }
 loop-ai = { workspace = true }
 loop-protocol = { workspace = true }
 serde = { workspace = true }
@@ -56,6 +57,7 @@ required-features = ["telemetry"]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -55,7 +55,7 @@ Common settings in `settings.json`:
 | `toolPermissions` | `write`, `edit`, `bash`: `ask`; `read`, `grep`, `glob`, `ls`, `web_fetch`, `web_search`: `allow` | Per-tool rules, `allow`, `ask` or `deny`, with optional patterns such as `bash(git status*)`. `deny` applies in every mode; with nobody to ask, `ask` refuses the call. A project may only add `ask`/`deny` rules |
 | `bash.defaultTimeoutMs`, `bash.maxTimeoutMs` | `120000`, `600000` | `bash` time limits; a call may ask for up to the maximum (global only) |
 | `fileEditReview` | `newSession` | Kept for old settings files: with no `permissionMode`, `never` starts in `accept-edits`. Other values change nothing |
-| `sandbox.mode` | `off` | `off` or `local`. Podman on Linux, Seatbelt partial isolation on macOS |
+| `sandbox.mode` | `off` | `off` or `local`. Podman on Linux, Seatbelt partial isolation on macOS. A project may enable the sandbox, never turn it off |
 | `sandbox.isolation` | platform default | `full` or `partial`. Unset means `full` on Linux and `partial` on macOS. `full` on macOS is an error. Any other value is an error when `mode` is `local`. A project value overrides the global one only when the project sets it |
 | `sandbox.runtime` | platform default | `runc`, `crun`, `runsc` or `krun`. Unset means `runc` on Linux. These are Linux container runtimes: setting one on macOS is an error. Any other value is an error when `mode` is `local`. A project value overrides the global one only when the project sets it. Older versions saved `"isolation": "full", "runtime": "runc"` into every settings file; exactly that pair is read as unset |
 | `sandbox.network` | `false` | Allow network access from sandboxed commands. Enforced for macOS shell commands; the Linux sandbox does not enforce it yet. Unix sockets remain denied on macOS. A project may turn it off but not on |
@@ -67,10 +67,14 @@ Common settings in `settings.json`:
 | `runtime.maxSessions`, `runtime.maxActiveTurns` | `16`, `8` | Limits of `loop runtime start`; see [the Runtime](runtime.md#start-the-runtime). Each must be a whole number of at least 1. A command-line flag overrides it (global only) |
 
 On macOS, `/sandbox local` starts Seatbelt after a preflight. Shell commands may
-write the real project, system temp directory and `sandbox.allowWrite`; file tools
+write the real project, private sandbox temp directory and `sandbox.allowWrite`; file tools
 may write the project and `allowWrite`. Reads are allowed except for credential
 paths, Keychains, and the resolved agent directory's `auth.json` and `run/`.
-Provider keys and Runtime tokens are removed from child environments. Network
+Project `.loop`, Git hooks/config and the entire agent directory are
+write-protected. OAuth/ACP credentials, databases, history, logs and common home
+credential files are also unreadable. Provider keys and Runtime tokens are
+removed from child environments. Child TMPDIR is a private Loop-created 0700
+directory; environment overrides cannot replace it. Network
 settings apply to shell subprocesses; host web/MCP services remain separate
 capabilities. See [the macOS sandbox decision](design/macos-sandbox.md).
 

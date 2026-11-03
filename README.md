@@ -108,7 +108,7 @@ another supported mode.
 #### macOS
 
 `/sandbox local` uses Seatbelt with partial isolation. Shell writes are limited
-to the project, system temp directory and `sandbox.allowWrite`; built-in file
+to the project, private sandbox temp directory and `sandbox.allowWrite`; built-in file
 tools also enforce write and secret-path restrictions. Shell network access is
 off unless `sandbox.network` is enabled. Runtime Unix sockets and agent
 credentials remain denied even when networking or broad write grants are enabled.

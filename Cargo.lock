@@ -4524,6 +4524,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "ignore",
+ "libc",
  "loop-ai",
  "loop-mcp",
  "loop-orchestration",

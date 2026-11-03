@@ -7,6 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 use super::{Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxStatus};
 use crate::harness::env::exec_command;
@@ -62,7 +63,14 @@ pub struct SeatbeltPolicy {
     project: PathBuf,
     writes: Vec<PathBuf>,
     denied: Vec<PathBuf>,
+    write_denied: Vec<PathBuf>,
+    database_dirs: Vec<PathBuf>,
+    #[cfg(unix)]
+    read_ids: std::collections::HashSet<(u64, u64)>,
+    #[cfg(unix)]
+    write_ids: std::collections::HashSet<(u64, u64)>,
     network: bool,
+    temp_root: Option<PathBuf>,
 }
 
 impl SeatbeltPolicy {
@@ -82,6 +90,28 @@ impl SeatbeltPolicy {
         }
         let mut denied_paths = vec![];
         for path in [
+            home.join(".netrc"),
+            home.join(".docker/config.json"),
+            home.join(".kube/config"),
+            home.join(".npmrc"),
+            home.join(".pypirc"),
+            home.join(".config/gcloud"),
+            home.join("Library/Cookies"),
+            home.join(".codex"),
+            home.join(".claude"),
+            home.join(".claude.json"),
+            home.join(".gemini"),
+            home.join(".qwen"),
+            home.join(".copilot"),
+            home.join(".config/github-copilot"),
+            home.join(".cursor"),
+            home.join(".continue"),
+            home.join(".aider.conf.yml"),
+            home.join(".config/opencode"),
+            home.join(".local/share/opencode"),
+            home.join(".config/goose"),
+            home.join(".config/amp"),
+            home.join(".local/share/amp"),
             home.join(".ssh"),
             home.join(".aws"),
             home.join(".gnupg"),
@@ -90,6 +120,11 @@ impl SeatbeltPolicy {
             PathBuf::from("/Library/Keychains"),
             agent.join("auth.json"),
             agent.join("run"),
+            agent.join("mcp-auth"),
+            agent.join("agents"),
+            agent.join("history.json"),
+            agent.join("history"),
+            agent.join("logs"),
         ]
         .into_iter()
         .chain(runtime_paths.iter().cloned())
@@ -98,9 +133,76 @@ impl SeatbeltPolicy {
             denied_paths.push(std::path::absolute(&path).map_err(io_error)?);
             denied_paths.push(resolve_path(&path)?);
         }
+        let mut database_dirs = vec![
+            std::path::absolute(agent).map_err(io_error)?,
+            resolve_path(agent)?,
+        ];
+        // Session storage can live outside the agent directory. Protect its
+        // SQLite files and sidecars too, without granting access to that root.
+        if let Some(dir) =
+            std::env::var_os("LOOP_CODING_AGENT_SESSION_DIR").filter(|v| !v.is_empty())
+        {
+            let dir = PathBuf::from(dir);
+            database_dirs.push(std::path::absolute(&dir).map_err(io_error)?);
+            database_dirs.push(resolve_path(&dir)?);
+        }
+        for dir in &database_dirs {
+            for name in [
+                "sessions.db",
+                "sessions.db-wal",
+                "sessions.db-shm",
+                "events.db",
+                "events.db-wal",
+                "events.db-shm",
+            ] {
+                denied_paths.push(dir.join(name));
+            }
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.starts_with("sessions.db") || name.starts_with("events.db") {
+                        denied_paths.push(entry.path());
+                    }
+                }
+            }
+        }
+        let mut write_denied = denied_paths.clone();
+        for path in [
+            agent.to_path_buf(),
+            project.join(".loop"),
+            project.join(".git/hooks"),
+            project.join(".git/config"),
+            project.join(".git/commondir"),
+        ] {
+            write_denied.push(std::path::absolute(&path).map_err(io_error)?);
+            write_denied.push(resolve_path(&path)?);
+        }
+        // Git worktrees store their real metadata outside the worktree. Protect
+        // the pointer itself and the shared hooks/config as well.
+        let dot_git = project.join(".git");
+        if dot_git.is_file() {
+            write_denied.push(dot_git.clone());
+            if let Some(dir) = std::fs::read_to_string(&dot_git)
+                .map_err(io_error)?
+                .trim()
+                .strip_prefix("gitdir: ")
+            {
+                let dir = resolve_path(&project.join(dir))?;
+                write_denied.push(dir.join("commondir"));
+                write_denied.push(dir.join("config"));
+                write_denied.push(dir.join("hooks"));
+                if let Ok(common) = std::fs::read_to_string(dir.join("commondir")) {
+                    let common = resolve_path(&dir.join(common.trim()))?;
+                    write_denied.push(common.join("hooks"));
+                    write_denied.push(common.join("config"));
+                }
+            }
+        }
         if writes
             .iter()
             .chain(denied_paths.iter())
+            .chain(write_denied.iter())
             .any(|p| p.to_str().is_none())
         {
             return Err(FileError::new(
@@ -108,46 +210,122 @@ impl SeatbeltPolicy {
                 "Seatbelt paths must be valid UTF-8",
             ));
         }
+        #[cfg(unix)]
+        let (read_ids, write_ids) = {
+            use std::os::unix::fs::MetadataExt;
+            let ids = |paths: &[PathBuf]| {
+                paths
+                    .iter()
+                    .filter_map(|p| std::fs::metadata(p).ok())
+                    .map(|m| (m.dev(), m.ino()))
+                    .collect()
+            };
+            (ids(&denied_paths), ids(&write_denied))
+        };
         Ok(Self {
+            #[cfg(unix)]
+            read_ids,
+            #[cfg(unix)]
+            write_ids,
             project,
             writes,
             denied: denied_paths,
+            write_denied,
+            database_dirs,
             network,
+            temp_root: None,
         })
     }
 
     fn resolve(&self, path: &Path, write: bool) -> Result<PathBuf, FileError> {
         let absolute = self.project.join(path);
         let resolved = resolve_path(&absolute)?;
+        if absolute.starts_with("/dev") || resolved.starts_with("/dev") {
+            return Err(denied(&absolute));
+        }
+        if self.db_path(&absolute) || self.db_path(&resolved) {
+            return Err(denied(&absolute));
+        }
         if self
             .denied
             .iter()
             .any(|p| absolute.starts_with(p) || resolved.starts_with(p))
-            || (write && !self.writes.iter().any(|p| resolved.starts_with(p)))
+            || (write
+                && (self
+                    .write_denied
+                    .iter()
+                    .any(|p| absolute.starts_with(p) || resolved.starts_with(p))
+                    || !self.writes.iter().any(|p| resolved.starts_with(p))))
         {
             return Err(denied(&absolute));
         }
         Ok(resolved)
     }
 
+    fn db_path(&self, path: &Path) -> bool {
+        self.database_dirs.iter().any(|root| {
+            path.strip_prefix(root).ok().is_some_and(|relative| {
+                relative.components().any(|c| {
+                    let name = c.as_os_str().to_string_lossy();
+                    name.starts_with("sessions.db") || name.starts_with("events.db")
+                })
+            })
+        })
+    }
+
+    #[cfg(unix)]
+    fn denied_identities(&self, write: bool) -> std::collections::HashSet<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let mut paths = self.denied.clone();
+        if write {
+            paths.extend(self.write_denied.iter().cloned());
+        }
+        for agent in &self.database_dirs {
+            if let Ok(entries) = std::fs::read_dir(agent) {
+                paths.extend(
+                    entries
+                        .flatten()
+                        .map(|e| e.path())
+                        .filter(|p| self.db_path(p)),
+                );
+            }
+        }
+        let mut ids = self.read_ids.clone();
+        if write {
+            ids.extend(&self.write_ids);
+        }
+        ids.extend(
+            paths
+                .iter()
+                .filter_map(|p| std::fs::metadata(p).ok())
+                .map(|m| (m.dev(), m.ino())),
+        );
+        ids
+    }
+
     fn profile(&self) -> (String, Vec<String>) {
         let mut profile = String::from(
             r#"(version 1)
 (deny default)
+(deny system-mac-syscall (mac-policy-name "Sandbox") (mac-syscall-number 0))
 (allow process-exec process-fork)
 (allow signal (target self))
 (allow sysctl-read)
 (allow file-read*)
 (allow mach-lookup (global-name "com.apple.system.logger") (global-name "com.apple.system.notification_center") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.configd") (global-name "com.apple.cfprefsd.daemon") (global-name "com.apple.cfprefsd.agent"))
-(allow file-write* (literal (param "DEV_NULL")) (literal (param "DEV_TTY")))
+(allow file-write* (literal (param "DEV_NULL")))
 "#,
         );
-        let mut params = vec!["DEV_NULL=/dev/null".into(), "DEV_TTY=/dev/tty".into()];
+        let mut params = vec!["DEV_NULL=/dev/null".into()];
         for (i, path) in self.writes.iter().enumerate() {
             profile.push_str(&format!(
                 "(allow file-write* (subpath (param \"WRITE_{i}\")))\n"
             ));
             params.push(format!("WRITE_{i}={}", path.display()));
+        }
+        if let Some(root) = &self.temp_root {
+            profile.push_str("(deny file-write-mode file-write-owner file-write-flags (literal (param \"TMP_ROOT\")))\n");
+            params.push(format!("TMP_ROOT={}", root.display()));
         }
         if self.network {
             profile.push_str(r#"(allow network*)
@@ -166,10 +344,20 @@ impl SeatbeltPolicy {
             ));
             params.push(format!("DENY_{i}={}", path.display()));
         }
+        for (i, path) in self.write_denied.iter().enumerate() {
+            profile.push_str(&format!(
+                "(deny file-write* (subpath (param \"WRITE_DENY_{i}\")))\n"
+            ));
+            params.push(format!("WRITE_DENY_{i}={}", path.display()));
+        }
+        for (i, path) in self.database_dirs.iter().enumerate() {
+            profile.push_str(&format!("(deny file-read* file-write* (require-all (subpath (param \"AGENT_{i}\")) (regex #\"/(sessions|events)\\.db[^/]*(/|$)\")))\n"));
+            params.push(format!("AGENT_{i}={}", path.display()));
+        }
         // A pathname deny can otherwise be bypassed by renaming an allowed
         // ancestor (e.g. the whole agent dir) and reading auth.json there.
         let mut locked = std::collections::BTreeSet::new();
-        for path in &self.denied {
+        for path in self.denied.iter().chain(self.write_denied.iter()) {
             for ancestor in path.ancestors().skip(1) {
                 locked.insert(ancestor.to_path_buf());
             }
@@ -183,15 +371,43 @@ impl SeatbeltPolicy {
         (profile, params)
     }
 
-    fn command(&self, program: &str, args: &[&str]) -> Command {
-        let (profile, params) = self.profile();
+    fn command(
+        &self,
+        program: &str,
+        args: &[&str],
+    ) -> Result<(Command, tempfile::TempDir), ExecutionError> {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+        let marker = builder
+            .prefix("loop-command-")
+            .tempdir_in("/tmp")
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+        let root = std::fs::canonicalize(marker.path())
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+        if root.to_str().is_none() {
+            return Err(ExecutionError::new(
+                ExecutionErrorCode::Io,
+                "Seatbelt command identity path must be UTF-8",
+            ));
+        }
+        for name in ["deny", "allow"] {
+            std::fs::write(root.join(name), "command identity")
+                .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+        }
+        let (mut profile, mut params) = self.profile();
+        profile.push_str("(deny file-read* (literal (param \"COMMAND_DENY\")))\n(deny file-write* (subpath (param \"COMMAND_ROOT\")))\n");
+        params.push(format!("COMMAND_DENY={}", root.join("deny").display()));
+        params.push(format!("COMMAND_ROOT={}", root.display()));
         let mut cmd = Command::new("/usr/bin/sandbox-exec");
         cmd.arg("-p").arg(profile);
         for param in params {
             cmd.arg("-D").arg(param);
         }
         cmd.arg(program).args(args);
-        cmd
+        Ok((cmd, marker))
     }
 }
 
@@ -241,6 +457,7 @@ impl JailedHostFs {
     ) -> Result<std::fs::File, FileError> {
         use rustix::fs::{mkdirat, open, openat, Mode, OFlags};
         let path = self.policy.resolve(path, write)?;
+        let denied_ids = self.policy.denied_identities(write);
         let mut fd = open(
             "/",
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
@@ -270,6 +487,13 @@ impl JailedHostFs {
                 }
             }
             fd = openat(&fd, *part, opts, Mode::from_raw_mode(0o644)).map_err(io_error)?;
+            let meta = std::fs::File::from(fd.try_clone().map_err(io_error)?)
+                .metadata()
+                .map_err(io_error)?;
+            use std::os::unix::fs::MetadataExt;
+            if denied_ids.contains(&(meta.dev(), meta.ino())) {
+                return Err(denied(&path));
+            }
         }
         let file = std::fs::File::from(fd);
         let metadata = file.metadata().map_err(io_error)?;
@@ -447,7 +671,10 @@ impl Shell for JailedHostFs {
             )
             .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
         let mut env: HashMap<String, String> = if options.inherit_env {
-            std::env::vars().filter(|(k, _)| safe_env_key(k)).collect()
+            std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .filter(|(k, _)| safe_env_key(k))
+                .collect()
         } else {
             HashMap::new()
         };
@@ -459,9 +686,13 @@ impl Shell for JailedHostFs {
                     .map(|(k, v)| (k.clone(), v.clone())),
             );
         }
-        let mut cmd = self.policy.command("/bin/sh", &["-c", command]);
+        let (mut cmd, marker) = self.policy.command("/bin/sh", &["-c", command])?;
         cmd.current_dir(cwd).env_clear().envs(env);
-        exec_command(cmd, options, true).await
+        let marker_path = std::fs::canonicalize(marker.path())
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+        let result = exec_command(cmd, options, true, Some(marker_path)).await;
+        drop(marker);
+        result
     }
 }
 
@@ -518,18 +749,51 @@ impl SandboxFactory for SeatbeltSandboxFactory {
             &runtime,
         )
         .map_err(|e| SandboxError::Policy(e.to_string()))?;
-        // Shell temp writes are allowed; file tools remain confined to explicit
-        // project/allowWrite grants because their policy is cloned first.
+        // Use a trusted parent, never the ambient TMPDIR. tempfile creates
+        // this directory exclusively; verify its owner, mode and resolved path.
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::Builder::new()
+            .prefix("loop-seatbelt-")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp")
+            .map_err(|e| SandboxError::Policy(e.to_string()))?;
+        let temp_path =
+            std::fs::canonicalize(temp.path()).map_err(|e| SandboxError::Policy(e.to_string()))?;
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(&temp_path)
+            .map_err(|e| SandboxError::Policy(e.to_string()))?;
+        // SAFETY: geteuid has no arguments or preconditions.
+        if !meta.is_dir()
+            || meta.mode() & 0o777 != 0o700
+            || meta.uid() != unsafe { libc::geteuid() }
+            || temp_path.to_str().is_none()
+        {
+            return Err(SandboxError::Policy(
+                "Seatbelt requires a private, user-owned UTF-8 temporary directory".into(),
+            ));
+        }
+        let canary_read = temp_path.join("denied-read");
+        let canary_write = temp_path.join("denied-write");
+        std::fs::write(&canary_read, "Seatbelt preflight canary")
+            .map_err(|e| SandboxError::Policy(e.to_string()))?;
+        policy.denied.push(canary_read.clone());
+        policy.write_denied.push(canary_write.clone());
         let fs = JailedHostFs::new(policy.clone());
-        policy.writes.push(
-            std::fs::canonicalize(std::env::temp_dir())
-                .map_err(|e| SandboxError::Policy(e.to_string()))?,
-        );
+        policy.writes.push(temp_path.clone());
+        policy.temp_root = Some(temp_path.clone());
         Ok(Arc::new(SeatbeltSandbox {
             id: loop_ai::new_id(),
             env: Arc::new(SeatbeltEnv {
                 fs,
                 shell: JailedHostFs::new(policy),
+                temp: Mutex::new(Some(temp)),
+                temp_path,
+                canary_read,
+                canary_write,
+                stopped: CancellationToken::new(),
+                active: Mutex::new(0),
+                cleanup_error: Mutex::new(None),
+                idle: tokio::sync::Notify::new(),
             }),
             status: Mutex::new(SandboxStatus::Created),
         }))
@@ -540,6 +804,25 @@ impl SandboxFactory for SeatbeltSandboxFactory {
 struct SeatbeltEnv {
     fs: JailedHostFs,
     shell: JailedHostFs,
+    temp: Mutex<Option<tempfile::TempDir>>,
+    temp_path: PathBuf,
+    canary_read: PathBuf,
+    canary_write: PathBuf,
+    stopped: CancellationToken,
+    active: Mutex<usize>,
+    cleanup_error: Mutex<Option<String>>,
+    idle: tokio::sync::Notify,
+}
+
+#[cfg(unix)]
+struct Flight<'a>(&'a SeatbeltEnv);
+
+#[cfg(unix)]
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        *self.0.active.lock() -= 1;
+        self.0.idle.notify_one();
+    }
 }
 
 #[cfg(unix)]
@@ -604,7 +887,6 @@ impl Sandbox for SeatbeltSandbox {
             }
             let out = self
                 .env
-                .shell
                 .exec(
                     "/usr/bin/true",
                     ShellExecOptions {
@@ -620,6 +902,11 @@ impl Sandbox for SeatbeltSandbox {
                     out.stderr.trim()
                 )));
             }
+            let script = format!("if /bin/cat {} >/dev/null 2>&1; then exit 71; fi; if /bin/sh -c 'echo canary > \"$1\"' canary {} 2>/dev/null; then exit 72; fi", shell_quote(&self.env.canary_read), shell_quote(&self.env.canary_write));
+            let canaries = self.env.exec(&script, ShellExecOptions { timeout_ms: Some(5_000), ..Default::default() }).await.map_err(|e| SandboxError::StartFailed(e.to_string()))?;
+            if canaries.exit_code != 0 || self.env.canary_write.exists() {
+                return Err(SandboxError::StartFailed("Seatbelt preflight failed: read/write denial canary did not hold".into()));
+            }
             Ok(())
         }
         .await;
@@ -631,11 +918,32 @@ impl Sandbox for SeatbeltSandbox {
         result
     }
     async fn stop(&self) -> Result<(), SandboxError> {
+        self.env.stopped.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let notified = self.env.idle.notified();
+                if *self.env.active.lock() == 0 {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .map_err(|_| SandboxError::Other("Seatbelt commands did not finish cleanup".into()))?;
+        if let Some(error) = self.env.cleanup_error.lock().clone() {
+            *self.status.lock() = SandboxStatus::Failed;
+            return Err(SandboxError::Other(error));
+        }
         *self.status.lock() = SandboxStatus::Stopped;
         Ok(())
     }
     async fn destroy(&self) -> Result<(), SandboxError> {
-        self.stop().await
+        self.stop().await?;
+        if let Some(temp) = self.env.temp.lock().take() {
+            temp.close()
+                .map_err(|e| SandboxError::Other(e.to_string()))?;
+        }
+        Ok(())
     }
 }
 
@@ -689,9 +997,46 @@ impl FileSystem for SeatbeltEnv {
 #[cfg(unix)]
 #[async_trait]
 impl Shell for SeatbeltEnv {
-    async fn exec(&self, c: &str, o: ShellExecOptions) -> Result<ShellOutput, ExecutionError> {
-        self.shell.exec(c, o).await
+    async fn exec(&self, c: &str, mut o: ShellExecOptions) -> Result<ShellOutput, ExecutionError> {
+        {
+            let mut active = self.active.lock();
+            if self.stopped.is_cancelled() {
+                return Err(ExecutionError::new(
+                    ExecutionErrorCode::Aborted,
+                    "Seatbelt sandbox stopped",
+                ));
+            }
+            *active += 1;
+        }
+        let _flight = Flight(self);
+        o.env.get_or_insert_default().insert(
+            "TMPDIR".into(),
+            self.temp_path.to_string_lossy().into_owned(),
+        );
+        let caller_cancel = o.cancel.take().unwrap_or_default();
+        let cancel = CancellationToken::new();
+        o.cancel = Some(cancel.clone());
+        let command = self.shell.exec(c, o);
+        tokio::pin!(command);
+        let result = tokio::select! {
+            biased;
+            _ = self.stopped.cancelled() => { cancel.cancel(); command.await }
+            _ = caller_cancel.cancelled() => { cancel.cancel(); command.await }
+            result = &mut command => result,
+        };
+        if self.stopped.is_cancelled() {
+            if let Err(error) = &result {
+                if error.code == ExecutionErrorCode::Io {
+                    *self.cleanup_error.lock() = Some(error.to_string());
+                }
+            }
+        }
+        result
     }
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -723,8 +1068,15 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
-        let policy =
-            SeatbeltPolicy::new(&project, root.path(), root.path(), &[], false, &[]).unwrap();
+        let policy = SeatbeltPolicy::new(
+            &project,
+            root.path(),
+            &root.path().join("agent"),
+            &[],
+            false,
+            &[],
+        )
+        .unwrap();
         assert!(policy.resolve(&project.join("new/deep/file"), true).is_ok());
         assert!(policy.resolve(&root.path().join("outside"), true).is_err());
         assert!(policy.resolve(&project.join("../outside"), true).is_err());
@@ -780,8 +1132,15 @@ mod tests {
             std::fs::create_dir_all(&inside).unwrap();
             std::fs::create_dir(&outside).unwrap();
             std::fs::write(outside.join("file"), "unchanged").unwrap();
-            let policy =
-                SeatbeltPolicy::new(&project, root.path(), root.path(), &[], false, &[]).unwrap();
+            let policy = SeatbeltPolicy::new(
+                &project,
+                root.path(),
+                &root.path().join("agent"),
+                &[],
+                false,
+                &[],
+            )
+            .unwrap();
             let fs = JailedHostFs::new(policy);
             let alias = project.join("alias");
             let swap = project.join("swap");

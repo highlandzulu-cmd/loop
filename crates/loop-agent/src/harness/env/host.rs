@@ -193,7 +193,7 @@ impl Shell for HostExecutionEnv {
         if let Some(env) = &options.env {
             cmd.envs(env);
         }
-        exec_command(cmd, options, false).await
+        exec_command(cmd, options, false, None).await
     }
 }
 
@@ -202,19 +202,49 @@ pub(crate) async fn exec_command(
     mut cmd: Command,
     options: ShellExecOptions,
     stop_background: bool,
+    _marker: Option<PathBuf>,
 ) -> Result<ShellOutput, ExecutionError> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
-    cmd.process_group(0);
+    if stop_background {
+        // SAFETY: setsid is async-signal-safe and no allocator/locks are used
+        // between fork and exec. Do not setpgid first: a group leader cannot setsid.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        cmd.process_group(0);
+    }
 
+    #[cfg(target_os = "macos")]
+    let descendants = _marker
+        .as_deref()
+        .map(super::process_tree::Descendants::new)
+        .transpose()
+        .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+    if options.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+        return Err(ExecutionError::new(
+            ExecutionErrorCode::Aborted,
+            "operation aborted",
+        ));
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
     // Kills the tree if this future is dropped before the command ends.
-    let mut tree = TreeKiller(child.id());
+    let mut tree = TreeKiller {
+        pid: child.id(),
+        #[cfg(target_os = "macos")]
+        descendants,
+    };
 
     let stdout = child
         .stdout
@@ -235,7 +265,7 @@ pub(crate) async fn exec_command(
     ));
     let on_output = options.on_output.clone();
 
-    let stdout_task = {
+    let mut stdout_task = PipeTask({
         let combined = Arc::clone(&combined);
         let stdout_acc = Arc::clone(&stdout_acc);
         let last_emit = Arc::clone(&last_emit);
@@ -243,8 +273,8 @@ pub(crate) async fn exec_command(
         tokio::spawn(async move {
             read_stream(stdout, combined, stdout_acc, last_emit, on_output).await;
         })
-    };
-    let stderr_task = {
+    });
+    let mut stderr_task = PipeTask({
         let combined = Arc::clone(&combined);
         let stderr_acc = Arc::clone(&stderr_acc);
         let last_emit = Arc::clone(&last_emit);
@@ -252,26 +282,28 @@ pub(crate) async fn exec_command(
         tokio::spawn(async move {
             read_stream(stderr, combined, stderr_acc, last_emit, on_output).await;
         })
-    };
+    });
 
     let status = match (&options.cancel, options.timeout_ms) {
         (Some(cancel), Some(ms)) => {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    tree.kill();
+                    let cleanup = tree.kill();
                     let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = tokio::join!(stdout_task, stderr_task);
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
                     return Err(ExecutionError::new(
                         ExecutionErrorCode::Aborted,
                         "operation aborted",
                     ));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(ms)) => {
-                    tree.kill();
+                    let cleanup = tree.kill();
                     let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = tokio::join!(stdout_task, stderr_task);
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
                     return Err(ExecutionError::new(
                         ExecutionErrorCode::TimedOut,
                         "command timed out",
@@ -285,10 +317,11 @@ pub(crate) async fn exec_command(
         (Some(cancel), None) => {
             tokio::select! {
                 _ = cancel.cancelled() => {
-                    tree.kill();
+                    let cleanup = tree.kill();
                     let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = tokio::join!(stdout_task, stderr_task);
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
                     return Err(ExecutionError::new(
                         ExecutionErrorCode::Aborted,
                         "operation aborted",
@@ -305,10 +338,11 @@ pub(crate) async fn exec_command(
                     res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
                 }
                 Err(_) => {
-                    tree.kill();
+                    let cleanup = tree.kill();
                     let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    let _ = tokio::join!(stdout_task, stderr_task);
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
                     return Err(ExecutionError::new(
                         ExecutionErrorCode::TimedOut,
                         "command timed out",
@@ -322,14 +356,14 @@ pub(crate) async fn exec_command(
             .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?,
     };
 
-    if stop_background {
-        // A sandbox command cannot leave descendants holding its pipes open.
-        tree.kill();
+    let cleanup = if stop_background {
+        tree.kill()
     } else {
-        // Preserve the host shell's existing background-process behavior.
-        tree.0 = None;
-    }
-    let _ = tokio::join!(stdout_task, stderr_task);
+        tree.pid = None;
+        Ok(())
+    };
+    drain(&mut stdout_task, &mut stderr_task).await;
+    cleanup?;
 
     let stdout_text = stdout_acc.lock().await.clone();
     let stderr_text = stderr_acc.lock().await.clone();
@@ -346,32 +380,65 @@ pub(crate) async fn exec_command(
     })
 }
 
+struct PipeTask(tokio::task::JoinHandle<()>);
+
+impl Drop for PipeTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn drain(stdout: &mut PipeTask, stderr: &mut PipeTask) {
+    if tokio::time::timeout(Duration::from_millis(250), async {
+        let _ = tokio::join!(&mut stdout.0, &mut stderr.0);
+    })
+    .await
+    .is_err()
+    {
+        stdout.0.abort();
+        stderr.0.abort();
+    }
+}
+
 /// Kills a process and everything in its process group (Unix) or tree
 /// (Windows), unless disarmed. Without it, a grandchild such as the `sleep`
 /// in `sh -c "sleep 60; echo"` keeps the output pipes open after a timeout.
-struct TreeKiller(Option<u32>);
+struct TreeKiller {
+    pid: Option<u32>,
+    #[cfg(target_os = "macos")]
+    descendants: Option<super::process_tree::Descendants>,
+}
 
 impl TreeKiller {
-    fn kill(&mut self) {
-        let Some(pid) = self.0.take() else { return };
+    fn kill(&mut self) -> Result<(), ExecutionError> {
+        #[cfg(target_os = "macos")]
+        let result = self.descendants.take().map(|d| d.kill()).transpose();
+        let Some(pid) = self.pid.take() else {
+            return Ok(());
+        };
         #[cfg(unix)]
-        let _ = std::process::Command::new("kill")
-            .args(["-KILL", "--", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // SAFETY: child PIDs fit pid_t; a negative PID targets its dedicated
+        // process group. Never launch a PATH-resolved cleanup helper on the host.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
         #[cfg(windows)]
         let _ = std::process::Command::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        #[cfg(target_os = "macos")]
+        result.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+        Ok(())
     }
 }
 
 impl Drop for TreeKiller {
     fn drop(&mut self) {
-        self.kill();
+        if let Err(error) = self.kill() {
+            tracing::error!(%error, "process cleanup failed while dropping execution");
+        }
     }
 }
 

@@ -134,7 +134,7 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens. Change wi
 ### macOS
 
 `/sandbox local` uses Seatbelt partial isolation, with shell networking off by
-default. Commands may write the project, system temp directory and configured
+default. Commands may write the project, private sandbox temp directory and configured
 `sandbox.allowWrite` paths. File tools enforce write and secret-path restrictions
 too. Agent credentials, Runtime state/control sockets and common credential
 folders remain denied even under broad grants. Use `sandbox.allowWrite: ["~/.cargo"]`
