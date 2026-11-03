@@ -201,7 +201,7 @@
           ]
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -306,7 +306,7 @@
           "type": "boolean"
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1180,7 +1180,7 @@
           "type": "array"
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1212,7 +1212,7 @@
           "type": "boolean"
         },
         "revision": {
-          "description": "The Session's config revision after the change.",
+          "description": "The Session revision after the change.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1235,7 +1235,7 @@
       "properties": {
         "expected_revision": {
           "default": null,
-          "description": "Reject if the current control revision differs.",
+          "description": "Fail with a conflict unless the Session is at this revision.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -1275,6 +1275,12 @@
           "minimum": 0,
           "type": "integer"
         },
+        "revision": {
+          "description": "The Session revision after the branch change.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "seq": {
           "description": "Committed update sequence.",
           "format": "uint64",
@@ -1283,6 +1289,7 @@
         }
       },
       "required": [
+        "revision",
         "branch_revision",
         "seq"
       ],
@@ -1496,7 +1503,7 @@
       "properties": {
         "expected_revision": {
           "default": null,
-          "description": "Reject if the current control revision differs.",
+          "description": "Fail with a conflict unless the Session is at this revision.",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -1885,7 +1892,7 @@
           "type": "boolean"
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1965,6 +1972,12 @@
               "description": "Why the transcript was replaced.",
               "type": "string"
             },
+            "revision": {
+              "description": "The Session revision after the branch change.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "type": {
               "const": "branch_reset",
               "type": "string"
@@ -1976,6 +1989,7 @@
           },
           "required": [
             "type",
+            "revision",
             "branch_revision",
             "view_id",
             "reason"

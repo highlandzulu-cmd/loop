@@ -358,11 +358,20 @@ fn session_tree_v1_capabilities_and_event_goldens() {
     );
     roundtrip(
         &SessionUpdate::BranchReset {
+            revision: 5,
             branch_revision: 3,
             view_id: "view-1".into(),
             reason: "navigate".into(),
         },
-        json!({"type":"branch_reset","branch_revision":3,"view_id":"view-1","reason":"navigate"}),
+        json!({"type":"branch_reset","revision":5,"branch_revision":3,"view_id":"view-1","reason":"navigate"}),
+    );
+    roundtrip(
+        &NavigateResult {
+            revision: 5,
+            branch_revision: 3,
+            seq: 9,
+        },
+        json!({"revision":5,"branch_revision":3,"seq":9}),
     );
 }
 

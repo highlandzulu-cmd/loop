@@ -446,24 +446,6 @@ impl Runtime {
             next_cursor: (end < rows.len()).then(|| format!("{rows_id}:{end}")),
         })
     }
-    async fn check_revision(
-        &self,
-        session: &SessionRef,
-        expected: Option<u64>,
-    ) -> BackendResult<()> {
-        if let Some(expected) = expected {
-            let current = self
-                .store
-                .control_state(&session.native_id)
-                .await
-                .map_err(failed)?
-                .revision;
-            if expected != current {
-                return Err(BackendError::Conflict { revision: current });
-            }
-        }
-        Ok(())
-    }
     /// Rename metadata and publish an ordered ConfigChanged, without a branch reset.
     pub async fn rename(&self, params: RenameParams) -> BackendResult<MutationResult> {
         if params.name.trim().is_empty() || params.name.len() > 4096 {
@@ -474,24 +456,26 @@ impl Runtime {
         let _guard = live.lifecycle.lock().await;
         self.check_tree_live(&live)?;
         barrier(&live).await?;
-        self.check_revision(&params.session, params.expected_revision)
-            .await?;
-        let marker = json!({"id":loop_ai::new_id(),"kind":"rename","name":name}).to_string();
-        let state = self
-            .store
+        // The lifecycle lock serializes this with the config setters.
+        live.opened
+            .native
+            .check_session_revision(params.expected_revision)?;
+        let marker =
+            json!({"id":loop_ai::new_id(),"kind":"rename","name":name.clone()}).to_string();
+        self.store
             .control_mutation(
                 &params.session.native_id,
                 self.identity.clone(),
-                params.expected_revision,
                 false,
-                PendingSessionWrite::SessionInfo { name },
+                PendingSessionWrite::SessionInfo { name: name.clone() },
                 marker,
             )
             .await
             .map_err(failed)?;
+        let revision = live.opened.native.record_change(Some(Some(name)));
         let seq = self.announce_control(&live, None).await?;
         Ok(MutationResult {
-            revision: state.revision,
+            revision,
             seq,
             pending: false,
             applies_after_turn: None,
@@ -506,8 +490,9 @@ impl Runtime {
             return Err(BackendError::Busy);
         }
         barrier(&live).await?;
-        self.check_revision(&params.session, params.expected_revision)
-            .await?;
+        live.opened
+            .native
+            .check_session_revision(params.expected_revision)?;
         let slot = self.reserve_view(&params.session, true)?;
         // Deterministic fallback summary, matching the native tree navigation.
         let summary = if params.summarize {
@@ -525,7 +510,6 @@ impl Runtime {
             .control_mutation(
                 &params.session.native_id,
                 self.identity.clone(),
-                params.expected_revision,
                 true,
                 PendingSessionWrite::Leaf {
                     target_id: params.target_entry_id,
@@ -534,8 +518,10 @@ impl Runtime {
             )
             .await
             .map_err(failed)?;
+        let revision = live.opened.native.record_change(None);
         let seq = self.announce_control(&live, Some(slot)).await?;
         Ok(NavigateResult {
+            revision,
             branch_revision: state.branch_revision,
             seq,
         })
@@ -565,12 +551,11 @@ impl Runtime {
             .latest_seq(&live.reference.key)
             .await
             .map_err(failed)?;
+        // The native backend counted the change, at commit or when the
+        // Session was reopened from its tree.
+        let changed = live.opened.native.config();
+        let revision = changed.revision;
         let update = if marker_value["kind"] == "rename" {
-            // Metadata only: the config and its revision stay as committed.
-            let name = marker_value["name"].as_str().map(str::to_owned);
-            live.opened.native.set_session_name(name.clone());
-            let mut changed = live.announced.lock().unwrap().latest.clone();
-            changed.metadata.name = name;
             SessionUpdate::ConfigChanged(changed)
         } else {
             let slot = match slot {
@@ -581,6 +566,7 @@ impl Runtime {
             let updates = self.transcript(live, &file, busy, at_seq + 1).await?;
             let view_id = slot.fill(updates, state.branch_revision, at_seq + 1);
             SessionUpdate::BranchReset {
+                revision,
                 branch_revision: state.branch_revision,
                 view_id,
                 reason: "navigate".into(),
@@ -595,6 +581,8 @@ impl Runtime {
             fail(live, &error);
             return Err(error);
         }
+        // No setter waits on this change's receipt.
+        live.announced.lock().unwrap().receipts.remove(&revision);
         self.store
             .acknowledge_control(&live.reference.native_id, &marker)
             .await

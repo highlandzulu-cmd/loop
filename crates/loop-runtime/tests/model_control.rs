@@ -916,10 +916,10 @@ async fn rename_between_config_changes_keeps_both_in_the_snapshot() {
             .await
             .unwrap();
         assert!(renamed.seq > model.seq);
-        // A metadata change is not a config change: the next setter still
-        // records and announces its own revision.
+        // A rename is a Session revision like any setter's; the next setter
+        // still records and announces its own change.
         let effort = rt
-            .set_effort(&session, "high", Some(model.revision))
+            .set_effort(&session, "high", Some(renamed.revision))
             .await
             .unwrap();
         assert!(effort.seq > renamed.seq && effort.revision > model.revision);
@@ -937,6 +937,112 @@ async fn rename_between_config_changes_keeps_both_in_the_snapshot() {
             assert_eq!(snapshot.revision, effort.revision);
             assert_eq!(snapshot.at_seq, log.latest_seq(&session.key).await.unwrap());
         }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn one_session_revision_orders_every_setter_across_a_restart() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::{NavigateParams, RenameParams};
+        use loop_wire::RuntimeControl;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let (session, last) = {
+            let log = Arc::new(SqliteEventLog::open(&db).await.unwrap());
+            let rt = runtime(dir.path(), log, Default::default()).await;
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            let start = rt
+                .attach_snapshot_watching(1, &session, 0)
+                .await
+                .unwrap()
+                .snapshot
+                .unwrap()
+                .revision;
+            let model = rt
+                .set_model(&session, "faux/second", Some(start))
+                .await
+                .unwrap();
+            let rename = |expected| RenameParams {
+                session: session.clone(),
+                name: "Review".into(),
+                expected_revision: Some(expected),
+            };
+            assert_eq!(
+                rt.rename(rename(start)).await.unwrap_err(),
+                BackendError::Conflict {
+                    revision: model.revision
+                }
+            );
+            let renamed = rt.rename(rename(model.revision)).await.unwrap();
+            assert_eq!(renamed.revision, model.revision + 1);
+            assert_eq!(
+                rt.set_effort(&session, "high", Some(model.revision))
+                    .await
+                    .unwrap_err(),
+                BackendError::Conflict {
+                    revision: renamed.revision
+                }
+            );
+            let navigate = |expected| NavigateParams {
+                session: session.clone(),
+                target_entry_id: None,
+                summarize: false,
+                expected_revision: Some(expected),
+            };
+            let moved = rt.navigate(navigate(renamed.revision)).await.unwrap();
+            assert_eq!(moved.revision, renamed.revision + 1);
+            assert_eq!(
+                rt.navigate(navigate(renamed.revision)).await.unwrap_err(),
+                BackendError::Conflict {
+                    revision: moved.revision
+                }
+            );
+            let effort = rt
+                .set_effort(&session, "high", Some(moved.revision))
+                .await
+                .unwrap();
+            assert_eq!(effort.revision, moved.revision + 1);
+            let snapshot = rt
+                .attach_snapshot_watching(2, &session, 0)
+                .await
+                .unwrap()
+                .snapshot
+                .unwrap();
+            assert_eq!(snapshot.revision, effort.revision);
+            assert_eq!(snapshot.metadata.name.as_deref(), Some("Review"));
+            rt.shutdown().await;
+            (session, effort.revision)
+        };
+        // The revision is the tree's, so a cold read and a reload agree.
+        let log = Arc::new(SqliteEventLog::open(&db).await.unwrap());
+        let rt = runtime(dir.path(), log, Default::default()).await;
+        let (watcher, _served) = connect(&rt).await;
+        assert_eq!(
+            watcher
+                .attach(&session, 0)
+                .await
+                .unwrap()
+                .snapshot
+                .unwrap()
+                .revision,
+            last
+        );
+        watcher.detach(&session).await.unwrap();
+        rt.load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        let renamed = rt
+            .rename(RenameParams {
+                session: session.clone(),
+                name: "Again".into(),
+                expected_revision: Some(last),
+            })
+            .await
+            .unwrap();
+        assert_eq!(renamed.revision, last + 1);
         rt.shutdown().await;
     })
     .await

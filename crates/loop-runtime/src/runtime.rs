@@ -715,8 +715,19 @@ impl Runtime {
             let initial_config = opened.native.config();
             // The tree is written before the Event Log; a change whose
             // announcement was lost is announced before anyone is served.
-            let unannounced =
-                !created && initial_config.revision > self.logged_revision(&reference.key).await?;
+            // A committed rename or branch move whose marker is still pending
+            // is announced by its own update before anyone is served.
+            let marked = !created
+                && self
+                    .store
+                    .control_state(&reference.native_id)
+                    .await
+                    .map_err(failed)?
+                    .pending
+                    .is_some();
+            let unannounced = !created
+                && initial_config.revision
+                    > self.logged_revision(&reference.key).await? + u64::from(marked);
             let published = self.log.latest_seq(&reference.key).await.map_err(failed)?;
             let live = Arc::new(LiveSession {
                 lifecycle: AsyncMutex::new(()),
@@ -1710,7 +1721,7 @@ impl Runtime {
             agent: d.agent.clone(),
         }
     }
-    /// The newest config revision the Event Log announced for `key`.
+    /// The newest Session revision the Event Log announced for `key`.
     async fn logged_revision(&self, key: &SessionKey) -> BackendResult<u64> {
         let records = self.log.read_after(key, 0).await.map_err(failed)?;
         Ok(records
@@ -1721,6 +1732,10 @@ impl Runtime {
                     update: SessionUpdate::ConfigChanged(changed),
                     ..
                 }) => Some(changed.revision),
+                EventKind::Update(UpdateEnvelope {
+                    update: SessionUpdate::BranchReset { revision, .. },
+                    ..
+                }) => Some(*revision),
                 _ => None,
             })
             .unwrap_or(0))
@@ -2062,8 +2077,16 @@ async fn publish(
             {
                 let mut announced = live.announced.lock().unwrap();
                 announced.published = envelope.seq;
-                if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
-                    announced.commit(envelope.seq, changed);
+                match &envelope.update {
+                    SessionUpdate::ConfigChanged(changed) => {
+                        announced.commit(envelope.seq, changed)
+                    }
+                    // A branch change advances the one Session revision too.
+                    SessionUpdate::BranchReset { revision, .. } => {
+                        announced.revision = announced.revision.max(*revision);
+                        announced.latest.revision = announced.latest.revision.max(*revision);
+                    }
+                    _ => {}
                 }
             }
             let mut tail = live.tail.lock().unwrap();

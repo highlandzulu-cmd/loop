@@ -77,6 +77,8 @@ pub enum Origin {
 pub enum SessionUpdate {
     /// Replace the transcript with an immutable branch view.
     BranchReset {
+        /// The Session revision after the branch change.
+        revision: u64,
         /// Committed transcript revision.
         branch_revision: u64,
         /// Immutable transcript view id; expires explicitly.
@@ -169,7 +171,7 @@ pub enum SessionUpdate {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ConfigChanged {
-    /// The Session's config revision.
+    /// The Session revision.
     pub revision: u64,
     /// Session metadata.
     #[serde(default)]

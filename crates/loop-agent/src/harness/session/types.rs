@@ -498,8 +498,8 @@ pub struct SessionConfigEntries {
     pub thinking_level: Option<AgentThinkingLevel>,
     /// Name last given to the Session.
     pub name: Option<String>,
-    /// How many model and effort changes the Session ever recorded: its
-    /// config revision, stable across restarts.
+    /// How many model, effort, name and branch changes the Session ever
+    /// recorded: its one Session revision, stable across restarts.
     pub revision: u64,
 }
 
@@ -513,10 +513,15 @@ pub fn config_from_entries(
     let mut by_id = std::collections::HashMap::with_capacity(entries.len());
     for entry in entries {
         match entry {
-            SessionTreeEntry::ModelChange { .. } | SessionTreeEntry::ThinkingLevelChange { .. } => {
+            SessionTreeEntry::ModelChange { .. }
+            | SessionTreeEntry::ThinkingLevelChange { .. }
+            | SessionTreeEntry::Leaf { .. } => {
                 config.revision += 1;
             }
-            SessionTreeEntry::SessionInfo { name, .. } => config.name = Some(name.clone()),
+            SessionTreeEntry::SessionInfo { name, .. } => {
+                config.revision += 1;
+                config.name = Some(name.clone());
+            }
             _ => {}
         }
         by_id.insert(entry.id(), entry);

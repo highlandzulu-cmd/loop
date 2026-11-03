@@ -1,6 +1,5 @@
 CREATE TABLE IF NOT EXISTS session_control (
     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-    revision INTEGER NOT NULL DEFAULT 0,
     branch_revision INTEGER NOT NULL DEFAULT 0,
     pending TEXT
 );

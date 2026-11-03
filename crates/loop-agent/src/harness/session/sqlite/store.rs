@@ -1227,11 +1227,13 @@ impl Drop for DestinationCreation {
     }
 }
 
-/// Persisted Session control revisions and an unannounced mutation.
+/// Persisted branch revision and an unannounced mutation. The Session
+/// revision is counted from the tree itself.
 #[derive(Debug, Clone, Default)]
 pub struct SessionControlState {
-    pub revision: u64,
+    /// Committed active-branch revision.
     pub branch_revision: u64,
+    /// Marker of a committed mutation not yet announced in the Event Log.
     pub pending: Option<String>,
 }
 
@@ -1241,20 +1243,31 @@ impl SqliteSessionStore {
         let path = self.path.clone();
         let id = id.to_owned();
         tokio::task::spawn_blocking(move || {
-            open(&path)?.query_row(
-                "SELECT revision, branch_revision, pending FROM session_control WHERE session_id=?1", [&id],
-                |row| Ok(SessionControlState { revision: row.get(0)?, branch_revision: row.get(1)?, pending: row.get(2)? }),
-            ).optional().map(|state| state.unwrap_or_default()).map_err(|e| SessionError::Storage(e.to_string()))
-        }).await.map_err(|e| SessionError::Storage(e.to_string()))?
+            open(&path)?
+                .query_row(
+                    "SELECT branch_revision, pending FROM session_control WHERE session_id=?1",
+                    [&id],
+                    |row| {
+                        Ok(SessionControlState {
+                            branch_revision: row.get(0)?,
+                            pending: row.get(1)?,
+                        })
+                    },
+                )
+                .optional()
+                .map(|state| state.unwrap_or_default())
+                .map_err(|e| SessionError::Storage(e.to_string()))
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))?
     }
 
     /// Commit a tree/metadata write and its recovery marker in one transaction.
-    #[allow(clippy::too_many_arguments)]
+    /// The caller has checked the Session revision under its own lock.
     pub async fn control_mutation(
         &self,
         id: &str,
         identity: super::leases::LeaseIdentity,
-        expected: Option<u64>,
         branch: bool,
         write: PendingSessionWrite,
         marker: String,
@@ -1266,34 +1279,63 @@ impl SqliteSessionStore {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let conn = open(&path)?;
-            let tx = begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
+            let tx =
+                begin_immediate(&conn, &gate).map_err(|e| SessionError::Storage(e.to_string()))?;
             super::leases::check_write(&tx, &id, Some(&identity))?;
-            tx.execute("INSERT OR IGNORE INTO session_control(session_id) VALUES (?1)", [&id]).map_err(|e| SessionError::Storage(e.to_string()))?;
-            let (revision, branch_revision, pending): (u64,u64,Option<String>) = tx.query_row(
-                "SELECT revision, branch_revision, pending FROM session_control WHERE session_id=?1", [&id],
-                |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-            ).map_err(|e| SessionError::Storage(e.to_string()))?;
-            if pending.is_some() { return Err(SessionError::Invalid("Session has an unannounced mutation; reopen it".into())); }
-            if expected.is_some_and(|e| e != revision) {
-                return Err(SessionError::Invalid(format!("revision conflict: current revision is {revision}")));
+            tx.execute(
+                "INSERT OR IGNORE INTO session_control(session_id) VALUES (?1)",
+                [&id],
+            )
+            .map_err(|e| SessionError::Storage(e.to_string()))?;
+            let (branch_revision, pending): (u64, Option<String>) = tx
+                .query_row(
+                    "SELECT branch_revision, pending FROM session_control WHERE session_id=?1",
+                    [&id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            if pending.is_some() {
+                return Err(SessionError::Invalid(
+                    "Session has an unannounced mutation; reopen it".into(),
+                ));
             }
-            if let PendingSessionWrite::Leaf { target_id: Some(target) } = &write {
-                if !load_all(&tx, &id)?.iter().any(|entry| entry.id() == target && !matches!(entry, SessionTreeEntry::Leaf { .. })) {
+            if let PendingSessionWrite::Leaf {
+                target_id: Some(target),
+            } = &write
+            {
+                if !load_all(&tx, &id)?.iter().any(|entry| {
+                    entry.id() == target && !matches!(entry, SessionTreeEntry::Leaf { .. })
+                }) {
                     return Err(SessionError::Invalid("unknown branch target".into()));
                 }
             }
-            let marker_value: serde_json::Value = serde_json::from_str(&marker).map_err(|error| SessionError::Invalid(error.to_string()))?;
+            let marker_value: serde_json::Value = serde_json::from_str(&marker)
+                .map_err(|error| SessionError::Invalid(error.to_string()))?;
             if let Some(summary) = marker_value["summary"].as_str() {
-                append_entry_tx(&tx,&id,PendingSessionWrite::BranchSummary { summary:summary.into() })?;
+                append_entry_tx(
+                    &tx,
+                    &id,
+                    PendingSessionWrite::BranchSummary {
+                        summary: summary.into(),
+                    },
+                )?;
             }
             append_entry_tx(&tx, &id, write)?;
-            let revision = revision + 1;
             let branch_revision = branch_revision + u64::from(branch);
-            tx.execute("UPDATE session_control SET revision=?2, branch_revision=?3, pending=?4 WHERE session_id=?1",
-                params![id,revision,branch_revision,marker]).map_err(|e| SessionError::Storage(e.to_string()))?;
-            tx.commit().map_err(|e| SessionError::Storage(e.to_string()))?;
-            Ok(SessionControlState { revision, branch_revision, pending: Some(marker) })
-        }).await.map_err(|e| SessionError::Storage(e.to_string()))?
+            tx.execute(
+                "UPDATE session_control SET branch_revision=?2, pending=?3 WHERE session_id=?1",
+                params![id, branch_revision, marker],
+            )
+            .map_err(|e| SessionError::Storage(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| SessionError::Storage(e.to_string()))?;
+            Ok(SessionControlState {
+                branch_revision,
+                pending: Some(marker),
+            })
+        })
+        .await
+        .map_err(|e| SessionError::Storage(e.to_string()))?
     }
 
     /// Clear only the marker that was durably announced in the Event Log.

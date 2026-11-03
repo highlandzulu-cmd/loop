@@ -215,7 +215,7 @@ fn session_tree_contracts_have_schema_entries_and_validate() {
         ),
         (
             "SessionUpdate",
-            json!({"type":"branch_reset","branch_revision":1,"view_id":"view","reason":"navigate"}),
+            json!({"type":"branch_reset","revision":1,"branch_revision":1,"view_id":"view","reason":"navigate"}),
         ),
     ] {
         validator(definition).validate(&value).unwrap();

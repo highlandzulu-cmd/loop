@@ -257,7 +257,7 @@ pub struct SessionSnapshot {
     /// The update sequence the snapshot was taken at: the replay's last
     /// update. Not the client's processed cursor.
     pub at_seq: u64,
-    /// The Session's config revision.
+    /// The Session revision.
     pub revision: u64,
     /// The active branch's revision.
     #[serde(default)]
@@ -316,7 +316,7 @@ pub struct ModelsResult {
     pub current: Option<String>,
     /// Every model on offer.
     pub models: Vec<ModelInfo>,
-    /// The Session's config revision.
+    /// The Session revision.
     pub revision: u64,
 }
 
@@ -339,7 +339,7 @@ pub struct ChoicesResult {
     pub current: Option<String>,
     /// Every choice on offer.
     pub choices: Vec<ChoiceInfo>,
-    /// The Session's config revision.
+    /// The Session revision.
     pub revision: u64,
 }
 
@@ -879,13 +879,15 @@ pub struct NavigateParams {
     /// Add a summary of the previous branch.
     pub summarize: bool,
     #[serde(default)]
-    /// Reject if the current control revision differs.
+    /// Fail with a conflict unless the Session is at this revision.
     pub expected_revision: Option<u64>,
 }
 /// Ordered branch mutation result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct NavigateResult {
+    /// The Session revision after the branch change.
+    pub revision: u64,
     /// Committed transcript revision.
     pub branch_revision: u64,
     /// Committed update sequence.
@@ -900,7 +902,7 @@ pub struct RenameParams {
     /// Session display name.
     pub name: String,
     #[serde(default)]
-    /// Reject if the current control revision differs.
+    /// Fail with a conflict unless the Session is at this revision.
     pub expected_revision: Option<u64>,
 }
 pub use crate::MutationResult;

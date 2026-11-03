@@ -1190,6 +1190,7 @@ mod tests {
                 feeds.route(&conn, update("s", 3)).unwrap();
                 let mut reset = update("s", 2);
                 reset.update = SessionUpdate::BranchReset {
+                    revision: 1,
                     branch_revision: 1,
                     view_id: "view".into(),
                     reason: "navigate".into(),
