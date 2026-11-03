@@ -5,6 +5,7 @@
 use loop_protocol::{rpc::*, AgentBackend, SessionRef, SessionSpec};
 use loop_wire::RuntimeControl;
 use std::sync::Arc;
+mod native_admin;
 mod native_sessions;
 use crate::theme::Theme;
 use crate::{keybindings, CliRuntime, PendingAgent, StartupSessions, ToolApprovalBridge};
@@ -1087,5 +1088,262 @@ mod runtime_default_tests {
         })
         .await
         .unwrap();
+    }
+}
+
+impl SurfaceClient {
+    /// S3.4 admin request service for the native owner. The borrow prevents the
+    /// UI from changing host state during an administrative operation.
+    pub fn admin(&mut self) -> impl loop_wire::RuntimeAdmin + '_ {
+        native_admin::NativeAdmin(tokio::sync::Mutex::new(&mut self.host.inner))
+    }
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn permission_mode(&self) -> loop_app_core::permissions::PermissionMode {
+        self.host.inner.permission_mode()
+    }
+    pub async fn set_permission_mode(
+        &mut self,
+        mode: loop_app_core::permissions::PermissionMode,
+    ) -> anyhow::Result<()> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::PermissionModeParams {
+            session: self.session_ref(),
+            mode: Some(mode.as_str().into()),
+            expected_revision: None,
+        };
+        self.admin().permission_mode(params).await?;
+        Ok(())
+    }
+    pub async fn sync_agent_mode(&mut self) -> Option<String> {
+        self.host.inner.sync_agent_mode().await
+    }
+    pub fn project_trusted(&self) -> bool {
+        self.host.inner.project_trusted
+    }
+    pub async fn set_trust(&mut self, trusted: bool) -> anyhow::Result<()> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::TrustParams {
+            workspace_id: self.workspace_id.clone(),
+            trusted: Some(trusted),
+            expected_revision: None,
+        };
+        self.admin().trust(params).await?;
+        Ok(())
+    }
+    pub fn sandbox_service(&self) -> Arc<dyn loop_wire::RuntimeAdmin> {
+        let r = &self.host.inner;
+        Arc::new(native_admin::NativeSandbox {
+            native: r.native.clone(),
+            harness: r.harness.clone(),
+            cwd: r.cwd.clone(),
+            agent_dir: r.agent_dir.clone(),
+            settings: r.settings.sandbox.clone(),
+            web: r.web_tools(),
+            search: r.tool_gate.search_filter(),
+            bash: r.bash_limits(),
+        })
+    }
+    pub fn clear_session_approvals(&self) {
+        self.host.clear_session_approvals();
+    }
+    pub async fn install_interactions(
+        &mut self,
+        host: loop_app_core::interaction::InteractionQueue,
+    ) -> anyhow::Result<Arc<ToolApprovalBridge>> {
+        let r = &mut self.host.inner;
+        let env = r.harness.tool_env().await?;
+        let grants = r
+            .harness
+            .read_session_entries()
+            .await
+            .map(|entries| crate::tool_approval::auto_approve_from_entries(&entries))
+            .unwrap_or_default();
+        r.agents.set_host(Arc::new(host.clone()));
+        let bridge = Arc::new(ToolApprovalBridge::with_host(
+            env,
+            r.settings.diff_editor.clone(),
+            grants,
+            Arc::new(host),
+        ));
+        let harness = r.harness.clone();
+        bridge.set_persist(Arc::new(move |label| {
+            let harness = harness.clone();
+            Box::pin(async move {
+                if let Err(error) = harness.append_label(label).await {
+                    tracing::warn!(%error, "persist tool approval label");
+                }
+            })
+        }));
+        r.tool_gate.set_approver(Some(bridge.clone()));
+        r.tool_approval = Some(bridge.clone());
+        Ok(bridge)
+    }
+    pub fn review_grants(&self) -> std::collections::HashSet<String> {
+        self.host
+            .inner
+            .tool_approval
+            .as_ref()
+            .map(|b| b.auto_approve_groups())
+            .unwrap_or_default()
+    }
+    pub fn mcp_configured(&self) -> bool {
+        !self.host.inner.settings.mcp_servers.is_empty()
+    }
+    pub fn mcp_enabled(&self, name: &str) -> Option<bool> {
+        self.host
+            .inner
+            .settings
+            .mcp_servers
+            .contains_key(name)
+            .then(|| {
+                !self
+                    .host
+                    .inner
+                    .settings
+                    .disabled_mcp_servers
+                    .iter()
+                    .any(|n| n == name)
+            })
+    }
+    pub fn mcp_choices(&self) -> Vec<(String, String)> {
+        self.host
+            .inner
+            .settings
+            .mcp_servers
+            .iter()
+            .map(|(name, cfg)| {
+                let hint = cfg
+                    .url
+                    .clone()
+                    .or_else(|| {
+                        cfg.command.as_ref().map(|command| {
+                            format!("{command} {}", cfg.args.join(" "))
+                                .trim()
+                                .to_string()
+                        })
+                    })
+                    .unwrap_or_else(|| "not configured".into());
+                (name.clone(), hint)
+            })
+            .collect()
+    }
+    pub async fn mcp(
+        &mut self,
+        action: loop_protocol::admin::AdminAction,
+        name: Option<String>,
+    ) -> anyhow::Result<loop_protocol::admin::McpResult> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::McpParams {
+            workspace_id: self.workspace_id.clone(),
+            action,
+            name,
+            expected_revision: None,
+        };
+        Ok(self.admin().mcp(params).await?)
+    }
+    pub async fn mcp_tools(&self) -> Vec<(String, Vec<String>)> {
+        self.host.inner.mcp_client.list_connection_tools().await
+    }
+}
+
+impl SurfaceClient {
+    pub fn note_sandbox(&mut self, mode: &str, isolation: Option<String>, runtime: Option<String>) {
+        let settings = &mut self.host.inner.settings.sandbox;
+        settings.mode = mode.into();
+        settings.isolation = isolation;
+        settings.runtime = runtime;
+    }
+    pub fn mcp_login(
+        &self,
+        name: &str,
+        on_url: impl FnOnce(&str) + Send + 'static,
+    ) -> anyhow::Result<
+        futures::future::BoxFuture<'static, Result<loop_mcp::OAuthLoginOutcome, String>>,
+    > {
+        let r = &self.host.inner;
+        let cfg = r
+            .settings
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("mcp server not found: {name} (see /mcp list)"))?;
+        let url = cfg.url.clone().ok_or_else(|| {
+            anyhow::anyhow!("mcp `{name}` is a local command server and does not use OAuth")
+        })?;
+        if r.mcp_client
+            .oauth_credential_path(name)
+            .map_err(|e| anyhow::anyhow!(e))?
+            .is_none()
+        {
+            anyhow::bail!("OAuth credential storage is not configured for this session");
+        }
+        let client = r.mcp_client.clone();
+        let name = name.to_string();
+        Ok(Box::pin(async move {
+            client.oauth_login(&name, &url, on_url).await
+        }))
+    }
+    pub async fn finish_mcp_login(&self, name: &str) -> anyhow::Result<Option<usize>> {
+        let r = &self.host.inner;
+        if self.mcp_enabled(name) == Some(false) {
+            return Ok(None);
+        }
+        let cfg = r
+            .settings
+            .mcp_servers
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("it is no longer configured"))?;
+        let entry = loop_app_core::runtime::mcp_server_entries(&std::collections::BTreeMap::from(
+            [(name.into(), cfg.clone())],
+        ))
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("it is no longer configured"))?;
+        r.mcp_client.disconnect(name).await;
+        let count = r
+            .mcp_client
+            .connect(&entry)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        r.refresh_mcp_tools().await?;
+        Ok(Some(count))
+    }
+    pub async fn mcp_logout(&self, name: &str) -> anyhow::Result<bool> {
+        let r = &self.host.inner;
+        if self.mcp_enabled(name).is_none() {
+            anyhow::bail!("mcp server not found: {name} (see /mcp list)");
+        }
+        let removed = r
+            .mcp_client
+            .clear_oauth_credentials(name)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if removed {
+            r.mcp_client.disconnect(name).await;
+            r.refresh_mcp_tools().await?;
+        }
+        Ok(removed)
+    }
+}
+
+impl SurfaceClient {
+    pub fn sandbox_plan(
+        &self,
+        flags: loop_app_core::sandbox_builder::LocalSandboxFlags,
+    ) -> anyhow::Result<(loop_protocol::admin::SandboxChoice, String)> {
+        use loop_app_core::sandbox_builder::{SandboxBuilder, SandboxRequest};
+        let request = SandboxRequest::for_flags(&self.host.inner.settings.sandbox, flags);
+        let plan = SandboxBuilder::for_current_platform()
+            .with_agent_dir(self.agent_dir())
+            .resolve(&request)?;
+        Ok((
+            loop_protocol::admin::SandboxChoice {
+                mode: "local".into(),
+                isolation: flags.isolation.map(|i| i.as_str().into()),
+                runtime: flags.runtime.map(|r| r.as_str().into()),
+            },
+            plan.label(),
+        ))
     }
 }

@@ -706,3 +706,153 @@ async fn opening_a_session_during_a_turn_is_refused_without_cancelling_it() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn permissions_require_full_access_confirmation_and_review_keeps_migration_help() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::Permissions(None))
+            .await;
+        assert!(ui.text().contains("permission mode: ask"));
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Permissions(Some("full-access".into())),
+        )
+        .await;
+        assert!(ui.text().contains("again to confirm"));
+        assert_eq!(runtime.legacy().permission_mode(), PermissionMode::Ask);
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Permissions(Some("full-access".into())),
+        )
+        .await;
+        assert_eq!(
+            runtime.legacy().permission_mode(),
+            PermissionMode::FullAccess
+        );
+        ui.effect(&mut runtime, CommandEffect::SetFileReview(None))
+            .await;
+        assert!(ui.text().contains("session auto-approve: (none)"));
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SetFileReview(Some("off".into())),
+        )
+        .await;
+        assert!(ui
+            .text()
+            .contains("/review no longer turns prompts on or off"));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sandbox_status_and_invalid_flags_do_not_start_work() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::SetSandbox(String::new()))
+            .await;
+        assert!(ui.text().contains("use /sandbox status|off|local"));
+        ui.effect(
+            &mut runtime,
+            CommandEffect::SetSandbox("local --unknown".into()),
+        )
+        .await;
+        assert!(ui.text().contains("unknown"));
+        assert!(!ui.working);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn mcp_empty_list_reload_and_missing_auth_keep_their_messages() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        for command in [McpCommand::List, McpCommand::Reload] {
+            ui.effect(&mut runtime, CommandEffect::Mcp(command)).await;
+            assert!(ui.text().contains("No MCP servers configured"));
+        }
+        for command in [
+            McpCommand::Enable("missing".into()),
+            McpCommand::Disable("missing".into()),
+            McpCommand::Login("missing".into()),
+            McpCommand::Logout("missing".into()),
+        ] {
+            ui.chat.clear();
+            ui.effect(&mut runtime, CommandEffect::Mcp(command)).await;
+            assert!(
+                ui.text()
+                    .contains("mcp server not found: missing (see /mcp list)"),
+                "{}",
+                ui.text()
+            );
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn trust_command_persists_explicit_choices_and_rejects_unknown_answers() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::Trust(Some("yes".into())))
+            .await;
+        assert!(ui.text().contains("project trust → true"));
+        ui.effect(&mut runtime, CommandEffect::Trust(Some("no".into())))
+            .await;
+        assert!(ui.text().contains("project trust → false"));
+        ui.effect(&mut runtime, CommandEffect::Trust(Some("maybe".into())))
+            .await;
+        assert!(ui.text().contains("usage: /trust [yes|no] (got maybe)"));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn mcp_picker_toggles_a_configured_server_and_reports_connection_failure() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        runtime.legacy_mut().settings_mut().mcp_servers.insert(
+            "broken".into(),
+            serde_json::from_value(serde_json::json!({"command": "/nonexistent-loop-mcp-test"}))
+                .unwrap(),
+        );
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::Mcp(McpCommand::Picker))
+            .await;
+        assert_eq!(ui.mcp.as_ref().unwrap().selected_name(), Some("broken"));
+        ui.key(&mut runtime, KeyCode::Char(' '), KeyModifiers::NONE)
+            .await;
+        assert_eq!(runtime.mcp_enabled("broken"), Some(false));
+        ui.key(&mut runtime, KeyCode::Enter, KeyModifiers::NONE)
+            .await;
+        assert_eq!(runtime.mcp_enabled("broken"), Some(true));
+        assert!(
+            ui.text().contains("enabled, but connecting failed"),
+            "{}",
+            ui.text()
+        );
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Mcp(McpCommand::Login("broken".into())),
+        )
+        .await;
+        assert!(ui
+            .text()
+            .contains("local command server and does not use OAuth"));
+    })
+    .await
+    .unwrap();
+}

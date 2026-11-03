@@ -711,9 +711,11 @@ Export/import filesystem access is in the TUI; services exchange bounded payload
 These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
 `legacy_mut()` and must move one group at a time after S3.4:
 
-- Group 3: sandbox, permission modes, review grants and approval bridge setup,
-  workspace trust/settings/reload, web search, MCP tools and MCP OAuth. `/ttfb`
-  still uses the old native timeout/default path in this group.
+- Group 3 migrated: sandbox and permissions use typed RuntimeAdmin requests;
+  trust reloads resources through the native admin adapter. MCP list/connect/
+  toggle and OAuth use facade services. Approval setup and grants stay private
+  to the native owner. Settings diagnostics move with group 5; web search and
+  timeout/default handling move with group 6.
 - Group 4: skills, prompt templates, dynamic command discovery, workflows and
   the current native workflow event bridge.
 - Group 5: usage/dashboard host data, tracing-backed usage logs and the effective

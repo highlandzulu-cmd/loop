@@ -17,7 +17,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use loop_agent::harness::{format_prompt_template_invocation, SandboxMode};
+use loop_agent::harness::format_prompt_template_invocation;
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, CredentialStore, Usage};
 use loop_app_core::interaction::{
@@ -46,10 +46,7 @@ use crate::keybindings::{
 use crate::provider_setup::{LoginChoice, ProviderSetup};
 use crate::setup_prompt::SetupPrompt;
 use crate::theme::Theme;
-use crate::tool_approval::{
-    auto_approve_from_entries, ApprovalDecision, ApprovalKind, ToolApprovalBridge, GROUP_BASH,
-    GROUP_FILE, GROUP_WEB,
-};
+use crate::tool_approval::{ApprovalDecision, ApprovalKind, GROUP_BASH, GROUP_FILE, GROUP_WEB};
 #[cfg(feature = "telemetry")]
 use crate::tracing_setup::TracingSetup;
 use crate::tui::attachments::{
@@ -64,7 +61,7 @@ use crate::tui::{
     CardStatus, ChatItem, CommandHistory, FileEntry, FooterOpts, InputBuffer, McpServerListing,
     PickerRow, PickerView, FOOTER_HEIGHT,
 };
-use crate::{build_tools, PendingAgent, StartupSessions, SurfaceClient};
+use crate::{PendingAgent, StartupSessions, SurfaceClient};
 use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
@@ -416,40 +413,8 @@ async fn run_loop(
     }
     ensure_forwarding(runtime, runtime.backend().as_ref(), &tx);
 
-    let tool_env = runtime.legacy().harness().tool_env().await?;
-    let session_grants = match runtime.legacy().harness().read_session_entries().await {
-        Ok(entries) => auto_approve_from_entries(&entries),
-        Err(e) => {
-            tracing::warn!("failed to load session tool approvals: {e}");
-            Default::default()
-        }
-    };
     let (host, mut review_rx) = InteractionQueue::new();
-    // External agents ask the user through the same queue as Loop's own
-    // approvals.
-    runtime.legacy().agents().set_host(Arc::new(host.clone()));
-    let bridge = Arc::new(ToolApprovalBridge::with_host(
-        tool_env,
-        runtime.legacy().settings().diff_editor.clone(),
-        session_grants,
-        Arc::new(host),
-    ));
-    {
-        let harness = Arc::clone(runtime.legacy().harness());
-        bridge.set_persist(Arc::new(move |label| {
-            let harness = Arc::clone(&harness);
-            Box::pin(async move {
-                if let Err(e) = harness.append_label(label).await {
-                    tracing::warn!("persist tool approval label: {e}");
-                }
-            })
-        }));
-    }
-    runtime
-        .legacy()
-        .tool_gate()
-        .set_approver(Some(Arc::clone(&bridge)));
-    *runtime.legacy_mut().tool_approval_mut() = Some(Arc::clone(&bridge));
+    runtime.install_interactions(host).await?;
 
     let mut chat: Vec<ChatItem> = match runtime.backend().transcript(&runtime.session_ref()).await {
         Ok(updates) => chat_from_agent_transcript(updates, active_agent_name(runtime)),
@@ -696,10 +661,7 @@ async fn run_loop(
             Some(spec) => format!("{spec} · {}", runtime.native_effort()),
             None => NO_MODEL_LABEL.to_string(),
         };
-        let model_line = format!(
-            "{} · {model_line}",
-            runtime.legacy().permission_mode().label()
-        );
+        let model_line = format!("{} · {model_line}", runtime.permission_mode().label());
 
         let ac_entries = if input.as_str().starts_with('/')
             && !input.as_str().contains(' ')
@@ -829,12 +791,7 @@ async fn run_loop(
                     .iter()
                     .filter_map(|&i| p.servers.get(i))
                     .map(|(name, desc)| {
-                        let enabled = !runtime
-                            .legacy()
-                            .settings()
-                            .disabled_mcp_servers
-                            .iter()
-                            .any(|n| n == name);
+                        let enabled = runtime.mcp_enabled(name) == Some(true);
                         PickerRow {
                             label: format!("[{}] {name}", if enabled { "x" } else { " " }),
                             description: desc.clone(),
@@ -1017,7 +974,7 @@ async fn run_loop(
                     path_line: &path_line,
                     model_line: &model_line,
                     usage_line: &usage_line,
-                    warning: (runtime.legacy().permission_mode() == PermissionMode::FullAccess)
+                    warning: (runtime.permission_mode() == PermissionMode::FullAccess)
                         .then_some(FULL_ACCESS_BANNER),
                 },
             );
@@ -1646,7 +1603,7 @@ async fn drain_ui_events(
                         runtime.sync_agent_effort().await;
                         // Without this the agent keeps its own default mode
                         // (Codex: auto review, which edits without asking).
-                        runtime.legacy_mut().sync_agent_mode().await;
+                        runtime.sync_agent_mode().await;
                         let label = runtime.active_model_label().unwrap_or_else(|| id.clone());
                         *status = format!("ready · {label}");
                         if !resumed {
@@ -1726,8 +1683,7 @@ async fn drain_ui_events(
                 turn_step.clear();
                 match result {
                     Ok(SandboxDoneOk::Off) => {
-                        runtime.legacy_mut().settings_mut().sandbox.mode = "off".into();
-                        let _ = runtime.legacy().save_settings();
+                        runtime.note_sandbox("off", None, None);
                         chat.push(sys("sandbox → off"));
                         *status = "ready".into();
                     }
@@ -1736,10 +1692,7 @@ async fn drain_ui_events(
                         isolation,
                         runtime: oci,
                     }) => {
-                        runtime.legacy_mut().settings_mut().sandbox.mode = "local".into();
-                        runtime.legacy_mut().settings_mut().sandbox.isolation = isolation;
-                        runtime.legacy_mut().settings_mut().sandbox.runtime = oci;
-                        let _ = runtime.legacy().save_settings();
+                        runtime.note_sandbox("local", isolation, oci);
                         chat.push(sys(format!("sandbox → local {label}")));
                         *status = "ready".into();
                     }
@@ -2994,12 +2947,7 @@ async fn handle_key(
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(name) = picker.selected_name().map(str::to_string) {
-                    let enabled = runtime
-                        .legacy()
-                        .settings()
-                        .disabled_mcp_servers
-                        .iter()
-                        .any(|n| n == &name);
+                    let enabled = runtime.mcp_enabled(&name) == Some(false);
                     set_mcp_enabled(runtime, &name, enabled, chat, status).await;
                 }
             }
@@ -3689,9 +3637,7 @@ async fn resume_session(
     match choice.agent {
         Some(record) => {
             // Approvals accepted in the previous session don't carry over.
-            if let Some(bridge) = runtime.legacy().tool_approval() {
-                bridge.clear_session_grants();
-            }
+            runtime.clear_session_approvals();
             chat.clear();
             *redraw_request = true;
             *purge_ui_events = true;
@@ -3929,12 +3875,7 @@ struct McpPickerState {
 }
 
 impl McpPickerState {
-    fn new(settings: &crate::config::Settings) -> Self {
-        let servers = settings
-            .mcp_servers
-            .iter()
-            .map(|(name, cfg)| (name.clone(), mcp_server_hint(cfg)))
-            .collect::<Vec<_>>();
+    fn new(servers: Vec<(String, String)>) -> Self {
         let filtered = (0..servers.len()).collect();
         Self {
             servers,
@@ -3968,20 +3909,6 @@ impl McpPickerState {
     }
 }
 
-fn mcp_server_hint(cfg: &loop_app_core::config::settings::McpServerConfig) -> String {
-    if let Some(url) = &cfg.url {
-        url.clone()
-    } else if let Some(command) = &cfg.command {
-        if cfg.args.is_empty() {
-            command.clone()
-        } else {
-            format!("{command} {}", cfg.args.join(" "))
-        }
-    } else {
-        "not configured".into()
-    }
-}
-
 fn start_mcp_login(
     runtime: &SurfaceClient,
     chat: &mut Vec<ChatItem>,
@@ -3989,51 +3916,31 @@ fn start_mcp_login(
     tx: &mpsc::UnboundedSender<UiEvent>,
     name: &str,
 ) {
-    let Some(cfg) = runtime.legacy().settings().mcp_servers.get(name) else {
-        chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
-        return;
-    };
-    let Some(url) = cfg.url.clone() else {
-        chat.push(error_item(format!(
-            "mcp `{name}` is a local command server and does not use OAuth"
-        )));
-        return;
-    };
-    match runtime.legacy().mcp_client().oauth_credential_path(name) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            chat.push(error_item(
-                "OAuth credential storage is not configured for this session".to_string(),
-            ));
+    let tx_url = tx.clone();
+    let server_name = name.to_string();
+    let login = runtime.mcp_login(name, move |auth_url| {
+        let browser_error = open_browser(auth_url).err().map(|err| err.to_string());
+        let _ = tx_url.send(UiEvent::McpAuthUrl {
+            name: server_name,
+            url: auth_url.to_string(),
+            browser_error,
+        });
+    });
+    let login = match login {
+        Ok(login) => login,
+        Err(error) => {
+            chat.push(error_item(error.to_string()));
             return;
         }
-        Err(err) => {
-            chat.push(error_item(err));
-            return;
-        }
-    }
+    };
     chat.push(sys(format!("Starting OAuth login for mcp `{name}`…")));
     *status = format!("mcp `{name}` · waiting for browser authorization");
-
-    let client = Arc::clone(runtime.legacy().mcp_client());
-    let tx_url = tx.clone();
-    let tx_done = tx.clone();
-    let server_name = name.to_string();
+    let tx = tx.clone();
+    let name = name.to_string();
     tokio::spawn(async move {
-        let name_for_url = server_name.clone();
-        let result = client
-            .oauth_login(&server_name, &url, move |auth_url| {
-                let browser_error = open_browser(auth_url).err().map(|err| err.to_string());
-                let _ = tx_url.send(UiEvent::McpAuthUrl {
-                    name: name_for_url,
-                    url: auth_url.to_string(),
-                    browser_error,
-                });
-            })
-            .await;
-        let _ = tx_done.send(UiEvent::McpLoginDone {
-            name: server_name,
-            result,
+        let _ = tx.send(UiEvent::McpLoginDone {
+            name,
+            result: login.await,
         });
     });
 }
@@ -4067,54 +3974,23 @@ async fn finish_mcp_login(
     name: &str,
     outcome: loop_mcp::OAuthLoginOutcome,
 ) {
-    let disabled = runtime
-        .legacy()
-        .settings()
-        .disabled_mcp_servers
-        .iter()
-        .any(|server| server == name);
     let note = match outcome {
         loop_mcp::OAuthLoginOutcome::Authorized => "authorized",
         loop_mcp::OAuthLoginOutcome::NotRequired => "does not require authorization",
     };
-    if disabled {
-        chat.push(sys(format!(
+    match runtime.finish_mcp_login(name).await {
+        Ok(None) => chat.push(sys(format!(
             "mcp `{name}` {note}. It is disabled; /mcp enable {name} to connect."
-        )));
-        *status = "ready".into();
-        return;
-    }
-    let Some(entry) = mcp_entry(runtime, name) else {
-        chat.push(error_item(format!(
-            "mcp `{name}` {note}, but it is no longer configured"
-        )));
-        *status = "ready".into();
-        return;
-    };
-    runtime.legacy().mcp_client().disconnect(name).await;
-    match runtime.legacy().mcp_client().connect(&entry).await {
-        Ok(count) => {
-            if let Err(err) = runtime.legacy().refresh_mcp_tools().await {
-                chat.push(error_item(format!("error setting tools: {err}")));
-            }
+        ))),
+        Ok(Some(count)) => {
             let noun = if count == 1 { "tool" } else { "tools" };
             chat.push(sys(format!("mcp `{name}` {note} — {count} {noun}")));
-            *status = "ready".into();
         }
-        Err(err) => {
-            chat.push(error_item(format!(
-                "mcp `{name}` {note}, but connecting failed: {err}"
-            )));
-            *status = "ready".into();
-        }
+        Err(err) => chat.push(error_item(format!(
+            "mcp `{name}` {note}, but connecting failed: {err}"
+        ))),
     }
-}
-
-fn mcp_entry(runtime: &SurfaceClient, name: &str) -> Option<loop_mcp::McpServerEntry> {
-    let cfg = runtime.legacy().settings().mcp_servers.get(name)?.clone();
-    let mut one = std::collections::BTreeMap::new();
-    one.insert(name.to_string(), cfg);
-    crate::runtime::mcp_server_entries(&one).into_iter().next()
+    *status = "ready".into();
 }
 
 async fn logout_mcp(
@@ -4123,28 +3999,15 @@ async fn logout_mcp(
     status: &mut String,
     name: &str,
 ) {
-    if !runtime.legacy().settings().mcp_servers.contains_key(name) {
-        chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
-        return;
-    }
-    match runtime
-        .legacy()
-        .mcp_client()
-        .clear_oauth_credentials(name)
-        .await
-    {
+    match runtime.mcp_logout(name).await {
         Ok(true) => {
-            runtime.legacy().mcp_client().disconnect(name).await;
-            if let Err(err) = runtime.legacy().refresh_mcp_tools().await {
-                chat.push(error_item(format!("error setting tools: {err}")));
-            }
             chat.push(sys(format!(
                 "mcp `{name}` authorization removed. /mcp reload to reconnect."
             )));
             *status = format!("mcp `{name}` logged out");
         }
         Ok(false) => chat.push(sys(format!("mcp `{name}` has no saved authorization"))),
-        Err(err) => chat.push(error_item(err)),
+        Err(err) => chat.push(error_item(err.to_string())),
     }
 }
 
@@ -4155,27 +4018,34 @@ async fn set_mcp_enabled(
     chat: &mut Vec<ChatItem>,
     status: &mut String,
 ) {
-    use crate::runtime::McpToggleOutcome;
-
+    use loop_protocol::admin::AdminAction;
     let state = if enabled { "enabled" } else { "disabled" };
     match runtime
-        .legacy_mut()
-        .set_mcp_server_enabled(name, enabled)
+        .mcp(
+            if enabled {
+                AdminAction::Enable
+            } else {
+                AdminAction::Disable
+            },
+            Some(name.into()),
+        )
         .await
     {
-        Ok(McpToggleOutcome::Updated) => *status = format!("mcp `{name}` {state}"),
-        Ok(McpToggleOutcome::Missing) => {
-            chat.push(sys(format!("mcp server not found: {name} (see /mcp list)")));
+        Ok(result) => {
+            *status = format!("mcp `{name}` {state}");
+            if let Some(error) = result
+                .servers
+                .iter()
+                .find(|s| s.name == name)
+                .and_then(|s| s.error.as_ref())
+            {
+                *status = format!("mcp `{name}` enabled · connect failed");
+                chat.push(error_item(format!(
+                    "mcp `{name}` enabled, but connecting failed: {error}"
+                )));
+            }
         }
-        Ok(McpToggleOutcome::ConnectFailed(err)) => {
-            *status = format!("mcp `{name}` enabled · connect failed");
-            chat.push(error_item(format!(
-                "mcp `{name}` enabled, but connecting failed: {err}"
-            )));
-        }
-        Err(e) => chat.push(error_item(format!(
-            "mcp `{name}` {state} for this session, but saving settings failed: {e:#}"
-        ))),
+        Err(error) => chat.push(error_item(error.to_string())),
     }
 }
 
@@ -4185,15 +4055,11 @@ async fn mcp_status_item(
     mark_ok: bool,
     connect_errors: &[(String, String)],
 ) -> ChatItem {
-    let connected = runtime.legacy().mcp_client().list_connection_tools().await;
+    let connected = runtime.mcp_tools().await;
     let mut servers = Vec::new();
-    for name in runtime.legacy().settings().mcp_servers.keys() {
-        let disabled = runtime
-            .legacy()
-            .settings()
-            .disabled_mcp_servers
-            .iter()
-            .any(|n| n == name);
+    for (name, _) in runtime.mcp_choices() {
+        let name = &name;
+        let disabled = runtime.mcp_enabled(name) == Some(false);
         if disabled {
             servers.push(McpServerListing {
                 name: name.clone(),
@@ -5241,7 +5107,7 @@ async fn apply_effect(
         },
         CommandEffect::Permissions(None) => {
             runtime.confirm_full_access = false;
-            let current = runtime.legacy().permission_mode();
+            let current = runtime.permission_mode();
             let mut lines = vec![format!(
                 "permission mode: {} — /permissions <mode> to switch",
                 current.as_str()
@@ -5261,7 +5127,7 @@ async fn apply_effect(
         }
         CommandEffect::Permissions(Some(arg)) => match PermissionMode::parse(&arg) {
             Some(PermissionMode::FullAccess)
-                if runtime.legacy().permission_mode() != PermissionMode::FullAccess
+                if runtime.permission_mode() != PermissionMode::FullAccess
                     && !std::mem::take(&mut runtime.confirm_full_access) =>
             {
                 runtime.confirm_full_access = true;
@@ -5273,10 +5139,7 @@ async fn apply_effect(
             }
             Some(PermissionMode::Plan) => {
                 runtime.confirm_full_access = false;
-                runtime
-                    .legacy_mut()
-                    .set_permission_mode(PermissionMode::Plan)
-                    .await;
+                runtime.set_permission_mode(PermissionMode::Plan).await?;
                 chat.push(sys(
                     "plan mode · the agent investigates and proposes a plan; nothing changes \
                      until you approve it, then work continues in the mode you had",
@@ -5284,7 +5147,7 @@ async fn apply_effect(
             }
             Some(mode) => {
                 runtime.confirm_full_access = false;
-                runtime.legacy_mut().set_permission_mode(mode).await;
+                runtime.set_permission_mode(mode).await?;
                 chat.push(sys(format!(
                     "permission mode → {} ({}) for this session",
                     mode.as_str(),
@@ -5334,8 +5197,16 @@ async fn apply_effect(
         },
         CommandEffect::SetSandbox(mode) => {
             if mode.is_empty() || mode.trim() == "status" {
-                let info = runtime.legacy().harness().sandbox_info().await;
-                chat.push(sys(info.format_box()));
+                let info = runtime
+                    .sandbox_service()
+                    .sandbox(loop_protocol::admin::SandboxParams {
+                        session: runtime.session_ref(),
+                        action: loop_protocol::admin::SandboxAction::Status,
+                        config: None,
+                        expected_revision: None,
+                    })
+                    .await?;
+                chat.push(sys(info.info));
                 if mode.is_empty() {
                     chat.push(sys(
                         "use /sandbox status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]",
@@ -5346,35 +5217,32 @@ async fn apply_effect(
             let parts: Vec<&str> = mode.split_whitespace().collect();
             match parts.as_slice() {
                 ["off"] | ["disabled"] => {
-                    let harness = Arc::clone(runtime.legacy().harness());
-                    let web = runtime.legacy().web_tools();
-                    let search = runtime.legacy().tool_gate().search_filter();
-                    let bash = runtime.legacy().bash_limits();
+                    let service = runtime.sandbox_service();
+                    let session = runtime.session_ref();
                     let tx = tx.clone();
                     *working = true;
                     *status = "disabling sandbox…".into();
                     chat.push(sys(" "));
                     chat.push(sys("disabling sandbox…"));
                     tokio::spawn(async move {
-                        let result = async {
-                            harness.clear_sandbox().await;
-                            let env = harness
-                                .tool_env()
-                                .await
-                                .map_err(|e| format!("sandbox: {e}"))?;
-                            harness
-                                .set_tools(build_tools(env, &web, bash, search))
-                                .await
-                                .map_err(|e| format!("sandbox: {e}"))?;
-                            Ok(SandboxDoneOk::Off)
-                        }
-                        .await;
+                        let result = service
+                            .sandbox(loop_protocol::admin::SandboxParams {
+                                session,
+                                action: loop_protocol::admin::SandboxAction::Set,
+                                config: Some(loop_protocol::admin::SandboxChoice {
+                                    mode: "off".into(),
+                                    ..Default::default()
+                                }),
+                                expected_revision: None,
+                            })
+                            .await
+                            .map(|_| SandboxDoneOk::Off)
+                            .map_err(|e| format!("sandbox: {e}"));
                         let _ = tx.send(UiEvent::SandboxDone(result));
                     });
                     return Ok(false);
                 }
                 ["local", rest @ ..] => {
-                    use loop_app_core::sandbox_builder::{SandboxBuilder, SandboxRequest};
                     let flags = match commands::parse_local_sandbox_flags(rest) {
                         Ok(v) => v,
                         Err(e) => {
@@ -5382,52 +5250,35 @@ async fn apply_effect(
                             return Ok(false);
                         }
                     };
-                    let builder =
-                        SandboxBuilder::for_current_platform().with_agent_dir(runtime.agent_dir());
-                    let request =
-                        SandboxRequest::for_flags(&runtime.legacy().settings().sandbox, flags);
-                    let plan = match builder.resolve(&request) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            chat.push(sys(format!("sandbox: {e}")));
+                    let (choice, label) = match runtime.sandbox_plan(flags) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            chat.push(sys(format!("sandbox: {error}")));
                             return Ok(false);
                         }
                     };
-                    let harness = Arc::clone(runtime.legacy().harness());
-                    let cwd = runtime.cwd().clone();
-                    let web = runtime.legacy().web_tools();
-                    let search = runtime.legacy().tool_gate().search_filter();
-                    let bash = runtime.legacy().bash_limits();
+                    let service = runtime.sandbox_service();
+                    let session = runtime.session_ref();
                     let tx = tx.clone();
-                    let label = plan.label();
                     *working = true;
                     *status = format!("enabling sandbox ({label})…");
                     chat.push(sys(" "));
                     chat.push(sys(format!("enabling sandbox ({label})…")));
                     tokio::spawn(async move {
-                        let result = async {
-                            let (sb, _plan) = builder
-                                .start(&cwd, &request)
-                                .await
-                                .map_err(|e| e.to_string())?;
-                            let env = sb.env();
-                            if let Err(e) = harness
-                                .set_tools(build_tools(Arc::clone(&env), &web, bash, search))
-                                .await
-                            {
-                                let _ = sb.destroy().await;
-                                return Err(format!("sandbox: {e}"));
-                            }
-                            harness
-                                .set_sandbox(SandboxMode::Enabled { sandbox: sb })
-                                .await;
-                            Ok(SandboxDoneOk::Local {
-                                label,
-                                isolation: flags.isolation.map(|i| i.as_str().to_string()),
-                                runtime: flags.runtime.map(|r| r.as_str().to_string()),
+                        let result = service
+                            .sandbox(loop_protocol::admin::SandboxParams {
+                                session,
+                                action: loop_protocol::admin::SandboxAction::Set,
+                                config: Some(choice.clone()),
+                                expected_revision: None,
                             })
-                        }
-                        .await;
+                            .await
+                            .map(|_| SandboxDoneOk::Local {
+                                label,
+                                isolation: choice.isolation,
+                                runtime: choice.runtime,
+                            })
+                            .map_err(|e| format!("sandbox: {e}"));
                         let _ = tx.send(UiEvent::SandboxDone(result));
                     });
                     return Ok(false);
@@ -5497,36 +5348,23 @@ async fn apply_effect(
         }
         CommandEffect::SetFileReview(arg) => match arg {
             None => {
-                let grants = runtime
-                    .legacy()
-                    .tool_approval()
-                    .as_ref()
-                    .map(|b| {
-                        let g = b.auto_approve_groups();
-                        let mut parts = Vec::new();
-                        if g.contains(GROUP_FILE) {
-                            parts.push("file");
-                        }
-                        if g.contains(GROUP_BASH) {
-                            parts.push("bash");
-                        }
-                        if g.contains(GROUP_WEB) {
-                            parts.push("web");
-                        }
-                        if parts.is_empty() {
-                            "(none)".into()
-                        } else {
-                            parts.join(", ")
-                        }
-                    })
-                    .unwrap_or_else(|| "(none)".into());
+                let groups = runtime.review_grants();
+                let grants = [GROUP_FILE, GROUP_BASH, GROUP_WEB]
+                    .into_iter()
+                    .filter(|group| groups.contains(*group))
+                    .collect::<Vec<_>>();
+                let grants = if grants.is_empty() {
+                    "(none)".into()
+                } else {
+                    grants.join(", ")
+                };
                 let mut perms = String::new();
                 for (k, v) in &runtime.legacy().settings().tool_permissions {
                     perms.push_str(&format!("\n    {k}: {v}"));
                 }
                 chat.push(sys(format!(
                         "permission mode: {} (change it with /permissions)\n  session auto-approve: {grants}\n  settings.toolPermissions:{perms}\n  settings.diffEditor: {}",
-                        runtime.legacy().permission_mode().as_str(),
+                        runtime.permission_mode().as_str(),
                         runtime.legacy().settings()
                             .diff_editor
                             .as_deref()
@@ -5640,7 +5478,7 @@ async fn apply_effect(
                         "\nEnvironment\n  Sessions DB: {}\n  Theme: {}\n  Trusted: {}\n  Model: {}\n",
                         runtime.sessions_db().display(),
                         runtime.theme().name,
-                        runtime.legacy().project_trusted(),
+                        runtime.project_trusted(),
                         runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
                     ));
                     chat.push(sys(report));
@@ -5653,7 +5491,7 @@ async fn apply_effect(
                             .unwrap_or_else(|| "none".into()),
                         runtime.sessions_db().display(),
                         runtime.theme().name,
-                        runtime.legacy().project_trusted()
+                        runtime.project_trusted()
                     )));
                 }
             }
@@ -5670,7 +5508,7 @@ async fn apply_effect(
                 runtime.legacy().settings().theme,
                 runtime.legacy().settings().default_thinking_level,
                 runtime.legacy().settings().sandbox.display(),
-                runtime.legacy().permission_mode().as_str(),
+                runtime.permission_mode().as_str(),
                 runtime.legacy().settings()
                     .diff_editor
                     .as_deref()
@@ -5688,15 +5526,13 @@ async fn apply_effect(
             let decision = match arg.as_deref() {
                 Some("yes") | Some("y") => true,
                 Some("no") | Some("n") => false,
-                None => !runtime.legacy().project_trusted(),
+                None => !runtime.project_trusted(),
                 Some(other) => {
                     chat.push(sys(format!("usage: /trust [yes|no] (got {other})")));
                     return Ok(false);
                 }
             };
-            let cwd = runtime.cwd().clone();
-            runtime.legacy_mut().trust_mut().set(&cwd, decision)?;
-            *runtime.legacy_mut().project_trusted_mut() = decision;
+            runtime.set_trust(decision).await?;
             chat.push(sys(format!("project trust → {decision}")));
         }
         CommandEffect::Reload => {
@@ -5704,7 +5540,7 @@ async fn apply_effect(
             *runtime.legacy_mut().resources_mut() = crate::resources::load_resources(
                 runtime.agent_dir(),
                 runtime.cwd(),
-                runtime.legacy().project_trusted(),
+                runtime.project_trusted(),
                 runtime.legacy().settings(),
             );
             runtime.legacy().sync_harness_resources().await;
@@ -5986,40 +5822,25 @@ async fn apply_effect(
         }
         CommandEffect::Mcp(McpCommand::Enable(name)) => {
             set_mcp_enabled(runtime, &name, true, chat, status).await;
-            if runtime.legacy().settings().mcp_servers.contains_key(&name)
-                && !runtime
-                    .legacy()
-                    .settings()
-                    .disabled_mcp_servers
-                    .iter()
-                    .any(|n| n == &name)
-            {
+            if runtime.mcp_enabled(&name).is_some() && runtime.mcp_enabled(&name) == Some(true) {
                 chat.push(sys(format!("mcp `{name}` enabled")));
             }
         }
         CommandEffect::Mcp(McpCommand::Disable(name)) => {
             set_mcp_enabled(runtime, &name, false, chat, status).await;
-            if runtime
-                .legacy()
-                .settings()
-                .disabled_mcp_servers
-                .iter()
-                .any(|n| n == &name)
-            {
+            if runtime.mcp_enabled(&name) == Some(false) {
                 chat.push(sys(format!("mcp `{name}` disabled")));
             }
         }
-        CommandEffect::Mcp(McpCommand::Picker)
-            if !runtime.legacy().settings().mcp_servers.is_empty() =>
-        {
+        CommandEffect::Mcp(McpCommand::Picker) if !!runtime.mcp_configured() => {
             *model_picker = None;
             *fork_picker = None;
             *skill_picker = None;
-            *mcp_picker = Some(McpPickerState::new(runtime.legacy().settings()));
+            *mcp_picker = Some(McpPickerState::new(runtime.mcp_choices()));
             *status = "mcp · toggle on or off".into();
         }
         CommandEffect::Mcp(McpCommand::Picker | McpCommand::List) => {
-            if runtime.legacy().settings().mcp_servers.is_empty() {
+            if !runtime.mcp_configured() {
                 chat.push(sys(
                     "No MCP servers configured.\n\nAdd them under \"mcpServers\" in settings.json, then /mcp reload.\nToggle with /mcp (picker) or /mcp enable|disable <name>. Disabled servers are not connected.",
                 ));
@@ -6037,27 +5858,21 @@ async fn apply_effect(
             logout_mcp(runtime, chat, status, &name).await;
         }
         CommandEffect::Mcp(McpCommand::Reload) => {
-            runtime.legacy().mcp_client().disconnect_all().await;
-            if runtime.legacy().settings().mcp_servers.is_empty() {
+            if !runtime.mcp_configured() {
                 chat.push(sys("No MCP servers configured in settings.json"));
             } else {
-                let entries = crate::runtime::enabled_mcp_server_entries(
-                    &runtime.legacy().settings().mcp_servers,
-                    &runtime.legacy().settings().disabled_mcp_servers,
-                );
-                let results = runtime.legacy().mcp_client().connect_all(&entries).await;
-                let errors: Vec<(String, String)> = results
-                    .iter()
-                    .filter_map(|(name, result)| {
-                        result.as_ref().err().map(|err| (name.clone(), err.clone()))
-                    })
-                    .collect();
-                if let Err(e) = runtime.legacy().refresh_mcp_tools().await {
-                    chat.push(sys(format!("error setting tools: {e}")));
-                }
+                let result = runtime
+                    .mcp(loop_protocol::admin::AdminAction::Reload, None)
+                    .await?;
+                let errors = result
+                    .servers
+                    .into_iter()
+                    .filter_map(|s| s.error.map(|e| (s.name, e)))
+                    .collect::<Vec<_>>();
                 chat.push(mcp_status_item(runtime, "reload", true, &errors).await);
             }
         }
+
         CommandEffect::Skill { name, args } => {
             if runtime.legacy().harness().activate_skill(&name).await {
                 if !runtime.legacy().active_skills().iter().any(|n| n == &name) {
