@@ -272,6 +272,20 @@ pub trait ModelControl: Send + Sync {
             "choosing a reasoning effort".into(),
         ))
     }
+    /// Read the Session's response-timeout override, or change it: set
+    /// `Some(ms)` (0 waits indefinitely) or clear it (`None`) to inherit the
+    /// default. A change during a turn applies to the next one. It never
+    /// changes the default for new Sessions.
+    async fn ttfb(
+        &self,
+        _session: &SessionRef,
+        _change: Option<Option<u64>>,
+        _expected_revision: Option<u64>,
+    ) -> BackendResult<crate::rpc::TtfbResult> {
+        Err(BackendError::Unsupported(
+            "changing the response timeout".into(),
+        ))
+    }
     /// The approval and sandbox modes the session offers, as choices.
     async fn modes(&self, _session: &SessionRef) -> BackendResult<ModelChoices> {
         Err(BackendError::Unsupported("choosing a mode".into()))
@@ -463,10 +477,6 @@ pub struct ShellResult {
 
 /// The most output `session/shell` keeps per stream, in bytes.
 pub const SHELL_OUTPUT_LIMIT: usize = 1024 * 1024;
-/// How long a user command runs when the caller names no timeout.
-pub const SHELL_DEFAULT_TIMEOUT_MS: u64 = 120_000;
-/// The longest timeout a user command may ask for.
-pub const SHELL_MAX_TIMEOUT_MS: u64 = 600_000;
 
 impl ShellResult {
     /// Cut each stream to [`SHELL_OUTPUT_LIMIT`] on a character boundary,
@@ -486,18 +496,16 @@ impl ShellResult {
     }
 }
 
-/// Check a requested shell timeout: the default when none is named, and a
-/// failure for zero or more than [`SHELL_MAX_TIMEOUT_MS`].
-pub fn shell_timeout(requested: Option<u64>) -> BackendResult<u64> {
+/// Check a requested shell timeout against the host's `max_ms` (its
+/// `bash.maxTimeoutMs`): the maximum when none is named, and a failure for
+/// zero or more than the maximum.
+pub fn shell_timeout(requested: Option<u64>, max_ms: u64) -> BackendResult<u64> {
     match requested {
-        None => Ok(SHELL_DEFAULT_TIMEOUT_MS),
-        Some(ms) if (1..=SHELL_MAX_TIMEOUT_MS).contains(&ms) => Ok(ms),
+        None => Ok(max_ms),
+        Some(ms) if (1..=max_ms).contains(&ms) => Ok(ms),
         Some(_) => Err(BackendError::failed(
             ErrorCategory::Agent,
-            format!(
-                "the shell timeout must be between 1 and {} ms",
-                SHELL_MAX_TIMEOUT_MS
-            ),
+            format!("the shell timeout must be between 1 and {max_ms} ms"),
         )),
     }
 }
@@ -505,8 +513,9 @@ pub fn shell_timeout(requested: Option<u64>) -> BackendResult<u64> {
 /// Run a command the user typed, in the session's execution environment.
 #[async_trait]
 pub trait LocalShell: Send + Sync {
-    /// Run `command` and wait for it to finish, for at most `timeout_ms`
-    /// (see [`shell_timeout`]). Output is bounded per stream.
+    /// Run `command` and wait for it to finish, for at most `timeout_ms`;
+    /// by default the host's bash maximum (see [`shell_timeout`]). Output is
+    /// bounded per stream.
     async fn run(
         &self,
         session: &SessionRef,

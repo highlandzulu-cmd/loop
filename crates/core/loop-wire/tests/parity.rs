@@ -933,7 +933,7 @@ async fn compact_stats_and_shell_are_the_same_over_the_wire() {
                 .await
                 .unwrap_err();
             assert!(slow.to_string().contains("timed out"), "{slow}");
-            for bad in [0, loop_protocol::SHELL_MAX_TIMEOUT_MS + 1] {
+            for bad in [0, 600_001] {
                 let here = local
                     .local_shell()
                     .unwrap()
@@ -1008,11 +1008,125 @@ async fn compact_stats_and_shell_need_their_capabilities() {
             ("session/compact", json!({"session": session})),
             ("session/stats", json!({"session": session})),
             ("session/shell", json!({"session": session, "command": "true"})),
+            ("session/ttfb", json!({"session": session})),
         ] {
             let refused = conn.request(method, params).await.unwrap_err();
             assert!(
                 matches!(refused, RpcError::Remote { code, .. } if code == loop_protocol::rpc::error_codes::UNSUPPORTED),
                 "{method}: {refused:?}"
+            );
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// The response-timeout override reads and changes alike in-process and over
+/// each wire, including an authenticated WebSocket, and never becomes the
+/// default for new Sessions.
+#[tokio::test]
+async fn ttfb_is_the_same_over_the_wire() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::TtfbResult;
+        for wire in [
+            Wire::Memory,
+            #[cfg(unix)]
+            Wire::Unix,
+            Wire::WebSocket,
+        ] {
+            let local = native(vec![], vec![]).await;
+            let (remote, _served) = over(native(vec![], vec![]).await, wire).await;
+            assert!(local.capabilities().session_ttfb);
+            assert!(remote.capabilities().session_ttfb, "{wire:?}");
+            let local_session = local.current_session().await;
+            let remote_session = remote
+                .new_session(loop_protocol::SessionSpec::default())
+                .await
+                .unwrap();
+            let (here, there) = (
+                local.model_control().unwrap(),
+                remote.model_control().unwrap(),
+            );
+            let read = there.ttfb(&remote_session, None, None).await.unwrap();
+            assert_eq!(here.ttfb(&local_session, None, None).await.unwrap(), read);
+            assert_eq!(read.override_ms, None);
+            assert_eq!(read.seq, None);
+            let default = read.effective_ms;
+            assert!(default > 0);
+
+            // Explicit zero is an override that waits indefinitely.
+            let mut rx = remote.subscribe();
+            let zero = there
+                .ttfb(&remote_session, Some(Some(0)), Some(read.revision))
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    zero.override_ms,
+                    zero.effective_ms,
+                    zero.revision,
+                    zero.pending
+                ),
+                (Some(0), 0, read.revision + 1, false)
+            );
+            let changed = loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let SessionUpdate::ConfigChanged(changed) = envelope.update {
+                    assert_eq!(Some(envelope.seq), zero.seq);
+                    break changed;
+                }
+            };
+            assert_eq!(changed.config.response_timeout_ms, Some(0));
+            assert_eq!(changed.revision, zero.revision);
+            assert_eq!(
+                here.ttfb(&local_session, Some(Some(0)), None)
+                    .await
+                    .unwrap()
+                    .override_ms,
+                Some(0)
+            );
+            // A stale revision conflicts, over the wire too.
+            assert_eq!(
+                there
+                    .ttfb(&remote_session, Some(Some(5_000)), Some(read.revision))
+                    .await
+                    .unwrap_err(),
+                BackendError::Conflict {
+                    revision: zero.revision
+                },
+                "{wire:?}"
+            );
+            let set = there
+                .ttfb(&remote_session, Some(Some(45_000)), None)
+                .await
+                .unwrap();
+            assert_eq!((set.override_ms, set.effective_ms), (Some(45_000), 45_000));
+
+            // Clearing inherits the default again.
+            let cleared = there.ttfb(&remote_session, Some(None), None).await.unwrap();
+            assert_eq!((cleared.override_ms, cleared.effective_ms), (None, default));
+            // Set again, then a new Session still starts from the default.
+            there
+                .ttfb(&remote_session, Some(Some(1_000)), None)
+                .await
+                .unwrap();
+            let fresh = remote
+                .new_session(loop_protocol::SessionSpec::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                there.ttfb(&fresh, None, None).await.unwrap(),
+                TtfbResult {
+                    override_ms: None,
+                    effective_ms: default,
+                    revision: 0,
+                    seq: None,
+                    pending: false,
+                },
+                "{wire:?}"
             );
         }
     })

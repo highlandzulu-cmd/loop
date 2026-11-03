@@ -521,6 +521,10 @@ async fn handle(
             Ok(result) => result,
             Err(error) => return conn.respond(id, Err(error)),
         },
+        methods::SESSION_TTFB => match ttfb(backend, params).await {
+            Ok(result) => result,
+            Err(error) => return conn.respond(id, Err(error)),
+        },
         methods::SESSION_COMPACT | methods::SESSION_STATS | methods::SESSION_SHELL => {
             match session_services(backend, method, params).await {
                 Ok(result) => result,
@@ -602,6 +606,32 @@ async fn model_control(
                 .map(|r| to_value(&r))
         }
     })
+}
+
+/// `session/ttfb`: read or change the Session's response-timeout override.
+/// It never writes the default for new Sessions, so it is Session-scoped
+/// and served on every authenticated transport.
+async fn ttfb(
+    backend: &dyn AgentBackend,
+    params: Value,
+) -> Result<BackendResult<Value>, (i64, String)> {
+    let Some(control) = backend
+        .model_control()
+        .filter(|_| backend.capabilities().session_ttfb)
+    else {
+        return Ok(Err(loop_protocol::BackendError::Unsupported(
+            "changing the response timeout".into(),
+        )));
+    };
+    let p: loop_protocol::rpc::TtfbParams = parse(params)?;
+    let change = match p.change() {
+        Ok(change) => change,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(control
+        .ttfb(&p.session, change, p.expected_revision)
+        .await
+        .map(|r| to_value(&r)))
 }
 
 /// `session/compact`, `session/stats` and `session/shell`. A backend

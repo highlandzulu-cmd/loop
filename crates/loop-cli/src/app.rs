@@ -5524,7 +5524,8 @@ async fn apply_effect(
             Some(raw) => match parse_response_header_timeout(&raw) {
                 Ok(ms) => {
                     runtime.settings.response_header_timeout_ms = ms;
-                    runtime.harness.set_response_header_timeout_ms(ms).await;
+                    // The saved default; a Session override still wins.
+                    runtime.native.set_default_response_timeout(ms).await;
                     let _ = runtime.save_settings();
                     let label = if ms == 0 {
                         "off (unlimited — for long-running workflows)".into()

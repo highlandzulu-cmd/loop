@@ -507,6 +507,7 @@ fn config_changed_and_attach_snapshot_wire() {
         model: Some("faux/one".into()),
         effort: Some("off".into()),
         mode: None,
+        response_timeout_ms: None,
     };
     let update = SessionUpdate::ConfigChanged(ConfigChanged {
         revision: 3,
@@ -659,15 +660,14 @@ fn compact_stats_and_shell_methods_wire() {
 
 #[test]
 fn shell_bounds() {
-    use loop_protocol::{shell_timeout, ShellResult, SHELL_MAX_TIMEOUT_MS, SHELL_OUTPUT_LIMIT};
-    assert_eq!(shell_timeout(None).unwrap(), 120_000);
-    assert_eq!(shell_timeout(Some(1)).unwrap(), 1);
-    assert_eq!(
-        shell_timeout(Some(SHELL_MAX_TIMEOUT_MS)).unwrap(),
-        SHELL_MAX_TIMEOUT_MS
-    );
-    assert!(shell_timeout(Some(0)).is_err());
-    assert!(shell_timeout(Some(SHELL_MAX_TIMEOUT_MS + 1)).is_err());
+    use loop_protocol::{shell_timeout, ShellResult, SHELL_OUTPUT_LIMIT};
+    // The default is the host's maximum (its bash.maxTimeoutMs).
+    assert_eq!(shell_timeout(None, 600_000).unwrap(), 600_000);
+    assert_eq!(shell_timeout(None, 30_000).unwrap(), 30_000);
+    assert_eq!(shell_timeout(Some(1), 600_000).unwrap(), 1);
+    assert_eq!(shell_timeout(Some(600_000), 600_000).unwrap(), 600_000);
+    assert!(shell_timeout(Some(0), 600_000).is_err());
+    assert!(shell_timeout(Some(30_001), 30_000).is_err());
     // A cut never splits a character, and only a cut marks truncation.
     let exact = ShellResult {
         stdout: "a".repeat(SHELL_OUTPUT_LIMIT),
@@ -684,4 +684,67 @@ fn shell_bounds() {
     .bounded();
     assert!(cut.truncated);
     assert_eq!(cut.stderr.len(), SHELL_OUTPUT_LIMIT - 1);
+}
+
+#[test]
+fn ttfb_method_wire() {
+    use loop_protocol::rpc::{methods, TtfbParams, TtfbResult};
+    use loop_protocol::Capabilities;
+    assert_eq!(methods::SESSION_TTFB, "session/ttfb");
+    let reference = json!({"instance":"native","key":"s1","native_id":"n1"});
+    let session: loop_protocol::SessionRef = serde_json::from_value(reference.clone()).unwrap();
+    let read: TtfbParams = serde_json::from_value(json!({"session":reference})).unwrap();
+    assert_eq!(read.change().unwrap(), None);
+    roundtrip(
+        &TtfbParams {
+            session: session.clone(),
+            timeout_ms: Some(0),
+            clear_override: false,
+            expected_revision: Some(3),
+        },
+        json!({"session":reference,"timeout_ms":0,"clear_override":false,"expected_revision":3}),
+    );
+    let zero: TtfbParams =
+        serde_json::from_value(json!({"session":reference,"timeout_ms":0})).unwrap();
+    assert_eq!(zero.change().unwrap(), Some(Some(0)));
+    let clear: TtfbParams =
+        serde_json::from_value(json!({"session":reference,"clear_override":true})).unwrap();
+    assert_eq!(clear.change().unwrap(), Some(None));
+    let both: TtfbParams =
+        serde_json::from_value(json!({"session":reference,"timeout_ms":5,"clear_override":true}))
+            .unwrap();
+    assert!(both.change().is_err());
+    roundtrip(
+        &TtfbResult {
+            override_ms: Some(0),
+            effective_ms: 0,
+            revision: 4,
+            seq: Some(9),
+            pending: true,
+        },
+        json!({"override_ms":0,"effective_ms":0,"revision":4,"seq":9,"pending":true}),
+    );
+    roundtrip(
+        &TtfbResult {
+            override_ms: None,
+            effective_ms: 120_000,
+            revision: 4,
+            seq: None,
+            pending: false,
+        },
+        json!({"effective_ms":120000,"revision":4,"pending":false}),
+    );
+    let old: Capabilities = serde_json::from_value(json!({})).unwrap();
+    assert!(!old.session_ttfb);
+    let config: loop_protocol::SessionConfig =
+        serde_json::from_value(json!({"model":"faux/one"})).unwrap();
+    assert_eq!(config.response_timeout_ms, None);
+    assert_eq!(
+        serde_json::to_value(loop_protocol::SessionConfig {
+            response_timeout_ms: Some(0),
+            ..Default::default()
+        })
+        .unwrap(),
+        json!({"response_timeout_ms":0})
+    );
 }

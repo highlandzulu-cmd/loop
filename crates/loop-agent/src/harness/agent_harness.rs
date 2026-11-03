@@ -199,6 +199,11 @@ impl AgentHarness {
         *self.bash_limits.lock() = limits;
     }
 
+    /// The bash time limits.
+    pub fn bash_limits(&self) -> crate::harness::tools::BashLimits {
+        *self.bash_limits.lock()
+    }
+
     /// The hook registry, for hosts that emit their own events (tool gate).
     pub fn hooks(&self) -> HookRegistry {
         self.hooks.clone()

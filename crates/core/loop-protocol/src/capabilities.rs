@@ -58,4 +58,7 @@ pub struct Capabilities {
     /// Runs a user command in the Session's environment (`session/shell`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub local_shell: bool,
+    /// Reads and overrides the Session's response timeout (`session/ttfb`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_ttfb: bool,
 }

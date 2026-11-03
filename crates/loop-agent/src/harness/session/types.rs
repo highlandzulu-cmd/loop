@@ -280,7 +280,18 @@ pub enum PendingSessionWrite {
         /// Name.
         name: String,
     },
+    /// Custom opaque entry.
+    Custom {
+        /// Custom type.
+        custom_type: String,
+        /// Payload.
+        data: Value,
+    },
 }
+
+/// Custom entry type recording a Session's response-timeout override:
+/// `{"timeout_ms": n}`, or `{"timeout_ms": null}` to inherit the default.
+pub const RESPONSE_TIMEOUT_ENTRY: &str = "response_timeout";
 
 /// Reader over a session's entries.
 #[async_trait]
@@ -498,8 +509,11 @@ pub struct SessionConfigEntries {
     pub thinking_level: Option<AgentThinkingLevel>,
     /// Name last given to the Session.
     pub name: Option<String>,
-    /// How many model, effort, name, branch and compaction changes the
-    /// Session ever recorded: its one Session revision, stable across restarts.
+    /// Response-timeout override last recorded; `None` inherits the
+    /// default, `Some(0)` waits indefinitely.
+    pub response_timeout_ms: Option<u64>,
+    /// How many model, effort, name, branch, compaction and response-timeout
+    /// changes the Session ever recorded: its one Session revision, stable across restarts.
     pub revision: u64,
 }
 
@@ -522,6 +536,12 @@ pub fn config_from_entries(
             SessionTreeEntry::SessionInfo { name, .. } => {
                 config.revision += 1;
                 config.name = Some(name.clone());
+            }
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == RESPONSE_TIMEOUT_ENTRY => {
+                config.revision += 1;
+                config.response_timeout_ms = data["timeout_ms"].as_u64();
             }
             _ => {}
         }

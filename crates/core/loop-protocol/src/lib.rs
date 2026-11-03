@@ -21,8 +21,7 @@ pub use backend::{
     AgentBackend, BackendError, BackendResult, Compaction, CompactionReport, HostFileSystem,
     HostServices, HostTerminals, LocalShell, ModelChoice, ModelChoices, ModelControl,
     MutationResult, SessionRef, SessionSpec, SessionStats, ShellResult, StatsSummary, TerminalExit,
-    TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome, SHELL_DEFAULT_TIMEOUT_MS,
-    SHELL_MAX_TIMEOUT_MS, SHELL_OUTPUT_LIMIT,
+    TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome, SHELL_OUTPUT_LIMIT,
 };
 pub use capabilities::Capabilities;
 pub use content::ContentBlock;

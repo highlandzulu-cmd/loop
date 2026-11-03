@@ -136,6 +136,10 @@
           "description": "Lists and navigates Session branches.",
           "type": "boolean"
         },
+        "session_ttfb": {
+          "description": "Reads and overrides the Session's response timeout (`session/ttfb`).",
+          "type": "boolean"
+        },
         "set_model": {
           "default": false,
           "description": "Can switch models within a session.",
@@ -1723,6 +1727,15 @@
             "string",
             "null"
           ]
+        },
+        "response_timeout_ms": {
+          "description": "The Session's response-timeout override in ms (`session/ttfb`);\nabsent inherits the default, 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -2448,7 +2461,7 @@
           "description": "Session reference."
         },
         "timeout_ms": {
-          "description": "At most this long; the default is 120 s and the maximum 600 s.",
+          "description": "At most this long; the default and the maximum are the host's\n`bash.maxTimeoutMs` (600 s unless configured).",
           "format": "uint64",
           "minimum": 0,
           "type": [
@@ -3054,6 +3067,87 @@
       ],
       "type": "object"
     },
+    "TtfbParams": {
+      "description": "`session/ttfb` params. Without `timeout_ms` or `clear_override` it reads.",
+      "properties": {
+        "clear_override": {
+          "default": false,
+          "description": "Remove the override and inherit the default. Not with `timeout_ms`.",
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "timeout_ms": {
+          "description": "New override in ms; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "TtfbResult": {
+      "description": "`session/ttfb` result.",
+      "properties": {
+        "effective_ms": {
+          "description": "The timeout the next turn uses; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "override_ms": {
+          "description": "The Session's override, when it has one; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pending": {
+          "default": false,
+          "description": "The change waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "The update sequence that announced a change; absent for a read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "effective_ms",
+        "revision"
+      ],
+      "type": "object"
+    },
     "TurnId": {
       "description": "One user prompt and everything the agent does in response.",
       "type": "string"
@@ -3275,8 +3369,7 @@
     "page_default": 100,
     "page_max": 1000,
     "session_transfer_bytes": 8388608,
-    "shell_output_bytes": 1048576,
-    "shell_timeout_max_ms": 600000
+    "shell_output_bytes": 1048576
   },
   "methods": {
     "host/interact": {
@@ -3577,6 +3670,16 @@
       },
       "result": {
         "$ref": "#/$defs/TreeResult"
+      }
+    },
+    "session/ttfb": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TtfbParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TtfbResult"
       }
     },
     "session/update": {

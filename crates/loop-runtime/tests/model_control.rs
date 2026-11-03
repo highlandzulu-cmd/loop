@@ -1048,3 +1048,86 @@ async fn one_session_revision_orders_every_setter_across_a_restart() {
     .await
     .unwrap();
 }
+
+/// The response-timeout override is Session config: during a turn it waits
+/// for the next one, it never becomes the default for new Sessions, and a
+/// reopened Session keeps it.
+#[tokio::test]
+async fn ttfb_waits_for_the_turn_and_never_changes_the_default() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        use loop_ai::providers::{FauxResponse, FauxScript};
+        let script = FauxScript::new();
+        script.push(FauxResponse::ToolCalls(vec![loop_ai::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "echo waiting"}),
+            thought_signature: None,
+        }]));
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log.clone(), script).await;
+        assert!(rt.capabilities().session_ttfb);
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let read = rt.ttfb(&session, None, None).await.unwrap();
+        assert_eq!((read.override_ms, read.effective_ms), (None, 120_000));
+        let mut rx = rt.subscribe();
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("run it")])
+            .await
+            .unwrap();
+        loop {
+            let raised = log
+                .read_runtime_after(0)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.event.kind, EventKind::EscalationRaised(_)));
+            if raised {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let result = rt
+            .ttfb(&session, Some(Some(0)), Some(read.revision))
+            .await
+            .unwrap();
+        assert!(result.pending);
+        assert_eq!(result.revision, read.revision + 1);
+        assert_eq!((result.override_ms, result.effective_ms), (Some(0), 0));
+        let (seq, changed) = config_changed(&mut rx, &session.key).await;
+        assert_eq!(Some(seq), result.seq);
+        assert!(changed.pending);
+        assert_eq!(changed.config.response_timeout_ms, Some(0));
+        assert_eq!(changed.effective.response_timeout_ms, None);
+        rt.cancel(&session);
+        turn.outcome().await;
+        let (_, applied) = config_changed(&mut rx, &session.key).await;
+        assert!(!applied.pending);
+        assert_eq!(applied.effective.response_timeout_ms, Some(0));
+
+        // New Sessions keep the host default.
+        let other = rt.new_session(SessionSpec::default()).await.unwrap();
+        let fresh = rt.ttfb(&other, None, None).await.unwrap();
+        assert_eq!((fresh.override_ms, fresh.effective_ms), (None, 120_000));
+
+        // The override is counted from the tree, so it survives a reopen.
+        rt.close(&session.key, false).await.unwrap();
+        rt.load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        let reopened = rt.ttfb(&session, None, None).await.unwrap();
+        assert_eq!(
+            (
+                reopened.override_ms,
+                reopened.effective_ms,
+                reopened.revision
+            ),
+            (Some(0), 0, result.revision)
+        );
+        let cleared = rt.ttfb(&session, Some(None), None).await.unwrap();
+        assert_eq!((cleared.override_ms, cleared.effective_ms), (None, 120_000));
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

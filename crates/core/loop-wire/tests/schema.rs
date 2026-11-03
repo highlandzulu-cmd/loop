@@ -306,6 +306,7 @@ fn compact_stats_and_shell_are_in_the_schema() {
         methods::SESSION_COMPACT,
         methods::SESSION_STATS,
         methods::SESSION_SHELL,
+        methods::SESSION_TTFB,
     ] {
         assert_eq!(schema["methods"][method]["direction"], "client_to_server");
         assert_eq!(schema["methods"][method]["kind"], "request");
@@ -315,7 +316,6 @@ fn compact_stats_and_shell_are_in_the_schema() {
         );
     }
     assert_eq!(schema["limits"]["shell_output_bytes"], 1024 * 1024);
-    assert_eq!(schema["limits"]["shell_timeout_max_ms"], 600_000);
     let reference = json!({"instance": "loop", "key": "s", "native_id": "s"});
     let cases = [
         (

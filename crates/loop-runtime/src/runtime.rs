@@ -1832,8 +1832,9 @@ impl Runtime {
         command: &str,
         timeout_ms: Option<u64>,
     ) -> BackendResult<ShellResult> {
-        let timeout_ms = loop_protocol::shell_timeout(timeout_ms)?;
         let live = self.loaded(session).await?;
+        // Checked before the Session is reserved.
+        let timeout_ms = live.opened.native.shell_timeout(timeout_ms)?;
         let mut cancelled = live.cancel.subscribe();
         {
             let _lifecycle = live.lifecycle.lock().await;
@@ -1941,6 +1942,46 @@ impl ModelControl for Runtime {
         let live = self.loaded(session).await?;
         Self::control(&live)?.modes(session).await
     }
+    async fn ttfb(
+        &self,
+        session: &SessionRef,
+        change: Option<Option<u64>>,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        if change.is_none() {
+            let live = self.loaded(session).await?;
+            return Self::control(&live)?.ttfb(session, None, None).await;
+        }
+        // During a turn the change waits for the next one.
+        let read = Mutex::new(None);
+        let mutation = self
+            .set_config(session, false, |live| {
+                let read = &read;
+                async move {
+                    let result = Self::control(&live)?
+                        .ttfb(session, change, expected_revision)
+                        .await?;
+                    let mutation = MutationResult {
+                        revision: result.revision,
+                        seq: result.seq.unwrap_or(0),
+                        pending: result.pending,
+                        applies_after_turn: None,
+                    };
+                    *read.lock().unwrap() = Some(result);
+                    Ok(mutation)
+                }
+            })
+            .await?;
+        let mut result = read
+            .into_inner()
+            .unwrap()
+            .ok_or_else(|| failed("the change was not recorded"))?;
+        // The Runtime's own sequence, committed in its Event Log.
+        result.revision = mutation.revision;
+        result.seq = Some(mutation.seq);
+        result.pending = mutation.pending;
+        Ok(result)
+    }
     async fn set_mode(
         &self,
         session: &SessionRef,
@@ -1978,6 +2019,7 @@ impl AgentBackend for Runtime {
             compaction: true,
             session_stats: true,
             local_shell: true,
+            session_ttfb: true,
             ..Capabilities::default()
         }
     }

@@ -383,7 +383,7 @@ impl AgentBackend for RemoteBackend {
 
     fn model_control(&self) -> Option<&dyn ModelControl> {
         let c = self.capabilities;
-        (c.set_model || c.efforts || c.modes).then_some(self as &dyn ModelControl)
+        (c.set_model || c.efforts || c.modes || c.session_ttfb).then_some(self as &dyn ModelControl)
     }
 
     fn compaction(&self) -> Option<&dyn Compaction> {
@@ -440,8 +440,6 @@ impl LocalShell for RemoteBackend {
         command: &str,
         timeout_ms: Option<u64>,
     ) -> BackendResult<ShellResult> {
-        // Checked here too, so a bad value never reaches the host.
-        loop_protocol::shell_timeout(timeout_ms)?;
         let params = loop_protocol::rpc::ShellParams {
             session: session.clone(),
             command: command.to_owned(),
@@ -462,6 +460,25 @@ fn offered(offered: bool, what: &str) -> BackendResult<()> {
 
 #[async_trait]
 impl ModelControl for RemoteBackend {
+    async fn ttfb(
+        &self,
+        session: &SessionRef,
+        change: Option<Option<u64>>,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        offered(
+            self.capabilities.session_ttfb,
+            "changing the response timeout",
+        )?;
+        let params = loop_protocol::rpc::TtfbParams {
+            session: session.clone(),
+            timeout_ms: change.flatten(),
+            clear_override: matches!(change, Some(None)),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_TTFB, &params).await
+    }
+
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
         offered(self.capabilities.set_model, "choosing a model")?;
         self.session_models(session).await.map(ModelChoices::from)
