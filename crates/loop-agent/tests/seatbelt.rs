@@ -771,6 +771,9 @@ async fn git_metadata_in_every_repository_is_protected() {
             "mv .git .git-old",
             "mv sub/.git sub/.git-old",
             "rm -f sub/.git",
+            "printf 'gitdir: ../evil' > sub/.git",
+            "printf 'gitdir: ../evil' >> sub/.git",
+            "touch sub/.git",
             "mkdir -p fresh && cd fresh && git init -q",
             "git clone -q ./vendor/lib cloned",
             "mkdir -p pointer && printf 'gitdir: ../evil' > pointer/.git",
@@ -939,6 +942,218 @@ async fn stale_temporary_directories_are_removed_at_start() {
         for dir in [&held, &fresh] {
             std::fs::remove_dir_all(dir).unwrap();
         }
+    })
+    .await
+    .unwrap();
+}
+
+const COMMIT: &str = "git -c user.name=Sandbox -c user.email=sandbox@example.invalid -c commit.gpgsign=false commit -q --allow-empty -m sandbox";
+
+/// Plant a git payload at each of `targets` (shell and file tools); every
+/// attempt must fail. Returns the marker a planted payload would create.
+async fn plant_everywhere(sandbox: &Arc<dyn Sandbox>, root: &Path, targets: &[PathBuf]) -> PathBuf {
+    let pwned = root.join("PWNED");
+    let payload = format!(
+        "[core]\n\tfsmonitor = \"touch {}; false\"\n",
+        pwned.display()
+    );
+    for path in targets {
+        let out = run(
+            sandbox,
+            &format!(
+                "mkdir -p {} ; printf '%s' {} >> {}",
+                q(path.parent().unwrap()),
+                q(Path::new(&payload)),
+                q(path)
+            ),
+        )
+        .await;
+        assert_ne!(out.exit_code, 0, "{}: {out:?}", path.display());
+        assert!(
+            sandbox
+                .env()
+                .write_file(path, payload.as_bytes())
+                .await
+                .is_err(),
+            "{}",
+            path.display()
+        );
+    }
+    pwned
+}
+
+fn host_git_status(dirs: &[&Path]) {
+    for dir in dirs {
+        let _ = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["status"])
+            .output();
+    }
+}
+
+/// A Session's git worktree: commits and branches work; the shared git
+/// directory's executable metadata stays protected.
+#[tokio::test]
+async fn a_linked_worktree_commits_and_its_shared_metadata_is_protected() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let (_guard, root) = scratch();
+        std::fs::remove_dir(root.join("project")).unwrap();
+        let main = root.join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "main"]);
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "session", "../project"],
+        );
+        let project = root.join("project");
+        let sandbox = seatbelt(&project, &root, json!({})).await.unwrap();
+        let out = run(
+            &sandbox,
+            &format!("{COMMIT} && git branch -q topic && git switch -q topic && {COMMIT}"),
+        )
+        .await;
+        assert_eq!(out.exit_code, 0, "{out:?}");
+        let common = main.join(".git");
+        let admin = common.join("worktrees/project");
+        let pwned = plant_everywhere(
+            &sandbox,
+            &root,
+            &[
+                common.join("config"),
+                common.join("config.worktree"),
+                common.join("hooks/pre-commit"),
+                common.join("info/attributes"),
+                common.join("HEAD"),
+                admin.join("config.worktree"),
+                admin.join("commondir"),
+                admin.join("gitdir"),
+                main.join("README"),
+            ],
+        )
+        .await;
+        for command in [
+            "printf x > c && mv c ../main/.git/config",
+            "rm -f .git",
+            "printf 'gitdir: ../evil' > .git",
+        ] {
+            assert_ne!(run(&sandbox, command).await.exit_code, 0, "{command}");
+        }
+        host_git_status(&[&project, &main]);
+        assert!(
+            !pwned.exists(),
+            "a sandboxed command got git to run on the host"
+        );
+        let branches = std::process::Command::new("git")
+            .current_dir(&main)
+            .args(["branch", "--list", "topic"])
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&branches.stdout).contains("topic"));
+        sandbox.destroy().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A submodule checkout as the project: commits and branches work; the
+/// superproject's and the submodule's metadata stay protected.
+#[tokio::test]
+async fn a_submodule_checkout_commits_and_its_metadata_is_protected() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let (_guard, root) = scratch();
+        let upstream = root.join("upstream");
+        let superproject = root.join("project");
+        std::fs::create_dir(&upstream).unwrap();
+        git(&upstream, &["init", "-q"]);
+        git(
+            &upstream,
+            &["commit", "-q", "--allow-empty", "-m", "upstream"],
+        );
+        git(&superproject, &["init", "-q"]);
+        git(
+            &superproject,
+            &["submodule", "add", "-q", upstream.to_str().unwrap(), "sub"],
+        );
+        git(&superproject, &["commit", "-q", "-m", "super"]);
+        let project = superproject.join("sub");
+        let sandbox = seatbelt(&project, &root, json!({})).await.unwrap();
+        let out = run(&sandbox, &format!("{COMMIT} && git branch -q topic")).await;
+        assert_eq!(out.exit_code, 0, "{out:?}");
+        let module = superproject.join(".git/modules/sub");
+        let pwned = plant_everywhere(
+            &sandbox,
+            &root,
+            &[
+                module.join("config"),
+                module.join("hooks/post-checkout"),
+                module.join("info/attributes"),
+                superproject.join(".git/config"),
+                superproject.join(".git/hooks/pre-commit"),
+                superproject.join(".gitmodules"),
+            ],
+        )
+        .await;
+        host_git_status(&[&project, &superproject]);
+        assert!(
+            !pwned.exists(),
+            "a sandboxed command got git to run on the host"
+        );
+        sandbox.destroy().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// Pointers that only look like a worktree are refused.
+#[tokio::test]
+async fn forged_worktree_pointers_refuse_to_start() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_guard, root) = scratch();
+        let project = root.join("project");
+        let main = root.join("main");
+        let other = root.join("other");
+        for dir in [&main, &other] {
+            std::fs::create_dir(dir).unwrap();
+            git(dir, &["init", "-q"]);
+            git(dir, &["commit", "-q", "--allow-empty", "-m", "x"]);
+        }
+        let admin = main.join(".git/worktrees/fake");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::write(admin.join("HEAD"), "ref: refs/heads/master\n").unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        // commondir names another repository.
+        std::fs::write(
+            admin.join("commondir"),
+            format!("{}\n", other.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", project.join(".git").display()),
+        )
+        .unwrap();
+        assert!(seatbelt(&project, &root, json!({})).await.is_err());
+        // gitdir names another checkout.
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", other.join(".git").display()),
+        )
+        .unwrap();
+        assert!(seatbelt(&project, &root, json!({})).await.is_err());
+        // Consistent: accepted.
+        std::fs::write(
+            admin.join("gitdir"),
+            format!("{}\n", project.join(".git").display()),
+        )
+        .unwrap();
+        let sandbox = seatbelt(&project, &root, json!({})).await.unwrap();
+        sandbox.destroy().await.unwrap();
     })
     .await
     .unwrap();

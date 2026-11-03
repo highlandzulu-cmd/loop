@@ -42,11 +42,26 @@ sandbox fail; run them outside it. Existing repositories, nested ones and
 submodules included, keep working: commits, branches, fetches into an existing
 repository and submodule commits write only objects, refs, the index and logs.
 
-Sandbox start is refused when the project's `.git` is a symlink, or a pointer
-file whose git directory is outside the project or not inside a `.git`
-directory (a git worktree or `--separate-git-dir` checkout). The sandbox could
-not protect that repository's hooks and config. Run Loop in the main checkout,
-or turn the sandbox off for that project.
+Linked worktrees (one per Session on the roadmap, and how Loop is developed)
+and submodule checkouts keep working. When the project's `.git` is a pointer
+file, sandbox start accepts it only if it names:
+
+- a linked worktree's admin directory `<common>/worktrees/<name>`, whose
+  `commondir` names that same `<common>` git directory and whose `gitdir` names
+  this checkout's `.git`; or
+- a submodule's complete git directory below `<superproject>/.git/modules/`.
+
+Both lie on a `.git` path, so the rules above keep their config, hooks and
+pointers write-protected, including the shared directory's `config`,
+`config.worktree`, `hooks`, `info/attributes` and every `worktrees/*`
+pointer. Writes are granted only where commits and branches need them: the
+worktree's admin directory (its HEAD, index and logs) plus the shared
+`objects`, `refs`, `logs` and `packed-refs`, or the submodule's git directory.
+Branches are shared between worktrees, so a command can move any branch of the
+repository, as a command in the main checkout can. The `.git` pointer file
+itself cannot be rewritten. A symlinked `.git`, a bare shared directory and any
+other pointer are refused at start: the sandbox could not protect that
+repository's hooks and config.
 
 Reads are denied for SSH/AWS/GPG/GitHub credentials, Keychains, `.netrc`, Docker,
 Kubernetes, npm/PyPI and gcloud credentials, git credential stores

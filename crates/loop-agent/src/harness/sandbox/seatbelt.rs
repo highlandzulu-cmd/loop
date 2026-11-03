@@ -64,9 +64,9 @@ fn resolve_path(path: &Path) -> Result<PathBuf, FileError> {
 /// [`JailedHostFs`], so paths created later are covered too.
 const GIT_METADATA: &str = r"/\.git/((modules|worktrees)/.+/)?(config|config\.worktree|commondir|gitdir|hooks|info/attributes)(/|$)";
 
-/// A `.git` entry itself. Commands may not create, replace or remove one, so
-/// they cannot start a repository whose config they wrote or point one
-/// elsewhere.
+/// A `.git` entry itself. Commands may not create, rewrite, replace or remove
+/// one, so they cannot start a repository whose config they wrote or point an
+/// existing pointer file elsewhere.
 const GIT_ENTRY: &str = r"/\.git$";
 
 fn git_metadata(path: &Path) -> bool {
@@ -87,13 +87,20 @@ fn git_entry_write(path: &Path) -> bool {
     })
 }
 
-/// Refuse a project whose `.git` is a symlink, or a pointer file to a git
-/// directory the sandbox cannot cover: outside the project, or not inside a
-/// `.git` directory (where [`GIT_METADATA`] applies).
-fn check_project_git(project: &Path) -> Result<(), FileError> {
+/// Check the project's `.git` and return the git directories outside the
+/// project that commits and branches need to write.
+///
+/// Accepted: a `.git` directory; a pointer to a git directory inside the
+/// project within a `.git` path; a linked worktree, pointing to
+/// `<common>/worktrees/<name>` whose `commondir` names `<common>` and whose
+/// `gitdir` names this project; and a submodule checkout, pointing to
+/// `<superproject>/.git/modules/<name>`. Every accepted git directory lies on a
+/// `.git` path, so [`GIT_METADATA`] keeps its config, hooks and pointers
+/// write-protected. A symlinked `.git` and any other pointer are refused.
+fn project_git_writes(project: &Path) -> Result<Vec<PathBuf>, FileError> {
     let dot_git = project.join(".git");
     let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
-        return Ok(());
+        return Ok(vec![]);
     };
     let refuse = |why: String| {
         Err(FileError::new(
@@ -110,23 +117,77 @@ fn check_project_git(project: &Path) -> Result<(), FileError> {
             dot_git.display()
         ));
     }
-    if meta.is_file() {
-        let text = std::fs::read_to_string(&dot_git).map_err(io_error)?;
-        let Some(dir) = text.trim().strip_prefix("gitdir:") else {
-            return refuse("the project's .git is a file that is not a git pointer".into());
-        };
-        let target = resolve_path(&project.join(dir.trim()))?;
-        let covered = target
-            .strip_prefix(project)
-            .is_ok_and(|inside| inside.components().any(|c| c.as_os_str() == ".git"));
-        if !covered {
-            return refuse(format!(
-                "the project's .git points to {} (a git worktree or separate git directory)",
-                target.display()
-            ));
-        }
+    if !meta.is_file() {
+        return Ok(vec![]);
     }
-    Ok(())
+    let text = std::fs::read_to_string(&dot_git).map_err(io_error)?;
+    let Some(dir) = text.trim().strip_prefix("gitdir:") else {
+        return refuse("the project's .git is a file that is not a git pointer".into());
+    };
+    let target = resolve_path(&project.join(dir.trim()))?;
+    let on_git_path = |p: &Path| p.components().any(|c| c.as_os_str() == ".git");
+    if target.starts_with(project) && on_git_path(&target) {
+        return Ok(vec![]);
+    }
+    let unsupported = || {
+        refuse(format!(
+            "the project's .git points to {}, which is not a linked worktree or submodule \
+             of a repository with a .git directory",
+            target.display()
+        ))
+    };
+    let is_git_dir = |p: &Path| p.join("HEAD").is_file() && p.join("objects").is_dir();
+    if !on_git_path(&target) || !target.join("HEAD").is_file() {
+        return unsupported();
+    }
+    let parent = target.parent();
+    if parent
+        .and_then(Path::file_name)
+        .is_some_and(|n| n == "worktrees")
+    {
+        // Linked worktree: its admin directory names the shared git directory
+        // and points back at this checkout.
+        let common = parent.and_then(Path::parent);
+        let named = std::fs::read_to_string(target.join("commondir"))
+            .ok()
+            .and_then(|c| resolve_path(&target.join(c.trim())).ok());
+        let back = std::fs::read_to_string(target.join("gitdir"))
+            .ok()
+            .and_then(|g| resolve_path(&target.join(g.trim())).ok());
+        let (Some(common), Some(named), Some(back)) = (common, named, back) else {
+            return unsupported();
+        };
+        if named != common
+            || !is_git_dir(common)
+            || !common.join("config").is_file()
+            || back != resolve_path(&dot_git)?
+        {
+            return unsupported();
+        }
+        return Ok(vec![
+            target.clone(),
+            common.join("objects"),
+            common.join("refs"),
+            common.join("logs"),
+            common.join("packed-refs"),
+            common.join("packed-refs.lock"),
+        ]);
+    }
+    // Submodule checkout: a complete git directory below `.git/modules`.
+    let in_modules = target
+        .components()
+        .map(|c| c.as_os_str().to_owned())
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|w| w[0] == ".git" && w[1] == "modules");
+    if in_modules
+        && is_git_dir(&target)
+        && target.join("config").is_file()
+        && !target.join("commondir").exists()
+    {
+        return Ok(vec![target]);
+    }
+    unsupported()
 }
 
 /// Lock file inside a Seatbelt temporary directory, held while the
@@ -245,7 +306,9 @@ impl SeatbeltPolicy {
         for path in allow_write {
             writes.push(resolve_path(&project.join(path))?);
         }
-        check_project_git(&project)?;
+        // Commits and branches in a linked worktree or submodule checkout
+        // write its git directory outside the project.
+        writes.extend(project_git_writes(&project)?);
         let mut denied_paths = vec![];
         for path in [
             home.join(".git-credentials"),
@@ -540,7 +603,7 @@ impl SeatbeltPolicy {
             params.push(format!("TMP_LOCK={}", root.join(TEMP_LOCK).display()));
         }
         profile.push_str(&format!(
-            "(deny file-write* (regex #\"{GIT_METADATA}\"))\n(deny file-write-create file-write-unlink (regex #\"{GIT_ENTRY}\"))\n"
+            "(deny file-write* (regex #\"{GIT_METADATA}\"))\n(deny file-write* (regex #\"{GIT_ENTRY}\"))\n"
         ));
         if let Some((homes, readable)) = &self.home_reads {
             // Contents only: lookups and stat of ancestors keep working.

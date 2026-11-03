@@ -75,8 +75,9 @@ paths, Keychains, and the resolved agent directory's `auth.json` and `run/`.
 Project `.loop`, the entire agent directory and Git hooks, config and pointers
 in every repository (submodules and nested ones included) are write-protected,
 and commands cannot create or replace a `.git` entry: run `git clone` and `git
-init` outside the sandbox. A project whose `.git` is a symlink or a pointer
-outside the project (a git worktree) cannot start the sandbox. OAuth/ACP credentials, databases, history, logs and common home
+init` outside the sandbox. Git worktrees and submodule checkouts work;
+a project whose `.git` is a symlink or any other outside pointer cannot start
+the sandbox. OAuth/ACP credentials, databases, history, logs and common home
 credential files are also unreadable. Provider keys and Runtime tokens are
 removed from child environments. Child TMPDIR is a private Loop-created 0700
 directory; environment overrides cannot replace it. Network
