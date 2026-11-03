@@ -84,6 +84,9 @@ pub struct Runtime {
     recipients: AsyncMutex<HashMap<SessionKey, Recipients>>,
     admission: AsyncMutex<()>,
     stopped: AtomicBool,
+    /// Tests start their own sandboxes instead of a platform one.
+    #[cfg(test)]
+    sandbox_starter: Mutex<Option<admin::SandboxStarter>>,
     log: Arc<dyn EventLog>,
     generation: u64,
     limits: RuntimeLimits,
@@ -362,6 +365,8 @@ impl Runtime {
             recipients: AsyncMutex::new(HashMap::new()),
             admission: AsyncMutex::new(()),
             stopped: AtomicBool::new(false),
+            #[cfg(test)]
+            sandbox_starter: Mutex::new(None),
             log,
             generation,
             limits,
@@ -699,6 +704,29 @@ impl Runtime {
                 // The Session's own model and effort win over the Runtime's
                 // startup defaults.
                 opened.native.restore_config().await?;
+            }
+            let mut sandbox_choice = sandbox_choice;
+            if !created && child.is_none() {
+                // The sandbox the Session last chose outlives a restart.
+                let recorded = opened
+                    .native
+                    .recorded_sandbox()
+                    .and_then(|v| serde_json::from_value::<loop_protocol::admin::SandboxChoice>(v).ok())
+                    .filter(|choice| *choice != sandbox_choice);
+                if let Some(choice) = recorded {
+                    match self.restore_sandbox(&opened, &choice).await {
+                        Ok(()) => {
+                            sandbox_choice = if choice.mode == "local" {
+                                choice
+                            } else {
+                                Self::sandbox_choice(&opened.settings, false)
+                            };
+                        }
+                        Err(error) => opened.startup_notices.push(format!(
+                            "Could not restore this Session's sandbox: {error}"
+                        )),
+                    }
+                }
             }
             if !created {
                 // Turn ids stay unique per Session across Runtime generations.
@@ -1857,7 +1885,7 @@ impl Runtime {
     }
     /// Run a config setter under the Session's lifecycle lock and return
     /// once its `config_changed` update is committed (outside the lock). A setter that cannot
-    /// wait for the next turn refuses a busy Session.
+    /// wait for the next turn refuses a busy Session by passing `refuse_busy`.
     async fn set_config<F, Fut>(
         &self,
         session: &SessionRef,
@@ -2017,8 +2045,8 @@ impl ModelControl for Runtime {
         model: &str,
         expected_revision: Option<u64>,
     ) -> BackendResult<MutationResult> {
-        // A model change never lands in the middle of a turn.
-        self.set_config(session, true, |live| async move {
+        // During a turn the choice waits: the running turn keeps its model.
+        self.set_config(session, false, |live| async move {
             Self::control(&live)?
                 .set_model(session, model, expected_revision)
                 .await

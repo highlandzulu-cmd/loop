@@ -36,6 +36,7 @@ pub use sandbox::{
     check_krun_deps, check_local_sandbox_deps, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
     SandboxError, SandboxFactory, SandboxInfo, SandboxMode, SandboxRegistry, SandboxStatus,
+    TaggedSandbox,
     KRUN_DEFAULT_IMAGE, KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
 };
 pub use session::{

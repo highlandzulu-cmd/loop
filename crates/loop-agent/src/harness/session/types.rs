@@ -297,6 +297,10 @@ pub const RESPONSE_TIMEOUT_ENTRY: &str = "response_timeout";
 /// `{"mode": "ask"}` (`session/permission_mode`).
 pub const PERMISSION_MODE_ENTRY: &str = "permission_mode";
 
+/// Custom entry type recording a Session's chosen sandbox:
+/// `{"choice": {"mode": "local", ...}}` (`session/sandbox`).
+pub const SANDBOX_ENTRY: &str = "sandbox";
+
 /// Reader over a session's entries.
 #[async_trait]
 pub trait SessionReader: Send + Sync {
@@ -537,6 +541,8 @@ pub struct SessionConfigEntries {
     pub response_timeout_ms: Option<u64>,
     /// Permission mode last recorded with `session/permission_mode`.
     pub permission_mode: Option<String>,
+    /// Sandbox choice last recorded with `session/sandbox`.
+    pub sandbox: Option<Value>,
     /// How many model, effort, name, branch, compaction, response-timeout
     /// and permission-mode changes the Session ever recorded: its one
     /// Session revision, stable across restarts.
@@ -574,6 +580,12 @@ pub fn config_from_entries(
             } if custom_type == PERMISSION_MODE_ENTRY => {
                 config.revision += 1;
                 config.permission_mode = data["mode"].as_str().map(str::to_owned);
+            }
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == SANDBOX_ENTRY => {
+                config.revision += 1;
+                config.sandbox = data.get("choice").filter(|c| c.is_object()).cloned();
             }
             SessionTreeEntry::Custom { custom_type, .. } if custom_type == "active_skills" => {
                 config.revision += 1;

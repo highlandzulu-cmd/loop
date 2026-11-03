@@ -27,7 +27,7 @@ use crate::effort::{effective_effort, native_efforts, parse_thinking, NATIVE_EFF
 use crate::harness::agent_harness::AgentHarness;
 use crate::harness::session::format_session_stats;
 use crate::harness::session::types::{
-    PendingSessionWrite, PERMISSION_MODE_ENTRY, RESPONSE_TIMEOUT_ENTRY,
+    PendingSessionWrite, PERMISSION_MODE_ENTRY, RESPONSE_TIMEOUT_ENTRY, SANDBOX_ENTRY,
 };
 use crate::harness::types::{AgentHarnessError, AgentHarnessPhase, ShellExecOptions};
 use crate::protocol_events::{replay, turn_outcome, NativeEventMapper};
@@ -68,6 +68,9 @@ pub struct NativeBackend {
     /// Jobs that start with the next turn, by key; a newer job replaces the
     /// older one of its key.
     next_turn: Mutex<std::collections::HashMap<&'static str, NextTurnJob>>,
+    /// Set by a cancel or shutdown that arrives while a prompt is still
+    /// being prepared, before the harness has a turn to abort.
+    cancel_requested: AtomicBool,
     /// Held while a turn is admitted or the model changes, so a model
     /// change never lands between the busy check and a turn's start.
     admission: tokio::sync::Mutex<()>,
@@ -93,6 +96,11 @@ struct ConfigState {
     effective: SessionConfig,
     /// The running turn a change waits for.
     pending: Option<TurnId>,
+    /// The full sandbox choice last recorded for the Session, if any.
+    sandbox_choice: Option<serde_json::Value>,
+    /// The recorded sandbox is queued for the next turn, so `effective`
+    /// keeps the old one until it is installed.
+    sandbox_deferred: bool,
 }
 
 impl ConfigState {
@@ -113,6 +121,16 @@ impl ConfigState {
             workspace_revision: 0,
         }
     }
+}
+
+/// How [`SessionConfig::sandbox`] names a recorded sandbox choice: its mode,
+/// then its isolation and runtime when it sets them, joined by `/`.
+fn sandbox_label(choice: &serde_json::Value) -> Option<String> {
+    let mode = choice["mode"].as_str()?;
+    let parts = ["isolation", "runtime"]
+        .into_iter()
+        .filter_map(|key| choice[key].as_str());
+    Some(std::iter::once(mode).chain(parts).collect::<Vec<_>>().join("/"))
 }
 
 /// `provider/id` of `model`.
@@ -150,6 +168,7 @@ pub fn session_config(model: Option<&loop_ai::Model>, level: AgentThinkingLevel)
         effort: Some(effective_effort(model, level)),
         mode: None,
         response_timeout_ms: None,
+        sandbox: None,
         active_skills: vec![],
     }
 }
@@ -214,6 +233,8 @@ impl NativeBackend {
                 config: SessionConfig::default(),
                 effective: SessionConfig::default(),
                 pending: None,
+                sandbox_choice: None,
+                sandbox_deferred: false,
             })),
             setting: tokio::sync::Mutex::new(()),
             default_effort: Mutex::new(level),
@@ -221,6 +242,7 @@ impl NativeBackend {
             default_response_timeout: Mutex::new(default_response_timeout),
             pending_model: Mutex::new(None),
             next_turn: Mutex::new(Default::default()),
+            cancel_requested: AtomicBool::new(false),
             admission: tokio::sync::Mutex::new(()),
         });
         backend.read_config().await;
@@ -312,6 +334,10 @@ impl NativeBackend {
     /// Read the current Session's config from the harness and its tree.
     async fn read_config(&self) {
         let session = SessionKey(self.harness.session_id().await);
+        // Work queued for another Session never starts in this one.
+        if self.config.lock().session != session {
+            self.discard_next_turn().await;
+        }
         let recorded = self.harness.session_config().await.unwrap_or_default();
         let model = self.harness.model().await;
         let level = self.harness.thinking_level().await;
@@ -321,6 +347,7 @@ impl NativeBackend {
         }
         let mut config = session_config(model.as_ref(), level);
         config.response_timeout_ms = recorded.response_timeout_ms;
+        config.sandbox = recorded.sandbox.as_ref().and_then(sandbox_label);
         config.active_skills = self.harness.active_skills().await;
         let timeout = recorded
             .response_timeout_ms
@@ -335,6 +362,8 @@ impl NativeBackend {
             effective: config.clone(),
             config,
             pending: None,
+            sandbox_choice: recorded.sandbox,
+            sandbox_deferred: false,
         };
     }
 
@@ -354,14 +383,70 @@ impl NativeBackend {
         // Holding admission keeps the turn from ending into a new one
         // between this check and the job being filed.
         let _admission = self.admission.lock().await;
+        // Whichever way the new job goes, an older one of its key is stale.
+        let older = self.next_turn.lock().remove(key);
+        if let Some(older) = older {
+            older(false).await;
+        }
         if !self.is_busy_now() {
             return Some(job);
         }
-        let replaced = self.next_turn.lock().insert(key, job);
-        if let Some(replaced) = replaced {
-            replaced(false).await;
-        }
+        self.next_turn.lock().insert(key, job);
         None
+    }
+
+    /// Release everything queued for the next turn without starting it.
+    async fn discard_next_turn(&self) {
+        let jobs: Vec<NextTurnJob> = self.next_turn.lock().drain().map(|(_, job)| job).collect();
+        for job in jobs {
+            job(false).await;
+        }
+    }
+
+    /// The Session's recorded sandbox choice, for a caller that reopens it.
+    pub fn recorded_sandbox(&self) -> Option<serde_json::Value> {
+        self.config.lock().sandbox_choice.clone()
+    }
+
+    /// Record the Session's sandbox choice in its tree and announce it. The
+    /// caller installs the sandbox; `deferred` says it waits for the next
+    /// turn, so the effective config keeps the old one until
+    /// [`Self::sandbox_applied`].
+    pub async fn record_sandbox(
+        &self,
+        session: &SessionRef,
+        choice: serde_json::Value,
+        expected_revision: Option<u64>,
+        deferred: bool,
+    ) -> BackendResult<MutationResult> {
+        let _setting = self.setting.lock().await;
+        self.current_config(session).await?;
+        self.check_revision(expected_revision)?;
+        self.harness
+            .record_config(PendingSessionWrite::Custom {
+                custom_type: SANDBOX_ENTRY.into(),
+                data: serde_json::json!({ "choice": choice }),
+            })
+            .await
+            .map_err(harness_error)?;
+        {
+            let mut state = self.config.lock();
+            state.config.sandbox = sandbox_label(&choice);
+            state.sandbox_choice = Some(choice);
+            state.sandbox_deferred = deferred;
+        }
+        Ok(self.announce_change().await)
+    }
+
+    /// A deferred sandbox is now installed: announce it as effective.
+    pub fn sandbox_applied(&self) {
+        let mut state = self.config.lock();
+        if !state.sandbox_deferred || state.session != self.stream.lock().session {
+            return;
+        }
+        state.sandbox_deferred = false;
+        state.effective.sandbox = state.config.sandbox.clone();
+        announce(&self.instance, &self.stream, state.update());
     }
 
     /// The model the next turn uses: one chosen during a turn, else the
@@ -391,8 +476,11 @@ impl NativeBackend {
         state.revision += 1;
         state.level = level;
         let timeout = state.config.response_timeout_ms;
+        let sandbox = state.config.sandbox.clone();
+        let applied_sandbox = state.effective.sandbox.clone();
         state.config = session_config(model.as_ref(), level);
         state.config.response_timeout_ms = timeout;
+        state.config.sandbox = sandbox;
         state.config.active_skills = skills;
         let current_turn = self.stream.lock().mapper.current_turn().cloned();
         match current_turn.filter(|_| running) {
@@ -401,6 +489,9 @@ impl NativeBackend {
                 state.effective = state.config.clone();
                 state.pending = None;
             }
+        }
+        if state.sandbox_deferred {
+            state.effective.sandbox = applied_sandbox;
         }
         let seq = announce(&self.instance, &self.stream, state.update());
         MutationResult {
@@ -537,7 +628,11 @@ fn apply_pending(
     if state.pending.take().is_none() || state.session != stream.lock().session {
         return;
     }
+    let applied_sandbox = state.effective.sandbox.clone();
     state.effective = state.config.clone();
+    if state.sandbox_deferred {
+        state.effective.sandbox = applied_sandbox;
+    }
     announce(instance, stream, state.update());
 }
 
@@ -757,6 +852,7 @@ impl AgentBackend for NativeBackend {
             return Err(BackendError::Busy);
         }
         let input = prompt_input(input)?;
+        self.cancel_requested.store(false, Ordering::Release);
         let jobs: Vec<NextTurnJob> = self.next_turn.lock().drain().map(|(_, job)| job).collect();
         for job in jobs {
             job(true).await;
@@ -767,6 +863,14 @@ impl AgentBackend for NativeBackend {
             if key == self.config.lock().session {
                 self.harness.set_model(model).await;
             }
+        }
+        // A cancel during preparation found no turn to abort; it stops the
+        // prompt here, before any model or tool call.
+        if self.cancel_requested.load(Ordering::Acquire) {
+            return Err(BackendError::failed(
+                ErrorCategory::Cancelled,
+                "the turn was cancelled before it started",
+            ));
         }
         let (done, handle) = TurnHandle::channel();
         let harness = Arc::clone(&self.harness);
@@ -819,6 +923,9 @@ impl AgentBackend for NativeBackend {
     }
 
     fn cancel(&self, _session: &SessionRef) {
+        if self.prompting.load(Ordering::Acquire) {
+            self.cancel_requested.store(true, Ordering::Release);
+        }
         self.harness.abort();
     }
 
@@ -827,7 +934,12 @@ impl AgentBackend for NativeBackend {
     }
 
     async fn shutdown(&self) {
+        self.cancel_requested.store(true, Ordering::Release);
         self.harness.request_shutdown();
+        // A prompt still preparing holds admission; wait for it to settle,
+        // then release whatever it left queued.
+        let _admission = self.admission.lock().await;
+        self.discard_next_turn().await;
     }
 
     fn compaction(&self) -> Option<&dyn Compaction> {

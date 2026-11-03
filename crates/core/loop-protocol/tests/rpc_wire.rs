@@ -510,6 +510,7 @@ fn config_changed_and_attach_snapshot_wire() {
         effort: Some("off".into()),
         mode: None,
         response_timeout_ms: None,
+        sandbox: None,
         active_skills: vec![],
     };
     let update = SessionUpdate::ConfigChanged(ConfigChanged {

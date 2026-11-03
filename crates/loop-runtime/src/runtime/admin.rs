@@ -47,6 +47,11 @@ pub(super) async fn release(generation: Arc<Generation>) {
     }
 }
 
+/// Starts the sandbox a test asks for.
+#[cfg(test)]
+pub(super) type SandboxStarter =
+    Arc<dyn Fn(&SandboxChoice) -> BackendResult<SandboxMode> + Send + Sync>;
+
 /// A Session's sandbox choice that waits for its work to end.
 pub(super) struct PendingSandbox {
     mode: SandboxMode,
@@ -100,6 +105,8 @@ impl LiveSession {
         } else {
             Runtime::sandbox_choice(&workspace.settings, false)
         };
+        // A choice that waited for the turn to end is now the effective one.
+        self.opened.native.sandbox_applied();
         Ok(())
     }
 
@@ -158,6 +165,59 @@ impl Runtime {
             }
         }
         *live.generation.lock().unwrap() = Some(current);
+    }
+
+    /// Start, record and install (or queue) a Session's new sandbox. Runs
+    /// under the Session's lifecycle lock inside `set_config`.
+    async fn choose_sandbox(
+        &self,
+        live: Arc<LiveSession>,
+        choice: SandboxChoice,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        let native = &live.opened.native;
+        if let Some(expected) = expected_revision {
+            if expected != native.revision() {
+                return Err(BackendError::Conflict {
+                    revision: native.revision(),
+                });
+            }
+        }
+        let workspace = self.workspace_now(&live.opened.workspace.cwd).await?;
+        let mode = self.start_sandbox(&workspace, &choice).await?;
+        let shared = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&workspace.cwd)
+            .and_then(|state| state.sandbox.clone());
+        let json = serde_json::to_value(&choice).map_err(failed)?;
+        let session = native.current_session().await;
+        let chosen = PendingSandbox {
+            mode,
+            choice,
+            shared,
+        };
+        // Whatever an earlier choice left waiting is stale now.
+        let stale = live.pending_sandbox.lock().unwrap().take();
+        if let Some(stale) = stale {
+            stale.discard().await;
+        }
+        if live.busy.load(Ordering::Acquire) {
+            // Running tool calls keep their sandbox; the next turn starts
+            // in this one. Recorded first: a choice that cannot be saved is
+            // not made.
+            let recorded = native.record_sandbox(&session, json, None, true).await;
+            if let Err(error) = recorded {
+                chosen.discard().await;
+                return Err(error);
+            }
+            *live.pending_sandbox.lock().unwrap() = Some(chosen);
+            recorded
+        } else {
+            live.install_sandbox(&workspace, chosen).await?;
+            native.record_sandbox(&session, json, None, false).await
+        }
     }
 
     /// Release what admin gave a closing Session: its place in a pending
@@ -399,6 +459,33 @@ impl Runtime {
         }
     }
 
+    /// Put a reopened Session back in the sandbox it last chose. Nothing has
+    /// run in it yet, so the swap needs no waiting.
+    pub(super) async fn restore_sandbox(
+        &self,
+        opened: &OpenedSession,
+        choice: &SandboxChoice,
+    ) -> BackendResult<()> {
+        let mode = self.start_sandbox(&opened.workspace, choice).await?;
+        let shared = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&opened.workspace.cwd)
+            .and_then(|state| state.sandbox.clone());
+        let previous = opened.harness.replace_sandbox(mode).await;
+        if let SandboxMode::Enabled { sandbox } = previous {
+            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
+                let _ = sandbox.destroy().await;
+            }
+        }
+        opened
+            .apply_workspace(&opened.workspace, RUNTIME_TOOLS)
+            .await
+            .map_err(failed)?;
+        Ok(())
+    }
+
     /// Start the sandbox `choice` asks for, validated by the platform builder.
     async fn start_sandbox(
         &self,
@@ -408,6 +495,13 @@ impl Runtime {
         use loop_app_core::sandbox_builder::{
             parse_local_sandbox_flags, SandboxBuilder, SandboxRequest,
         };
+        #[cfg(test)]
+        {
+            let starter = self.sandbox_starter.lock().unwrap().clone();
+            if let Some(starter) = starter {
+                return starter(choice);
+            }
+        }
         match choice.mode.as_str() {
             "off" | "disabled" => Ok(SandboxMode::Disabled),
             "local" => {
@@ -782,49 +876,18 @@ impl RuntimeAdmin for Runtime {
 
     async fn sandbox(&self, params: SandboxParams) -> BackendResult<SandboxResult> {
         let live = self.loaded(&params.session).await?;
+        let mut mutation = None;
         if params.action == SandboxAction::Set {
             let choice = params
                 .config
                 .ok_or_else(|| protocol("give the sandbox config to set"))?;
-            let _lifecycle = live.lifecycle.lock().await;
-            if live.closing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
-                return Err(failed("Session closing"));
-            }
-            let native = &live.opened.native;
-            if let Some(expected) = params.expected_revision {
-                if expected != native.revision() {
-                    return Err(BackendError::Conflict {
-                        revision: native.revision(),
-                    });
-                }
-            }
-            let workspace = self.workspace_now(&live.opened.workspace.cwd).await?;
-            let mode = self.start_sandbox(&workspace, &choice).await?;
-            let shared = self
-                .workspaces
-                .lock()
-                .unwrap()
-                .get(&workspace.cwd)
-                .and_then(|state| state.sandbox.clone());
-            let chosen = PendingSandbox {
-                mode,
-                choice,
-                shared,
-            };
-            if live.busy.load(Ordering::Acquire) {
-                // Running tool calls keep their sandbox; the next turn
-                // starts in this one.
-                let replaced = live.pending_sandbox.lock().unwrap().replace(chosen);
-                if let Some(replaced) = replaced {
-                    replaced.discard().await;
-                }
-            } else {
-                let replaced = live.pending_sandbox.lock().unwrap().take();
-                if let Some(replaced) = replaced {
-                    replaced.discard().await;
-                }
-                live.install_sandbox(&workspace, chosen).await?;
-            }
+            let target = Arc::clone(&live);
+            mutation = Some(
+                self.set_config(&params.session, false, |_| {
+                    self.choose_sandbox(target, choice, params.expected_revision)
+                })
+                .await?,
+            );
         }
         let mut info = live
             .opened
@@ -833,15 +896,26 @@ impl RuntimeAdmin for Runtime {
             .await
             .format_box()
             .to_string();
-        if live.pending_sandbox.lock().unwrap().is_some() {
+        let waiting = live
+            .pending_sandbox
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|pending| pending.choice.clone());
+        if waiting.is_some() {
             info.push_str("\nThe new sandbox applies from the next turn.");
         }
-        let config = live.sandbox_choice.lock().unwrap().clone();
+        let config = match waiting {
+            Some(choice) => choice,
+            None => live.sandbox_choice.lock().unwrap().clone(),
+        };
         Ok(SandboxResult {
             config,
             info,
-            revision: live.opened.native.revision(),
-            seq: None,
+            revision: mutation
+                .as_ref()
+                .map_or_else(|| live.opened.native.revision(), |m| m.revision),
+            seq: mutation.map(|m| m.seq),
         })
     }
 
