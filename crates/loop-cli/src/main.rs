@@ -601,7 +601,10 @@ async fn real_main() -> anyhow::Result<()> {
                 print_mode::shutdown_telemetry(&telemetry).await;
                 return result;
             }
-            Err(error) => eprintln!("loop: {error}; using in-process mode for this run"),
+            Err(error) => eprintln!(
+                "loop: {error}; using in-process mode for this run (Runtime log: {})",
+                agent_dir.join("logs/runtime.log").display()
+            ),
         }
     }
     let mut runtime = bootstrap_cli(BootstrapOpts {

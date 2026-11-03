@@ -98,6 +98,19 @@ pub fn pick(targets: &[Target]) -> anyhow::Result<usize> {
     read_choice(std::io::stdin().lock(), targets.len())
 }
 
+/// `--token-file` wins over `LOOP_RUNTIME_TOKEN`; one of them is required.
+fn websocket_token(token_file: Option<&Path>, env_token: Option<&str>) -> anyhow::Result<String> {
+    match token_file {
+        Some(path) => Ok(loop_wire::token::read(path)?),
+        None => env_token
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                anyhow::anyhow!("WebSocket connections require LOOP_RUNTIME_TOKEN or --token-file")
+            }),
+    }
+}
+
 pub async fn connect(
     target: &Target,
     token_file: Option<&Path>,
@@ -109,17 +122,10 @@ pub async fn connect(
                 loop_wire::socket::unix(tokio::net::UnixStream::connect(socket).await?)
             }
             Target::WebSocket(url) => {
-                let token = match token_file {
-                    Some(path) => loop_wire::token::read(path)?,
-                    None => std::env::var("LOOP_RUNTIME_TOKEN")
-                        .ok()
-                        .filter(|v| !v.trim().is_empty())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "WebSocket connections require LOOP_RUNTIME_TOKEN or --token-file"
-                            )
-                        })?,
-                };
+                let token = websocket_token(
+                    token_file,
+                    std::env::var("LOOP_RUNTIME_TOKEN").ok().as_deref(),
+                )?;
                 loop_wire::socket::websocket_connect(url, token.trim()).await?
             }
         };
@@ -643,6 +649,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn websocket_token_comes_from_the_file_or_the_environment() {
+        let error = websocket_token(None, None).unwrap_err().to_string();
+        assert!(error.contains("LOOP_RUNTIME_TOKEN"), "{error}");
+        assert!(websocket_token(None, Some("  ")).is_err());
+        assert_eq!(
+            websocket_token(None, Some("env-token")).unwrap(),
+            "env-token"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("token");
+        std::fs::write(&file, "file-token\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            websocket_token(Some(&file), Some("env-token"))
+                .unwrap()
+                .trim(),
+            "file-token"
+        );
+    }
     #[test]
     fn only_a_known_auto_started_empty_owner_can_be_version_replaced() {
         let mut status: loop_protocol::rpc::RuntimeStatus = serde_json::from_value(serde_json::json!({
