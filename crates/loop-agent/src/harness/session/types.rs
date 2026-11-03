@@ -487,6 +487,66 @@ pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionCont
     ctx
 }
 
+/// A Session's recorded model, reasoning effort and name, read from its
+/// whole tree rather than only the part since the last compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionConfigEntries {
+    /// Provider and model id last chosen on the active branch.
+    pub model: Option<(String, String)>,
+    /// Effort last chosen on the active branch, including an explicit
+    /// `Off`. `None` means the Session inherits the default.
+    pub thinking_level: Option<AgentThinkingLevel>,
+    /// Name last given to the Session.
+    pub name: Option<String>,
+    /// How many model and effort changes the Session ever recorded: its
+    /// config revision, stable across restarts.
+    pub revision: u64,
+}
+
+/// Read [`SessionConfigEntries`] from all of a Session's `entries`, for the
+/// branch ending at `head`.
+pub fn config_from_entries(
+    entries: &[SessionTreeEntry],
+    head: Option<&str>,
+) -> SessionConfigEntries {
+    let mut config = SessionConfigEntries::default();
+    let mut by_id = std::collections::HashMap::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            SessionTreeEntry::ModelChange { .. } | SessionTreeEntry::ThinkingLevelChange { .. } => {
+                config.revision += 1;
+            }
+            SessionTreeEntry::SessionInfo { name, .. } => config.name = Some(name.clone()),
+            _ => {}
+        }
+        by_id.insert(entry.id(), entry);
+    }
+    // Nearest first: the first value found on the way to the root wins.
+    let mut next = head;
+    let mut steps = 0;
+    while let Some(entry) = next.and_then(|id| by_id.get(id)) {
+        match entry {
+            SessionTreeEntry::ModelChange {
+                provider, model_id, ..
+            } if config.model.is_none() => {
+                config.model = Some((provider.clone(), model_id.clone()));
+            }
+            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. }
+                if config.thinking_level.is_none() =>
+            {
+                config.thinking_level = Some(*thinking_level);
+            }
+            _ => {}
+        }
+        steps += 1;
+        if steps > entries.len() || (config.model.is_some() && config.thinking_level.is_some()) {
+            break;
+        }
+        next = entry.parent_id();
+    }
+    config
+}
+
 /// Create a session id.
 pub fn create_session_id() -> String {
     loop_ai::new_id()

@@ -84,24 +84,6 @@ pub enum SessionUpdate {
         /// Why the transcript was replaced.
         reason: String,
     },
-    /// Replace the public Session metadata and configuration.
-    ConfigChanged {
-        /// Committed control revision.
-        revision: u64,
-        /// Complete public Session metadata.
-        metadata: crate::rpc::SessionMetadataView,
-        /// Desired public Session configuration.
-        config: serde_json::Value,
-        /// Public configuration effective for the current turn.
-        effective: serde_json::Value,
-        /// Desired state waiting for the next turn.
-        pending: serde_json::Value,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        /// Turn after which pending state takes effect.
-        applies_after_turn: Option<String>,
-        /// Revision of the workspace configuration.
-        workspace_revision: u64,
-    },
     /// A turn began.
     TurnStarted {
         /// Turn id.
@@ -175,9 +157,66 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,
     },
+    /// The Session's metadata or public config changed. Replaces the
+    /// previous metadata and config view; the transcript is unchanged.
+    ConfigChanged(ConfigChanged),
     /// An update with a `type` this reader does not know. The raw JSON is kept.
     #[serde(untagged)]
     Unknown(Value),
+}
+
+/// A Session's complete public config after a change (`config_changed`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigChanged {
+    /// The Session's config revision.
+    pub revision: u64,
+    /// Session metadata.
+    #[serde(default)]
+    pub metadata: SessionMetadata,
+    /// The selected config: what the next turn uses.
+    #[serde(default)]
+    pub config: SessionConfig,
+    /// The config the current turn runs with; equals `config` unless
+    /// `pending`.
+    #[serde(default)]
+    pub effective: SessionConfig,
+    /// Part of `config` waits for the running turn to end.
+    #[serde(default)]
+    pub pending: bool,
+    /// The turn after which `config` takes effect, while `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applies_after_turn: Option<TurnId>,
+    /// Revision of the workspace definitions the Session uses.
+    #[serde(default)]
+    pub workspace_revision: u64,
+}
+
+/// Session metadata carried by [`ConfigChanged`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct SessionMetadata {
+    /// Display name, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A Session's public config. Absent fields are not offered by the backend
+/// or not known yet. Never holds secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Model id, as `session/models` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort id, as `session/efforts` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Backend mode id, as `session/modes` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 /// Who wrote a message.

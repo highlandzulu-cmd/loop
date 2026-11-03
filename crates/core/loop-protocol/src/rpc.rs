@@ -74,6 +74,24 @@ pub mod methods {
     /// its normal signal shutdown: it closes every Session, removes its
     /// socket and exits. Served only by a shared Runtime.
     pub const RUNTIME_STOP: &str = "runtime/stop";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`super::ModelsResult`]. Needs the `set_model` capability.
+    pub const SESSION_MODELS: &str = "session/models";
+    /// Client → server request: [`super::SetModelParams`] →
+    /// [`crate::MutationResult`]. Needs the `set_model` capability.
+    pub const SESSION_SET_MODEL: &str = "session/set_model";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`super::ChoicesResult`]. Needs the `efforts` capability.
+    pub const SESSION_EFFORTS: &str = "session/efforts";
+    /// Client → server request: [`super::SetEffortParams`] →
+    /// [`crate::MutationResult`]. Needs the `efforts` capability.
+    pub const SESSION_SET_EFFORT: &str = "session/set_effort";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`super::ChoicesResult`]. Needs the `modes` capability.
+    pub const SESSION_MODES: &str = "session/modes";
+    /// Client → server request: [`super::SetModeParams`] →
+    /// [`crate::MutationResult`]. Needs the `modes` capability.
+    pub const SESSION_SET_MODE: &str = "session/set_mode";
 }
 
 /// Who is on the other end, for logs. Never used for feature checks.
@@ -217,13 +235,224 @@ fn is_zero(value: &u64) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AttachResult {
-    /// Immutable public state; absent on legacy servers.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub snapshot: Option<SessionSnapshot>,
     /// Last update sequence in the replay snapshot, not an audit cursor.
     pub latest_seq: u64,
     /// Runtime generation of the snapshot.
     pub generation: u64,
+    /// The Session's state at `latest_seq`, from servers with the
+    /// `attach_snapshot` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SessionSnapshot>,
+}
+
+/// A Session's state at one committed update sequence. Excludes secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionSnapshot {
+    /// The Session.
+    pub session: SessionRef,
+    /// Opaque host workspace identity, when the server reports one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace_id: String,
+    /// The update sequence the snapshot was taken at: the replay's last
+    /// update. Not the client's processed cursor.
+    pub at_seq: u64,
+    /// The Session's config revision.
+    pub revision: u64,
+    /// The active branch's revision.
+    #[serde(default)]
+    pub branch_revision: u64,
+    /// Immutable transcript view at `at_seq`, for servers with the
+    /// `branch_snapshot` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view_id: Option<String>,
+    /// Session metadata.
+    #[serde(default)]
+    pub metadata: crate::SessionMetadata,
+    /// The selected config.
+    #[serde(default)]
+    pub config: crate::SessionConfig,
+    /// The config the current turn runs with.
+    #[serde(default)]
+    pub effective: crate::SessionConfig,
+    /// Part of `config` waits for the running turn to end.
+    #[serde(default)]
+    pub pending: bool,
+    /// What this Session supports.
+    #[serde(default)]
+    pub capabilities: Capabilities,
+    /// Idle, busy or parked, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_state: Option<String>,
+    /// Public stats; unknown values are omitted.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub stats: Value,
+    /// Revision of the workspace definitions the Session uses.
+    #[serde(default)]
+    pub workspace_revision: u64,
+}
+
+/// One model in `session/models`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ModelInfo {
+    /// Id to pass to `session/set_model`.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Short description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The backend instance that runs the model.
+    pub backend: BackendInstanceId,
+}
+
+/// `session/models` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ModelsResult {
+    /// The current model's id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Every model on offer.
+    pub models: Vec<ModelInfo>,
+    /// The Session's config revision.
+    pub revision: u64,
+}
+
+/// One effort level or mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ChoiceInfo {
+    /// Id to pass to the setter.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+}
+
+/// `session/efforts` and `session/modes` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ChoicesResult {
+    /// The current choice's id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Every choice on offer.
+    pub choices: Vec<ChoiceInfo>,
+    /// The Session's config revision.
+    pub revision: u64,
+}
+
+/// `session/set_model` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetModelParams {
+    /// The Session.
+    pub session: SessionRef,
+    /// A [`ModelInfo::id`].
+    pub model: String,
+    /// Fail with a conflict unless the Session is at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+/// `session/set_effort` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetEffortParams {
+    /// The Session.
+    pub session: SessionRef,
+    /// A [`ChoiceInfo::id`] from `session/efforts`.
+    pub effort: String,
+    /// Fail with a conflict unless the Session is at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+/// `session/set_mode` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetModeParams {
+    /// The Session.
+    pub session: SessionRef,
+    /// A [`ChoiceInfo::id`] from `session/modes`.
+    pub mode: String,
+    /// Fail with a conflict unless the Session is at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+impl ModelsResult {
+    /// The wire form of `choices`, offered by backend `backend`.
+    pub fn from_choices(choices: crate::ModelChoices, backend: &BackendInstanceId) -> Self {
+        Self {
+            current: choices.current,
+            models: choices
+                .models
+                .into_iter()
+                .map(|m| ModelInfo {
+                    id: m.id,
+                    name: m.name,
+                    description: m.description,
+                    backend: backend.clone(),
+                })
+                .collect(),
+            revision: choices.revision,
+        }
+    }
+}
+
+impl From<ModelsResult> for crate::ModelChoices {
+    fn from(result: ModelsResult) -> Self {
+        Self {
+            current: result.current,
+            models: result
+                .models
+                .into_iter()
+                .map(|m| crate::ModelChoice {
+                    id: m.id,
+                    name: m.name,
+                    description: m.description,
+                })
+                .collect(),
+            revision: result.revision,
+        }
+    }
+}
+
+impl From<crate::ModelChoices> for ChoicesResult {
+    fn from(choices: crate::ModelChoices) -> Self {
+        Self {
+            current: choices.current,
+            choices: choices
+                .models
+                .into_iter()
+                .map(|m| ChoiceInfo {
+                    id: m.id,
+                    name: m.name,
+                })
+                .collect(),
+            revision: choices.revision,
+        }
+    }
+}
+
+impl From<ChoicesResult> for crate::ModelChoices {
+    fn from(result: ChoicesResult) -> Self {
+        Self {
+            current: result.current,
+            models: result
+                .choices
+                .into_iter()
+                .map(|c| crate::ModelChoice {
+                    id: c.id,
+                    name: c.name,
+                    description: None,
+                })
+                .collect(),
+            revision: result.revision,
+        }
+    }
 }
 
 /// `host/interact` params, preserving the v1 interaction shape.
@@ -333,14 +562,14 @@ impl From<PromptResult> for TurnOutcome {
 pub mod error_codes {
     /// [`crate::BackendError::Busy`].
     pub const BUSY: i64 = -32001;
-    /// A control setter used an outdated revision.
-    pub const CONFLICT: i64 = -32005;
     /// [`crate::BackendError::Unsupported`].
     pub const UNSUPPORTED: i64 = -32002;
     /// [`crate::BackendError::SessionNotFound`].
     pub const SESSION_NOT_FOUND: i64 = -32003;
     /// [`crate::BackendError::Failed`].
     pub const FAILED: i64 = -32004;
+    /// [`crate::BackendError::Conflict`]; data is `{"revision": n}`.
+    pub const CONFLICT: i64 = -32005;
 }
 
 /// A JSON-RPC error: code, message and optional data.
@@ -359,10 +588,6 @@ pub struct RpcErrorBody {
 impl From<&BackendError> for RpcErrorBody {
     fn from(error: &BackendError) -> Self {
         let (code, data) = match error {
-            BackendError::Conflict { revision } => (
-                error_codes::CONFLICT,
-                Some(serde_json::json!({"revision":revision})),
-            ),
             BackendError::Busy => (error_codes::BUSY, None),
             BackendError::Unsupported(what) => {
                 (error_codes::UNSUPPORTED, Some(Value::from(what.as_str())))
@@ -370,6 +595,10 @@ impl From<&BackendError> for RpcErrorBody {
             BackendError::SessionNotFound(key) => (
                 error_codes::SESSION_NOT_FOUND,
                 Some(serde_json::json!({ "session": key })),
+            ),
+            BackendError::Conflict { revision } => (
+                error_codes::CONFLICT,
+                Some(serde_json::json!({ "revision": revision })),
             ),
             BackendError::Failed(info) => (error_codes::FAILED, serde_json::to_value(info).ok()),
         };
@@ -388,9 +617,6 @@ impl RpcErrorBody {
     pub fn into_backend_error(self) -> BackendError {
         let data = self.data.unwrap_or(Value::Null);
         match self.code {
-            error_codes::CONFLICT => BackendError::Conflict {
-                revision: data["revision"].as_u64().unwrap_or_default(),
-            },
             error_codes::BUSY => BackendError::Busy,
             error_codes::UNSUPPORTED => {
                 BackendError::Unsupported(data.as_str().unwrap_or(&self.message).to_owned())
@@ -399,6 +625,9 @@ impl RpcErrorBody {
                 serde_json::from_value::<SessionKey>(data["session"].clone())
                     .unwrap_or_else(|_| SessionKey(String::new())),
             ),
+            error_codes::CONFLICT => BackendError::Conflict {
+                revision: data["revision"].as_u64().unwrap_or_default(),
+            },
             error_codes::FAILED => BackendError::Failed(
                 serde_json::from_value(data)
                     .unwrap_or_else(|_| ErrorInfo::new(ErrorCategory::Agent, self.message)),
@@ -453,12 +682,17 @@ pub fn json_schema() -> Value {
     let navigate_params = reference(generator.subschema_for::<NavigateParams>());
     let navigate_result = reference(generator.subschema_for::<NavigateResult>());
     let rename_params = reference(generator.subschema_for::<RenameParams>());
-    let mutation_result = reference(generator.subschema_for::<MutationResult>());
     let fork_params = reference(generator.subschema_for::<ForkParams>());
     let clone_params = reference(generator.subschema_for::<CloneParams>());
     let destination = reference(generator.subschema_for::<DestinationResult>());
     let export = reference(generator.subschema_for::<ExportResult>());
     let import = reference(generator.subschema_for::<ImportParams>());
+    let models = reference(generator.subschema_for::<ModelsResult>());
+    let choices = reference(generator.subschema_for::<ChoicesResult>());
+    let set_model = reference(generator.subschema_for::<SetModelParams>());
+    let set_effort = reference(generator.subschema_for::<SetEffortParams>());
+    let set_mode = reference(generator.subschema_for::<SetModeParams>());
+    let mutation = reference(generator.subschema_for::<crate::MutationResult>());
     let empty = serde_json::json!({"type": "object"});
     let method = |direction: &str, kind: &str, params: &Value, result: Option<&Value>| {
         let mut method = serde_json::json!({
@@ -473,7 +707,7 @@ pub fn json_schema() -> Value {
     };
     let up = "client_to_server";
     let down = "server_to_client";
-    serde_json::json!({
+    let mut schema = serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "loop-protocol",
         "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
@@ -485,7 +719,7 @@ pub fn json_schema() -> Value {
             methods::SESSION_TREE: method(up, "request", &tree_params, Some(&tree_result)),
             methods::SESSION_VIEW: method(up, "request", &view_params, Some(&view_result)),
             methods::SESSION_NAVIGATE: method(up, "request", &navigate_params, Some(&navigate_result)),
-            methods::SESSION_RENAME: method(up, "request", &rename_params, Some(&mutation_result)),
+            methods::SESSION_RENAME: method(up, "request", &rename_params, Some(&mutation)),
             methods::SESSION_FORK: method(up, "request", &fork_params, Some(&destination)),
             methods::SESSION_CLONE: method(up, "request", &clone_params, Some(&destination)),
             methods::SESSION_EXPORT: method(up, "request", &session_params, Some(&export)),
@@ -507,7 +741,38 @@ pub fn json_schema() -> Value {
         },
         "error": error,
         "$defs": generator.definitions(),
-    })
+    });
+    // Added separately: one `json!` this large exceeds the macro recursion limit.
+    let s3_methods = [
+        (
+            methods::SESSION_MODELS,
+            method(up, "request", &session_params, Some(&models)),
+        ),
+        (
+            methods::SESSION_SET_MODEL,
+            method(up, "request", &set_model, Some(&mutation)),
+        ),
+        (
+            methods::SESSION_EFFORTS,
+            method(up, "request", &session_params, Some(&choices)),
+        ),
+        (
+            methods::SESSION_SET_EFFORT,
+            method(up, "request", &set_effort, Some(&mutation)),
+        ),
+        (
+            methods::SESSION_MODES,
+            method(up, "request", &session_params, Some(&choices)),
+        ),
+        (
+            methods::SESSION_SET_MODE,
+            method(up, "request", &set_mode, Some(&mutation)),
+        ),
+    ];
+    for (name, entry) in s3_methods {
+        schema["methods"][name] = entry;
+    }
+    schema
 }
 
 /// Maximum UTF-8 JSONL transfer size, in bytes.
@@ -638,20 +903,7 @@ pub struct RenameParams {
     /// Reject if the current control revision differs.
     pub expected_revision: Option<u64>,
 }
-/// A committed metadata/config mutation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct MutationResult {
-    /// Committed control revision.
-    pub revision: u64,
-    /// Committed update sequence.
-    pub seq: u64,
-    /// Desired state waiting for the next turn.
-    pub pending: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Turn after which pending state takes effect.
-    pub applies_after_turn: Option<String>,
-}
+pub use crate::MutationResult;
 /// Create a new Session before a user message on the source branch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -716,48 +968,6 @@ pub struct ImportParams {
     pub jsonl: String,
     /// Stable retry id; reuse only for identical parameters.
     pub request_id: String,
-}
-
-/// Public Session metadata; never changes the transcript revision.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct SessionMetadataView {
-    /// Session display name.
-    pub name: Option<String>,
-}
-
-/// Consistent public Session state and an immutable transcript captured at at_seq.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-pub struct SessionSnapshot {
-    /// Session reference.
-    pub session: SessionRef,
-    /// Host workspace identity.
-    pub workspace_id: String,
-    /// Captured Event Log high-water mark.
-    pub at_seq: u64,
-    /// Control revision.
-    pub revision: u64,
-    /// Branch revision.
-    pub branch_revision: u64,
-    /// Immutable transcript view.
-    pub view_id: String,
-    /// Public metadata.
-    pub metadata: SessionMetadataView,
-    /// Desired public configuration.
-    pub config: Value,
-    /// Effective public configuration.
-    pub effective: Value,
-    /// Pending configuration changes.
-    pub pending: Value,
-    /// Services supported by this Session.
-    pub capabilities: Capabilities,
-    /// Idle, busy or parked.
-    pub turn_state: String,
-    /// Public stats; unknown values are omitted.
-    pub stats: Value,
-    /// Workspace configuration revision.
-    pub workspace_revision: u64,
 }
 
 /// One tree row, including its branch membership and editable user text.

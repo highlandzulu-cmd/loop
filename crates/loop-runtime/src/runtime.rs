@@ -18,9 +18,11 @@ use loop_app_core::{
     runtime::{BootstrapOpts, GlobalResources, OpenedSession, SessionFactory, WorkspaceResources},
 };
 use loop_protocol::{
-    rpc::SessionInfo, AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities,
-    ContentBlock, ErrorCategory, Origin, SessionKey, SessionRef, SessionSpec, SessionUpdate,
-    TurnHandle, TurnOutcome, UpdateEnvelope,
+    rpc::{SessionInfo, SessionSnapshot},
+    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ConfigChanged,
+    ContentBlock, ErrorCategory, ModelChoices, ModelControl, MutationResult, Origin, SessionKey,
+    SessionMetadata, SessionRef, SessionSpec, SessionUpdate, TurnHandle, TurnOutcome,
+    UpdateEnvelope,
 };
 use loop_wire::control::EscalationRecipient;
 use serde_json::json;
@@ -211,6 +213,55 @@ struct LiveSession {
     waiting: AsyncMutex<usize>,
     /// The cancellation count when the current turn began.
     turn_epoch: std::sync::atomic::AtomicU64,
+    /// The Session's config as last committed to the Event Log.
+    announced: Mutex<Announced>,
+}
+/// What the pump has committed and published of one Session. The pump is
+/// the only writer of a loaded Session's updates, so `published` and
+/// `latest`, read together, are a consistent point in its stream.
+struct Announced {
+    /// The newest update sequence the pump committed and is publishing.
+    published: u64,
+    /// The newest committed config (or the config the Session opened with).
+    latest: ConfigChanged,
+    /// Receipts of committed changes whose setters have not read them yet:
+    /// revision to sequence. Each setter takes its own, so any number may be
+    /// outstanding while the Event Log is slow.
+    receipts: HashMap<u64, u64>,
+    /// The newest revision committed. A later update with the same revision
+    /// (a pending change taking effect) is not a new change.
+    revision: u64,
+}
+impl Announced {
+    fn commit(&mut self, seq: u64, changed: &ConfigChanged) {
+        if changed.revision > self.revision {
+            self.revision = changed.revision;
+            self.receipts.insert(changed.revision, seq);
+        }
+        self.latest = changed.clone();
+    }
+}
+/// Drops a setter's receipt if the setter goes away before reading it.
+struct Receipt<'a> {
+    live: &'a LiveSession,
+    revision: u64,
+}
+impl Receipt<'_> {
+    fn take(self) -> Option<u64> {
+        self.live
+            .announced
+            .lock()
+            .unwrap()
+            .receipts
+            .remove(&self.revision)
+    }
+}
+impl Drop for Receipt<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut announced) = self.live.announced.lock() {
+            announced.receipts.remove(&self.revision);
+        }
+    }
 }
 enum Command {
     Cancel,
@@ -521,21 +572,7 @@ impl Runtime {
         if full() && (!self.unload_one().await || full()) {
             return Err(BackendError::Busy);
         }
-        let d = &self.defaults;
-        let mut opts = BootstrapOpts {
-            cwd: d.cwd.clone(),
-            provider: d.provider.clone(),
-            model: d.model.clone(),
-            theme: d.theme.clone(),
-            system_prompt: d.system_prompt.clone(),
-            append_system_prompt: d.append_system_prompt.clone(),
-            no_context_files: d.no_context_files,
-            interactive: false,
-            session_id: None,
-            no_web: d.no_web,
-            permission_mode: d.permission_mode.clone(),
-            agent: d.agent.clone(),
-        };
+        let mut opts = self.session_opts();
         if let Some(child) = &child {
             opts.cwd = child.cwd.clone();
         } else if let Some(cwd) = spec.cwd {
@@ -615,6 +652,11 @@ impl Runtime {
                 },
             );
             let reference = opened.native.current_session().await;
+            if !created && child.is_none() {
+                // The Session's own model and effort win over the Runtime's
+                // startup defaults.
+                opened.native.restore_config().await?;
+            }
             if !created {
                 // Turn ids stay unique per Session across Runtime generations.
                 let turns = self.log.turn_ids(&reference.key).await.map_err(failed)?;
@@ -670,6 +712,12 @@ impl Runtime {
                     keys.insert(reference.key.clone());
                 }
             }
+            let initial_config = opened.native.config();
+            // The tree is written before the Event Log; a change whose
+            // announcement was lost is announced before anyone is served.
+            let unannounced =
+                !created && initial_config.revision > self.logged_revision(&reference.key).await?;
+            let published = self.log.latest_seq(&reference.key).await.map_err(failed)?;
             let live = Arc::new(LiveSession {
                 lifecycle: AsyncMutex::new(()),
                 committed: AsyncMutex::new(None),
@@ -694,7 +742,30 @@ impl Runtime {
                 child: child_state,
                 waiting: AsyncMutex::new(0),
                 turn_epoch: std::sync::atomic::AtomicU64::new(0),
+                announced: Mutex::new(Announced {
+                    published,
+                    revision: initial_config.revision,
+                    latest: initial_config.clone(),
+                    receipts: HashMap::new(),
+                }),
             });
+            if unannounced {
+                publish(
+                    &live,
+                    UpdateEnvelope::live(
+                        self.instance.clone(),
+                        self.generation,
+                        reference.key.clone(),
+                        None,
+                        0,
+                        SessionUpdate::ConfigChanged(initial_config),
+                    ),
+                    self.log.as_ref(),
+                    self.generation,
+                    &self.updates,
+                )
+                .await?;
+            }
             if depth < self.subagent_depth {
                 if let Some(me) = self.me.get() {
                     subagent::offer(me.clone(), &live).await.map_err(failed)?;
@@ -1332,11 +1403,12 @@ impl Runtime {
             self.check_tree_live(&live)?;
             barrier(&live).await?;
             self.announce_control(&live, None).await?;
-            let mut attachment =
-                loop_wire::RuntimeControl::attach(self, session, after_seq).await?;
+            // Under the lock already held: read the pump's committed point.
+            let (at_seq, changed) = Self::announced(&live);
+            let public = self.public_snapshot(session, at_seq, changed);
+            let mut attachment = self.attachment(session, after_seq, public.clone()).await?;
             if snapshot {
-                attachment.snapshot =
-                    Some(self.snapshot_locked(&live, attachment.latest_seq).await?);
+                attachment.snapshot = Some(self.snapshot_locked(&live, public).await?);
             } else {
                 attachment.baseline = self.baseline_locked(&live, attachment.latest_seq).await?;
                 attachment.replay = Box::new(std::iter::empty());
@@ -1490,7 +1562,23 @@ impl loop_wire::RuntimeControl for Runtime {
                 return Err(BackendError::SessionNotFound(session.key.clone()));
             }
         }
-        // Plain Event Log replay stays read-only, including closed Sessions.
+        // The caller already listens for live updates, so anything committed
+        // after this read is delivered live; the caller removes the overlap.
+        let snapshot = self.snapshot(session).await?;
+        self.attachment(session, after_seq, snapshot).await
+    }
+}
+
+impl Runtime {
+    /// Committed updates after `after_seq` through the snapshot's `at_seq`.
+    /// Plain Event Log replay stays read-only, including closed Sessions;
+    /// callers may hold the lifecycle lock.
+    async fn attachment(
+        &self,
+        session: &SessionRef,
+        after_seq: u64,
+        snapshot: SessionSnapshot,
+    ) -> BackendResult<loop_wire::Attachment> {
         let records = self
             .log
             .read_after(&session.key, after_seq)
@@ -1499,20 +1587,256 @@ impl loop_wire::RuntimeControl for Runtime {
         let mut replay = Vec::with_capacity(records.len());
         for record in records {
             if let EventKind::Update(envelope) = record.event.kind {
-                replay.push(envelope);
+                if envelope.seq <= snapshot.at_seq {
+                    replay.push(envelope);
+                }
             }
         }
-        let latest_seq = match replay.last() {
-            Some(last) => last.seq,
-            None => self.log.latest_seq(&session.key).await.map_err(failed)?,
-        };
         Ok(loop_wire::Attachment {
             baseline: Vec::new(),
-            snapshot: None,
-            latest_seq,
+            latest_seq: snapshot.at_seq,
             generation: self.generation,
             replay: Box::new(replay.into_iter()),
+            snapshot: Some(snapshot),
         })
+    }
+}
+
+impl Runtime {
+    /// The Session's state at its newest published update. A loaded
+    /// Session's comes from its pump without waiting for it, so a stalled
+    /// Event Log does not hold up an attach; another one's is read from its
+    /// tree.
+    async fn snapshot(&self, session: &SessionRef) -> BackendResult<SessionSnapshot> {
+        // The pump records each committed sequence and config together, so
+        // they are a consistent point; the lifecycle lock orders the snapshot
+        // with prompt admission and close. Updates committed after it are
+        // delivered live; the caller removes the overlap by sequence.
+        let committed = match self.route(session) {
+            Ok(live) => {
+                let _lifecycle = live.lifecycle.lock().await;
+                Some(Self::announced(&live))
+            }
+            Err(_) => None,
+        };
+        let (at_seq, changed) = match committed {
+            Some(committed) => committed,
+            None => {
+                let at_seq = self.log.latest_seq(&session.key).await.map_err(failed)?;
+                (at_seq, self.recorded_config(session).await?)
+            }
+        };
+        Ok(self.public_snapshot(session, at_seq, changed))
+    }
+    /// The newest published sequence and config. Caller holds the lifecycle lock.
+    fn announced(live: &LiveSession) -> (u64, ConfigChanged) {
+        let announced = live.announced.lock().unwrap();
+        (announced.published, announced.latest.clone())
+    }
+    /// Public state at `at_seq`, without a transcript view.
+    fn public_snapshot(
+        &self,
+        session: &SessionRef,
+        at_seq: u64,
+        changed: ConfigChanged,
+    ) -> SessionSnapshot {
+        SessionSnapshot {
+            session: session.clone(),
+            workspace_id: String::new(),
+            at_seq,
+            revision: changed.revision,
+            branch_revision: 0,
+            view_id: None,
+            metadata: changed.metadata,
+            config: changed.config,
+            effective: changed.effective,
+            pending: changed.pending,
+            capabilities: self.capabilities(),
+            turn_state: None,
+            stats: serde_json::Value::Null,
+            workspace_revision: changed.workspace_revision,
+        }
+    }
+    /// A Session's config as its tree records it, without loading it.
+    async fn recorded_config(&self, session: &SessionRef) -> BackendResult<ConfigChanged> {
+        // A reader only: listing and attaching never take a writer lease.
+        let reader = SessionStore::load(self.store.as_ref(), &session.native_id)
+            .await
+            .map_err(failed)?;
+        let head = reader.read_head().await.map_err(failed)?;
+        let entries = reader.read_entries(None).await.map_err(failed)?;
+        let recorded =
+            loop_agent::harness::session::types::config_from_entries(&entries, head.as_deref());
+        // Described as loading it would set it up: the same defaults and
+        // the same rule for the Session's own choices.
+        let mut opts = self.session_opts();
+        if let Some(cwd) = &reader.metadata().cwd {
+            opts.cwd = PathBuf::from(cwd);
+        }
+        let workspace = self.factory.workspace(&opts).await.map_err(failed)?;
+        let (default_model, default_effort) = self.factory.session_defaults(&workspace, &opts);
+        let (model, level) = loop_agent::native_backend::restored_choice(
+            &self.factory.globals.models,
+            &recorded,
+            default_model,
+            default_effort,
+        );
+        let config = loop_agent::native_backend::session_config(model.as_ref(), level);
+        Ok(ConfigChanged {
+            revision: recorded.revision,
+            metadata: SessionMetadata {
+                name: recorded.name.or_else(|| reader.metadata().name.clone()),
+            },
+            effective: config.clone(),
+            config,
+            ..ConfigChanged::default()
+        })
+    }
+    /// Options to open a Session with the Runtime's startup defaults.
+    fn session_opts(&self) -> BootstrapOpts {
+        let d = &self.defaults;
+        BootstrapOpts {
+            cwd: d.cwd.clone(),
+            provider: d.provider.clone(),
+            model: d.model.clone(),
+            theme: d.theme.clone(),
+            system_prompt: d.system_prompt.clone(),
+            append_system_prompt: d.append_system_prompt.clone(),
+            no_context_files: d.no_context_files,
+            interactive: false,
+            session_id: None,
+            no_web: d.no_web,
+            permission_mode: d.permission_mode.clone(),
+            agent: d.agent.clone(),
+        }
+    }
+    /// The newest config revision the Event Log announced for `key`.
+    async fn logged_revision(&self, key: &SessionKey) -> BackendResult<u64> {
+        let records = self.log.read_after(key, 0).await.map_err(failed)?;
+        Ok(records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event.kind {
+                EventKind::Update(UpdateEnvelope {
+                    update: SessionUpdate::ConfigChanged(changed),
+                    ..
+                }) => Some(changed.revision),
+                _ => None,
+            })
+            .unwrap_or(0))
+    }
+    /// The loaded Session, loading it again when it was unloaded to make room.
+    async fn loaded(&self, session: &SessionRef) -> BackendResult<Arc<LiveSession>> {
+        match self.route(session) {
+            Err(BackendError::SessionNotFound(key)) if self.was_unloaded(&key) => {
+                self.reload(session).await?;
+                self.route(session)
+            }
+            other => other,
+        }
+    }
+    /// Run a config setter under the Session's lifecycle lock and return
+    /// once its `config_changed` update is committed (outside the lock). A setter that cannot
+    /// wait for the next turn refuses a busy Session.
+    async fn set_config<F, Fut>(
+        &self,
+        session: &SessionRef,
+        refuse_busy: bool,
+        set: F,
+    ) -> BackendResult<MutationResult>
+    where
+        F: FnOnce(Arc<LiveSession>) -> Fut,
+        Fut: Future<Output = BackendResult<MutationResult>>,
+    {
+        let live = self.loaded(session).await?;
+        let mut result = {
+            let _lifecycle = live.lifecycle.lock().await;
+            if live.closing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+                return Err(failed("Session closing"));
+            }
+            if let Some(error) = live.failure.lock().unwrap().clone() {
+                return Err(failed(error));
+            }
+            if refuse_busy && live.busy.load(Ordering::Acquire) {
+                return Err(BackendError::Busy);
+            }
+            set(Arc::clone(&live)).await?
+        };
+        let receipt = Receipt {
+            live: &live,
+            revision: result.revision,
+        };
+        // Not under the lock: a stalled Event Log must not hold up attach,
+        // admission or close. The pump commits in the order changes were
+        // made, so the reply still follows the commit.
+        barrier(&live).await?;
+        result.seq = receipt
+            .take()
+            .ok_or_else(|| failed("the change was not recorded in the Event Log"))?;
+        Ok(result)
+    }
+    fn control(live: &LiveSession) -> BackendResult<&dyn ModelControl> {
+        live.opened
+            .native
+            .model_control()
+            .ok_or_else(|| BackendError::Unsupported("choosing a model".into()))
+    }
+}
+
+#[async_trait]
+impl ModelControl for Runtime {
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        let live = self.loaded(session).await?;
+        Self::control(&live)?.models(session).await
+    }
+    async fn set_model(
+        &self,
+        session: &SessionRef,
+        model: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        // A model change never lands in the middle of a turn.
+        self.set_config(session, true, |live| async move {
+            Self::control(&live)?
+                .set_model(session, model, expected_revision)
+                .await
+        })
+        .await
+    }
+    async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        let live = self.loaded(session).await?;
+        Self::control(&live)?.efforts(session).await
+    }
+    async fn set_effort(
+        &self,
+        session: &SessionRef,
+        effort: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        // During a turn the change waits for the next one.
+        self.set_config(session, false, |live| async move {
+            Self::control(&live)?
+                .set_effort(session, effort, expected_revision)
+                .await
+        })
+        .await
+    }
+    async fn modes(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        let live = self.loaded(session).await?;
+        Self::control(&live)?.modes(session).await
+    }
+    async fn set_mode(
+        &self,
+        session: &SessionRef,
+        mode: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        self.set_config(session, false, |live| async move {
+            Self::control(&live)?
+                .set_mode(session, mode, expected_revision)
+                .await
+        })
+        .await
     }
 }
 
@@ -1528,16 +1852,21 @@ impl AgentBackend for Runtime {
             session_fork: true,
             session_transfer: true,
             branch_snapshot: true,
-            attach_snapshot: true,
             multi_session: true,
             attach: true,
+            attach_snapshot: true,
             load_session: true,
             images: true,
+            set_model: true,
+            efforts: true,
             ..Capabilities::default()
         }
     }
     fn subscribe(&self) -> broadcast::Receiver<UpdateEnvelope> {
         self.updates.subscribe()
+    }
+    fn model_control(&self) -> Option<&dyn ModelControl> {
+        Some(self)
     }
     async fn new_session(&self, spec: SessionSpec) -> BackendResult<SessionRef> {
         self.open(None, spec, None).await
@@ -1592,14 +1921,11 @@ impl AgentBackend for Runtime {
             }
             if !live.busy.load(Ordering::Acquire) {
                 self.announce_control(&live, None).await?;
-                barrier(&live).await?;
-                live.turn_start_seq.store(
-                    self.log
-                        .latest_seq(&live.reference.key)
-                        .await
-                        .map_err(failed)?,
-                    Ordering::Release,
-                );
+                // The pump's committed point, without waiting on the Event
+                // Log: anything still queued before this turn is a config
+                // update, which transcript views leave out.
+                let published = live.announced.lock().unwrap().published;
+                live.turn_start_seq.store(published, Ordering::Release);
                 *live.committed.lock().await =
                     Some(live.opened.harness.export_session().await.map_err(failed)?);
             }
@@ -1733,6 +2059,13 @@ async fn publish(
     }
     for record in committed {
         if let EventKind::Update(envelope) = record.event.kind {
+            {
+                let mut announced = live.announced.lock().unwrap();
+                announced.published = envelope.seq;
+                if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
+                    announced.commit(envelope.seq, changed);
+                }
+            }
             let mut tail = live.tail.lock().unwrap();
             if tail.len() == 256 {
                 tail.pop_front();

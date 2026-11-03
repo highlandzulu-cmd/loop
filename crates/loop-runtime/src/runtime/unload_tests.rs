@@ -596,7 +596,7 @@ async fn busy_attach_view_contains_already_committed_current_turn_updates() {
         parked(&rt,&source).await;
         let attachment = rt.attach_snapshot_watching(90,&source,0).await.unwrap();
         let snapshot = attachment.snapshot.unwrap();
-        let view = rt.view(ViewParams { session:source.clone(),view_id:snapshot.view_id,cursor:None,limit:None }).await.unwrap();
+        let view = rt.view(ViewParams { session:source.clone(),view_id:snapshot.view_id.unwrap(),cursor:None,limit:None }).await.unwrap();
         assert_eq!(view.at_seq,attachment.latest_seq);
         assert!(view.updates.iter().any(|update| matches!(update,SessionUpdate::MessageChunk { content,.. } if content.as_text() == Some("park snapshot"))));
         rt.cancel(&source);
@@ -918,7 +918,7 @@ async fn an_attach_snapshot_holds_turn_settlement_until_it_is_captured() {
         let view = rt
             .view(ViewParams {
                 session: source.clone(),
-                view_id: snapshot.view_id,
+                view_id: snapshot.view_id.unwrap(),
                 cursor: None,
                 limit: None,
             })

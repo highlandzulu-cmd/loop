@@ -7,7 +7,7 @@ use loop_protocol::{BackendError, BackendResult, ErrorCategory, SessionRef, Upda
 
 /// A consistent view of one Session's Event Log, for `session/attach`.
 pub struct Attachment {
-    /// Public Session state captured at the high-water mark.
+    /// The Session's state at `latest_seq`, when the owner can take one.
     pub snapshot: Option<loop_protocol::rpc::SessionSnapshot>,
     /// Last update `session_seq` in `replay`'s range (the high-water mark).
     pub latest_seq: u64,

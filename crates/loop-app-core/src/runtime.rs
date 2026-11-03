@@ -11,7 +11,7 @@ use loop_agent::harness::{
     search_tools_with_filter, verify_web_search_key, AgentHarness, AgentHarnessOptions,
     AgentHarnessResources, HostExecutionEnv, SandboxMode, WebSearchConfig,
 };
-use loop_agent::types::{AgentThinkingLevel, AgentTool};
+use loop_agent::types::AgentTool;
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
 use loop_ai::{CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions};
 
@@ -223,57 +223,53 @@ impl Runtime {
     }
 
     /// The reasoning effort Loop's own agent uses with the selected model:
-    /// the saved level, or `off` when the model does not accept it.
+    /// the Session's level, or `off` when the model does not accept it.
     pub fn native_effort(&self) -> String {
-        let saved = self.settings.default_thinking_level.to_lowercase();
-        if native_efforts(self.selected_model.as_ref(), &NATIVE_EFFORTS).contains(&saved) {
-            saved
-        } else {
-            "off".into()
-        }
+        loop_agent::effort::effective_effort(
+            self.selected_model.as_ref(),
+            self.native.thinking_level(),
+        )
     }
 
     /// The reasoning effort levels on offer, and the current one.
     pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {
-        if self.is_native() {
-            let current = self.native_effort();
-            return Ok((
-                native_efforts(self.selected_model.as_ref(), &NATIVE_EFFORTS),
-                current,
-            ));
-        }
+        let session = self.session_ref();
         let control = self
             .backend
             .model_control()
             .ok_or_else(|| anyhow::anyhow!("this subscription has no reasoning effort setting"))?;
-        let choices = control.efforts(&self.session_ref()).await?;
+        let choices = control.efforts(&session).await?;
         let levels = choices.models.into_iter().map(|m| m.id).collect();
         Ok((levels, choices.current.unwrap_or_default()))
     }
 
-    /// Set the reasoning effort to `level` and remember it for the next
-    /// session. Returns the level set.
+    /// Set the Session's reasoning effort to `level` and remember it for the
+    /// next session. Returns the level set.
     pub async fn set_effort(&mut self, level: &str) -> anyhow::Result<String> {
         let level = level.trim().to_lowercase();
-        let (levels, _) = self.efforts().await?;
-        if !levels.contains(&level) {
-            anyhow::bail!(
-                "unknown effort `{level}`; choose one of: {}",
-                levels.join(", ")
-            );
-        }
+        let session = self.session_ref();
+        let control = self
+            .backend
+            .model_control()
+            .ok_or_else(|| anyhow::anyhow!("this subscription has no reasoning effort setting"))?;
         match self.active_agent.clone() {
             None => {
-                self.harness
-                    .set_thinking_level(parse_thinking(&level))
-                    .await;
+                control.set_effort(&session, &level, None).await?;
+                // Today's TUI also makes the choice the default for new Sessions.
                 self.settings.default_thinking_level = level.clone();
+                self.native
+                    .set_default_effort(loop_agent::effort::parse_thinking(&level));
                 self.save_settings()?;
             }
             Some(id) => {
-                if let Some(control) = self.backend.model_control() {
-                    control.set_effort(&self.session_ref(), &level).await?;
+                let (levels, _) = self.efforts().await?;
+                if !levels.contains(&level) {
+                    anyhow::bail!(
+                        "unknown effort `{level}`; choose one of: {}",
+                        levels.join(", ")
+                    );
                 }
+                control.set_effort(&session, &level, None).await?;
                 self.agents.remember_effort(&id, &level)?;
                 self.agent_effort = Some(level.clone());
             }
@@ -285,9 +281,9 @@ impl Runtime {
     /// off → low → medium → high.
     pub async fn cycle_effort(&mut self) -> anyhow::Result<String> {
         let (levels, current) = if self.is_native() {
-            let levels = native_efforts(
+            let levels = loop_agent::effort::native_efforts(
                 self.selected_model.as_ref(),
-                &["off", "low", "medium", "high"],
+                &loop_agent::effort::CYCLE_EFFORTS,
             );
             (levels, self.native_effort())
         } else {
@@ -317,6 +313,7 @@ impl Runtime {
     /// Save `provider/model` as the default for the next start.
     pub fn remember_model(&mut self, provider: &str, model: &str) -> anyhow::Result<()> {
         self.settings.set_selected_model(provider, model);
+        self.sync_native_default_model();
         self.save_settings()
     }
 
@@ -431,17 +428,13 @@ impl Runtime {
                 }
             }
         }
-        if let Ok(ctx) = self.harness.session_context().await {
-            let recorded = ctx.model.as_ref().and_then(|(provider, model)| {
-                self.models
-                    .get_model(provider, model)
-                    .filter(|_| !self.credentials.is_logged_out(provider))
-            });
-            if let Some(model) = recorded {
-                self.harness.set_model(model.clone()).await;
-                self.selected_model = Some(model);
-                self.model_note = None;
-            }
+        self.native.restore_config().await?;
+        let restored = self.harness.model().await;
+        if restored.as_ref().map(|m| (&m.provider, &m.id))
+            != self.selected_model.as_ref().map(|m| (&m.provider, &m.id))
+        {
+            self.selected_model = restored;
+            self.model_note = None;
         }
         Ok(())
     }
@@ -482,9 +475,28 @@ impl Runtime {
                     })
                     .await?;
                 self.session_id = session.native_id;
+                // A new Session starts on the default model.
+                self.selected_model = self.harness.model().await;
                 Ok(())
             }
         }
+    }
+
+    /// Point Loop's own new Sessions at the saved default model. A default
+    /// that is a subscription agent leaves the native default unchanged.
+    fn sync_native_default_model(&self) {
+        let Some((provider, id)) = self.settings.selected_model() else {
+            self.native.set_default_model(None);
+            return;
+        };
+        if self.agents.entry(provider).is_some() {
+            return;
+        }
+        let model = self
+            .models
+            .get_model(provider, id)
+            .filter(|m| !self.credentials.is_logged_out(&m.provider));
+        self.native.set_default_model(model);
     }
 
     /// The active session as the backend interface names it.
@@ -707,6 +719,8 @@ impl Runtime {
                 self.save_settings()?;
             }
         }
+        // The default's metadata may have changed with the provider.
+        self.sync_native_default_model();
         self.needs_provider_setup = false;
         if id == loop_ai::providers::SOKET_PROVIDER_ID {
             // The Soket key also powers the default web search and fetch.
@@ -825,7 +839,7 @@ impl Runtime {
             .iter()
             .find(|m| offered.models.iter().any(|o| o.id == **m))?;
         if offered.current.as_deref() != Some(*wanted) {
-            if let Err(e) = control.set_mode(&session, wanted).await {
+            if let Err(e) = control.set_mode(&session, wanted, None).await {
                 tracing::warn!("could not set the agent's mode to {wanted}: {e}");
                 return offered.current;
             }
@@ -967,6 +981,7 @@ impl Runtime {
             self.selected_model = None;
             self.harness.clear_model().await;
             self.settings.clear_selected_model();
+            self.sync_native_default_model();
             self.save_settings()?;
         }
         if id == loop_ai::providers::SOKET_PROVIDER_ID {
@@ -977,7 +992,8 @@ impl Runtime {
         Ok(name)
     }
 
-    /// Select `provider/id` for this and future runs (harness + saved settings).
+    /// Select `provider/id` for Loop's own Session and future runs (the
+    /// Session records it; the TUI also saves it as the default).
     pub async fn select_model(
         &mut self,
         provider: &str,
@@ -990,8 +1006,16 @@ impl Runtime {
             .models
             .get_model(provider, id)
             .ok_or_else(|| anyhow::anyhow!("model not found: {provider}/{id}"))?;
-        self.harness.set_model(model.clone()).await;
+        let session = self.native.current_session().await;
+        loop_protocol::ModelControl::set_model(
+            self.native.as_ref(),
+            &session,
+            &format!("{provider}/{id}"),
+            None,
+        )
+        .await?;
         self.settings.set_selected_model(provider, id);
+        self.sync_native_default_model();
         self.selected_model = Some(model.clone());
         self.model_note = None;
         self.save_settings()?;
@@ -1383,55 +1407,6 @@ pub fn resolve_trust(
     }
 }
 
-/// Reasoning effort levels of Loop's own agent, as `/effort` names them.
-const NATIVE_EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// The levels of `candidates` that `model` accepts: only `off` for a model
-/// without reasoning, and none its thinking map marks unsupported.
-fn native_efforts(model: Option<&loop_ai::Model>, candidates: &[&str]) -> Vec<String> {
-    candidates
-        .iter()
-        .filter(|level| {
-            let Some(model) = model else {
-                return true;
-            };
-            let Some(reasoning) = parse_thinking(level).to_reasoning() else {
-                return true; // "off" is always available
-            };
-            model.reasoning
-                && !loop_ai::reasoning_rejected(model)
-                && model.thinking_level_map.as_ref().is_none_or(|map| {
-                    map.get(&loop_ai::ModelThinkingLevel::from(reasoning)) != Some(&None)
-                })
-        })
-        .map(|level| (*level).to_owned())
-        .collect()
-}
-
-fn parse_thinking(s: &str) -> AgentThinkingLevel {
-    match s.to_lowercase().as_str() {
-        "minimal" => AgentThinkingLevel::Minimal,
-        "low" => AgentThinkingLevel::Low,
-        "medium" => AgentThinkingLevel::Medium,
-        "high" => AgentThinkingLevel::High,
-        "xhigh" => AgentThinkingLevel::XHigh,
-        "max" => AgentThinkingLevel::Max,
-        _ => AgentThinkingLevel::Off,
-    }
-}
-
-fn thinking_label(level: AgentThinkingLevel) -> &'static str {
-    match level {
-        AgentThinkingLevel::Off => "off",
-        AgentThinkingLevel::Minimal => "minimal",
-        AgentThinkingLevel::Low => "low",
-        AgentThinkingLevel::Medium => "medium",
-        AgentThinkingLevel::High => "high",
-        AgentThinkingLevel::XHigh => "xhigh",
-        AgentThinkingLevel::Max => "max",
-    }
-}
-
 /// Bootstrap the full application Runtime, preserving interactive trust and sandbox fallback.
 pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let agent_dir = get_agent_dir();
@@ -1713,23 +1688,6 @@ mod tests {
             kept.compat.unwrap().thinking_format,
             Some(loop_ai::ThinkingFormat::Zai)
         );
-    }
-
-    #[test]
-    fn native_efforts_follow_the_model() {
-        let all = ["off", "low", "high"];
-        let mut model = loop_ai::providers::soket_seed_models().remove(0);
-        assert_eq!(native_efforts(Some(&model), &all), ["off", "low", "high"]);
-
-        model.thinking_level_map = Some(std::collections::HashMap::from([(
-            loop_ai::ModelThinkingLevel::High,
-            None,
-        )]));
-        assert_eq!(native_efforts(Some(&model), &all), ["off", "low"]);
-
-        model.reasoning = false;
-        assert_eq!(native_efforts(Some(&model), &all), ["off"]);
-        assert_eq!(native_efforts(None, &all), ["off", "low", "high"]);
     }
 }
 

@@ -18,9 +18,9 @@ mod update;
 
 pub use backend::{
     AgentBackend, BackendError, BackendResult, Compaction, CompactionReport, HostFileSystem,
-    HostServices, HostTerminals, LocalShell, ModelChoice, ModelChoices, ModelControl, SessionRef,
-    SessionSpec, SessionStats, ShellResult, StatsSummary, TerminalExit, TerminalOutput,
-    TerminalRequest, TurnHandle, TurnOutcome,
+    HostServices, HostTerminals, LocalShell, ModelChoice, ModelChoices, ModelControl,
+    MutationResult, SessionRef, SessionSpec, SessionStats, ShellResult, StatsSummary, TerminalExit,
+    TerminalOutput, TerminalRequest, TurnHandle, TurnOutcome,
 };
 pub use capabilities::Capabilities;
 pub use content::ContentBlock;
@@ -31,8 +31,9 @@ pub use interaction::{
     DECLINE_CHOICE,
 };
 pub use update::{
-    NoticeLevel, Origin, PlanEntry, PlanEntryStatus, Role, SessionUpdate, StopReason, ToolCall,
-    ToolCallStatus, ToolCallUpdate, ToolContent, ToolKind, ToolLocation, UpdateEnvelope, Usage,
+    ConfigChanged, NoticeLevel, Origin, PlanEntry, PlanEntryStatus, Role, SessionConfig,
+    SessionMetadata, SessionUpdate, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
+    ToolContent, ToolKind, ToolLocation, UpdateEnvelope, Usage,
 };
 
 /// Version of the event model. Bumped only for changes an older reader cannot

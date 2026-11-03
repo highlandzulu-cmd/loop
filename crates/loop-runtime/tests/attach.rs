@@ -660,12 +660,12 @@ async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
         let mut capable_rx = capable.subscribe();
         let attached = capable.attach(&source,log.latest_seq(&source.key).await.unwrap()).await.unwrap();
         let snapshot = attached.snapshot.unwrap();
-        let original_view = snapshot.view_id.clone();
+        let original_view = snapshot.view_id.clone().unwrap();
         let mut legacy_rx = legacy.subscribe();
         let renamed = capable.rename(RenameParams { session:source.clone(),name:"  renamed  ".into(),expected_revision:Some(snapshot.revision) }).await.unwrap();
         for receiver in [&mut capable_rx,&mut legacy_rx] {
             let events = collect(receiver,&source.key,renamed.seq).await;
-            assert!(matches!(events.last().unwrap().update,SessionUpdate::ConfigChanged { ref metadata, .. } if metadata.name.as_deref() == Some("renamed")));
+            assert!(matches!(events.last().unwrap().update,SessionUpdate::ConfigChanged(ref changed) if changed.metadata.name.as_deref() == Some("renamed")));
             assert!(!events.iter().any(|event| matches!(event.update,SessionUpdate::BranchReset { .. })));
         }
         let tree = capable.tree(TreeParams { session:source.clone(),cursor:None,limit:Some(1) }).await.unwrap();

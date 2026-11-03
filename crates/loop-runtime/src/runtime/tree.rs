@@ -295,10 +295,12 @@ impl Runtime {
             filled: false,
         })
     }
+    /// Add the branch state and an immutable transcript view at `public`'s
+    /// sequence. Caller holds the lifecycle lock.
     pub(super) async fn snapshot_locked(
         &self,
         live: &LiveSession,
-        at_seq: u64,
+        public: SessionSnapshot,
     ) -> BackendResult<SessionSnapshot> {
         let state = self
             .store
@@ -306,31 +308,22 @@ impl Runtime {
             .await
             .map_err(failed)?;
         let (file, busy) = self.capture(live).await?;
-        let config = self.public_config(live).await?;
         let slot = self.reserve_view(&live.reference, true)?;
-        let updates = self.transcript(live, &file, busy, at_seq).await?;
+        let updates = self.transcript(live, &file, busy, public.at_seq).await?;
+        let turn_state = if live.escalations.has_pending().await {
+            "parked"
+        } else if busy {
+            "busy"
+        } else {
+            "idle"
+        };
         Ok(SessionSnapshot {
-            session: live.reference.clone(),
             workspace_id: workspace_id(&live.opened.workspace.cwd),
-            at_seq,
-            revision: state.revision,
             branch_revision: state.branch_revision,
-            view_id: slot.fill(updates, state.branch_revision, at_seq),
-            metadata: SessionMetadataView { name: file.name },
-            config: config.clone(),
-            effective: config,
-            pending: json!({}),
-            capabilities: self.capabilities(),
-            turn_state: if live.escalations.has_pending().await {
-                "parked"
-            } else if busy {
-                "busy"
-            } else {
-                "idle"
-            }
-            .into(),
+            view_id: Some(slot.fill(updates, state.branch_revision, public.at_seq)),
+            turn_state: Some(turn_state.into()),
             stats: json!({}),
-            workspace_revision: 0,
+            ..public
         })
     }
     /// Read an immutable transcript page. Expired views fail explicitly.
@@ -573,18 +566,12 @@ impl Runtime {
             .await
             .map_err(failed)?;
         let update = if marker_value["kind"] == "rename" {
-            let config = self.public_config(live).await?;
-            SessionUpdate::ConfigChanged {
-                revision: state.revision,
-                metadata: SessionMetadataView {
-                    name: marker_value["name"].as_str().map(str::to_owned),
-                },
-                config: config.clone(),
-                effective: config,
-                pending: json!({}),
-                applies_after_turn: None,
-                workspace_revision: 0,
-            }
+            // Metadata only: the config and its revision stay as committed.
+            let name = marker_value["name"].as_str().map(str::to_owned);
+            live.opened.native.set_session_name(name.clone());
+            let mut changed = live.announced.lock().unwrap().latest.clone();
+            changed.metadata.name = name;
+            SessionUpdate::ConfigChanged(changed)
         } else {
             let slot = match slot {
                 Some(slot) => slot,
@@ -616,22 +603,6 @@ impl Runtime {
             .latest_seq(&live.reference.key)
             .await
             .map_err(failed)
-    }
-    async fn public_config(&self, live: &LiveSession) -> BackendResult<serde_json::Value> {
-        let harness = &live.opened.harness;
-        let model = harness
-            .model()
-            .await
-            .map(|model| format!("{}/{}", model.provider, model.id));
-        let context = harness.session_context().await.map_err(failed)?;
-        let mode = live.opened.tool_gate.mode().as_str();
-        let sandbox = harness.sandbox_info().await;
-        Ok(
-            json!({"backend":"native","model":model,"effort":context.thinking_level,
-            "mode":mode,"permission_mode":mode,"sandbox":{"fields":sandbox.fields},
-            "response_timeout_override_ms":null,"response_timeout_ms":harness.response_header_timeout_ms().await,
-            "active_skills":harness.active_skills().await}),
-        )
     }
     /// Return a bounded, consistent payload. The caller writes its own files.
     pub async fn export(&self, session: &SessionRef) -> BackendResult<ExportResult> {

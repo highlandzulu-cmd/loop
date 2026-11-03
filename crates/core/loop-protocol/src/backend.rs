@@ -35,9 +35,10 @@ pub enum BackendError {
     Unsupported(String),
     /// The session does not exist or belongs to another backend.
     SessionNotFound(SessionKey),
-    /// A setter used an outdated control revision.
+    /// The caller's expected revision is out of date; `revision` is the
+    /// current one.
     Conflict {
-        /// Current committed control revision.
+        /// The current revision.
         revision: u64,
     },
     /// The operation failed.
@@ -54,12 +55,13 @@ impl BackendError {
 impl fmt::Display for BackendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Conflict { revision } => {
-                write!(f, "revision conflict: current revision is {revision}")
-            }
             Self::Busy => f.write_str("a turn is already running"),
             Self::Unsupported(what) => write!(f, "not supported by this agent: {what}"),
             Self::SessionNotFound(key) => write!(f, "session not found: {key}"),
+            Self::Conflict { revision } => write!(
+                f,
+                "the Session changed meanwhile (now at revision {revision}); read it again"
+            ),
             Self::Failed(info) => f.write_str(&info.message),
         }
     }
@@ -214,15 +216,44 @@ pub struct ModelChoices {
     pub current: Option<String>,
     /// Every model on offer.
     pub models: Vec<ModelChoice>,
+    /// The Session's config revision these choices were read at. Zero when
+    /// the backend does not track revisions.
+    pub revision: u64,
 }
 
-/// Model selection for backends that choose their own models.
+/// What a committed Session setter changed (`MutationResult` on the wire).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MutationResult {
+    /// The Session's config revision after the change.
+    pub revision: u64,
+    /// Sequence of the `config_changed` update that announced it; zero when
+    /// the backend publishes no such update.
+    pub seq: u64,
+    /// The change waits for the running turn to end.
+    #[serde(default)]
+    pub pending: bool,
+    /// The turn after which a pending change takes effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applies_after_turn: Option<crate::ids::TurnId>,
+}
+
+/// Model, reasoning effort and mode selection for a Session.
+///
+/// Setters take the revision the caller last read; a stale one fails with
+/// [`BackendError::Conflict`]. `None` applies the change whatever the
+/// revision is (the latest setter wins).
 #[async_trait]
 pub trait ModelControl: Send + Sync {
     /// The models the session can use.
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices>;
     /// Switch the session to `model` (a [`ModelChoice::id`]).
-    async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()>;
+    async fn set_model(
+        &self,
+        session: &SessionRef,
+        model: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult>;
     /// The reasoning effort levels the session's model offers, as choices.
     async fn efforts(&self, _session: &SessionRef) -> BackendResult<ModelChoices> {
         Err(BackendError::Unsupported(
@@ -231,7 +262,12 @@ pub trait ModelControl: Send + Sync {
     }
     /// Switch the session to reasoning effort `effort` (a [`ModelChoice::id`]
     /// from [`Self::efforts`]).
-    async fn set_effort(&self, _session: &SessionRef, _effort: &str) -> BackendResult<()> {
+    async fn set_effort(
+        &self,
+        _session: &SessionRef,
+        _effort: &str,
+        _expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
         Err(BackendError::Unsupported(
             "choosing a reasoning effort".into(),
         ))
@@ -242,7 +278,12 @@ pub trait ModelControl: Send + Sync {
     }
     /// Switch the session to mode `mode` (a [`ModelChoice::id`] from
     /// [`Self::modes`]).
-    async fn set_mode(&self, _session: &SessionRef, _mode: &str) -> BackendResult<()> {
+    async fn set_mode(
+        &self,
+        _session: &SessionRef,
+        _mode: &str,
+        _expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
         Err(BackendError::Unsupported("choosing a mode".into()))
     }
 }

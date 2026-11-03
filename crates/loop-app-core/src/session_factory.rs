@@ -317,6 +317,62 @@ impl SessionFactory {
         Ok(Arc::clone(workspace))
     }
 
+    /// The model a Session opened with `opts` in `workspace` starts on, and
+    /// why there is none: the command-line choice, else the saved default.
+    fn startup_model(
+        &self,
+        workspace: &WorkspaceResources,
+        opts: &BootstrapOpts,
+    ) -> anyhow::Result<(Option<loop_ai::Model>, Option<String>)> {
+        let settings = &workspace.settings;
+        let agents = crate::agents::AgentManager::new(
+            crate::agents::agent_entries(&settings.agents),
+            workspace.cwd.clone(),
+            &self.globals.agent_dir,
+        );
+        // A saved subscription model is started by the surface, not Loop's agent.
+        let saved = settings
+            .selected_model()
+            .filter(|(provider, _)| agents.entry(provider).is_none());
+        let (model, note) = match crate::model_selection::resolve_startup_model(
+            &self.globals.models,
+            saved,
+            opts.provider.as_deref(),
+            opts.model.as_deref(),
+        )? {
+            StartupModel::Selected(model) => (Some(*model), None),
+            StartupModel::NotSelected { reason } => (None, reason),
+        };
+        if model
+            .as_ref()
+            .is_some_and(|m| self.globals.credentials.is_logged_out(&m.provider))
+        {
+            if opts.provider.is_some() || opts.model.is_some() {
+                bail!("selected provider is logged out; run /login before selecting its model");
+            }
+            return Ok((
+                None,
+                Some("saved provider is logged out; use /login or /model".into()),
+            ));
+        }
+        Ok((model, note))
+    }
+
+    /// The model and effort a Session without choices of its own uses in
+    /// `workspace`: what `open` gives it before restoring its tree.
+    pub fn session_defaults(
+        &self,
+        workspace: &WorkspaceResources,
+        opts: &BootstrapOpts,
+    ) -> (Option<loop_ai::Model>, loop_agent::AgentThinkingLevel) {
+        let model = self
+            .startup_model(workspace, opts)
+            .ok()
+            .and_then(|(m, _)| m);
+        let effort = loop_agent::effort::parse_thinking(&workspace.settings.default_thinking_level);
+        (model, effort)
+    }
+
     pub async fn open(
         &self,
         workspace: Arc<WorkspaceResources>,
@@ -347,34 +403,7 @@ impl SessionFactory {
         let models = Arc::clone(&globals.models);
         let credentials = Arc::clone(&globals.credentials);
         let mut settings = workspace.settings.clone();
-        let agents = crate::agents::AgentManager::new(
-            crate::agents::agent_entries(&settings.agents),
-            workspace.cwd.clone(),
-            &globals.agent_dir,
-        );
-        // A saved subscription model is started by the surface, not Loop's agent.
-        let saved = settings
-            .selected_model()
-            .filter(|(provider, _)| agents.entry(provider).is_none());
-        let (mut model, mut model_note) = match crate::model_selection::resolve_startup_model(
-            &models,
-            saved,
-            opts.provider.as_deref(),
-            opts.model.as_deref(),
-        )? {
-            StartupModel::Selected(model) => (Some(*model), None),
-            StartupModel::NotSelected { reason } => (None, reason),
-        };
-        if model
-            .as_ref()
-            .is_some_and(|m| credentials.is_logged_out(&m.provider))
-        {
-            if opts.provider.is_some() || opts.model.is_some() {
-                bail!("selected provider is logged out; run /login before selecting its model");
-            }
-            model = None;
-            model_note = Some("saved provider is logged out; use /login or /model".into());
-        }
+        let (mut model, mut model_note) = self.startup_model(&workspace, opts)?;
         if let Some(m) = &model {
             settings.set_selected_model(&m.provider, &m.id);
         }
@@ -420,24 +449,39 @@ impl SessionFactory {
                 .map_err(|e| session_error("create session", e))?
         };
 
-        // Restore model from the session branch when resuming (unless CLI overrides).
+        // A resumed Session gets back the model and effort it recorded: the
+        // model unless the command line names one, the effort when it chose
+        // one (an explicit off stays off). The saved defaults are untouched.
+        let default_model = model.clone();
+        let default_effort = loop_agent::effort::parse_thinking(&settings.default_thinking_level);
+        let mut effort = default_effort;
         if resumed {
-            if let Ok(ctx) = session.build_context().await {
+            let recorded = async {
+                let reader = session.reader();
+                let head = reader.read_head().await?;
+                let entries = reader.read_entries(None).await?;
+                Ok::<_, loop_agent::harness::types::SessionError>(
+                    loop_agent::harness::session::types::config_from_entries(
+                        &entries,
+                        head.as_deref(),
+                    ),
+                )
+            }
+            .await;
+            if let Ok(recorded) = recorded {
                 if opts.provider.is_none() && opts.model.is_none() {
-                    if let Some((p, m)) = &ctx.model {
+                    if let Some((p, m)) = &recorded.model {
                         if let Some(resolved) = models
                             .get_model(p, m)
                             .filter(|_| !credentials.is_logged_out(p))
                         {
-                            settings.set_selected_model(p, m);
                             model = Some(resolved);
                             model_note = None;
                         }
                     }
                 }
-                // Thinking-level changes are recorded on the branch when present.
-                if !matches!(ctx.thinking_level, AgentThinkingLevel::Off) {
-                    settings.default_thinking_level = thinking_label(ctx.thinking_level).into();
+                if let Some(level) = recorded.thinking_level {
+                    effort = level;
                 }
             }
         }
@@ -481,9 +525,7 @@ impl SessionFactory {
                 prompt_templates: workspace.resources.prompts.clone(),
             },
         }));
-        harness
-            .set_thinking_level(parse_thinking(&settings.default_thinking_level))
-            .await;
+        harness.set_thinking_level(effort).await;
         harness.set_bash_limits(bash_limits);
         harness
             .set_response_header_timeout_ms(settings.response_header_timeout_ms)
@@ -496,6 +538,8 @@ impl SessionFactory {
             .await;
 
         let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
+        native.set_default_effort(default_effort);
+        native.set_default_model(default_model);
 
         tool_gate.install(&harness);
         let mut startup_notices = workspace.startup_notices.clone();

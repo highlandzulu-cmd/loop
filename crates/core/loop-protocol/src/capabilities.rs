@@ -45,7 +45,8 @@ pub struct Capabilities {
     /// Serves immutable transcript pages.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub branch_snapshot: bool,
-    /// Supplies a consistent public snapshot on attach.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    /// Has selectable reasoning effort levels (`session/efforts`).
+    pub efforts: bool,
+    /// `session/attach` returns a Session snapshot with its result.
     pub attach_snapshot: bool,
 }
