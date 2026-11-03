@@ -207,8 +207,12 @@ struct LiveSession {
     /// The Session's config as last committed to the Event Log.
     announced: Mutex<Announced>,
 }
-/// Committed `config_changed` updates of one Session.
+/// What the pump has committed and published of one Session. The pump is
+/// the only writer of a loaded Session's updates, so `published` and
+/// `latest`, read together, are a consistent point in its stream.
 struct Announced {
+    /// The newest update sequence the pump committed and is publishing.
+    published: u64,
     /// The newest committed config (or the config the Session opened with).
     latest: ConfigChanged,
     /// Sequence of the first committed update of each recent revision.
@@ -238,9 +242,6 @@ impl Announced {
 enum Command {
     Cancel,
     Barrier(oneshot::Sender<()>),
-    /// Commit everything sent so far, then report the newest committed
-    /// sequence and config: a consistent point for an attach snapshot.
-    Snapshot(oneshot::Sender<BackendResult<(u64, ConfigChanged)>>),
     Stop(oneshot::Sender<()>),
 }
 pub(crate) fn now() -> i64 {
@@ -698,6 +699,7 @@ impl Runtime {
                 }
             }
             let initial_config = opened.native.config();
+            let published = self.log.latest_seq(&reference.key).await.map_err(failed)?;
             let live = Arc::new(LiveSession {
                 lifecycle: AsyncMutex::new(()),
                 opened,
@@ -720,6 +722,7 @@ impl Runtime {
                 waiting: AsyncMutex::new(0),
                 turn_epoch: std::sync::atomic::AtomicU64::new(0),
                 announced: Mutex::new(Announced {
+                    published,
                     latest: initial_config,
                     seqs: VecDeque::new(),
                 }),
@@ -1405,22 +1408,22 @@ impl loop_wire::RuntimeControl for Runtime {
 }
 
 impl Runtime {
-    /// The Session's state at its newest committed update. A loaded
-    /// Session's is taken under its lifecycle lock once its pump has
-    /// committed everything sent so far; another one's is read from its tree.
+    /// The Session's state at its newest published update. A loaded
+    /// Session's comes from its pump without waiting for it, so a stalled
+    /// Event Log does not hold up an attach; another one's is read from its
+    /// tree.
     async fn snapshot(&self, session: &SessionRef) -> BackendResult<SessionSnapshot> {
+        // Under the lifecycle lock no setter is between its change and the
+        // commit of its update. Updates committed after this point are
+        // delivered live; the caller removes the overlap by sequence.
         let committed = match self.route(session) {
             Ok(live) => {
                 let _lifecycle = live.lifecycle.lock().await;
-                let (tx, rx) = oneshot::channel();
-                match live.commands.send(Command::Snapshot(tx)) {
-                    Ok(()) => rx.await.ok().and_then(Result::ok),
-                    Err(_) => None,
-                }
+                let announced = live.announced.lock().unwrap();
+                Some((announced.published, announced.latest.clone()))
             }
             Err(_) => None,
         };
-        // Not loaded, or closing meanwhile: its pump commits nothing more.
         let (at_seq, changed) = match committed {
             Some(committed) => committed,
             None => {
@@ -1773,8 +1776,12 @@ async fn publish(
     }
     for record in committed {
         if let EventKind::Update(envelope) = record.event.kind {
-            if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
-                live.announced.lock().unwrap().commit(envelope.seq, changed);
+            {
+                let mut announced = live.announced.lock().unwrap();
+                announced.published = envelope.seq;
+                if let SessionUpdate::ConfigChanged(changed) = &envelope.update {
+                    announced.commit(envelope.seq, changed);
+                }
             }
             let mut tail = live.tail.lock().unwrap();
             if tail.len() == 256 {
@@ -1882,27 +1889,6 @@ async fn pump(
                         live.opened.native.cancel(&live.reference);
                         let withdrawn = live.escalations.withdraw("turn cancelled", false).await.map_err(failed);
                         result.map(|_| ()).and(withdrawn)
-                    }
-                    Some(Command::Snapshot(tx)) => {
-                        let result = async {
-                            loop { match receiver.try_recv() {
-                                Ok(e) => publish(&live, e, log.as_ref(), generation, &updates).await?,
-                                Err(broadcast::error::TryRecvError::Empty) => break,
-                                Err(error) => return Err(failed(format!("Session update pump lost activity: {error}"))),
-                            } }
-                            Ok(())
-                        }.await;
-                        if let Err(error) = &result { fail(&live, error); }
-                        let reply = match &result {
-                            Ok(()) => log
-                                .latest_seq(&live.reference.key)
-                                .await
-                                .map_err(failed)
-                                .map(|seq| (seq, live.announced.lock().unwrap().latest.clone())),
-                            Err(error) => Err(error.clone()),
-                        };
-                        let _ = tx.send(reply);
-                        result
                     }
                     Some(Command::Barrier(tx) | Command::Stop(tx)) => {
                         let result = async {

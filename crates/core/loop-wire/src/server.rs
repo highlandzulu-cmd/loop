@@ -151,7 +151,7 @@ enum Control {
         key: SessionKey,
         op: u64,
         after_seq: u64,
-        result: BackendResult<Attachment>,
+        result: Box<BackendResult<Attachment>>,
         session: loop_protocol::SessionRef,
     },
     /// Stop forwarding `key`, then answer `id`.
@@ -344,7 +344,7 @@ async fn handle(
                     session,
                     op,
                     after_seq,
-                    result,
+                    result: Box::new(result),
                 });
                 return;
             }
@@ -542,7 +542,7 @@ async fn forward(
                 Some(Control::Attaching { key, op }) => feeds.start_attach(key, op),
                 Some(Control::Attached { id, key, op, after_seq, result, session }) => {
                     let attached = result.is_ok() && matches!(feeds.map.get(&key), Some(Feed::Attaching { op: current, .. }) if *current == op);
-                    if feeds.finish_attach(&conn, id, key, op, after_seq, result).is_err() {
+                    if feeds.finish_attach(&conn, id, key, op, after_seq, *result).is_err() {
                         return;
                     }
                     if attached { register_recipient(runtime.as_deref(), &host, &session, true).await; }
