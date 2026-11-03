@@ -200,6 +200,52 @@ impl Runtime {
         Ok(updates)
     }
 
+    /// Whether the Event Log holds a branch reset at or after `after_seq`. A
+    /// detached legacy Surface's cursor is the reset's own seq.
+    pub(super) async fn reset_since(
+        &self,
+        session: &SessionRef,
+        after_seq: u64,
+    ) -> BackendResult<bool> {
+        Ok(self
+            .log
+            .read_after(&session.key, after_seq.saturating_sub(1))
+            .await
+            .map_err(failed)?
+            .iter()
+            .any(|record| {
+                matches!(&record.event.kind, EventKind::Update(envelope)
+                    if envelope.seq >= after_seq
+                        && matches!(envelope.update, SessionUpdate::BranchReset { .. }))
+            }))
+    }
+    /// The current branch through `at_seq`, stamped at `at_seq`. Caller holds
+    /// the lifecycle lock.
+    pub(super) async fn baseline_locked(
+        &self,
+        live: &LiveSession,
+        at_seq: u64,
+    ) -> BackendResult<Vec<UpdateEnvelope>> {
+        let (file, busy) = self.capture(live).await?;
+        Ok(self
+            .transcript(live, &file, busy, at_seq)
+            .await?
+            .into_iter()
+            .map(|update| {
+                let mut envelope = UpdateEnvelope::live(
+                    live.reference.instance.clone(),
+                    self.generation,
+                    live.reference.key.clone(),
+                    None,
+                    0,
+                    update,
+                );
+                envelope.seq = at_seq;
+                envelope.origin = Origin::Replay;
+                envelope
+            })
+            .collect())
+    }
     /// Reserve a view before changing any state, so a full Runtime refuses the
     /// change rather than committing a branch it cannot announce. Unbounded
     /// reservations reconcile an already committed change: one per Session.

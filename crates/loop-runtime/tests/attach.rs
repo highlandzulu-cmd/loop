@@ -699,3 +699,132 @@ async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
         rt.shutdown().await;
     }).await.unwrap();
 }
+
+/// Exact-text message chunks among `events`.
+fn texts(events: &[UpdateEnvelope]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match &event.update {
+            loop_protocol::SessionUpdate::MessageChunk { content, .. } => {
+                content.as_text().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect()
+}
+fn detach_notices(events: &[UpdateEnvelope]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(&event.update, loop_protocol::SessionUpdate::Notice { text, .. } if text == "this Session changed branch; attach again"))
+        .count()
+}
+
+#[tokio::test]
+async fn a_legacy_reattach_recovers_the_current_branch() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::*;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log.clone()).await;
+        let (legacy, _legacy_server) = connect(&rt).await;
+        let source = legacy.new_session(SessionSpec::default()).await.unwrap();
+        say(&legacy, &source, "first branch").await;
+        say(&legacy, &source, "second branch").await;
+        let (server, client) = memory();
+        let _capable_server = serve_with_control(
+            rt.clone(),
+            rt.clone(),
+            server,
+            info(),
+            ServeOptions {
+                owns_backend: false,
+            },
+        );
+        let capable = RemoteBackend::connect_with_capabilities(
+            client,
+            info(),
+            Arc::new(Reject),
+            ClientCapabilities {
+                interact: true,
+                branch_reset: true,
+            },
+        )
+        .await
+        .unwrap();
+        capable
+            .attach(&source, log.latest_seq(&source.key).await.unwrap())
+            .await
+            .unwrap();
+        let tree = capable
+            .tree(TreeParams {
+                session: source.clone(),
+                cursor: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let second = tree
+            .entries
+            .iter()
+            .find(|entry| entry.text.as_deref() == Some("second branch"))
+            .unwrap();
+        let mut legacy_rx = legacy.subscribe();
+        let reset = capable
+            .navigate(NavigateParams {
+                session: source.clone(),
+                target_entry_id: second.parent_id.clone(),
+                summarize: false,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            detach_notices(&collect(&mut legacy_rx, &source.key, reset.seq).await),
+            1
+        );
+
+        // Reattaching at the cursor the detach left starts from the current branch.
+        legacy.attach(&source, reset.seq).await.unwrap();
+        say(&capable, &source, "third branch").await;
+        let events = collect(
+            &mut legacy_rx,
+            &source.key,
+            log.latest_seq(&source.key).await.unwrap(),
+        )
+        .await;
+        let seen = texts(&events);
+        assert_eq!(
+            seen.iter().filter(|text| *text == "first branch").count(),
+            1,
+            "{seen:?}"
+        );
+        assert!(!seen.iter().any(|text| text == "second branch"), "{seen:?}");
+        assert!(seen.iter().any(|text| text == "third branch"), "{seen:?}");
+        assert_eq!(detach_notices(&events), 0);
+
+        // A fresh legacy attach from zero is not detached by the historical reset.
+        let (fresh, _fresh_server) = connect(&rt).await;
+        let mut fresh_rx = fresh.subscribe();
+        fresh.attach(&source, 0).await.unwrap();
+        say(&capable, &source, "fourth branch").await;
+        let events = collect(
+            &mut fresh_rx,
+            &source.key,
+            log.latest_seq(&source.key).await.unwrap(),
+        )
+        .await;
+        let seen = texts(&events);
+        assert_eq!(detach_notices(&events), 0);
+        assert_eq!(
+            seen.iter().filter(|text| *text == "first branch").count(),
+            1,
+            "{seen:?}"
+        );
+        assert!(!seen.iter().any(|text| text == "second branch"), "{seen:?}");
+        assert!(seen.iter().any(|text| text == "fourth branch"), "{seen:?}");
+        assert!(rt.watcher_count(&source.key) >= 3);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

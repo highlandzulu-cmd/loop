@@ -1305,7 +1305,11 @@ impl Runtime {
             let unloading = self
                 .route(session)
                 .map_or(true, |live| live.closing.load(Ordering::Acquire));
-            if unloading && (snapshot || self.was_unloaded(&session.key)) {
+            // A legacy Surface whose cursor reaches a branch reset cannot
+            // replay through it; give it the current branch instead.
+            let baseline = !snapshot && self.reset_since(session, after_seq).await?;
+            let fresh = snapshot || baseline;
+            if unloading && (fresh || self.was_unloaded(&session.key)) {
                 // Finished Subagents have an audit stream but cannot be reopened
                 // without their parent's policy and cancellation lineage.
                 if self.route(session).is_err() && self.subagent_parent(session).await?.is_some() {
@@ -1313,7 +1317,7 @@ impl Runtime {
                 }
                 self.reload(session).await?;
             }
-            if !snapshot {
+            if !fresh {
                 return loop_wire::RuntimeControl::attach(self, session, after_seq).await;
             }
             let live = self.route(session)?;
@@ -1323,7 +1327,13 @@ impl Runtime {
             self.announce_control(&live, None).await?;
             let mut attachment =
                 loop_wire::RuntimeControl::attach(self, session, after_seq).await?;
-            attachment.snapshot = Some(self.snapshot_locked(&live, attachment.latest_seq).await?);
+            if snapshot {
+                attachment.snapshot =
+                    Some(self.snapshot_locked(&live, attachment.latest_seq).await?);
+            } else {
+                attachment.baseline = self.baseline_locked(&live, attachment.latest_seq).await?;
+                attachment.replay = Box::new(std::iter::empty());
+            }
             Ok(attachment)
         }
         .await;
@@ -1490,6 +1500,7 @@ impl loop_wire::RuntimeControl for Runtime {
             None => self.log.latest_seq(&session.key).await.map_err(failed)?,
         };
         Ok(loop_wire::Attachment {
+            baseline: Vec::new(),
             snapshot: None,
             latest_seq,
             generation: self.generation,

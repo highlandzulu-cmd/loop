@@ -866,6 +866,13 @@ impl Feeds {
                 );
                 // A cursor ahead of the log would hide new updates.
                 let mut last = after_seq.min(attachment.latest_seq);
+                // A fresh branch transcript; it leaves the cursor at its stamp.
+                for mut envelope in attachment.baseline {
+                    last = last.max(envelope.seq);
+                    envelope.origin = Origin::Replay;
+                    envelope.generation = attachment.generation;
+                    self.send(conn, &envelope)?;
+                }
                 for mut envelope in attachment.replay {
                     if envelope.seq <= last {
                         continue;
@@ -1110,6 +1117,7 @@ mod tests {
                             snapshot: None,
                             latest_seq: 2,
                             generation: 1,
+                            baseline: Vec::new(),
                             replay: Box::new(vec![update("s", 1), reset].into_iter()),
                         }),
                     )
@@ -1158,6 +1166,7 @@ mod tests {
                 snapshot: None,
                 latest_seq: 0,
                 generation: 1,
+                baseline: Vec::new(),
                 replay: Box::new(std::iter::empty()),
             })
         };
