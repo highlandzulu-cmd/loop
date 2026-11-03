@@ -12,17 +12,21 @@ use async_trait::async_trait;
 use loop_ai::ImageContent;
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
-    CompactionReport, ContentBlock, ErrorCategory, ErrorInfo, LocalShell, NoticeLevel, Origin,
-    SessionKey, SessionRef, SessionSpec, SessionStats, SessionUpdate, ShellResult, StatsSummary,
-    StopReason, TurnHandle, TurnOutcome, UpdateEnvelope,
+    CompactionReport, ConfigChanged, ContentBlock, ErrorCategory, ErrorInfo, LocalShell,
+    ModelChoice, ModelChoices, ModelControl, MutationResult, NoticeLevel, Origin, SessionConfig,
+    SessionKey, SessionMetadata, SessionRef, SessionSpec, SessionStats, SessionUpdate, ShellResult,
+    StatsSummary, StopReason, TurnHandle, TurnId, TurnOutcome, UpdateEnvelope,
 };
 use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
+use crate::effort::{effective_effort, native_efforts, parse_thinking, NATIVE_EFFORTS};
 use crate::harness::agent_harness::AgentHarness;
 use crate::harness::session::format_session_stats;
+use crate::harness::session::types::PendingSessionWrite;
 use crate::harness::types::{AgentHarnessError, AgentHarnessPhase, ShellExecOptions};
 use crate::protocol_events::{replay, turn_outcome, NativeEventMapper};
+use crate::types::AgentThinkingLevel;
 use crate::types::{AgentEvent, PromptInput};
 
 /// Instance id of Loop's own agent.
@@ -40,6 +44,96 @@ pub struct NativeBackend {
     /// Set while a prompt sent through this backend runs, so two callers
     /// cannot both start one.
     prompting: Arc<AtomicBool>,
+    /// The current Session's model and effort, as last announced.
+    config: Arc<Mutex<ConfigState>>,
+    /// Serializes model and effort changes, so each revision check and its
+    /// write happen together.
+    setting: tokio::sync::Mutex<()>,
+    /// Effort for a Session that never chose one.
+    default_effort: Mutex<AgentThinkingLevel>,
+    /// Model for a new Session, or one that never chose one.
+    default_model: Mutex<Option<loop_ai::Model>>,
+    /// Held while a turn is admitted or the model changes, so a model
+    /// change never lands between the busy check and a turn's start.
+    admission: tokio::sync::Mutex<()>,
+}
+
+/// A Session's config as this backend last announced it.
+#[derive(Debug, Clone)]
+struct ConfigState {
+    /// The Session it describes; another one means it must be read again.
+    session: SessionKey,
+    revision: u64,
+    name: Option<String>,
+    /// The effort level chosen for the next turn, before the model's limits.
+    level: AgentThinkingLevel,
+    /// What the next turn uses.
+    config: SessionConfig,
+    /// What the running turn uses.
+    effective: SessionConfig,
+    /// The running turn a change waits for.
+    pending: Option<TurnId>,
+}
+
+impl ConfigState {
+    fn update(&self) -> SessionUpdate {
+        SessionUpdate::ConfigChanged(self.changed())
+    }
+
+    fn changed(&self) -> ConfigChanged {
+        ConfigChanged {
+            revision: self.revision,
+            metadata: SessionMetadata {
+                name: self.name.clone(),
+            },
+            config: self.config.clone(),
+            effective: self.effective.clone(),
+            pending: self.pending.is_some(),
+            applies_after_turn: self.pending.clone(),
+            workspace_revision: 0,
+        }
+    }
+}
+
+/// `provider/id` of `model`.
+fn model_id(model: &loop_ai::Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+/// The model and effort a Session with `recorded` choices opens with: its
+/// own model while still available (else `default_model`), and its own
+/// effort, including an explicit off (else `default_effort`). Loaded and
+/// not-yet-loaded Sessions are described with the same rule.
+pub fn restored_choice(
+    models: &loop_ai::Models,
+    recorded: &crate::harness::session::types::SessionConfigEntries,
+    default_model: Option<loop_ai::Model>,
+    default_effort: AgentThinkingLevel,
+) -> (Option<loop_ai::Model>, AgentThinkingLevel) {
+    let own = recorded.model.as_ref().and_then(|(provider, id)| {
+        if models.credentials().is_logged_out(provider) {
+            None
+        } else {
+            models.get_model(provider, id)
+        }
+    });
+    (
+        own.or(default_model),
+        recorded.thinking_level.unwrap_or(default_effort),
+    )
+}
+
+/// The config a Session runs with on `model` at `level`.
+pub fn session_config(model: Option<&loop_ai::Model>, level: AgentThinkingLevel) -> SessionConfig {
+    SessionConfig {
+        model: model.map(model_id),
+        effort: Some(effective_effort(model, level)),
+        mode: None,
+    }
+}
+
+fn invalid(message: String) -> BackendError {
+    BackendError::failed(ErrorCategory::Other, message)
 }
 
 /// Clears [`NativeBackend::prompting`] when the prompt is over.
@@ -55,6 +149,9 @@ impl Drop for PromptSlot {
 struct StreamState {
     session: SessionKey,
     seq: u64,
+    /// Envelopes are numbered and sent under the same lock, so subscribers
+    /// always see `seq` in increasing order.
+    updates: broadcast::Sender<UpdateEnvelope>,
     mapper: NativeEventMapper,
     /// Turns already numbered per Session this backend streamed before, so
     /// switching back never repeats a turn id.
@@ -72,26 +169,154 @@ impl NativeBackend {
         let stream = Arc::new(Mutex::new(StreamState {
             session,
             seq: 0,
+            updates: updates.clone(),
             mapper: NativeEventMapper::new(),
             turns: Default::default(),
         }));
+        let level = harness.thinking_level().await;
+        let default_model = harness.model().await;
         let backend = Arc::new(Self {
             instance: BackendInstanceId::from(NATIVE_INSTANCE),
             harness: Arc::clone(&harness),
             updates: updates.clone(),
             stream: Arc::clone(&stream),
             prompting: Arc::new(AtomicBool::new(false)),
+            config: Arc::new(Mutex::new(ConfigState {
+                session: SessionKey(String::new()),
+                revision: 0,
+                name: None,
+                level,
+                config: SessionConfig::default(),
+                effective: SessionConfig::default(),
+                pending: None,
+            })),
+            setting: tokio::sync::Mutex::new(()),
+            default_effort: Mutex::new(level),
+            default_model: Mutex::new(default_model),
+            admission: tokio::sync::Mutex::new(()),
         });
+        backend.read_config().await;
         let instance = backend.instance.clone();
+        let config = Arc::clone(&backend.config);
         harness.subscribe(move |event: AgentEvent| {
-            let envelopes = translate(&instance, &stream, &event);
-            for envelope in envelopes {
-                // No receivers is fine: nobody is listening yet.
-                let _ = updates.send(envelope);
+            if translate(&instance, &stream, &event) {
+                apply_pending(&instance, &stream, &config);
             }
             async {}
         });
         backend
+    }
+
+    /// The current Session's config, as a `config_changed` update would
+    /// carry it.
+    pub fn config(&self) -> ConfigChanged {
+        self.config.lock().changed()
+    }
+
+    /// Effort for Sessions that never chose one, used when one is restored.
+    pub fn set_default_effort(&self, level: AgentThinkingLevel) {
+        *self.default_effort.lock() = level;
+    }
+
+    /// Model for new Sessions and Sessions that never chose one.
+    pub fn set_default_model(&self, model: Option<loop_ai::Model>) {
+        *self.default_model.lock() = model;
+    }
+
+    /// The effort level the current Session chose for its next turn, before
+    /// the model's limits apply (see [`crate::effort::effective_effort`]).
+    pub fn thinking_level(&self) -> AgentThinkingLevel {
+        self.config.lock().level
+    }
+
+    /// Apply the model and effort the current Session recorded: its model
+    /// when still available, and its effort, or the default effort when it
+    /// never chose one (an explicit `off` stays off).
+    pub async fn restore_config(&self) -> BackendResult<()> {
+        let _setting = self.setting.lock().await;
+        let recorded = self.harness.session_config().await.map_err(harness_error)?;
+        let default_model = self.default_model.lock().clone();
+        let default_effort = *self.default_effort.lock();
+        let (model, level) = restored_choice(
+            self.harness.models(),
+            &recorded,
+            default_model,
+            default_effort,
+        );
+        match model {
+            Some(model) => self.harness.set_model(model).await,
+            None => self.harness.clear_model().await,
+        }
+        self.harness.set_thinking_level(level).await;
+        self.read_config().await;
+        Ok(())
+    }
+
+    /// Read the current Session's config from the harness and its tree.
+    async fn read_config(&self) {
+        let session = SessionKey(self.harness.session_id().await);
+        let recorded = self.harness.session_config().await.unwrap_or_default();
+        let model = self.harness.model().await;
+        let level = self.harness.thinking_level().await;
+        let config = session_config(model.as_ref(), level);
+        *self.config.lock() = ConfigState {
+            session,
+            revision: recorded.revision,
+            name: recorded.name,
+            level,
+            effective: config.clone(),
+            config,
+            pending: None,
+        };
+    }
+
+    /// Make sure the announced config is the harness's current Session's.
+    async fn current_config(&self, session: &SessionRef) -> BackendResult<()> {
+        self.check_session(session).await?;
+        let stale = self.config.lock().session != session.key;
+        if stale {
+            self.read_config().await;
+        }
+        Ok(())
+    }
+
+    /// Announce a change made under [`Self::setting`] and say when it
+    /// applies.
+    async fn announce_change(&self) -> MutationResult {
+        let model = self.harness.model().await;
+        let level = self.harness.thinking_level().await;
+        let running = self.is_busy_now();
+        let mut state = self.config.lock();
+        state.revision += 1;
+        state.level = level;
+        state.config = session_config(model.as_ref(), level);
+        let current_turn = self.stream.lock().mapper.current_turn().cloned();
+        match current_turn.filter(|_| running) {
+            Some(turn) => state.pending = Some(turn),
+            None => {
+                state.effective = state.config.clone();
+                state.pending = None;
+            }
+        }
+        let seq = announce(&self.instance, &self.stream, state.update());
+        MutationResult {
+            revision: state.revision,
+            seq,
+            pending: state.pending.is_some(),
+            applies_after_turn: state.pending.clone(),
+        }
+    }
+
+    fn check_revision(&self, expected: Option<u64>) -> BackendResult<()> {
+        let revision = self.config.lock().revision;
+        match expected {
+            Some(expected) if expected != revision => Err(BackendError::Conflict { revision }),
+            _ => Ok(()),
+        }
+    }
+
+    fn is_busy_now(&self) -> bool {
+        self.prompting.load(Ordering::Acquire) || self.harness.phase() != AgentHarnessPhase::Idle
     }
 
     /// The wrapped harness, for native-only features (sandbox, skills, MCP,
@@ -145,15 +370,17 @@ impl NativeBackend {
     }
 }
 
+/// Translate and send `event`'s updates. True when a turn ended.
 fn translate(
     instance: &BackendInstanceId,
     stream: &Mutex<StreamState>,
     event: &AgentEvent,
-) -> Vec<UpdateEnvelope> {
+) -> bool {
     let mut state = stream.lock();
     let updates = state.mapper.map(event);
-    let mut envelopes = Vec::with_capacity(updates.len());
+    let mut ended = false;
     for update in updates {
+        ended |= matches!(update, SessionUpdate::TurnEnded { .. });
         let turn = match &update {
             SessionUpdate::TurnStarted { turn_id } | SessionUpdate::TurnEnded { turn_id, .. } => {
                 Some(turn_id.clone())
@@ -161,37 +388,65 @@ fn translate(
             _ => state.mapper.current_turn().cloned(),
         };
         state.seq += 1;
-        envelopes.push(UpdateEnvelope::live(
+        let envelope = UpdateEnvelope::live(
             instance.clone(),
             0,
             state.session.clone(),
             turn,
             state.seq,
             update,
-        ));
+        );
+        // No receivers is fine: nobody is listening yet.
+        let _ = state.updates.send(envelope);
     }
-    envelopes
+    ended
 }
 
-/// An error notice outside any turn.
-fn error_notice(
+/// Send `update` as the current Session's next envelope, outside any turn.
+/// Returns its sequence.
+fn announce(
     instance: &BackendInstanceId,
     stream: &Mutex<StreamState>,
-    info: &ErrorInfo,
-) -> UpdateEnvelope {
+    update: SessionUpdate,
+) -> u64 {
     let mut state = stream.lock();
     state.seq += 1;
-    UpdateEnvelope::live(
+    let envelope = UpdateEnvelope::live(
         instance.clone(),
         0,
         state.session.clone(),
         None,
         state.seq,
+        update,
+    );
+    let _ = state.updates.send(envelope);
+    state.seq
+}
+
+/// A turn ended: changes made during it now apply. Announce that.
+fn apply_pending(
+    instance: &BackendInstanceId,
+    stream: &Mutex<StreamState>,
+    config: &Mutex<ConfigState>,
+) {
+    let mut state = config.lock();
+    if state.pending.take().is_none() || state.session != stream.lock().session {
+        return;
+    }
+    state.effective = state.config.clone();
+    announce(instance, stream, state.update());
+}
+
+/// Send an error notice outside any turn.
+fn error_notice(instance: &BackendInstanceId, stream: &Mutex<StreamState>, info: &ErrorInfo) {
+    announce(
+        instance,
+        stream,
         SessionUpdate::Notice {
             level: NoticeLevel::Error,
             text: info.message.clone(),
         },
-    )
+    );
 }
 
 /// Keep the stream complete when the harness fails outside a normal run, so
@@ -207,7 +462,7 @@ fn close_failed_turn(
     stream: &Mutex<StreamState>,
     turns_before: u64,
     info: &ErrorInfo,
-) -> Vec<UpdateEnvelope> {
+) {
     let mut state = stream.lock();
     let started = state.mapper.turns_started() > turns_before;
     let mut updates = Vec::new();
@@ -224,25 +479,24 @@ fn close_failed_turn(
         updates.extend(state.mapper.end_turn_with_error(info.clone()));
     }
     let session = state.session.clone();
-    updates
-        .into_iter()
-        .map(|update| {
-            let turn = match &update {
-                SessionUpdate::TurnStarted { turn_id }
-                | SessionUpdate::TurnEnded { turn_id, .. } => Some(turn_id.clone()),
-                _ => None,
-            };
-            state.seq += 1;
-            UpdateEnvelope::live(
-                instance.clone(),
-                0,
-                session.clone(),
-                turn,
-                state.seq,
-                update,
-            )
-        })
-        .collect()
+    for update in updates {
+        let turn = match &update {
+            SessionUpdate::TurnStarted { turn_id } | SessionUpdate::TurnEnded { turn_id, .. } => {
+                Some(turn_id.clone())
+            }
+            _ => None,
+        };
+        state.seq += 1;
+        let envelope = UpdateEnvelope::live(
+            instance.clone(),
+            0,
+            session.clone(),
+            turn,
+            state.seq,
+            update,
+        );
+        let _ = state.updates.send(envelope);
+    }
 }
 
 fn harness_error(err: AgentHarnessError) -> BackendError {
@@ -297,6 +551,7 @@ impl AgentBackend for NativeBackend {
         Capabilities {
             load_session: true,
             set_model: true,
+            efforts: true,
             usage: true,
             images: true,
             ..Capabilities::default()
@@ -314,7 +569,17 @@ impl AgentBackend for NativeBackend {
             .start_new_session(cwd, spec.name)
             .await
             .map_err(harness_error)?;
-        Ok(self.adopt_session(&id))
+        let session = self.adopt_session(&id);
+        // A new Session starts from the defaults, not the last one's choices.
+        let level = *self.default_effort.lock();
+        let model = self.default_model.lock().clone();
+        match model {
+            Some(model) => self.harness.set_model(model).await,
+            None => self.harness.clear_model().await,
+        }
+        self.harness.set_thinking_level(level).await;
+        self.read_config().await;
+        Ok(session)
     }
 
     async fn load_session(
@@ -331,6 +596,7 @@ impl AgentBackend for NativeBackend {
             .await
             .map_err(harness_error)?;
         let session = self.adopt_session(&id);
+        self.restore_config().await?;
         let history = self.transcript(&session).await?;
         let mut stream = self.stream.lock();
         for update in history {
@@ -365,6 +631,8 @@ impl AgentBackend for NativeBackend {
         input: Vec<ContentBlock>,
     ) -> BackendResult<TurnHandle> {
         self.check_session(session).await?;
+        // A model change in progress finishes before this turn is admitted.
+        let _admission = self.admission.lock().await;
         // Reserve the turn before checking the harness, so two callers
         // cannot both pass the check.
         if self
@@ -383,8 +651,8 @@ impl AgentBackend for NativeBackend {
         let harness = Arc::clone(&self.harness);
         let instance = self.instance.clone();
         let stream = Arc::clone(&self.stream);
-        let updates = self.updates.clone();
         let turns_before = self.stream.lock().mapper.turns_started();
+        let config = Arc::clone(&self.config);
         tokio::spawn(async move {
             let result = harness.prompt(input).await;
             drop(slot);
@@ -416,12 +684,11 @@ impl AgentBackend for NativeBackend {
                 // Another caller of the harness is running a turn; that
                 // turn is not this prompt's to close.
                 TurnOutcome::Failed(info) if rejected_busy => {
-                    let _ = updates.send(error_notice(&instance, &stream, info));
+                    error_notice(&instance, &stream, info);
                 }
                 TurnOutcome::Failed(info) if !ran => {
-                    for envelope in close_failed_turn(&instance, &stream, turns_before, info) {
-                        let _ = updates.send(envelope);
-                    }
+                    close_failed_turn(&instance, &stream, turns_before, info);
+                    apply_pending(&instance, &stream, &config);
                 }
                 _ => {}
             }
@@ -435,7 +702,7 @@ impl AgentBackend for NativeBackend {
     }
 
     fn is_busy(&self, _session: &SessionRef) -> bool {
-        self.prompting.load(Ordering::Acquire) || self.harness.phase() != AgentHarnessPhase::Idle
+        self.is_busy_now()
     }
 
     async fn shutdown(&self) {
@@ -452,6 +719,120 @@ impl AgentBackend for NativeBackend {
 
     fn local_shell(&self) -> Option<&dyn LocalShell> {
         Some(self)
+    }
+
+    fn model_control(&self) -> Option<&dyn ModelControl> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl ModelControl for NativeBackend {
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.current_config(session).await?;
+        let models = self.harness.models();
+        let available = models.get_available().await;
+        let state = self.config.lock();
+        Ok(ModelChoices {
+            current: state.config.model.clone(),
+            models: available
+                .iter()
+                .filter(|m| !models.credentials().is_logged_out(&m.provider))
+                .map(|m| ModelChoice {
+                    id: model_id(m),
+                    name: m.name.clone(),
+                    description: None,
+                })
+                .collect(),
+            revision: state.revision,
+        })
+    }
+
+    async fn set_model(
+        &self,
+        session: &SessionRef,
+        model: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        let _setting = self.setting.lock().await;
+        self.current_config(session).await?;
+        // Provider ids never contain `/`; model ids may.
+        let (provider, id) = model
+            .split_once('/')
+            .ok_or_else(|| invalid(format!("choose a model as provider/model, not `{model}`")))?;
+        if self.harness.models().credentials().is_logged_out(provider) {
+            return Err(invalid(format!(
+                "{provider} is logged out; run /login {provider}"
+            )));
+        }
+        let resolved = self
+            .harness
+            .models()
+            .get_model(provider, id)
+            .ok_or_else(|| invalid(format!("model not found: {provider}/{id}")))?;
+        self.check_revision(expected_revision)?;
+        // A model change never lands in the middle of a turn; holding
+        // admission keeps a turn from starting until it is done.
+        let _admission = self.admission.lock().await;
+        if self.is_busy_now() {
+            return Err(BackendError::Busy);
+        }
+        // Recorded first: a choice that cannot be saved is not made.
+        self.harness
+            .record_config(PendingSessionWrite::ModelChange {
+                provider: provider.into(),
+                model_id: id.into(),
+            })
+            .await
+            .map_err(harness_error)?;
+        self.harness.set_model(resolved).await;
+        Ok(self.announce_change().await)
+    }
+
+    async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        self.current_config(session).await?;
+        let model = self.harness.model().await;
+        let state = self.config.lock();
+        Ok(ModelChoices {
+            current: Some(effective_effort(model.as_ref(), state.level)),
+            models: native_efforts(model.as_ref(), &NATIVE_EFFORTS)
+                .into_iter()
+                .map(|level| ModelChoice {
+                    name: level.clone(),
+                    id: level,
+                    description: None,
+                })
+                .collect(),
+            revision: state.revision,
+        })
+    }
+
+    async fn set_effort(
+        &self,
+        session: &SessionRef,
+        effort: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        let _setting = self.setting.lock().await;
+        self.current_config(session).await?;
+        let level = effort.trim().to_lowercase();
+        let model = self.harness.model().await;
+        let levels = native_efforts(model.as_ref(), &NATIVE_EFFORTS);
+        if !levels.contains(&level) {
+            return Err(invalid(format!(
+                "unknown effort `{level}`; choose one of: {}",
+                levels.join(", ")
+            )));
+        }
+        let thinking_level = parse_thinking(&level);
+        self.check_revision(expected_revision)?;
+        self.harness
+            .record_config(PendingSessionWrite::ThinkingLevelChange { thinking_level })
+            .await
+            .map_err(harness_error)?;
+        // A running turn keeps the level it started with.
+        self.harness.set_thinking_level(thinking_level).await;
+        Ok(self.announce_change().await)
     }
 }
 

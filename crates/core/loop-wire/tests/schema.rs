@@ -178,3 +178,79 @@ fn runtime_methods_and_messages_are_in_the_schema() {
     assert!(!validator("InteractParams")
         .is_valid(&json!({"kind":"permission","id":"p1","session":7,"options":[]})));
 }
+
+#[test]
+fn model_control_methods_and_messages_are_in_the_schema() {
+    use loop_protocol::rpc::methods;
+    let schema = json_schema();
+    for method in [
+        methods::SESSION_MODELS,
+        methods::SESSION_SET_MODEL,
+        methods::SESSION_EFFORTS,
+        methods::SESSION_SET_EFFORT,
+        methods::SESSION_MODES,
+        methods::SESSION_SET_MODE,
+    ] {
+        assert_eq!(schema["methods"][method]["direction"], "client_to_server");
+        assert_eq!(schema["methods"][method]["kind"], "request");
+        assert!(
+            schema["methods"][method].get("result").is_some(),
+            "{method}"
+        );
+    }
+    let reference = json!({"instance": "loop", "key": "s", "native_id": "s"});
+    let cases = [
+        (
+            "UpdateEnvelope",
+            json!({"v": 1, "instance": "loop", "generation": 2, "session": "s", "seq": 9,
+                   "origin": "live",
+                   "update": {"type": "config_changed", "revision": 3, "metadata": {"name": "Review"},
+                              "config": {"model": "faux/one", "effort": "off"},
+                              "effective": {"model": "faux/one", "effort": "high"},
+                              "pending": true, "applies_after_turn": "turn-2",
+                              "workspace_revision": 0}}),
+        ),
+        (
+            "ModelsResult",
+            json!({"current": "faux/one", "revision": 3,
+                   "models": [{"id": "faux/one", "name": "One", "backend": "loop"}]}),
+        ),
+        (
+            "ChoicesResult",
+            json!({"current": "off", "revision": 3, "choices": [{"id": "off", "name": "off"}]}),
+        ),
+        (
+            "SetModelParams",
+            json!({"session": reference, "model": "faux/two", "expected_revision": 3}),
+        ),
+        (
+            "SetEffortParams",
+            json!({"session": reference, "effort": "high"}),
+        ),
+        (
+            "SetModeParams",
+            json!({"session": reference, "mode": "plan"}),
+        ),
+        (
+            "MutationResult",
+            json!({"revision": 4, "seq": 10, "pending": true, "applies_after_turn": "turn-2"}),
+        ),
+        (
+            "AttachResult",
+            json!({"latest_seq": 9, "generation": 2,
+                   "snapshot": {"session": reference, "at_seq": 9, "revision": 3,
+                                "metadata": {}, "config": {"effort": "off"},
+                                "effective": {"effort": "off"}, "pending": false,
+                                "capabilities": {"attach_snapshot": true}}}),
+        ),
+        ("AttachResult", json!({"latest_seq": 9, "generation": 2})),
+    ];
+    for (definition, message) in cases {
+        let validator = validator(definition);
+        let errors: Vec<String> = validator
+            .iter_errors(&message)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{definition}: {errors:?}\n{message}");
+    }
+}

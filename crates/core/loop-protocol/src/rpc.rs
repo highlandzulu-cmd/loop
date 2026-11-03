@@ -57,6 +57,24 @@ pub mod methods {
     /// its normal signal shutdown: it closes every Session, removes its
     /// socket and exits. Served only by a shared Runtime.
     pub const RUNTIME_STOP: &str = "runtime/stop";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`super::ModelsResult`]. Needs the `set_model` capability.
+    pub const SESSION_MODELS: &str = "session/models";
+    /// Client → server request: [`super::SetModelParams`] →
+    /// [`crate::MutationResult`]. Needs the `set_model` capability.
+    pub const SESSION_SET_MODEL: &str = "session/set_model";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`super::ChoicesResult`]. Needs the `efforts` capability.
+    pub const SESSION_EFFORTS: &str = "session/efforts";
+    /// Client → server request: [`super::SetEffortParams`] →
+    /// [`crate::MutationResult`]. Needs the `efforts` capability.
+    pub const SESSION_SET_EFFORT: &str = "session/set_effort";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`super::ChoicesResult`]. Needs the `modes` capability.
+    pub const SESSION_MODES: &str = "session/modes";
+    /// Client → server request: [`super::SetModeParams`] →
+    /// [`crate::MutationResult`]. Needs the `modes` capability.
+    pub const SESSION_SET_MODE: &str = "session/set_mode";
 }
 
 /// Who is on the other end, for logs. Never used for feature checks.
@@ -198,6 +216,201 @@ pub struct AttachResult {
     pub latest_seq: u64,
     /// Runtime generation of the snapshot.
     pub generation: u64,
+    /// The Session's state at `latest_seq`, from servers with the
+    /// `attach_snapshot` capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SessionSnapshot>,
+}
+
+/// A Session's state at one committed update sequence. Excludes secrets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SessionSnapshot {
+    /// The Session.
+    pub session: SessionRef,
+    /// The update sequence the snapshot was taken at: the replay's last
+    /// update. Not the client's processed cursor.
+    pub at_seq: u64,
+    /// The Session's config revision.
+    pub revision: u64,
+    /// Session metadata.
+    #[serde(default)]
+    pub metadata: crate::SessionMetadata,
+    /// The selected config.
+    #[serde(default)]
+    pub config: crate::SessionConfig,
+    /// The config the current turn runs with.
+    #[serde(default)]
+    pub effective: crate::SessionConfig,
+    /// Part of `config` waits for the running turn to end.
+    #[serde(default)]
+    pub pending: bool,
+    /// What this Session supports.
+    #[serde(default)]
+    pub capabilities: Capabilities,
+}
+
+/// One model in `session/models`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ModelInfo {
+    /// Id to pass to `session/set_model`.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Short description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The backend instance that runs the model.
+    pub backend: BackendInstanceId,
+}
+
+/// `session/models` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ModelsResult {
+    /// The current model's id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Every model on offer.
+    pub models: Vec<ModelInfo>,
+    /// The Session's config revision.
+    pub revision: u64,
+}
+
+/// One effort level or mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ChoiceInfo {
+    /// Id to pass to the setter.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+}
+
+/// `session/efforts` and `session/modes` result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ChoicesResult {
+    /// The current choice's id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current: Option<String>,
+    /// Every choice on offer.
+    pub choices: Vec<ChoiceInfo>,
+    /// The Session's config revision.
+    pub revision: u64,
+}
+
+/// `session/set_model` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetModelParams {
+    /// The Session.
+    pub session: SessionRef,
+    /// A [`ModelInfo::id`].
+    pub model: String,
+    /// Fail with a conflict unless the Session is at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+/// `session/set_effort` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetEffortParams {
+    /// The Session.
+    pub session: SessionRef,
+    /// A [`ChoiceInfo::id`] from `session/efforts`.
+    pub effort: String,
+    /// Fail with a conflict unless the Session is at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+/// `session/set_mode` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct SetModeParams {
+    /// The Session.
+    pub session: SessionRef,
+    /// A [`ChoiceInfo::id`] from `session/modes`.
+    pub mode: String,
+    /// Fail with a conflict unless the Session is at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+
+impl ModelsResult {
+    /// The wire form of `choices`, offered by backend `backend`.
+    pub fn from_choices(choices: crate::ModelChoices, backend: &BackendInstanceId) -> Self {
+        Self {
+            current: choices.current,
+            models: choices
+                .models
+                .into_iter()
+                .map(|m| ModelInfo {
+                    id: m.id,
+                    name: m.name,
+                    description: m.description,
+                    backend: backend.clone(),
+                })
+                .collect(),
+            revision: choices.revision,
+        }
+    }
+}
+
+impl From<ModelsResult> for crate::ModelChoices {
+    fn from(result: ModelsResult) -> Self {
+        Self {
+            current: result.current,
+            models: result
+                .models
+                .into_iter()
+                .map(|m| crate::ModelChoice {
+                    id: m.id,
+                    name: m.name,
+                    description: m.description,
+                })
+                .collect(),
+            revision: result.revision,
+        }
+    }
+}
+
+impl From<crate::ModelChoices> for ChoicesResult {
+    fn from(choices: crate::ModelChoices) -> Self {
+        Self {
+            current: choices.current,
+            choices: choices
+                .models
+                .into_iter()
+                .map(|m| ChoiceInfo {
+                    id: m.id,
+                    name: m.name,
+                })
+                .collect(),
+            revision: choices.revision,
+        }
+    }
+}
+
+impl From<ChoicesResult> for crate::ModelChoices {
+    fn from(result: ChoicesResult) -> Self {
+        Self {
+            current: result.current,
+            models: result
+                .choices
+                .into_iter()
+                .map(|c| crate::ModelChoice {
+                    id: c.id,
+                    name: c.name,
+                    description: None,
+                })
+                .collect(),
+            revision: result.revision,
+        }
+    }
 }
 
 /// `host/interact` params, preserving the v1 interaction shape.
@@ -313,6 +526,8 @@ pub mod error_codes {
     pub const SESSION_NOT_FOUND: i64 = -32003;
     /// [`crate::BackendError::Failed`].
     pub const FAILED: i64 = -32004;
+    /// [`crate::BackendError::Conflict`]; data is `{"revision": n}`.
+    pub const CONFLICT: i64 = -32005;
 }
 
 /// A JSON-RPC error: code, message and optional data.
@@ -339,6 +554,10 @@ impl From<&BackendError> for RpcErrorBody {
                 error_codes::SESSION_NOT_FOUND,
                 Some(serde_json::json!({ "session": key })),
             ),
+            BackendError::Conflict { revision } => (
+                error_codes::CONFLICT,
+                Some(serde_json::json!({ "revision": revision })),
+            ),
             BackendError::Failed(info) => (error_codes::FAILED, serde_json::to_value(info).ok()),
         };
         Self {
@@ -364,6 +583,9 @@ impl RpcErrorBody {
                 serde_json::from_value::<SessionKey>(data["session"].clone())
                     .unwrap_or_else(|_| SessionKey(String::new())),
             ),
+            error_codes::CONFLICT => BackendError::Conflict {
+                revision: data["revision"].as_u64().unwrap_or_default(),
+            },
             error_codes::FAILED => BackendError::Failed(
                 serde_json::from_value(data)
                     .unwrap_or_else(|_| ErrorInfo::new(ErrorCategory::Agent, self.message)),
@@ -411,6 +633,12 @@ pub fn json_schema() -> Value {
     let interaction = reference(generator.subschema_for::<InteractParams>());
     let interaction_outcome = reference(generator.subschema_for::<InteractionOutcome>());
     let error = reference(generator.subschema_for::<RpcErrorBody>());
+    let models = reference(generator.subschema_for::<ModelsResult>());
+    let choices = reference(generator.subschema_for::<ChoicesResult>());
+    let set_model = reference(generator.subschema_for::<SetModelParams>());
+    let set_effort = reference(generator.subschema_for::<SetEffortParams>());
+    let set_mode = reference(generator.subschema_for::<SetModeParams>());
+    let mutation = reference(generator.subschema_for::<crate::MutationResult>());
     let empty = serde_json::json!({"type": "object"});
     let method = |direction: &str, kind: &str, params: &Value, result: Option<&Value>| {
         let mut method = serde_json::json!({
@@ -425,7 +653,7 @@ pub fn json_schema() -> Value {
     };
     let up = "client_to_server";
     let down = "server_to_client";
-    serde_json::json!({
+    let mut schema = serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "title": "loop-protocol",
         "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
@@ -450,5 +678,36 @@ pub fn json_schema() -> Value {
         },
         "error": error,
         "$defs": generator.definitions(),
-    })
+    });
+    // Added separately: one `json!` this large exceeds the macro recursion limit.
+    let s3_methods = [
+        (
+            methods::SESSION_MODELS,
+            method(up, "request", &session_params, Some(&models)),
+        ),
+        (
+            methods::SESSION_SET_MODEL,
+            method(up, "request", &set_model, Some(&mutation)),
+        ),
+        (
+            methods::SESSION_EFFORTS,
+            method(up, "request", &session_params, Some(&choices)),
+        ),
+        (
+            methods::SESSION_SET_EFFORT,
+            method(up, "request", &set_effort, Some(&mutation)),
+        ),
+        (
+            methods::SESSION_MODES,
+            method(up, "request", &session_params, Some(&choices)),
+        ),
+        (
+            methods::SESSION_SET_MODE,
+            method(up, "request", &set_mode, Some(&mutation)),
+        ),
+    ];
+    for (name, entry) in s3_methods {
+        schema["methods"][name] = entry;
+    }
+    schema
 }

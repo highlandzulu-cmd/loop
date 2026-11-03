@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use loop_protocol::rpc::{
-    methods, negotiate, AttachParams, AttachResult, CloseParams, InitializeParams,
-    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
-    SessionParams,
+    methods, negotiate, AttachParams, AttachResult, ChoicesResult, CloseParams, InitializeParams,
+    InitializeResult, LoadParams, ModelsResult, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
+    SessionParams, SetEffortParams, SetModeParams, SetModelParams,
 };
 use loop_protocol::{
     AgentBackend, BackendInstanceId, BackendResult, HostServices, InteractionOutcome,
@@ -151,7 +151,7 @@ enum Control {
         key: SessionKey,
         op: u64,
         after_seq: u64,
-        result: BackendResult<Attachment>,
+        result: Box<BackendResult<Attachment>>,
         session: loop_protocol::SessionRef,
     },
     /// Stop forwarding `key`, then answer `id`.
@@ -203,6 +203,12 @@ async fn run(
                             // Advertise only what this connection can serve.
                             capabilities.multi_session = runtime.is_some();
                             capabilities.attach = runtime.is_some();
+                            capabilities.attach_snapshot &= runtime.is_some();
+                            if backend.model_control().is_none() {
+                                capabilities.set_model = false;
+                                capabilities.efforts = false;
+                                capabilities.modes = false;
+                            }
                             let result = InitializeResult {
                                 protocol_version: negotiate(params.protocol_version),
                                 server_info: info.clone(),
@@ -338,7 +344,7 @@ async fn handle(
                     session,
                     op,
                     after_seq,
-                    result,
+                    result: Box::new(result),
                 });
                 return;
             }
@@ -384,6 +390,15 @@ async fn handle(
             }
             Err(error) => return conn.respond(id, Err(error)),
         },
+        methods::SESSION_MODELS
+        | methods::SESSION_SET_MODEL
+        | methods::SESSION_EFFORTS
+        | methods::SESSION_SET_EFFORT
+        | methods::SESSION_MODES
+        | methods::SESSION_SET_MODE => match model_control(backend, method, params).await {
+            Ok(result) => result,
+            Err(error) => return conn.respond(id, Err(error)),
+        },
         _ => {
             return conn.respond(
                 id,
@@ -392,6 +407,73 @@ async fn handle(
         }
     };
     respond(conn, id, result.map_err(|e| RpcErrorBody::from(&e)));
+}
+
+/// `session/models`, `session/efforts`, `session/modes` and their setters.
+/// A backend without the service, or without the method's capability,
+/// answers Unsupported. The outer error is a malformed request.
+async fn model_control(
+    backend: &dyn AgentBackend,
+    method: &str,
+    params: Value,
+) -> Result<BackendResult<Value>, (i64, String)> {
+    let capabilities = backend.capabilities();
+    let (offered, what) = match method {
+        methods::SESSION_MODELS | methods::SESSION_SET_MODEL => {
+            (capabilities.set_model, "choosing a model")
+        }
+        methods::SESSION_EFFORTS | methods::SESSION_SET_EFFORT => {
+            (capabilities.efforts, "choosing a reasoning effort")
+        }
+        _ => (capabilities.modes, "choosing a mode"),
+    };
+    let Some(control) = backend.model_control().filter(|_| offered) else {
+        return Ok(Err(loop_protocol::BackendError::Unsupported(what.into())));
+    };
+    Ok(match method {
+        methods::SESSION_MODELS => {
+            let SessionParams { session } = parse(params)?;
+            control
+                .models(&session)
+                .await
+                .map(|c| to_value(&ModelsResult::from_choices(c, &session.instance)))
+        }
+        methods::SESSION_EFFORTS => {
+            let SessionParams { session } = parse(params)?;
+            control
+                .efforts(&session)
+                .await
+                .map(|c| to_value(&ChoicesResult::from(c)))
+        }
+        methods::SESSION_MODES => {
+            let SessionParams { session } = parse(params)?;
+            control
+                .modes(&session)
+                .await
+                .map(|c| to_value(&ChoicesResult::from(c)))
+        }
+        methods::SESSION_SET_MODEL => {
+            let p: SetModelParams = parse(params)?;
+            control
+                .set_model(&p.session, &p.model, p.expected_revision)
+                .await
+                .map(|r| to_value(&r))
+        }
+        methods::SESSION_SET_EFFORT => {
+            let p: SetEffortParams = parse(params)?;
+            control
+                .set_effort(&p.session, &p.effort, p.expected_revision)
+                .await
+                .map(|r| to_value(&r))
+        }
+        _ => {
+            let p: SetModeParams = parse(params)?;
+            control
+                .set_mode(&p.session, &p.mode, p.expected_revision)
+                .await
+                .map(|r| to_value(&r))
+        }
+    })
 }
 
 /// A prompt waiting for its turn to end.
@@ -460,7 +542,7 @@ async fn forward(
                 Some(Control::Attaching { key, op }) => feeds.start_attach(key, op),
                 Some(Control::Attached { id, key, op, after_seq, result, session }) => {
                     let attached = result.is_ok() && matches!(feeds.map.get(&key), Some(Feed::Attaching { op: current, .. }) if *current == op);
-                    if feeds.finish_attach(&conn, id, key, op, after_seq, result).is_err() {
+                    if feeds.finish_attach(&conn, id, key, op, after_seq, *result).is_err() {
                         return;
                     }
                     if attached { register_recipient(runtime.as_deref(), &host, &session, true).await; }
@@ -717,6 +799,7 @@ impl Feeds {
                     Ok(to_value(&AttachResult {
                         latest_seq: attachment.latest_seq,
                         generation: attachment.generation,
+                        snapshot: attachment.snapshot,
                     })),
                 );
                 // A cursor ahead of the log would hide new updates.
@@ -912,6 +995,7 @@ mod tests {
                 latest_seq: 0,
                 generation: 1,
                 replay: Box::new(std::iter::empty()),
+                snapshot: None,
             })
         };
         // The first completion is stale: it must not touch the newer entry.

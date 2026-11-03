@@ -124,6 +124,7 @@ fn every_backend_error_survives_the_wire() {
         BackendError::Unsupported("images".into()),
         BackendError::SessionNotFound("s9".into()),
         BackendError::failed(ErrorCategory::Auth, "sign in again"),
+        BackendError::Conflict { revision: 7 },
     ];
     for error in errors {
         let body = RpcErrorBody::from(&error);
@@ -225,6 +226,7 @@ fn session_control_wire_and_defaults() {
         &AttachResult {
             latest_seq: 42,
             generation: 3,
+            snapshot: None,
         },
         json!({"latest_seq":42,"generation":3}),
     );
@@ -284,7 +286,8 @@ fn runtime_capabilities_are_opt_in() {
         &capabilities,
         json!({"load_session":false,"resume_session":false,"set_model":false,
         "modes":false,"usage":false,"images":false,"steering":false,"fs_client":false,
-        "terminal_client":false,"multi_session":true,"attach":true}),
+        "terminal_client":false,"multi_session":true,"attach":true,"efforts":false,
+        "attach_snapshot":false}),
     );
 }
 
@@ -329,4 +332,177 @@ fn interactions_route_to_a_session_and_withdraw_by_native_id() {
         },
         json!({"session":{"instance":"native","key":"s1","native_id":"n1"},"id":"p1"}),
     );
+}
+
+#[test]
+fn model_control_methods_wire() {
+    use loop_protocol::rpc::{
+        methods, ChoiceInfo, ChoicesResult, ModelInfo, ModelsResult, SetEffortParams,
+        SetModeParams, SetModelParams,
+    };
+    use loop_protocol::{ModelChoice, ModelChoices, MutationResult};
+    let reference = json!({"instance":"native","key":"s1","native_id":"n1"});
+    assert_eq!(
+        [
+            methods::SESSION_MODELS,
+            methods::SESSION_SET_MODEL,
+            methods::SESSION_EFFORTS,
+            methods::SESSION_SET_EFFORT,
+            methods::SESSION_MODES,
+            methods::SESSION_SET_MODE,
+        ],
+        [
+            "session/models",
+            "session/set_model",
+            "session/efforts",
+            "session/set_effort",
+            "session/modes",
+            "session/set_mode",
+        ]
+    );
+    let models = ModelsResult {
+        current: Some("faux/one".into()),
+        models: vec![ModelInfo {
+            id: "faux/one".into(),
+            name: "One".into(),
+            description: None,
+            backend: "loop".into(),
+        }],
+        revision: 4,
+    };
+    roundtrip(
+        &models,
+        json!({"current":"faux/one","models":[{"id":"faux/one","name":"One","backend":"loop"}],
+            "revision":4}),
+    );
+    let choices = ModelChoices::from(models.clone());
+    assert_eq!(
+        choices,
+        ModelChoices {
+            current: Some("faux/one".into()),
+            models: vec![ModelChoice {
+                id: "faux/one".into(),
+                name: "One".into(),
+                description: None,
+            }],
+            revision: 4,
+        }
+    );
+    assert_eq!(ModelsResult::from_choices(choices, &"loop".into()), models);
+    let efforts = ChoicesResult {
+        current: None,
+        choices: vec![ChoiceInfo {
+            id: "off".into(),
+            name: "off".into(),
+        }],
+        revision: 0,
+    };
+    roundtrip(
+        &efforts,
+        json!({"choices":[{"id":"off","name":"off"}],"revision":0}),
+    );
+    assert_eq!(
+        ChoicesResult::from(ModelChoices::from(efforts.clone())),
+        efforts
+    );
+    roundtrip(
+        &SetModelParams {
+            session: session(),
+            model: "faux/two".into(),
+            expected_revision: Some(4),
+        },
+        json!({"session":reference,"model":"faux/two","expected_revision":4}),
+    );
+    roundtrip(
+        &SetEffortParams {
+            session: session(),
+            effort: "off".into(),
+            expected_revision: None,
+        },
+        json!({"session":reference,"effort":"off"}),
+    );
+    roundtrip(
+        &SetModeParams {
+            session: session(),
+            mode: "plan".into(),
+            expected_revision: None,
+        },
+        json!({"session":reference,"mode":"plan"}),
+    );
+    roundtrip(
+        &MutationResult {
+            revision: 5,
+            seq: 12,
+            pending: true,
+            applies_after_turn: Some("turn-3".into()),
+        },
+        json!({"revision":5,"seq":12,"pending":true,"applies_after_turn":"turn-3"}),
+    );
+    let old: MutationResult = serde_json::from_value(json!({"revision":1,"seq":2})).unwrap();
+    assert!(!old.pending);
+}
+
+#[test]
+fn a_conflict_carries_the_current_revision() {
+    let body = RpcErrorBody::from(&BackendError::Conflict { revision: 9 });
+    assert_eq!(body.code, error_codes::CONFLICT);
+    assert_eq!(body.data, Some(json!({"revision": 9})));
+}
+
+#[test]
+fn config_changed_and_attach_snapshot_wire() {
+    use loop_protocol::rpc::{AttachResult, SessionSnapshot};
+    use loop_protocol::{ConfigChanged, SessionConfig, SessionMetadata, SessionUpdate};
+    let config = SessionConfig {
+        model: Some("faux/one".into()),
+        effort: Some("off".into()),
+        mode: None,
+    };
+    let update = SessionUpdate::ConfigChanged(ConfigChanged {
+        revision: 3,
+        metadata: SessionMetadata {
+            name: Some("Review".into()),
+        },
+        config: config.clone(),
+        effective: SessionConfig {
+            effort: Some("high".into()),
+            ..config.clone()
+        },
+        pending: true,
+        applies_after_turn: Some("turn-1".into()),
+        workspace_revision: 0,
+    });
+    roundtrip(
+        &update,
+        json!({"type":"config_changed","revision":3,"metadata":{"name":"Review"},
+            "config":{"model":"faux/one","effort":"off"},
+            "effective":{"model":"faux/one","effort":"high"},
+            "pending":true,"applies_after_turn":"turn-1","workspace_revision":0}),
+    );
+    let reference = json!({"instance":"native","key":"s1","native_id":"n1"});
+    let attached = AttachResult {
+        latest_seq: 8,
+        generation: 2,
+        snapshot: Some(SessionSnapshot {
+            session: session(),
+            at_seq: 8,
+            revision: 3,
+            metadata: SessionMetadata::default(),
+            config: config.clone(),
+            effective: config,
+            pending: false,
+            capabilities: Capabilities::default(),
+        }),
+    };
+    let value = serde_json::to_value(&attached).unwrap();
+    assert_eq!(value["snapshot"]["session"], reference);
+    assert_eq!(value["snapshot"]["at_seq"], 8);
+    assert_eq!(value["snapshot"]["config"]["effort"], "off");
+    assert_eq!(
+        serde_json::from_value::<AttachResult>(value).unwrap(),
+        attached
+    );
+    // An old server's result has no snapshot.
+    let old: AttachResult = serde_json::from_value(json!({"latest_seq":8,"generation":2})).unwrap();
+    assert_eq!(old.snapshot, None);
 }

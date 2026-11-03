@@ -14,6 +14,8 @@ pub struct Attachment {
     /// Committed updates after the client's cursor through `latest_seq`, in
     /// contiguous order.
     pub replay: Box<dyn Iterator<Item = UpdateEnvelope> + Send>,
+    /// The Session's state at `latest_seq`, when the owner can take one.
+    pub snapshot: Option<loop_protocol::rpc::SessionSnapshot>,
 }
 
 /// Session management for a Runtime shared by many connections.

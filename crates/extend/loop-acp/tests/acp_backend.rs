@@ -910,7 +910,7 @@ async fn models_come_from_the_session_config_and_can_be_switched() {
     assert_eq!(ids, ["gpt-a", "gpt-b"]);
     assert_eq!(choices.models[1].description.as_deref(), Some("faster"));
 
-    control.set_model(&session, "gpt-b").await.unwrap();
+    control.set_model(&session, "gpt-b", None).await.unwrap();
     assert_eq!(
         control.models(&session).await.unwrap().current.as_deref(),
         Some("gpt-b")
@@ -927,7 +927,7 @@ async fn models_come_from_the_session_config_and_can_be_switched() {
     assert_eq!(sent["params"]["configId"], "model");
     assert_eq!(sent["params"]["value"], "gpt-b");
 
-    assert!(control.set_model(&session, "gpt-z").await.is_err());
+    assert!(control.set_model(&session, "gpt-z", None).await.is_err());
 }
 
 #[tokio::test]
@@ -945,7 +945,7 @@ async fn reasoning_effort_comes_from_the_session_config_and_can_be_switched() {
     let ids: Vec<_> = efforts.models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["low", "high"]);
 
-    control.set_effort(&session, "high").await.unwrap();
+    control.set_effort(&session, "high", None).await.unwrap();
     assert_eq!(
         control.efforts(&session).await.unwrap().current.as_deref(),
         Some("high")
@@ -962,7 +962,7 @@ async fn reasoning_effort_comes_from_the_session_config_and_can_be_switched() {
     assert_eq!(sent["params"]["configId"], "effort");
     assert_eq!(sent["params"]["value"], "high");
 
-    assert!(control.set_effort(&session, "ultra").await.is_err());
+    assert!(control.set_effort(&session, "ultra", None).await.is_err());
 }
 
 #[tokio::test]
@@ -977,7 +977,10 @@ async fn the_agent_mode_comes_from_the_session_config_and_can_be_switched() {
     let modes = control.modes(&session).await.unwrap();
     assert_eq!(modes.current.as_deref(), Some("read-only"));
 
-    control.set_mode(&session, "workspace-write").await.unwrap();
+    control
+        .set_mode(&session, "workspace-write", None)
+        .await
+        .unwrap();
     assert_eq!(
         control.modes(&session).await.unwrap().current.as_deref(),
         Some("workspace-write")
@@ -992,7 +995,7 @@ async fn the_agent_mode_comes_from_the_session_config_and_can_be_switched() {
         .cloned()
         .unwrap();
     assert_eq!(sent["params"]["configId"], "mode");
-    assert!(control.set_mode(&session, "yolo").await.is_err());
+    assert!(control.set_mode(&session, "yolo", None).await.is_err());
 }
 
 #[tokio::test]
@@ -1021,7 +1024,7 @@ async fn sessions_of_another_backend_are_refused() {
         Err(BackendError::SessionNotFound(_))
     ));
     assert!(matches!(
-        control.set_effort(&theirs, "high").await,
+        control.set_effort(&theirs, "high", None).await,
         Err(BackendError::SessionNotFound(_))
     ));
     fx.backend.cancel(&theirs);

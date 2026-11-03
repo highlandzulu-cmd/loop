@@ -30,4 +30,8 @@ pub struct Capabilities {
     pub multi_session: bool,
     /// Supports attach, cursor replay and detach.
     pub attach: bool,
+    /// Has selectable reasoning effort levels (`session/efforts`).
+    pub efforts: bool,
+    /// `session/attach` returns a Session snapshot with its result.
+    pub attach_snapshot: bool,
 }

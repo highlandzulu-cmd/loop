@@ -99,7 +99,6 @@ pub type ToolFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Agent harness.
 pub struct AgentHarness {
-    #[allow(dead_code)]
     models: Arc<Models>,
     stream_fn: StreamFn,
     session: Arc<tokio::sync::Mutex<Session>>,
@@ -523,6 +522,54 @@ impl AgentHarness {
     /// Set thinking level.
     pub async fn set_thinking_level(&self, level: AgentThinkingLevel) {
         *self.thinking_level.write().await = level;
+    }
+
+    /// The thinking level the next turn starts with.
+    pub async fn thinking_level(&self) -> AgentThinkingLevel {
+        *self.thinking_level.read().await
+    }
+
+    /// The model registry the harness resolves models from.
+    pub fn models(&self) -> &Arc<Models> {
+        &self.models
+    }
+
+    /// Record a model or effort choice in the active Session's tree before
+    /// returning, also during a turn: a choice that was acknowledged must
+    /// survive a crash. A running turn's own entries are written after it,
+    /// so the choice lands before them on the branch; it is Session config,
+    /// not turn output, and stays when the turn is cancelled.
+    pub async fn record_config(&self, write: PendingSessionWrite) -> Result<(), AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        let session = self.session.lock().await;
+        session
+            .store()
+            .append_entry(&session.metadata().id, write)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        Ok(())
+    }
+
+    /// The active Session's recorded model, effort, name and config revision.
+    pub async fn session_config(
+        &self,
+    ) -> Result<crate::harness::session::types::SessionConfigEntries, AgentHarnessError> {
+        let session = self.session.lock().await;
+        let reader = session.reader();
+        let head = reader
+            .read_head()
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let entries = reader
+            .read_entries(None)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let mut config =
+            crate::harness::session::types::config_from_entries(&entries, head.as_deref());
+        if config.name.is_none() {
+            config.name = session.metadata().name.clone();
+        }
+        Ok(config)
     }
 
     /// Set native streaming deadline settings.

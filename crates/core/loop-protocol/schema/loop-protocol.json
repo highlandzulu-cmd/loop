@@ -33,6 +33,17 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Session's state at `latest_seq`, from servers with the\n`attach_snapshot` capability."
         }
       },
       "required": [
@@ -51,6 +62,16 @@
         "attach": {
           "default": false,
           "description": "Supports attach, cursor replay and detach.",
+          "type": "boolean"
+        },
+        "attach_snapshot": {
+          "default": false,
+          "description": "`session/attach` returns a Session snapshot with its result.",
+          "type": "boolean"
+        },
+        "efforts": {
+          "default": false,
+          "description": "Has selectable reasoning effort levels (`session/efforts`).",
           "type": "boolean"
         },
         "fs_client": {
@@ -124,6 +145,54 @@
       ],
       "type": "object"
     },
+    "ChoiceInfo": {
+      "description": "One effort level or mode.",
+      "properties": {
+        "id": {
+          "description": "Id to pass to the setter.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ChoicesResult": {
+      "description": "`session/efforts` and `session/modes` result.",
+      "properties": {
+        "choices": {
+          "description": "Every choice on offer.",
+          "items": {
+            "$ref": "#/$defs/ChoiceInfo"
+          },
+          "type": "array"
+        },
+        "current": {
+          "description": "The current choice's id, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "The Session's config revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "choices",
+        "revision"
+      ],
+      "type": "object"
+    },
     "ClientCapabilities": {
       "description": "What a client can do for the server.",
       "properties": {
@@ -149,6 +218,59 @@
       },
       "required": [
         "session"
+      ],
+      "type": "object"
+    },
+    "ConfigChanged": {
+      "description": "A Session's complete public config after a change (`config_changed`).",
+      "properties": {
+        "applies_after_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn after which `config` takes effect, while `pending`."
+        },
+        "config": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The selected config: what the next turn uses."
+        },
+        "effective": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The config the current turn runs with; equals `config` unless\n`pending`."
+        },
+        "metadata": {
+          "$ref": "#/$defs/SessionMetadata",
+          "default": {},
+          "description": "Session metadata."
+        },
+        "pending": {
+          "default": false,
+          "description": "Part of `config` waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session's config revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workspace_revision": {
+          "default": 0,
+          "description": "Revision of the workspace definitions the Session uses.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
       ],
       "type": "object"
     },
@@ -810,6 +932,104 @@
       "description": "One user or agent message within a turn.",
       "type": "string"
     },
+    "ModelInfo": {
+      "description": "One model in `session/models`.",
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "The backend instance that runs the model."
+        },
+        "description": {
+          "description": "Short description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Id to pass to `session/set_model`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "backend"
+      ],
+      "type": "object"
+    },
+    "ModelsResult": {
+      "description": "`session/models` result.",
+      "properties": {
+        "current": {
+          "description": "The current model's id, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "description": "Every model on offer.",
+          "items": {
+            "$ref": "#/$defs/ModelInfo"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "description": "The Session's config revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "models",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "MutationResult": {
+      "description": "What a committed Session setter changed (`MutationResult` on the wire).",
+      "properties": {
+        "applies_after_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn after which a pending change takes effect."
+        },
+        "pending": {
+          "default": false,
+          "description": "The change waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session's config revision after the change.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "Sequence of the `config_changed` update that announced it; zero when\nthe backend publishes no such update.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "seq"
+      ],
+      "type": "object"
+    },
     "NoticeLevel": {
       "description": "Severity of a notice.",
       "oneOf": [
@@ -1119,6 +1339,33 @@
       ],
       "type": "object"
     },
+    "SessionConfig": {
+      "description": "A Session's public config. Absent fields are not offered by the backend\nor not known yet. Never holds secrets.",
+      "properties": {
+        "effort": {
+          "description": "Reasoning effort id, as `session/efforts` names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Backend mode id, as `session/modes` names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Model id, as `session/models` names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "SessionInfo": {
       "description": "One Session in the Runtime's list, including closed Sessions.",
       "properties": {
@@ -1185,6 +1432,19 @@
       "description": "A conversation as Loop knows it. Stable across process restarts.",
       "type": "string"
     },
+    "SessionMetadata": {
+      "description": "Session metadata carried by [`ConfigChanged`].",
+      "properties": {
+        "name": {
+          "description": "Display name, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "SessionParams": {
       "description": "Params naming one session.",
       "properties": {
@@ -1218,6 +1478,72 @@
         "instance",
         "key",
         "native_id"
+      ],
+      "type": "object"
+    },
+    "SessionSnapshot": {
+      "description": "A Session's state at one committed update sequence. Excludes secrets.",
+      "properties": {
+        "at_seq": {
+          "description": "The update sequence the snapshot was taken at: the replay's last\nupdate. Not the client's processed cursor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities",
+          "default": {
+            "attach": false,
+            "attach_snapshot": false,
+            "efforts": false,
+            "fs_client": false,
+            "images": false,
+            "load_session": false,
+            "modes": false,
+            "multi_session": false,
+            "resume_session": false,
+            "set_model": false,
+            "steering": false,
+            "terminal_client": false,
+            "usage": false
+          },
+          "description": "What this Session supports."
+        },
+        "config": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The selected config."
+        },
+        "effective": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The config the current turn runs with."
+        },
+        "metadata": {
+          "$ref": "#/$defs/SessionMetadata",
+          "default": {},
+          "description": "Session metadata."
+        },
+        "pending": {
+          "default": false,
+          "description": "Part of `config` waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session's config revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "at_seq",
+        "revision"
       ],
       "type": "object"
     },
@@ -1515,10 +1841,105 @@
           "type": "object"
         },
         {
+          "$ref": "#/$defs/ConfigChanged",
+          "description": "The Session's metadata or public config changed. Replaces the\nprevious metadata and config view; the transcript is unchanged.",
+          "properties": {
+            "type": {
+              "const": "config_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "An update with a `type` this reader does not know. The raw JSON is kept."
         }
       ],
       "description": "One change in a session."
+    },
+    "SetEffortParams": {
+      "description": "`session/set_effort` params.",
+      "properties": {
+        "effort": {
+          "description": "A [`ChoiceInfo::id`] from `session/efforts`.",
+          "type": "string"
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "effort"
+      ],
+      "type": "object"
+    },
+    "SetModeParams": {
+      "description": "`session/set_mode` params.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "A [`ChoiceInfo::id`] from `session/modes`.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "SetModelParams": {
+      "description": "`session/set_model` params.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "A [`ModelInfo::id`].",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "model"
+      ],
+      "type": "object"
     },
     "StopReason": {
       "description": "Why a turn ended.",
@@ -2118,6 +2539,16 @@
         "type": "object"
       }
     },
+    "session/efforts": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ChoicesResult"
+      }
+    },
     "session/list": {
       "direction": "client_to_server",
       "kind": "request",
@@ -2141,6 +2572,26 @@
         "$ref": "#/$defs/SessionRef"
       }
     },
+    "session/models": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ModelsResult"
+      }
+    },
+    "session/modes": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ChoicesResult"
+      }
+    },
     "session/new": {
       "direction": "client_to_server",
       "kind": "request",
@@ -2159,6 +2610,36 @@
       },
       "result": {
         "$ref": "#/$defs/PromptResult"
+      }
+    },
+    "session/set_effort": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SetEffortParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
+    "session/set_mode": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SetModeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
+    "session/set_model": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SetModelParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
       }
     },
     "session/transcript": {
