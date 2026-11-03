@@ -186,155 +186,164 @@ impl Shell for HostExecutionEnv {
             c.args(["-c", command]);
             c
         };
-        cmd.current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        // Its own process group, so a timeout or cancel can stop everything
-        // the command started, not just the shell.
-        #[cfg(unix)]
-        cmd.process_group(0);
-
+        cmd.current_dir(&cwd);
         if !options.inherit_env {
             cmd.env_clear();
         }
         if let Some(env) = &options.env {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
+            cmd.envs(env);
         }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
-        // Kills the tree if this future is dropped before the command ends.
-        let mut tree = TreeKiller(child.id());
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stdout pipe"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stderr pipe"))?;
-
-        let combined = Arc::new(Mutex::new(String::new()));
-        let stdout_acc = Arc::new(Mutex::new(String::new()));
-        let stderr_acc = Arc::new(Mutex::new(String::new()));
-        let last_emit = Arc::new(Mutex::new(
-            Instant::now()
-                .checked_sub(OUTPUT_EMIT_INTERVAL)
-                .unwrap_or_else(Instant::now),
-        ));
-        let on_output = options.on_output.clone();
-
-        let stdout_task = {
-            let combined = Arc::clone(&combined);
-            let stdout_acc = Arc::clone(&stdout_acc);
-            let last_emit = Arc::clone(&last_emit);
-            let on_output = on_output.clone();
-            tokio::spawn(async move {
-                read_stream(stdout, combined, stdout_acc, last_emit, on_output).await;
-            })
-        };
-        let stderr_task = {
-            let combined = Arc::clone(&combined);
-            let stderr_acc = Arc::clone(&stderr_acc);
-            let last_emit = Arc::clone(&last_emit);
-            let on_output = on_output.clone();
-            tokio::spawn(async move {
-                read_stream(stderr, combined, stderr_acc, last_emit, on_output).await;
-            })
-        };
-
-        let status = match (&options.cancel, options.timeout_ms) {
-            (Some(cancel), Some(ms)) => {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        tree.kill();
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::Aborted,
-                            "operation aborted",
-                        ));
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {
-                        tree.kill();
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::TimedOut,
-                            "command timed out",
-                        ));
-                    }
-                    res = child.wait() => res.map_err(|e| {
-                        ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
-                    })?,
-                }
-            }
-            (Some(cancel), None) => {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        tree.kill();
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::Aborted,
-                            "operation aborted",
-                        ));
-                    }
-                    res = child.wait() => res.map_err(|e| {
-                        ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
-                    })?,
-                }
-            }
-            (None, Some(ms)) => {
-                match tokio::time::timeout(Duration::from_millis(ms), child.wait()).await {
-                    Ok(res) => {
-                        res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
-                    }
-                    Err(_) => {
-                        tree.kill();
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::TimedOut,
-                            "command timed out",
-                        ));
-                    }
-                }
-            }
-            (None, None) => child
-                .wait()
-                .await
-                .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?,
-        };
-
-        // A command that ended normally keeps what it left running.
-        tree.0 = None;
-        let _ = tokio::join!(stdout_task, stderr_task);
-
-        let stdout_text = stdout_acc.lock().await.clone();
-        let stderr_text = stderr_acc.lock().await.clone();
-        let combined_text = combined.lock().await.clone();
-
-        if let Some(cb) = &on_output {
-            cb(&combined_text);
-        }
-
-        Ok(ShellOutput {
-            stdout: stdout_text,
-            stderr: stderr_text,
-            exit_code: status.code().unwrap_or(-1),
-        })
+        exec_command(cmd, options, false).await
     }
+}
+
+/// Shared process-group, cancellation and bounded-output runner.
+pub(crate) async fn exec_command(
+    mut cmd: Command,
+    options: ShellExecOptions,
+    stop_background: bool,
+) -> Result<ShellOutput, ExecutionError> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
+    // Kills the tree if this future is dropped before the command ends.
+    let mut tree = TreeKiller(child.id());
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stderr pipe"))?;
+
+    let combined = Arc::new(Mutex::new(String::new()));
+    let stdout_acc = Arc::new(Mutex::new(String::new()));
+    let stderr_acc = Arc::new(Mutex::new(String::new()));
+    let last_emit = Arc::new(Mutex::new(
+        Instant::now()
+            .checked_sub(OUTPUT_EMIT_INTERVAL)
+            .unwrap_or_else(Instant::now),
+    ));
+    let on_output = options.on_output.clone();
+
+    let stdout_task = {
+        let combined = Arc::clone(&combined);
+        let stdout_acc = Arc::clone(&stdout_acc);
+        let last_emit = Arc::clone(&last_emit);
+        let on_output = on_output.clone();
+        tokio::spawn(async move {
+            read_stream(stdout, combined, stdout_acc, last_emit, on_output).await;
+        })
+    };
+    let stderr_task = {
+        let combined = Arc::clone(&combined);
+        let stderr_acc = Arc::clone(&stderr_acc);
+        let last_emit = Arc::clone(&last_emit);
+        let on_output = on_output.clone();
+        tokio::spawn(async move {
+            read_stream(stderr, combined, stderr_acc, last_emit, on_output).await;
+        })
+    };
+
+    let status = match (&options.cancel, options.timeout_ms) {
+        (Some(cancel), Some(ms)) => {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tree.kill();
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = tokio::join!(stdout_task, stderr_task);
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::Aborted,
+                        "operation aborted",
+                    ));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(ms)) => {
+                    tree.kill();
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = tokio::join!(stdout_task, stderr_task);
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::TimedOut,
+                        "command timed out",
+                    ));
+                }
+                res = child.wait() => res.map_err(|e| {
+                    ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
+                })?,
+            }
+        }
+        (Some(cancel), None) => {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tree.kill();
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = tokio::join!(stdout_task, stderr_task);
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::Aborted,
+                        "operation aborted",
+                    ));
+                }
+                res = child.wait() => res.map_err(|e| {
+                    ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
+                })?,
+            }
+        }
+        (None, Some(ms)) => {
+            match tokio::time::timeout(Duration::from_millis(ms), child.wait()).await {
+                Ok(res) => {
+                    res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
+                }
+                Err(_) => {
+                    tree.kill();
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    let _ = tokio::join!(stdout_task, stderr_task);
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::TimedOut,
+                        "command timed out",
+                    ));
+                }
+            }
+        }
+        (None, None) => child
+            .wait()
+            .await
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?,
+    };
+
+    if stop_background {
+        // A sandbox command cannot leave descendants holding its pipes open.
+        tree.kill();
+    } else {
+        // Preserve the host shell's existing background-process behavior.
+        tree.0 = None;
+    }
+    let _ = tokio::join!(stdout_task, stderr_task);
+
+    let stdout_text = stdout_acc.lock().await.clone();
+    let stderr_text = stderr_acc.lock().await.clone();
+    let combined_text = combined.lock().await.clone();
+
+    if let Some(cb) = &on_output {
+        cb(&combined_text);
+    }
+
+    Ok(ShellOutput {
+        stdout: stdout_text,
+        stderr: stderr_text,
+        exit_code: status.code().unwrap_or(-1),
+    })
 }
 
 /// Kills a process and everything in its process group (Unix) or tree
@@ -366,6 +375,17 @@ impl Drop for TreeKiller {
     }
 }
 
+// Keep draining after the cap, so a noisy command never blocks on a full pipe.
+const OUTPUT_CAP: usize = 1024 * 1024;
+
+fn push_capped(acc: &mut String, chunk: &str) {
+    let mut end = chunk.len().min(OUTPUT_CAP.saturating_sub(acc.len()));
+    while !chunk.is_char_boundary(end) {
+        end -= 1;
+    }
+    acc.push_str(&chunk[..end]);
+}
+
 async fn read_stream<R: AsyncReadExt + Unpin>(
     mut reader: R,
     combined: Arc<Mutex<String>>,
@@ -381,11 +401,11 @@ async fn read_stream<R: AsyncReadExt + Unpin>(
                 let chunk = sanitize_binary_output(&buf[..n]);
                 {
                     let mut acc = stream_acc.lock().await;
-                    acc.push_str(&chunk);
+                    push_capped(&mut acc, &chunk);
                 }
                 let snapshot = {
                     let mut c = combined.lock().await;
-                    c.push_str(&chunk);
+                    push_capped(&mut c, &chunk);
                     c.clone()
                 };
                 if let Some(cb) = &on_output {

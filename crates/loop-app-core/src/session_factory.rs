@@ -95,6 +95,7 @@ pub struct WorkspaceResources {
     // Standalone prompts retain the caller's spelling and lexical ancestors;
     // cwd is separately normalized for workspace identity and execution.
     prompt_cwd: PathBuf,
+    agent_dir: PathBuf,
     hooks: crate::hooks_load::LoadedHooks,
     web: crate::web_tools::WebTools,
     sandbox: OnceCell<(SandboxMode, Arc<dyn ExecutionEnv>, bool)>,
@@ -199,6 +200,7 @@ impl WorkspaceResources {
             mcp_client,
             startup_notices,
             prompt_cwd,
+            agent_dir: globals.agent_dir.clone(),
             hooks,
             sandbox: OnceCell::new(),
             standalone,
@@ -213,7 +215,8 @@ impl WorkspaceResources {
                     match settings.sandbox.mode.as_str() {
                         "local" => {
                             let builder =
-                                crate::sandbox_builder::SandboxBuilder::for_current_platform();
+                                crate::sandbox_builder::SandboxBuilder::for_current_platform()
+                                    .with_agent_dir(&self.agent_dir);
                             let started =
                                 match crate::sandbox_builder::SandboxRequest::from_settings(
                                     &settings.sandbox,
@@ -228,10 +231,13 @@ impl WorkspaceResources {
                                 }
                                 Err(e) => {
                                     if !self.standalone {
-                                        let platform = if cfg!(target_os = "linux") {
+                                        let platform = if cfg!(any(
+                                            target_os = "linux",
+                                            target_os = "macos"
+                                        )) {
                                             ""
                                         } else {
-                                            "local sandbox is Linux-only on this platform. "
+                                            "local sandbox is unsupported on this platform. "
                                         };
                                         return Err(anyhow::anyhow!(
                                             "required workspace sandbox failed: {platform}{e}"

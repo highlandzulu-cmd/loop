@@ -313,7 +313,7 @@ async fn gate_uses_the_session_workspace_for_relative_paths() {
     );
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 #[tokio::test]
 async fn runtime_refuses_local_sandbox_with_platform_guidance() {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -332,15 +332,49 @@ async fn runtime_refuses_local_sandbox_with_platform_guidance() {
         };
         assert!(
             error.starts_with(
-                "required workspace sandbox failed: local sandbox is Linux-only on this platform"
+                "required workspace sandbox failed: local sandbox is unsupported on this platform"
             ),
             "{error}"
         );
-        #[cfg(target_os = "macos")]
-        {
-            assert!(error.contains("--permission-mode read-only"), "{error}");
-            assert!(error.contains("--permission-mode ask"), "{error}");
-        }
+    })
+    .await
+    .expect("sandbox admission timed out");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runtime_admits_seatbelt_and_protects_its_actual_agent_directory() {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        let mut settings = Settings::default();
+        settings.sandbox.mode = "local".into();
+        settings.save_file(&settings_path(&agent)).unwrap();
+        let factory = factory(&agent);
+        let opts = opts(dir.path());
+        let workspace = factory.workspace(&opts).await.unwrap();
+        let opened = factory.open(workspace, &opts).await.unwrap();
+        let card = opened.harness.sandbox_info().await.format_box();
+        assert!(
+            card.contains("seatbelt") && card.contains("partial"),
+            "{card}"
+        );
+        let read = opened
+            .harness
+            .get_tools()
+            .await
+            .into_iter()
+            .find(|tool| tool.name == "read")
+            .unwrap();
+        assert!((read.execute)(
+            "test".into(),
+            serde_json::json!({"path": agent.join("auth.json")}),
+            None,
+            None
+        )
+        .await
+        .is_err());
     })
     .await
     .expect("sandbox admission timed out");

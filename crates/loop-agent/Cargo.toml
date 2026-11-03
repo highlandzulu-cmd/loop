@@ -54,6 +54,9 @@ rmcp = { workspace = true, optional = true }
 name = "telemetry"
 required-features = ["telemetry"]
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 loop-test-support = { workspace = true }

@@ -91,11 +91,34 @@ First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, Anthr
 
 | Feature | Linux | macOS | Windows |
 |---------|-------|-------|---------|
-| Sandboxing | Supported | Planned | Planned |
+| Sandboxing | Podman | Seatbelt (partial) | Planned |
 | Compaction (manual) | Supported | Supported | In testing |
 | mcp-serve | Supported | Supported | In testing |
 
 The installer detects your OS and CPU, downloads the latest matching release from GitHub, verifies its SHA-256 checksum, installs to `~/.loop/bin`, and adds that directory to your `PATH`. Re-running it is safe: it skips the download if you already have the latest version (use `--force` to reinstall).
+
+### Sandboxing
+
+#### Linux
+
+`/sandbox local` uses Podman with full isolation and runc by default. Use
+`--partial` or an installed runtime flag (`--crun`, `--runsc`, `--krun`) to choose
+another supported mode.
+
+#### macOS
+
+`/sandbox local` uses Seatbelt with partial isolation. Shell writes are limited
+to the project, system temp directory and `sandbox.allowWrite`; built-in file
+tools also enforce write and secret-path restrictions. Shell network access is
+off unless `sandbox.network` is enabled. Runtime Unix sockets and agent
+credentials remain denied even when networking or broad write grants are enabled.
+For Rust development, add `~/.cargo` to `sandbox.allowWrite` (and `~/.rustup` if
+rustup needs to update installation metadata). `--full` is not available yet.
+
+`/sandbox status` shows the runtime, isolation, shell network policy and writable
+paths. Host web/MCP capabilities are separate from the shell sandbox. See
+[configuration](docs/configuration.md) and the
+[macOS boundary](docs/design/macos-sandbox.md).
 
 ### Shared Runtime (Linux and macOS)
 

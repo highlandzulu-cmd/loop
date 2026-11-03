@@ -3,6 +3,7 @@
 mod krun;
 mod podman;
 mod registry;
+pub mod seatbelt;
 mod traits;
 
 pub use krun::{
