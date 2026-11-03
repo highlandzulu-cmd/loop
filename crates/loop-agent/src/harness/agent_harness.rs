@@ -539,11 +539,11 @@ impl AgentHarness {
         &self.models
     }
 
-    /// Record a model or effort choice in the active Session's tree
-    /// (immediately when idle, after the running turn otherwise).
+    /// Record a model or effort choice in the active Session's tree: after
+    /// the running turn, whose end always writes it, or immediately.
     pub async fn record_config(&self, write: PendingSessionWrite) -> Result<(), AgentHarnessError> {
         self.assert_not_shut_down()?;
-        if *self.phase.lock() == AgentHarnessPhase::Idle {
+        if *self.phase.lock() != AgentHarnessPhase::Turn {
             let session = self.session.lock().await;
             session
                 .store()

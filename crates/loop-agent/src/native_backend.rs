@@ -254,27 +254,14 @@ impl NativeBackend {
         Ok(())
     }
 
-    /// Record a change made under [`Self::setting`], announce it, and say
-    /// when it applies.
-    async fn commit(&self, write: PendingSessionWrite) -> BackendResult<MutationResult> {
-        self.harness
-            .record_config(write)
-            .await
-            .map_err(harness_error)?;
+    /// Announce a change made under [`Self::setting`] and say when it
+    /// applies.
+    async fn announce_change(&self) -> MutationResult {
         let model = self.harness.model().await;
         let level = self.harness.thinking_level().await;
-        let name = self
-            .harness
-            .session_config()
-            .await
-            .ok()
-            .and_then(|c| c.name);
         let running = self.is_busy_now();
         let mut state = self.config.lock();
         state.revision += 1;
-        if name.is_some() {
-            state.name = name;
-        }
         state.level = level;
         state.config = session_config(model.as_ref(), level);
         let current_turn = self.stream.lock().mapper.current_turn().cloned();
@@ -293,7 +280,7 @@ impl NativeBackend {
             applies_after_turn: state.pending.clone(),
         };
         let _ = self.updates.send(envelope);
-        Ok(result)
+        result
     }
 
     fn check_revision(&self, expected: Option<u64>) -> BackendResult<()> {
@@ -760,12 +747,16 @@ impl ModelControl for NativeBackend {
             .get_model(provider, id)
             .ok_or_else(|| invalid(format!("model not found: {provider}/{id}")))?;
         self.check_revision(expected_revision)?;
+        // Recorded first: a choice that cannot be saved is not made.
+        self.harness
+            .record_config(PendingSessionWrite::ModelChange {
+                provider: provider.into(),
+                model_id: id.into(),
+            })
+            .await
+            .map_err(harness_error)?;
         self.harness.set_model(resolved).await;
-        self.commit(PendingSessionWrite::ModelChange {
-            provider: provider.into(),
-            model_id: id.into(),
-        })
-        .await
+        Ok(self.announce_change().await)
     }
 
     async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
@@ -805,10 +796,13 @@ impl ModelControl for NativeBackend {
         }
         let thinking_level = parse_thinking(&level);
         self.check_revision(expected_revision)?;
+        self.harness
+            .record_config(PendingSessionWrite::ThinkingLevelChange { thinking_level })
+            .await
+            .map_err(harness_error)?;
         // A running turn keeps the level it started with.
         self.harness.set_thinking_level(thinking_level).await;
-        self.commit(PendingSessionWrite::ThinkingLevelChange { thinking_level })
-            .await
+        Ok(self.announce_change().await)
     }
 }
 

@@ -1413,8 +1413,9 @@ impl Runtime {
     /// Event Log does not hold up an attach; another one's is read from its
     /// tree.
     async fn snapshot(&self, session: &SessionRef) -> BackendResult<SessionSnapshot> {
-        // Under the lifecycle lock no setter is between its change and the
-        // commit of its update. Updates committed after this point are
+        // The pump records each committed sequence and config together, so
+        // they are a consistent point; the lifecycle lock orders the snapshot
+        // with prompt admission and close. Updates committed after it are
         // delivered live; the caller removes the overlap by sequence.
         let committed = match self.route(session) {
             Ok(live) => {
@@ -1480,7 +1481,7 @@ impl Runtime {
         }
     }
     /// Run a config setter under the Session's lifecycle lock and return
-    /// once its `config_changed` update is committed. A setter that cannot
+    /// once its `config_changed` update is committed (outside the lock). A setter that cannot
     /// wait for the next turn refuses a busy Session.
     async fn set_config<F, Fut>(
         &self,
@@ -1493,17 +1494,22 @@ impl Runtime {
         Fut: Future<Output = BackendResult<MutationResult>>,
     {
         let live = self.loaded(session).await?;
-        let _lifecycle = live.lifecycle.lock().await;
-        if live.closing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
-            return Err(failed("Session closing"));
-        }
-        if let Some(error) = live.failure.lock().unwrap().clone() {
-            return Err(failed(error));
-        }
-        if refuse_busy && live.busy.load(Ordering::Acquire) {
-            return Err(BackendError::Busy);
-        }
-        let mut result = set(Arc::clone(&live)).await?;
+        let mut result = {
+            let _lifecycle = live.lifecycle.lock().await;
+            if live.closing.load(Ordering::Acquire) || self.stopped.load(Ordering::Acquire) {
+                return Err(failed("Session closing"));
+            }
+            if let Some(error) = live.failure.lock().unwrap().clone() {
+                return Err(failed(error));
+            }
+            if refuse_busy && live.busy.load(Ordering::Acquire) {
+                return Err(BackendError::Busy);
+            }
+            set(Arc::clone(&live)).await?
+        };
+        // Not under the lock: a stalled Event Log must not hold up attach,
+        // admission or close. The pump commits in the order changes were
+        // made, so the reply still follows the commit.
         barrier(&live).await?;
         result.seq = live
             .announced

@@ -529,3 +529,108 @@ async fn native() -> Arc<loop_agent::native_backend::NativeBackend> {
     }));
     loop_agent::native_backend::NativeBackend::new(harness).await
 }
+
+/// Holds Update appends while `held`, to stall the Event Log.
+#[derive(Default)]
+struct GatedLog {
+    inner: MemoryEventLog,
+    held: std::sync::atomic::AtomicBool,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+#[async_trait::async_trait]
+impl EventLog for GatedLog {
+    async fn append_batch(
+        &self,
+        events: Vec<loop_runtime::log::Event>,
+    ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
+        if events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Update(_)))
+            && self.held.load(std::sync::atomic::Ordering::Acquire)
+        {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.append_batch(events).await
+    }
+    async fn read_after(
+        &self,
+        key: &SessionKey,
+        seq: u64,
+    ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
+        self.inner.read_after(key, seq).await
+    }
+    async fn read_runtime_after(
+        &self,
+        seq: u64,
+    ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
+        self.inner.read_runtime_after(seq).await
+    }
+    async fn latest_seq(&self, key: &SessionKey) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(key).await
+    }
+    async fn allocate_generation(
+        &self,
+        owner: &str,
+        pid: u32,
+        ms: i64,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.allocate_generation(owner, pid, ms).await
+    }
+    async fn finish_generation(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
+        self.inner.finish_generation(generation, ms).await
+    }
+}
+
+#[tokio::test]
+async fn a_setter_waiting_on_a_stalled_event_log_holds_up_nothing_else() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(GatedLog::default());
+        let rt = runtime(dir.path(), log.clone(), Default::default()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        log.held.store(true, std::sync::atomic::Ordering::Release);
+        let setter = tokio::spawn({
+            let rt = rt.clone();
+            let session = session.clone();
+            async move { rt.set_effort(&session, "high", None).await }
+        });
+        log.started.notified().await;
+
+        // Attach, listing and prompt admission go ahead meanwhile.
+        let quick = Duration::from_secs(5);
+        let (watcher, _served) = connect(&rt).await;
+        let mut rx = watcher.subscribe();
+        let attached = tokio::time::timeout(quick, watcher.attach(&session, 0))
+            .await
+            .expect("attach waits for no setter")
+            .unwrap();
+        let snapshot = attached.snapshot.unwrap();
+        assert_eq!(snapshot.config.effort.as_deref(), Some("medium"));
+        tokio::time::timeout(quick, rt.list())
+            .await
+            .unwrap()
+            .unwrap();
+        let turn = tokio::time::timeout(
+            quick,
+            rt.prompt(&session, vec![ContentBlock::text("meanwhile")]),
+        )
+        .await
+        .expect("admission waits for no setter")
+        .unwrap();
+        assert!(!setter.is_finished(), "the setter waits for its commit");
+
+        log.held.store(false, std::sync::atomic::Ordering::Release);
+        log.release.notify_one();
+        let result = setter.await.unwrap().unwrap();
+        let (seq, changed) = config_changed(&mut rx, &session.key).await;
+        assert_eq!(seq, result.seq);
+        assert!(seq > snapshot.at_seq);
+        assert_eq!(changed.revision, result.revision);
+        turn.outcome().await;
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

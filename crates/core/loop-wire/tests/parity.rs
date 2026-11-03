@@ -538,75 +538,79 @@ async fn a_refused_second_prompt_does_not_lose_the_first_turns_answer() {
 /// Choosing model and effort is the same in-process and over each wire.
 #[tokio::test]
 async fn model_control_is_the_same_over_the_wire() {
-    for wire in [
-        Wire::Memory,
-        #[cfg(unix)]
-        Wire::Unix,
-        Wire::WebSocket,
-    ] {
-        let local = native(vec![], vec![]).await;
-        let (remote, _served) = over(native(vec![], vec![]).await, wire).await;
-        let local_session = local.current_session().await;
-        let remote_session = remote
-            .new_session(loop_protocol::SessionSpec::default())
-            .await
-            .unwrap();
-        let caps = (local.capabilities(), remote.capabilities());
-        assert_eq!(
-            (caps.0.set_model, caps.0.efforts, caps.0.modes),
-            (caps.1.set_model, caps.1.efforts, caps.1.modes),
-            "{wire:?}"
-        );
-        let (here, there) = (
-            local.model_control().unwrap(),
-            remote.model_control().unwrap(),
-        );
-        assert_eq!(
-            here.models(&local_session).await.unwrap(),
-            there.models(&remote_session).await.unwrap(),
-            "{wire:?}"
-        );
-        assert_eq!(
-            here.efforts(&local_session).await.unwrap(),
-            there.efforts(&remote_session).await.unwrap(),
-            "{wire:?}"
-        );
-        let mut rx = remote.subscribe();
-        let result = there
-            .set_model(&remote_session, "faux/faux-model", Some(0))
-            .await
-            .unwrap();
-        assert_eq!(result.revision, 1);
-        let changed = loop {
-            let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for wire in [
+            Wire::Memory,
+            #[cfg(unix)]
+            Wire::Unix,
+            Wire::WebSocket,
+        ] {
+            let local = native(vec![], vec![]).await;
+            let (remote, _served) = over(native(vec![], vec![]).await, wire).await;
+            let local_session = local.current_session().await;
+            let remote_session = remote
+                .new_session(loop_protocol::SessionSpec::default())
                 .await
-                .unwrap()
                 .unwrap();
-            if let SessionUpdate::ConfigChanged(changed) = envelope.update {
-                assert_eq!(envelope.seq, result.seq);
-                break changed;
-            }
-        };
-        assert_eq!(changed.config.model.as_deref(), Some("faux/faux-model"));
-        // Errors keep their kind across the wire.
-        assert_eq!(
-            there
-                .set_effort(&remote_session, "off", Some(0))
+            let caps = (local.capabilities(), remote.capabilities());
+            assert_eq!(
+                (caps.0.set_model, caps.0.efforts, caps.0.modes),
+                (caps.1.set_model, caps.1.efforts, caps.1.modes),
+                "{wire:?}"
+            );
+            let (here, there) = (
+                local.model_control().unwrap(),
+                remote.model_control().unwrap(),
+            );
+            assert_eq!(
+                here.models(&local_session).await.unwrap(),
+                there.models(&remote_session).await.unwrap(),
+                "{wire:?}"
+            );
+            assert_eq!(
+                here.efforts(&local_session).await.unwrap(),
+                there.efforts(&remote_session).await.unwrap(),
+                "{wire:?}"
+            );
+            let mut rx = remote.subscribe();
+            let result = there
+                .set_model(&remote_session, "faux/faux-model", Some(0))
                 .await
-                .unwrap_err(),
-            BackendError::Conflict { revision: 1 },
-            "{wire:?}"
-        );
-        let error = there
-            .set_effort(&remote_session, "max", None)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("choose one of"), "{error}");
-        assert!(matches!(
-            there.modes(&remote_session).await,
-            Err(BackendError::Unsupported(_))
-        ));
-    }
+                .unwrap();
+            assert_eq!(result.revision, 1);
+            let changed = loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let SessionUpdate::ConfigChanged(changed) = envelope.update {
+                    assert_eq!(envelope.seq, result.seq);
+                    break changed;
+                }
+            };
+            assert_eq!(changed.config.model.as_deref(), Some("faux/faux-model"));
+            // Errors keep their kind across the wire.
+            assert_eq!(
+                there
+                    .set_effort(&remote_session, "off", Some(0))
+                    .await
+                    .unwrap_err(),
+                BackendError::Conflict { revision: 1 },
+                "{wire:?}"
+            );
+            let error = there
+                .set_effort(&remote_session, "max", None)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("choose one of"), "{error}");
+            assert!(matches!(
+                there.modes(&remote_session).await,
+                Err(BackendError::Unsupported(_))
+            ));
+        }
+    })
+    .await
+    .expect("test timed out");
 }
 
 /// A backend with selectable modes, recording what it was asked.
@@ -715,73 +719,77 @@ impl loop_protocol::ModelControl for Moded {
 
 #[tokio::test]
 async fn modes_follow_the_capability_and_missing_ones_are_unsupported() {
-    let backend = Arc::new(Moded {
-        inner: native(vec![], vec![]).await,
-        mode: parking_lot::Mutex::new("ask".into()),
-    });
-    let (server_end, client_end) = memory();
-    let _served = serve(backend.clone(), server_end, info("server"));
-    let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
-        .await
-        .unwrap();
-    let session = backend.inner.current_session().await;
-    let control = remote.model_control().expect("modes are offered");
-    let modes = control.modes(&session).await.unwrap();
-    assert_eq!(modes.current.as_deref(), Some("ask"));
-    assert_eq!(modes.revision, 7);
-    assert_eq!(modes.models[1].name, "PLAN");
-    let result = control.set_mode(&session, "plan", Some(7)).await.unwrap();
-    assert_eq!(
-        result.applies_after_turn.as_ref().map(|t| t.as_str()),
-        Some("turn-1")
-    );
-    assert!(result.pending);
-    assert_eq!(*backend.mode.lock(), "plan");
-    assert_eq!(
-        control
-            .set_mode(&session, "ask", Some(1))
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let backend = Arc::new(Moded {
+            inner: native(vec![], vec![]).await,
+            mode: parking_lot::Mutex::new("ask".into()),
+        });
+        let (server_end, client_end) = memory();
+        let _served = serve(backend.clone(), server_end, info("server"));
+        let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
             .await
-            .unwrap_err(),
-        BackendError::Conflict { revision: 7 }
-    );
-    // Not advertised: the client refuses before asking, and the server
-    // refuses a client that asks anyway.
-    assert!(matches!(
-        control.models(&session).await,
-        Err(BackendError::Unsupported(_))
-    ));
-    assert!(matches!(
-        control.set_effort(&session, "off", None).await,
-        Err(BackendError::Unsupported(_))
-    ));
-    let (server_end, client_end) = memory();
-    let _served = serve(backend.clone(), server_end, info("server"));
-    let (conn, mut incoming) = Connection::new(client_end);
-    tokio::spawn({
-        let conn = conn.clone();
-        async move {
-            while let Some(message) = incoming.recv().await {
-                if let Incoming::Response { id, result } = message {
-                    conn.resolve(id, result).await;
+            .unwrap();
+        let session = backend.inner.current_session().await;
+        let control = remote.model_control().expect("modes are offered");
+        let modes = control.modes(&session).await.unwrap();
+        assert_eq!(modes.current.as_deref(), Some("ask"));
+        assert_eq!(modes.revision, 7);
+        assert_eq!(modes.models[1].name, "PLAN");
+        let result = control.set_mode(&session, "plan", Some(7)).await.unwrap();
+        assert_eq!(
+            result.applies_after_turn.as_ref().map(|t| t.as_str()),
+            Some("turn-1")
+        );
+        assert!(result.pending);
+        assert_eq!(*backend.mode.lock(), "plan");
+        assert_eq!(
+            control
+                .set_mode(&session, "ask", Some(1))
+                .await
+                .unwrap_err(),
+            BackendError::Conflict { revision: 7 }
+        );
+        // Not advertised: the client refuses before asking, and the server
+        // refuses a client that asks anyway.
+        assert!(matches!(
+            control.models(&session).await,
+            Err(BackendError::Unsupported(_))
+        ));
+        assert!(matches!(
+            control.set_effort(&session, "off", None).await,
+            Err(BackendError::Unsupported(_))
+        ));
+        let (server_end, client_end) = memory();
+        let _served = serve(backend.clone(), server_end, info("server"));
+        let (conn, mut incoming) = Connection::new(client_end);
+        tokio::spawn({
+            let conn = conn.clone();
+            async move {
+                while let Some(message) = incoming.recv().await {
+                    if let Incoming::Response { id, result } = message {
+                        conn.resolve(id, result).await;
+                    }
                 }
             }
-        }
-    });
-    conn.request(
-        "initialize",
-        json!({"protocol_version": 1, "client_info": {"name": "old", "version": "0"}}),
-    )
-    .await
-    .unwrap();
-    let refused = conn
-        .request(
-            "session/set_model",
-            json!({"session": session, "model": "faux/faux-model"}),
+        });
+        conn.request(
+            "initialize",
+            json!({"protocol_version": 1, "client_info": {"name": "old", "version": "0"}}),
         )
         .await
-        .unwrap_err();
-    assert!(
-        matches!(refused, RpcError::Remote { code, .. } if code == loop_protocol::rpc::error_codes::UNSUPPORTED),
-        "{refused:?}"
-    );
+        .unwrap();
+        let refused = conn
+            .request(
+                "session/set_model",
+                json!({"session": session, "model": "faux/faux-model"}),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, RpcError::Remote { code, .. } if code == loop_protocol::rpc::error_codes::UNSUPPORTED),
+            "{refused:?}"
+        );
+    })
+    .await
+    .expect("test timed out");
 }
