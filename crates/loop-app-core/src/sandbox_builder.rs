@@ -128,6 +128,10 @@ pub struct SandboxRequest {
     pub network: bool,
     /// Extra writable paths (`~` expanded; relative paths are under the workspace).
     pub allow_write: Vec<PathBuf>,
+    /// Deny reads under the home directory except the readable paths.
+    pub deny_home_reads: bool,
+    /// Paths under the home directory that stay readable (`~` expanded).
+    pub allow_read: Vec<PathBuf>,
 }
 
 impl SandboxRequest {
@@ -174,6 +178,8 @@ impl SandboxRequest {
                 .iter()
                 .map(|p| expand_home(p))
                 .collect(),
+            deny_home_reads: settings.deny_home_reads(),
+            allow_read: settings.allow_read.iter().map(|p| expand_home(p)).collect(),
         })
     }
 
@@ -192,6 +198,8 @@ impl SandboxRequest {
                 .iter()
                 .map(|p| expand_home(p))
                 .collect(),
+            deny_home_reads: settings.deny_home_reads(),
+            allow_read: settings.allow_read.iter().map(|p| expand_home(p)).collect(),
         }
     }
 }
@@ -217,6 +225,10 @@ pub struct SandboxPlan {
     pub network: bool,
     /// Extra writable paths.
     pub allow_write: Vec<PathBuf>,
+    /// Deny reads under the home directory except the readable paths.
+    pub deny_home_reads: bool,
+    /// Paths under the home directory that stay readable.
+    pub allow_read: Vec<PathBuf>,
 }
 
 impl SandboxPlan {
@@ -245,6 +257,12 @@ impl SandboxPlan {
             "isolation": self.isolation.as_str(),
             "network": self.network,
             "allowWrite": allow_write,
+            "denyHomeReads": self.deny_home_reads,
+            "allowRead": self
+                .allow_read
+                .iter()
+                .map(|p| workdir.join(p).display().to_string())
+                .collect::<Vec<_>>(),
             "homeDir": dirs::home_dir(),
             "agentDir": agent_dir,
         });
@@ -404,6 +422,8 @@ impl SandboxBuilder {
             runtime: request.runtime.or_else(|| platform.default_runtime()),
             network: request.network,
             allow_write: request.allow_write.clone(),
+            deny_home_reads: request.deny_home_reads,
+            allow_read: request.allow_read.clone(),
         })
     }
 

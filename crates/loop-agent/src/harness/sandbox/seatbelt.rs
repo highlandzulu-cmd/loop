@@ -57,6 +57,160 @@ fn resolve_path(path: &Path) -> Result<PathBuf, FileError> {
     Ok(out)
 }
 
+/// Git metadata that can make git run a command or trust another directory:
+/// config, hooks and pointers, in any repository's `.git`, including
+/// submodules (`.git/modules/**`) and worktrees (`.git/worktrees/**`).
+/// The same expression is used in the Seatbelt profile and by
+/// [`JailedHostFs`], so paths created later are covered too.
+const GIT_METADATA: &str = r"/\.git/((modules|worktrees)/.+/)?(config|config\.worktree|commondir|gitdir|hooks|info/attributes)(/|$)";
+
+/// A `.git` entry itself. Commands may not create, replace or remove one, so
+/// they cannot start a repository whose config they wrote or point one
+/// elsewhere.
+const GIT_ENTRY: &str = r"/\.git$";
+
+fn git_metadata(path: &Path) -> bool {
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(GIT_METADATA).expect("valid pattern"));
+    path.to_str().is_none_or(|p| RE.is_match(p))
+}
+
+/// Whether writing `path` would create, replace or remove a `.git` entry, or
+/// write below a `.git` that does not exist yet as a real directory.
+fn git_entry_write(path: &Path) -> bool {
+    if path.file_name().is_some_and(|n| n == ".git") {
+        return true;
+    }
+    path.ancestors().skip(1).any(|a| {
+        a.file_name().is_some_and(|n| n == ".git")
+            && !std::fs::symlink_metadata(a).is_ok_and(|m| m.is_dir())
+    })
+}
+
+/// Refuse a project whose `.git` is a symlink, or a pointer file to a git
+/// directory the sandbox cannot cover: outside the project, or not inside a
+/// `.git` directory (where [`GIT_METADATA`] applies).
+fn check_project_git(project: &Path) -> Result<(), FileError> {
+    let dot_git = project.join(".git");
+    let Ok(meta) = std::fs::symlink_metadata(&dot_git) else {
+        return Ok(());
+    };
+    let refuse = |why: String| {
+        Err(FileError::new(
+            FileErrorCode::PermissionDenied,
+            format!(
+                "{why}; the sandbox cannot protect that repository's hooks and config. \
+                 Run Loop in the repository's main checkout, or turn the sandbox off"
+            ),
+        ))
+    };
+    if meta.file_type().is_symlink() {
+        return refuse(format!(
+            "the project's .git is a symlink ({})",
+            dot_git.display()
+        ));
+    }
+    if meta.is_file() {
+        let text = std::fs::read_to_string(&dot_git).map_err(io_error)?;
+        let Some(dir) = text.trim().strip_prefix("gitdir:") else {
+            return refuse("the project's .git is a file that is not a git pointer".into());
+        };
+        let target = resolve_path(&project.join(dir.trim()))?;
+        let covered = target
+            .strip_prefix(project)
+            .is_ok_and(|inside| inside.components().any(|c| c.as_os_str() == ".git"));
+        if !covered {
+            return refuse(format!(
+                "the project's .git points to {} (a git worktree or separate git directory)",
+                target.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Lock file inside a Seatbelt temporary directory, held while the
+/// directory is in use. A directory whose lock can be taken is stale.
+const TEMP_LOCK: &str = ".loop-lock";
+
+/// Create and hold the lock of `dir`, a fresh temporary directory.
+#[cfg(unix)]
+fn hold_lock(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(TEMP_LOCK))?;
+    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
+    Ok(file)
+}
+
+/// Remove `/tmp/loop-seatbelt-*` and `/tmp/loop-command-*` directories this
+/// user left behind: their lock is free (its process ended), or, without a
+/// lock, they are more than a day old (an older build). Never follows links.
+#[cfg(unix)]
+pub fn clean_stale_temp_dirs() {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    // SAFETY: geteuid has no arguments or preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let Ok(entries) = std::fs::read_dir("/private/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("loop-seatbelt-") || name.starts_with("loop-command-")) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != uid {
+            continue;
+        }
+        let stale = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path.join(TEMP_LOCK))
+        {
+            Ok(lock) => {
+                rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+                    .is_ok()
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60)),
+            Err(_) => false,
+        };
+        if stale {
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                tracing::debug!(%error, path = %path.display(), "could not remove a stale Seatbelt directory");
+            }
+        }
+    }
+}
+
+/// A command's identity directory and the lock that marks it in use.
+struct Marker {
+    dir: tempfile::TempDir,
+    _lock: std::fs::File,
+}
+
+/// Paths under `$HOME` that stay readable with `sandbox.denyHomeReads`, so
+/// git and the Rust toolchain keep working. Credential files below them are
+/// still denied.
+const HOME_READ_DEFAULTS: [&str; 5] = [
+    ".gitconfig",
+    ".config/git",
+    ".cargo",
+    ".rustup",
+    ".gitignore_global",
+];
+
 /// Shared shell and file-tool policy. Paths are resolved before granting access.
 #[derive(Clone)]
 pub struct SeatbeltPolicy {
@@ -71,6 +225,9 @@ pub struct SeatbeltPolicy {
     write_ids: std::collections::HashSet<(u64, u64)>,
     network: bool,
     temp_root: Option<PathBuf>,
+    /// With `sandbox.denyHomeReads`: `$HOME` (configured and resolved) and
+    /// the paths below it that stay readable.
+    home_reads: Option<(Vec<PathBuf>, Vec<PathBuf>)>,
 }
 
 impl SeatbeltPolicy {
@@ -88,8 +245,29 @@ impl SeatbeltPolicy {
         for path in allow_write {
             writes.push(resolve_path(&project.join(path))?);
         }
+        check_project_git(&project)?;
         let mut denied_paths = vec![];
         for path in [
+            home.join(".git-credentials"),
+            home.join(".config/git/credentials"),
+            home.join(".cargo/credentials"),
+            home.join(".cargo/credentials.toml"),
+            home.join(".gem/credentials"),
+            home.join(".terraform.d/credentials.tfrc.json"),
+            home.join(".azure"),
+            home.join(".config/hub"),
+            home.join(".bash_history"),
+            home.join(".zsh_history"),
+            home.join(".zhistory"),
+            home.join(".sh_history"),
+            home.join(".history"),
+            home.join(".local/share/fish/fish_history"),
+            home.join(".python_history"),
+            home.join(".node_repl_history"),
+            home.join(".psql_history"),
+            home.join(".mysql_history"),
+            home.join(".sqlite_history"),
+            home.join(".lesshst"),
             home.join(".netrc"),
             home.join(".docker/config.json"),
             home.join(".kube/config"),
@@ -125,6 +303,7 @@ impl SeatbeltPolicy {
             agent.join("history.json"),
             agent.join("history"),
             agent.join("logs"),
+            agent.join("usage"),
         ]
         .into_iter()
         .chain(runtime_paths.iter().cloned())
@@ -168,36 +347,10 @@ impl SeatbeltPolicy {
             }
         }
         let mut write_denied = denied_paths.clone();
-        for path in [
-            agent.to_path_buf(),
-            project.join(".loop"),
-            project.join(".git/hooks"),
-            project.join(".git/config"),
-            project.join(".git/commondir"),
-        ] {
+        // Git metadata is covered by [`GIT_METADATA`] wherever it is.
+        for path in [agent.to_path_buf(), project.join(".loop")] {
             write_denied.push(std::path::absolute(&path).map_err(io_error)?);
             write_denied.push(resolve_path(&path)?);
-        }
-        // Git worktrees store their real metadata outside the worktree. Protect
-        // the pointer itself and the shared hooks/config as well.
-        let dot_git = project.join(".git");
-        if dot_git.is_file() {
-            write_denied.push(dot_git.clone());
-            if let Some(dir) = std::fs::read_to_string(&dot_git)
-                .map_err(io_error)?
-                .trim()
-                .strip_prefix("gitdir: ")
-            {
-                let dir = resolve_path(&project.join(dir))?;
-                write_denied.push(dir.join("commondir"));
-                write_denied.push(dir.join("config"));
-                write_denied.push(dir.join("hooks"));
-                if let Ok(common) = std::fs::read_to_string(dir.join("commondir")) {
-                    let common = resolve_path(&dir.join(common.trim()))?;
-                    write_denied.push(common.join("hooks"));
-                    write_denied.push(common.join("config"));
-                }
-            }
         }
         if writes
             .iter()
@@ -234,7 +387,53 @@ impl SeatbeltPolicy {
             database_dirs,
             network,
             temp_root: None,
+            home_reads: None,
         })
+    }
+
+    /// Deny reads under `home` except the project, the writable paths,
+    /// `allow_read` and [`HOME_READ_DEFAULTS`] (`sandbox.denyHomeReads`).
+    pub fn deny_home_reads(
+        &mut self,
+        home: &Path,
+        allow_read: &[PathBuf],
+    ) -> Result<(), FileError> {
+        let homes = vec![
+            std::path::absolute(home).map_err(io_error)?,
+            resolve_path(home)?,
+        ];
+        let mut readable = vec![self.project.clone()];
+        readable.extend(self.writes.iter().cloned());
+        for path in allow_read
+            .iter()
+            .map(|p| self.project.join(p))
+            .chain(HOME_READ_DEFAULTS.iter().map(|p| home.join(p)))
+        {
+            readable.push(std::path::absolute(&path).map_err(io_error)?);
+            readable.push(resolve_path(&path)?);
+        }
+        if homes
+            .iter()
+            .chain(readable.iter())
+            .any(|p| p.to_str().is_none())
+        {
+            return Err(FileError::new(
+                FileErrorCode::InvalidPath,
+                "Seatbelt paths must be valid UTF-8",
+            ));
+        }
+        self.home_reads = Some((homes, readable));
+        Ok(())
+    }
+
+    fn home_read_denied(&self, absolute: &Path, resolved: &Path) -> bool {
+        let Some((homes, readable)) = &self.home_reads else {
+            return false;
+        };
+        let under = |p: &Path, roots: &[PathBuf]| roots.iter().any(|r| p.starts_with(r));
+        [absolute, resolved]
+            .iter()
+            .any(|p| under(p, homes) && !under(p, readable))
     }
 
     fn resolve(&self, path: &Path, write: bool) -> Result<PathBuf, FileError> {
@@ -244,6 +443,17 @@ impl SeatbeltPolicy {
             return Err(denied(&absolute));
         }
         if self.db_path(&absolute) || self.db_path(&resolved) {
+            return Err(denied(&absolute));
+        }
+        if self.home_read_denied(&absolute, &resolved) {
+            return Err(denied(&absolute));
+        }
+        if write
+            && (git_metadata(&absolute)
+                || git_metadata(&resolved)
+                || git_entry_write(&absolute)
+                || git_entry_write(&resolved))
+        {
             return Err(denied(&absolute));
         }
         if self
@@ -326,6 +536,29 @@ impl SeatbeltPolicy {
         if let Some(root) = &self.temp_root {
             profile.push_str("(deny file-write-mode file-write-owner file-write-flags (literal (param \"TMP_ROOT\")))\n");
             params.push(format!("TMP_ROOT={}", root.display()));
+            profile.push_str("(deny file-write* (literal (param \"TMP_LOCK\")))\n");
+            params.push(format!("TMP_LOCK={}", root.join(TEMP_LOCK).display()));
+        }
+        profile.push_str(&format!(
+            "(deny file-write* (regex #\"{GIT_METADATA}\"))\n(deny file-write-create file-write-unlink (regex #\"{GIT_ENTRY}\"))\n"
+        ));
+        if let Some((homes, readable)) = &self.home_reads {
+            // Contents only: lookups and stat of ancestors keep working.
+            // Seatbelt prefers an operation-specific rule over a wildcard one,
+            // whatever their order, so every secret deny below also names
+            // `file-read-data`; otherwise these allows would reopen it.
+            for (i, path) in homes.iter().enumerate() {
+                profile.push_str(&format!(
+                    "(deny file-read-data (subpath (param \"HOME_{i}\")))\n"
+                ));
+                params.push(format!("HOME_{i}={}", path.display()));
+            }
+            for (i, path) in readable.iter().enumerate() {
+                profile.push_str(&format!(
+                    "(allow file-read-data (subpath (param \"READ_{i}\")))\n"
+                ));
+                params.push(format!("READ_{i}={}", path.display()));
+            }
         }
         if self.network {
             profile.push_str(r#"(allow network*)
@@ -340,7 +573,7 @@ impl SeatbeltPolicy {
         // when networking is on. Runtime and custom Unix sockets stay denied.
         for (i, path) in self.denied.iter().enumerate() {
             profile.push_str(&format!(
-                "(deny file-read* file-write* (subpath (param \"DENY_{i}\")))\n"
+                "(deny file-read* file-read-data file-write* (subpath (param \"DENY_{i}\")))\n"
             ));
             params.push(format!("DENY_{i}={}", path.display()));
         }
@@ -351,7 +584,7 @@ impl SeatbeltPolicy {
             params.push(format!("WRITE_DENY_{i}={}", path.display()));
         }
         for (i, path) in self.database_dirs.iter().enumerate() {
-            profile.push_str(&format!("(deny file-read* file-write* (require-all (subpath (param \"AGENT_{i}\")) (regex #\"/(sessions|events)\\.db[^/]*(/|$)\")))\n"));
+            profile.push_str(&format!("(deny file-read* file-read-data file-write* (require-all (subpath (param \"AGENT_{i}\")) (regex #\"/(sessions|events)\\.db[^/]*(/|$)\")))\n"));
             params.push(format!("AGENT_{i}={}", path.display()));
         }
         // A pathname deny can otherwise be bypassed by renaming an allowed
@@ -371,11 +604,7 @@ impl SeatbeltPolicy {
         (profile, params)
     }
 
-    fn command(
-        &self,
-        program: &str,
-        args: &[&str],
-    ) -> Result<(Command, tempfile::TempDir), ExecutionError> {
+    fn command(&self, program: &str, args: &[&str]) -> Result<(Command, Marker), ExecutionError> {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         let mut builder = tempfile::Builder::new();
@@ -385,7 +614,13 @@ impl SeatbeltPolicy {
             .prefix("loop-command-")
             .tempdir_in("/tmp")
             .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
-        let root = std::fs::canonicalize(marker.path())
+        let lock = hold_lock(marker.path())
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+        let marker = Marker {
+            dir: marker,
+            _lock: lock,
+        };
+        let root = std::fs::canonicalize(marker.dir.path())
             .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
         if root.to_str().is_none() {
             return Err(ExecutionError::new(
@@ -688,7 +923,7 @@ impl Shell for JailedHostFs {
         }
         let (mut cmd, marker) = self.policy.command("/bin/sh", &["-c", command])?;
         cmd.current_dir(cwd).env_clear().envs(env);
-        let marker_path = std::fs::canonicalize(marker.path())
+        let marker_path = std::fs::canonicalize(marker.dir.path())
             .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
         let result = exec_command(cmd, options, true, Some(marker_path)).await;
         drop(marker);
@@ -749,6 +984,27 @@ impl SandboxFactory for SeatbeltSandboxFactory {
             &runtime,
         )
         .map_err(|e| SandboxError::Policy(e.to_string()))?;
+        if config
+            .options
+            .get("denyHomeReads")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let allow_read: Vec<PathBuf> = config
+                .options
+                .get("allowRead")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            policy
+                .deny_home_reads(&home, &allow_read)
+                .map_err(|e| SandboxError::Policy(e.to_string()))?;
+        }
+        clean_stale_temp_dirs();
         // Use a trusted parent, never the ambient TMPDIR. tempfile creates
         // this directory exclusively; verify its owner, mode and resolved path.
         use std::os::unix::fs::PermissionsExt;
@@ -772,6 +1028,7 @@ impl SandboxFactory for SeatbeltSandboxFactory {
                 "Seatbelt requires a private, user-owned UTF-8 temporary directory".into(),
             ));
         }
+        let temp_lock = hold_lock(&temp_path).map_err(|e| SandboxError::Policy(e.to_string()))?;
         let canary_read = temp_path.join("denied-read");
         let canary_write = temp_path.join("denied-write");
         std::fs::write(&canary_read, "Seatbelt preflight canary")
@@ -786,7 +1043,7 @@ impl SandboxFactory for SeatbeltSandboxFactory {
             env: Arc::new(SeatbeltEnv {
                 fs,
                 shell: JailedHostFs::new(policy),
-                temp: Mutex::new(Some(temp)),
+                temp: Mutex::new(Some((temp, temp_lock))),
                 temp_path,
                 canary_read,
                 canary_write,
@@ -804,7 +1061,7 @@ impl SandboxFactory for SeatbeltSandboxFactory {
 struct SeatbeltEnv {
     fs: JailedHostFs,
     shell: JailedHostFs,
-    temp: Mutex<Option<tempfile::TempDir>>,
+    temp: Mutex<Option<(tempfile::TempDir, std::fs::File)>>,
     temp_path: PathBuf,
     canary_read: PathBuf,
     canary_write: PathBuf,
@@ -939,9 +1196,10 @@ impl Sandbox for SeatbeltSandbox {
     }
     async fn destroy(&self) -> Result<(), SandboxError> {
         self.stop().await?;
-        if let Some(temp) = self.env.temp.lock().take() {
+        if let Some((temp, lock)) = self.env.temp.lock().take() {
             temp.close()
                 .map_err(|e| SandboxError::Other(e.to_string()))?;
+            drop(lock);
         }
         Ok(())
     }
@@ -1167,6 +1425,41 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn git_metadata_rule_covers_every_repository_but_not_ordinary_git_data() {
+        for path in [
+            "/p/.git/config",
+            "/p/.git/config.worktree",
+            "/p/.git/hooks",
+            "/p/.git/hooks/pre-commit",
+            "/p/.git/commondir",
+            "/p/.git/info/attributes",
+            "/p/.git/modules/a/config",
+            "/p/.git/modules/a/modules/b/hooks/x",
+            "/p/.git/worktrees/w/gitdir",
+            "/p/vendor/lib/.git/config",
+        ] {
+            assert!(git_metadata(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/p/.git/objects/ab/cdef",
+            "/p/.git/refs/heads/config",
+            "/p/.git/logs/refs/heads/hooks",
+            "/p/.git/index",
+            "/p/.git/HEAD",
+            "/p/.gitconfig",
+            "/p/src/config",
+            "/p/.git/modules/a/objects/x",
+        ] {
+            assert!(!git_metadata(Path::new(path)), "{path}");
+        }
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        assert!(!git_entry_write(&root.path().join(".git/objects/x")));
+        assert!(git_entry_write(&root.path().join(".git")));
+        assert!(git_entry_write(&root.path().join("new/.git/objects/x")));
     }
 
     #[test]

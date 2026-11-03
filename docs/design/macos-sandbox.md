@@ -17,18 +17,52 @@ can execute a trivial command under the complete policy, then proves that a
 denied read and a denied write both fail with host-created canaries.
 
 Writes are allowed under the real project path, a Loop-created private temporary
-directory, and `sandbox.allowWrite`. Project `.loop`, Git hooks/config and the
-whole resolved agent directory are always write-protected, even under broad
-allowWrite grants. Git worktree pointers and shared hooks/config are protected
-as well. An existing repository supports commits; initialize repositories outside
-the sandbox because initialization writes the protected Git configuration.
+directory, and `sandbox.allowWrite`. Project `.loop` and the whole resolved agent
+directory are always write-protected, even under broad allowWrite grants.
 Project settings may enable sandbox mode, but cannot disable a required sandbox.
 
+### Git
+
+Git runs commands from repository metadata: hooks, `core.fsmonitor`,
+`core.hooksPath`, filter and diff drivers, and it follows `commondir`/`gitdir`
+pointers to other repositories. A command that can write that metadata can get
+code run outside the sandbox the next time anyone runs `git status`. So, under
+**any** `.git` path component, including submodules (`.git/modules/**`) and
+worktrees (`.git/worktrees/**`), writes to `config`, `config.worktree`,
+`hooks/**`, `commondir`, `gitdir` and `info/attributes` are denied. The profile
+uses a path regular expression, so metadata created later is covered as well;
+the file tools apply the same expression.
+
+No command may create, replace, rename or remove a `.git` entry (directory, file
+or symlink) anywhere it can write. This is the safer of the two choices for
+nested repositories: allowing new nested repositories would also allow a `.git`
+pointer file whose git directory sits outside any `.git` path, beyond the
+expression above. So `git clone`, `git init` and `git submodule add` inside the
+sandbox fail; run them outside it. Existing repositories, nested ones and
+submodules included, keep working: commits, branches, fetches into an existing
+repository and submodule commits write only objects, refs, the index and logs.
+
+Sandbox start is refused when the project's `.git` is a symlink, or a pointer
+file whose git directory is outside the project or not inside a `.git`
+directory (a git worktree or `--separate-git-dir` checkout). The sandbox could
+not protect that repository's hooks and config. Run Loop in the main checkout,
+or turn the sandbox off for that project.
+
 Reads are denied for SSH/AWS/GPG/GitHub credentials, Keychains, `.netrc`, Docker,
-Kubernetes, npm/PyPI and gcloud credentials, browser Cookies, and native ACP login
-folders including Codex, Claude, Gemini, OpenCode, Goose and Amp. The resolved
-agent directory's `auth.json`, `run/`, `mcp-auth/`, `agents/` subscription state,
-`sessions.db*`, `events.db*`, history and logs are also denied. The agent directory
+Kubernetes, npm/PyPI and gcloud credentials, git credential stores
+(`~/.git-credentials`, `~/.config/git/credentials`), Cargo, RubyGems and
+Terraform tokens, Azure and hub configuration, shell and REPL history files,
+browser Cookies, and native ACP login folders including Codex, Claude, Gemini,
+OpenCode, Goose and Amp. The resolved agent directory's `auth.json`, `run/`,
+`mcp-auth/`, `agents/` subscription state, `sessions.db*`, `events.db*`, history,
+logs and `usage/` are also denied.
+
+A list of secrets always lags new tools. `sandbox.denyHomeReads: true` (off by
+default) denies reading file contents anywhere under `$HOME`, except the project,
+`allowWrite`, `sandbox.allowRead` and git/Rust toolchain settings (`.gitconfig`,
+`.config/git`, `.cargo`, `.rustup`, `.gitignore_global`); the credential denies
+above still apply inside those. Names and metadata stay visible, so path lookups
+keep working. A project may turn it on, never off, and cannot add `allowRead`. The agent directory
 honors `LOOP_CODING_AGENT_DIR`, including relative paths and symlinks. The short
 Runtime socket fallback directory is protected too. Protected ancestors cannot
 be renamed out of the pathname denies.
@@ -38,6 +72,10 @@ system `/tmp`, independent of the ambient TMPDIR. The path is canonicalized and
 checked for owner, permissions and UTF-8 before granting access. Child TMPDIR
 always points there, overriding tool-provided values. Commands cannot loosen the
 root's mode or remove it. Destroy cleans it after command cleanup finishes.
+Each temporary and per-command marker directory holds an exclusive lock while in
+use. Sandbox start removes this user's `/tmp/loop-seatbelt-*` and
+`/tmp/loop-command-*` directories whose lock is free (their process ended), and
+lock-less ones older than a day, without following links.
 
 Shell networking is off by default. `sandbox.network: true` permits TCP/UDP
 networking; pathname Unix sockets remain denied, including custom Runtime

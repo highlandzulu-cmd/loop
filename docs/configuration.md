@@ -60,6 +60,8 @@ Common settings in `settings.json`:
 | `sandbox.runtime` | platform default | `runc`, `crun`, `runsc` or `krun`. Unset means `runc` on Linux. These are Linux container runtimes: setting one on macOS is an error. Any other value is an error when `mode` is `local`. A project value overrides the global one only when the project sets it. Older versions saved `"isolation": "full", "runtime": "runc"` into every settings file; exactly that pair is read as unset |
 | `sandbox.network` | `false` | Allow network access from sandboxed commands. Enforced for macOS shell commands; the Linux sandbox does not enforce it yet. Unix sockets remain denied on macOS. A project may turn it off but not on |
 | `sandbox.allowWrite` | empty | Extra paths macOS sandboxed commands and file tools may write, such as `~/.cargo`. Secret paths remain denied under broad grants. The Linux sandbox does not enforce this setting yet (global only) |
+| `sandbox.denyHomeReads` | `false` | macOS: deny reading files under the home directory, except the project, `allowWrite`, `allowRead` and git/Rust toolchain settings. Credential files stay denied either way. A project may turn it on but not off |
+| `sandbox.allowRead` | empty | macOS, with `denyHomeReads`: paths under the home directory sandboxed commands and file tools may still read, such as `~/.npm` (global only) |
 | `compaction` | enabled | `reserveTokens`, `keepRecentTokens` for `/compact` |
 | `skills`, `disabledSkills` | empty | Extra skill paths, and skills to hide |
 | `mcpServers`, `disabledMcpServers` | empty | MCP servers (stdio `command` or remote `url`) |
@@ -70,8 +72,11 @@ On macOS, `/sandbox local` starts Seatbelt after a preflight. Shell commands may
 write the real project, private sandbox temp directory and `sandbox.allowWrite`; file tools
 may write the project and `allowWrite`. Reads are allowed except for credential
 paths, Keychains, and the resolved agent directory's `auth.json` and `run/`.
-Project `.loop`, Git hooks/config and the entire agent directory are
-write-protected. OAuth/ACP credentials, databases, history, logs and common home
+Project `.loop`, the entire agent directory and Git hooks, config and pointers
+in every repository (submodules and nested ones included) are write-protected,
+and commands cannot create or replace a `.git` entry: run `git clone` and `git
+init` outside the sandbox. A project whose `.git` is a symlink or a pointer
+outside the project (a git worktree) cannot start the sandbox. OAuth/ACP credentials, databases, history, logs and common home
 credential files are also unreadable. Provider keys and Runtime tokens are
 removed from child environments. Child TMPDIR is a private Loop-created 0700
 directory; environment overrides cannot replace it. Network

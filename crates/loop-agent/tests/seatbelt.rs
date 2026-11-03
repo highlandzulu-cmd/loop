@@ -412,6 +412,18 @@ async fn configuration_credentials_and_descriptor_aliases_are_confined() {
             ".codex/auth.json",
             ".claude/.credentials.json",
             ".gemini/oauth_creds.json",
+            ".git-credentials",
+            ".config/git/credentials",
+            ".cargo/credentials",
+            ".cargo/credentials.toml",
+            ".gem/credentials",
+            ".terraform.d/credentials.tfrc.json",
+            ".azure/accessTokens.json",
+            ".config/hub",
+            ".zsh_history",
+            ".bash_history",
+            ".local/share/fish/fish_history",
+            ".python_history",
         ] {
             let path = f.home.join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -431,6 +443,7 @@ async fn configuration_credentials_and_descriptor_aliases_are_confined() {
             "events.db-shm",
             "history.json",
             "logs/runtime.log",
+            "usage/2026-11.jsonl",
         ] {
             let path = f.agent.join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -629,6 +642,303 @@ async fn nested_profiles_cannot_hide_cleanup_identity() {
             "a nested profile must not replace the cleanup marker"
         );
         assert!(out.stderr.contains("sandbox_apply"), "{out:?}");
+    })
+    .await
+    .unwrap();
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args([
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "user.name=Host",
+            "-c",
+            "user.email=host@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+}
+
+async fn seatbelt(project: &Path, root: &Path, extra: Value) -> Result<Arc<dyn Sandbox>, String> {
+    let mut options =
+        json!({"homeDir": root.join("home"), "agentDir": root.join("agent"), "network": false});
+    if let (Some(options), Some(extra)) = (options.as_object_mut(), extra.as_object()) {
+        options.extend(extra.clone());
+    }
+    let sandbox = SeatbeltSandboxFactory
+        .create(SandboxConfig {
+            workdir: project.to_path_buf(),
+            options,
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    sandbox.start().await.map_err(|e| e.to_string())?;
+    Ok(sandbox)
+}
+
+async fn run(sandbox: &Arc<dyn Sandbox>, command: &str) -> ShellOutput {
+    sandbox
+        .env()
+        .exec(
+            command,
+            ShellExecOptions {
+                timeout_ms: Some(20_000),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+}
+
+fn scratch() -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::Builder::new()
+        .prefix(".seatbelt-git-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let path = std::fs::canonicalize(root.path()).unwrap();
+    for dir in ["home", "agent", "project"] {
+        std::fs::create_dir_all(path.join(dir)).unwrap();
+    }
+    (root, path)
+}
+
+/// Git metadata that runs commands is protected in every repository the
+/// sandbox can write: the project, its submodules and nested repositories,
+/// including metadata created later. No `.git` entry can be created or
+/// replaced. Ordinary commits still work.
+#[tokio::test]
+async fn git_metadata_in_every_repository_is_protected() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let (_guard, root) = scratch();
+        let project = root.join("project");
+        let upstream = root.join("upstream");
+        std::fs::create_dir(&upstream).unwrap();
+        git(&upstream, &["init", "-q"]);
+        git(&upstream, &["commit", "-q", "--allow-empty", "-m", "upstream"]);
+        git(&project, &["init", "-q"]);
+        git(&project, &["submodule", "add", "-q", upstream.to_str().unwrap(), "sub"]);
+        git(&project, &["commit", "-q", "-m", "project"]);
+        let nested = project.join("vendor/lib");
+        std::fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "-q"]);
+        git(&nested, &["commit", "-q", "--allow-empty", "-m", "nested"]);
+        let sandbox = seatbelt(&project, &root, json!({})).await.unwrap();
+        let pwned = root.join("PWNED");
+        let payload = format!("[core]\n\tfsmonitor = \"touch {}; false\"\n", pwned.display());
+        for target in [
+            ".git/config",
+            ".git/config.worktree",
+            ".git/hooks/pre-commit",
+            ".git/info/attributes",
+            ".git/commondir",
+            ".git/modules/sub/config",
+            ".git/modules/sub/config.worktree",
+            ".git/modules/sub/hooks/post-checkout",
+            ".git/worktrees/w/gitdir",
+            ".git/worktrees/w/commondir",
+            "vendor/lib/.git/config",
+            "vendor/lib/.git/hooks/pre-commit",
+        ] {
+            let path = project.join(target);
+            let out = run(
+                &sandbox,
+                &format!(
+                    "mkdir -p {} && printf '%s' {} >> {}",
+                    q(path.parent().unwrap()),
+                    q(Path::new(&payload)),
+                    q(&path)
+                ),
+            )
+            .await;
+            assert_ne!(out.exit_code, 0, "{target}: {out:?}");
+            assert!(
+                sandbox.env().write_file(&path, payload.as_bytes()).await.is_err(),
+                "{target}"
+            );
+        }
+        // Replacing protected metadata by rename, or a .git entry itself.
+        for command in [
+            "printf x > new-config && mv new-config .git/config",
+            "printf x > new-config && mv new-config .git/modules/sub/config",
+            "mv .git .git-old",
+            "mv sub/.git sub/.git-old",
+            "rm -f sub/.git",
+            "mkdir -p fresh && cd fresh && git init -q",
+            "git clone -q ./vendor/lib cloned",
+            "mkdir -p pointer && printf 'gitdir: ../evil' > pointer/.git",
+            "mkdir -p evil && mkdir -p linked && ln -s ../evil linked/.git",
+            "mkdir -p made/.git",
+        ] {
+            let out = run(&sandbox, command).await;
+            assert_ne!(out.exit_code, 0, "{command}: {out:?}");
+        }
+        for path in ["file-tool/.git", "file-tool/deep/.git/config"] {
+            assert!(
+                sandbox
+                    .env()
+                    .write_file(Path::new(path), b"gitdir: ../evil")
+                    .await
+                    .is_err(),
+                "{path}"
+            );
+        }
+        assert!(sandbox
+            .env()
+            .create_dir(Path::new("file-tool-dir/.git"))
+            .await
+            .is_err());
+        assert!(project.join(".git").is_dir());
+        assert!(project.join("sub/.git").is_file());
+        // Git run by the person afterwards finds nothing planted.
+        for dir in [&project, &project.join("sub"), &nested] {
+            let _ = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(["status"])
+                .output();
+        }
+        assert!(!pwned.exists(), "a sandboxed command got git to run on the host");
+        // Ordinary work in existing repositories still succeeds.
+        let commit = "git -c user.name=Sandbox -c user.email=sandbox@example.invalid -c commit.gpgsign=false commit -q --allow-empty -m sandbox";
+        for dir in [".", "sub", "vendor/lib"] {
+            let out = run(&sandbox, &format!("cd {dir} && {commit} && git branch -q topic")).await;
+            assert_eq!(out.exit_code, 0, "{dir}: {out:?}");
+        }
+        sandbox.destroy().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A project whose `.git` the sandbox cannot cover does not start.
+#[tokio::test]
+async fn a_git_symlink_or_outside_pointer_refuses_to_start() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_guard, root) = scratch();
+        let project = root.join("project");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        git(&elsewhere, &["init", "-q"]);
+        std::os::unix::fs::symlink(elsewhere.join(".git"), project.join(".git")).unwrap();
+        let error = seatbelt(&project, &root, json!({})).await.err().unwrap();
+        assert!(error.contains("symlink"), "{error}");
+
+        std::fs::remove_file(project.join(".git")).unwrap();
+        std::fs::write(
+            project.join(".git"),
+            format!("gitdir: {}\n", elsewhere.join(".git").display()),
+        )
+        .unwrap();
+        let error = seatbelt(&project, &root, json!({})).await.err().unwrap();
+        assert!(error.contains("points to"), "{error}");
+
+        // A pointer to a git directory inside the project but outside any
+        // `.git` path is refused too: the metadata rule would not cover it.
+        std::fs::create_dir(project.join("gitdata")).unwrap();
+        std::fs::write(project.join(".git"), "gitdir: gitdata\n").unwrap();
+        assert!(seatbelt(&project, &root, json!({})).await.is_err());
+
+        // Inside a `.git` directory (as a submodule checkout has) is covered.
+        std::fs::create_dir_all(project.join("inner/.git")).unwrap();
+        std::fs::write(project.join(".git"), "gitdir: inner/.git\n").unwrap();
+        let sandbox = seatbelt(&project, &root, json!({})).await.unwrap();
+        sandbox.destroy().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// With denyHomeReads, only the project, allowWrite, allowRead and toolchain
+/// settings are readable under $HOME.
+#[tokio::test]
+async fn deny_home_reads_keeps_only_listed_home_paths_readable() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let (_guard, root) = scratch();
+        let home = root.join("home");
+        let project = home.join("work/project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("main.rs"), "project-file").unwrap();
+        std::fs::create_dir_all(home.join("allowed")).unwrap();
+        std::fs::write(home.join("allowed/notes"), "allowed-file").unwrap();
+        std::fs::create_dir_all(home.join("cache")).unwrap();
+        std::fs::write(home.join("private.txt"), "private-file").unwrap();
+        std::fs::write(home.join(".gitconfig"), "[user]\n").unwrap();
+        std::fs::create_dir_all(home.join(".cargo")).unwrap();
+        std::fs::write(home.join(".cargo/config.toml"), "[build]\n").unwrap();
+        std::fs::write(home.join(".cargo/credentials.toml"), "private-token").unwrap();
+        let sandbox = seatbelt(
+            &project,
+            &root,
+            json!({"denyHomeReads": true, "allowRead": [home.join("allowed")], "allowWrite": [home.join("cache")]}),
+        )
+        .await
+        .unwrap();
+        for (path, readable) in [
+            (project.join("main.rs"), true),
+            (home.join("allowed/notes"), true),
+            (home.join(".gitconfig"), true),
+            (home.join(".cargo/config.toml"), true),
+            (home.join("private.txt"), false),
+            (home.join(".cargo/credentials.toml"), false),
+        ] {
+            let out = run(&sandbox, &format!("cat {}", q(&path))).await;
+            assert_eq!(out.exit_code == 0, readable, "{}: {out:?}", path.display());
+            assert_eq!(
+                sandbox.env().read_text_file(&path).await.is_ok(),
+                readable,
+                "{}",
+                path.display()
+            );
+        }
+        assert_eq!(run(&sandbox, &format!("echo ok > {}/f && cat {0}/f", q(&home.join("cache")))).await.exit_code, 0);
+        assert_ne!(run(&sandbox, &format!("ls {}", q(&home))).await.exit_code, 0);
+        assert_eq!(run(&sandbox, "ls && pwd -P").await.exit_code, 0);
+        sandbox.destroy().await.unwrap();
+        // Off by default: the same home file is readable.
+        let open = seatbelt(&project, &root, json!({})).await.unwrap();
+        assert_eq!(run(&open, &format!("cat {}", q(&home.join("private.txt")))).await.exit_code, 0);
+        open.destroy().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// Sandbox start removes this user's abandoned temporary directories and
+/// keeps those still in use.
+#[tokio::test]
+async fn stale_temporary_directories_are_removed_at_start() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let id = std::process::id();
+        let stale = PathBuf::from(format!("/private/tmp/loop-seatbelt-test-stale-{id}"));
+        let held = PathBuf::from(format!("/private/tmp/loop-command-test-held-{id}"));
+        let fresh = PathBuf::from(format!("/private/tmp/loop-seatbelt-test-fresh-{id}"));
+        for dir in [&stale, &held, &fresh] {
+            let _ = std::fs::remove_dir_all(dir);
+            std::fs::create_dir(dir).unwrap();
+            std::fs::write(dir.join("left"), "x").unwrap();
+        }
+        std::fs::write(stale.join(".loop-lock"), "").unwrap();
+        let lock = std::fs::File::create(held.join(".loop-lock")).unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let (_guard, root) = scratch();
+        let sandbox = seatbelt(&root.join("project"), &root, json!({}))
+            .await
+            .unwrap();
+        assert!(!stale.exists(), "an unlocked directory is stale");
+        assert!(held.exists(), "a locked directory is in use");
+        assert!(fresh.exists(), "a recent directory without a lock is kept");
+        sandbox.destroy().await.unwrap();
+        drop(lock);
+        for dir in [&held, &fresh] {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     })
     .await
     .unwrap();
