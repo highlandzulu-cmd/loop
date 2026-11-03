@@ -407,6 +407,7 @@ impl PodmanClient for RealPodmanClient {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             exit_code: output.status.code().unwrap_or(-1),
+            truncated: false,
         })
     }
 

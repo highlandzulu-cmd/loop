@@ -848,3 +848,288 @@ async fn busy_model_rules_are_the_same_over_the_wire() {
     .await
     .expect("test timed out");
 }
+
+/// Compaction, stats and the user shell answer the same in-process and
+/// over each wire, including their failures and output bounds.
+#[tokio::test]
+async fn compact_stats_and_shell_are_the_same_over_the_wire() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        for wire in [
+            Wire::Memory,
+            #[cfg(unix)]
+            Wire::Unix,
+            Wire::WebSocket,
+        ] {
+            let local = native(vec![], vec![]).await;
+            let (remote, _served) = over(native(vec![], vec![]).await, wire).await;
+            let local_session = local.current_session().await;
+            let remote_session = remote
+                .new_session(loop_protocol::SessionSpec::default())
+                .await
+                .unwrap();
+            let flags =
+                |c: loop_protocol::Capabilities| (c.compaction, c.session_stats, c.local_shell);
+            assert_eq!(flags(local.capabilities()), (true, true, true));
+            assert_eq!(flags(remote.capabilities()), (true, true, true), "{wire:?}");
+
+            let here = local
+                .session_stats()
+                .unwrap()
+                .stats(&local_session)
+                .await
+                .unwrap();
+            let there = remote
+                .session_stats()
+                .unwrap()
+                .stats(&remote_session)
+                .await
+                .unwrap();
+            // The window is the Session model's, known before any usage.
+            assert!(here.context_window.is_some_and(|w| w > 0));
+            assert_eq!(here.context_window, there.context_window, "{wire:?}");
+            assert_eq!(here.total_tokens, there.total_tokens);
+            assert_eq!(there.turn_state.as_deref(), Some("idle"));
+            assert!(!there.report.is_empty());
+
+            let command = "printf out; printf err >&2; exit 3";
+            let here = local
+                .local_shell()
+                .unwrap()
+                .run(&local_session, command, None)
+                .await
+                .unwrap();
+            let there = remote
+                .local_shell()
+                .unwrap()
+                .run(&remote_session, command, None)
+                .await
+                .unwrap();
+            assert_eq!(here, there, "{wire:?}");
+            assert_eq!(
+                (
+                    there.stdout.as_str(),
+                    there.stderr.as_str(),
+                    there.exit_code
+                ),
+                ("out", "err", 3)
+            );
+
+            // Output is bounded per stream and the cut is marked.
+            let noisy = "head -c 1100000 /dev/zero | tr '\\0' a";
+            let big = remote
+                .local_shell()
+                .unwrap()
+                .run(&remote_session, noisy, None)
+                .await
+                .unwrap();
+            assert!(big.truncated, "{wire:?}");
+            assert_eq!(big.stdout.len(), loop_protocol::SHELL_OUTPUT_LIMIT);
+
+            // A timeout stops the command; bad timeouts are refused first.
+            let slow = remote
+                .local_shell()
+                .unwrap()
+                .run(&remote_session, "sleep 5", Some(100))
+                .await
+                .unwrap_err();
+            assert!(slow.to_string().contains("timed out"), "{slow}");
+            for bad in [0, 600_001] {
+                let here = local
+                    .local_shell()
+                    .unwrap()
+                    .run(&local_session, "true", Some(bad))
+                    .await;
+                let there = remote
+                    .local_shell()
+                    .unwrap()
+                    .run(&remote_session, "true", Some(bad))
+                    .await;
+                assert_eq!(here.unwrap_err(), there.unwrap_err(), "{wire:?}");
+            }
+
+            // Nothing to compact yet: the same typed refusal on both sides.
+            let here = local
+                .compaction()
+                .unwrap()
+                .compact(&local_session, None)
+                .await
+                .unwrap_err();
+            let there = remote
+                .compaction()
+                .unwrap()
+                .compact(&remote_session, Some("keep it short"))
+                .await
+                .unwrap_err();
+            assert_eq!(here.to_string(), there.to_string(), "{wire:?}");
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A backend that does not offer the services: the client hides them and
+/// the server refuses a client that asks anyway.
+#[tokio::test]
+async fn compact_stats_and_shell_need_their_capabilities() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let backend = Arc::new(Moded {
+            inner: native(vec![], vec![]).await,
+            mode: parking_lot::Mutex::new("ask".into()),
+        });
+        let (server_end, client_end) = memory();
+        let _served = serve(backend.clone(), server_end, info("server"));
+        let remote = RemoteBackend::connect(client_end, info("client"), Arc::new(FirstOption))
+            .await
+            .unwrap();
+        assert!(remote.compaction().is_none());
+        assert!(remote.session_stats().is_none());
+        assert!(remote.local_shell().is_none());
+        let session = backend.inner.current_session().await;
+        let (server_end, client_end) = memory();
+        let _served = serve(backend.clone(), server_end, info("server"));
+        let (conn, mut incoming) = Connection::new(client_end);
+        tokio::spawn({
+            let conn = conn.clone();
+            async move {
+                while let Some(message) = incoming.recv().await {
+                    if let Incoming::Response { id, result } = message {
+                        conn.resolve(id, result).await;
+                    }
+                }
+            }
+        });
+        conn.request(
+            "initialize",
+            json!({"protocol_version": 1, "client_info": {"name": "old", "version": "0"}}),
+        )
+        .await
+        .unwrap();
+        for (method, params) in [
+            ("session/compact", json!({"session": session})),
+            ("session/stats", json!({"session": session})),
+            ("session/shell", json!({"session": session, "command": "true"})),
+            ("session/ttfb", json!({"session": session})),
+        ] {
+            let refused = conn.request(method, params).await.unwrap_err();
+            assert!(
+                matches!(refused, RpcError::Remote { code, .. } if code == loop_protocol::rpc::error_codes::UNSUPPORTED),
+                "{method}: {refused:?}"
+            );
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// The response-timeout override reads and changes alike in-process and over
+/// each wire, including an authenticated WebSocket, and never becomes the
+/// default for new Sessions.
+#[tokio::test]
+async fn ttfb_is_the_same_over_the_wire() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::TtfbResult;
+        for wire in [
+            Wire::Memory,
+            #[cfg(unix)]
+            Wire::Unix,
+            Wire::WebSocket,
+        ] {
+            let local = native(vec![], vec![]).await;
+            let (remote, _served) = over(native(vec![], vec![]).await, wire).await;
+            assert!(local.capabilities().session_ttfb);
+            assert!(remote.capabilities().session_ttfb, "{wire:?}");
+            let local_session = local.current_session().await;
+            let remote_session = remote
+                .new_session(loop_protocol::SessionSpec::default())
+                .await
+                .unwrap();
+            let (here, there) = (
+                local.model_control().unwrap(),
+                remote.model_control().unwrap(),
+            );
+            let read = there.ttfb(&remote_session, None, None).await.unwrap();
+            assert_eq!(here.ttfb(&local_session, None, None).await.unwrap(), read);
+            assert_eq!(read.override_ms, None);
+            assert_eq!(read.seq, None);
+            let default = read.effective_ms;
+            assert!(default > 0);
+
+            // Explicit zero is an override that waits indefinitely.
+            let mut rx = remote.subscribe();
+            let zero = there
+                .ttfb(&remote_session, Some(Some(0)), Some(read.revision))
+                .await
+                .unwrap();
+            assert_eq!(
+                (
+                    zero.override_ms,
+                    zero.effective_ms,
+                    zero.revision,
+                    zero.pending
+                ),
+                (Some(0), 0, read.revision + 1, false)
+            );
+            let changed = loop {
+                let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let SessionUpdate::ConfigChanged(changed) = envelope.update {
+                    assert_eq!(Some(envelope.seq), zero.seq);
+                    break changed;
+                }
+            };
+            assert_eq!(changed.config.response_timeout_ms, Some(0));
+            assert_eq!(changed.revision, zero.revision);
+            assert_eq!(
+                here.ttfb(&local_session, Some(Some(0)), None)
+                    .await
+                    .unwrap()
+                    .override_ms,
+                Some(0)
+            );
+            // A stale revision conflicts, over the wire too.
+            assert_eq!(
+                there
+                    .ttfb(&remote_session, Some(Some(5_000)), Some(read.revision))
+                    .await
+                    .unwrap_err(),
+                BackendError::Conflict {
+                    revision: zero.revision
+                },
+                "{wire:?}"
+            );
+            let set = there
+                .ttfb(&remote_session, Some(Some(45_000)), None)
+                .await
+                .unwrap();
+            assert_eq!((set.override_ms, set.effective_ms), (Some(45_000), 45_000));
+
+            // Clearing inherits the default again.
+            let cleared = there.ttfb(&remote_session, Some(None), None).await.unwrap();
+            assert_eq!((cleared.override_ms, cleared.effective_ms), (None, default));
+            // Set again, then a new Session still starts from the default.
+            there
+                .ttfb(&remote_session, Some(Some(1_000)), None)
+                .await
+                .unwrap();
+            let fresh = remote
+                .new_session(loop_protocol::SessionSpec::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                there.ttfb(&fresh, None, None).await.unwrap(),
+                TtfbResult {
+                    override_ms: None,
+                    effective_ms: default,
+                    revision: 0,
+                    seq: None,
+                    pending: false,
+                },
+                "{wire:?}"
+            );
+        }
+    })
+    .await
+    .expect("test timed out");
+}

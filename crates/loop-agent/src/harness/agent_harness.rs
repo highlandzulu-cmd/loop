@@ -199,6 +199,11 @@ impl AgentHarness {
         *self.bash_limits.lock() = limits;
     }
 
+    /// The bash time limits.
+    pub fn bash_limits(&self) -> crate::harness::tools::BashLimits {
+        *self.bash_limits.lock()
+    }
+
     /// The hook registry, for hosts that emit their own events (tool gate).
     pub fn hooks(&self) -> HookRegistry {
         self.hooks.clone()
@@ -1002,6 +1007,39 @@ impl AgentHarness {
         settings: &CompactionSettings,
         custom_instructions: Option<&str>,
     ) -> Result<CompactResult, AgentHarnessError> {
+        let (result, write) = self
+            .prepare_compaction_inner(settings, custom_instructions)
+            .await?;
+        let session = self.session.lock().await;
+        session
+            .store()
+            .append_entry(&session.metadata().id, write)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        Ok(result)
+    }
+
+    /// Prepare a compaction without writing it (idle only): its summary and
+    /// the tree entry the caller commits itself.
+    pub async fn prepare_compaction(
+        &self,
+        custom_instructions: Option<&str>,
+    ) -> Result<(CompactResult, PendingSessionWrite), AgentHarnessError> {
+        let settings = self.compaction_settings.read().await.clone();
+        self.acquire_idle_phase(AgentHarnessPhase::Compaction)
+            .await?;
+        let result = self
+            .prepare_compaction_inner(&settings, custom_instructions)
+            .await;
+        self.release_to_idle();
+        result
+    }
+
+    async fn prepare_compaction_inner(
+        &self,
+        settings: &CompactionSettings,
+        custom_instructions: Option<&str>,
+    ) -> Result<(CompactResult, PendingSessionWrite), AgentHarnessError> {
         let ctx = {
             let session = self.session.lock().await;
             session
@@ -1040,27 +1078,18 @@ impl AgentHarness {
                 .map_err(AgentHarnessError::Session)?
         };
         let first_kept_entry_id = first_kept_entry_id_for_cut(&branch, prep.cut_index);
-
-        {
-            let session = self.session.lock().await;
-            session
-                .store()
-                .append_entry(
-                    &session.metadata().id,
-                    PendingSessionWrite::Compaction {
-                        summary: summary.clone(),
-                        first_kept_entry_id,
-                        details: None,
-                    },
-                )
-                .await
-                .map_err(AgentHarnessError::Session)?;
-        }
-
-        Ok(CompactResult {
-            summary,
-            tokens_before,
-        })
+        let write = PendingSessionWrite::Compaction {
+            summary: summary.clone(),
+            first_kept_entry_id,
+            details: None,
+        };
+        Ok((
+            CompactResult {
+                summary,
+                tokens_before,
+            },
+            write,
+        ))
     }
 
     /// Navigate the session tree to a target entry (idle only).

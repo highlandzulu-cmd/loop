@@ -521,6 +521,16 @@ async fn handle(
             Ok(result) => result,
             Err(error) => return conn.respond(id, Err(error)),
         },
+        methods::SESSION_TTFB => match ttfb(backend, params).await {
+            Ok(result) => result,
+            Err(error) => return conn.respond(id, Err(error)),
+        },
+        methods::SESSION_COMPACT | methods::SESSION_STATS | methods::SESSION_SHELL => {
+            match session_services(backend, method, params).await {
+                Ok(result) => result,
+                Err(error) => return conn.respond(id, Err(error)),
+            }
+        }
         _ => {
             return conn.respond(
                 id,
@@ -592,6 +602,91 @@ async fn model_control(
             let p: SetModeParams = parse(params)?;
             control
                 .set_mode(&p.session, &p.mode, p.expected_revision)
+                .await
+                .map(|r| to_value(&r))
+        }
+    })
+}
+
+/// `session/ttfb`: read or change the Session's response-timeout override.
+/// It never writes the default for new Sessions, so it is Session-scoped
+/// and served on every authenticated transport.
+async fn ttfb(
+    backend: &dyn AgentBackend,
+    params: Value,
+) -> Result<BackendResult<Value>, (i64, String)> {
+    let Some(control) = backend
+        .model_control()
+        .filter(|_| backend.capabilities().session_ttfb)
+    else {
+        return Ok(Err(loop_protocol::BackendError::Unsupported(
+            "changing the response timeout".into(),
+        )));
+    };
+    let p: loop_protocol::rpc::TtfbParams = parse(params)?;
+    let change = match p.change() {
+        Ok(change) => change,
+        Err(error) => return Ok(Err(error)),
+    };
+    Ok(control
+        .ttfb(&p.session, change, p.expected_revision)
+        .await
+        .map(|r| to_value(&r)))
+}
+
+/// `session/compact`, `session/stats` and `session/shell`. A backend
+/// without the service, or without its capability, answers Unsupported.
+/// The outer error is a malformed request.
+async fn session_services(
+    backend: &dyn AgentBackend,
+    method: &str,
+    params: Value,
+) -> Result<BackendResult<Value>, (i64, String)> {
+    let capabilities = backend.capabilities();
+    let unsupported = |what: &str| Ok(Err(loop_protocol::BackendError::Unsupported(what.into())));
+    Ok(match method {
+        methods::SESSION_COMPACT => {
+            let Some(service) = backend.compaction().filter(|_| capabilities.compaction) else {
+                return unsupported("compacting the conversation");
+            };
+            let p: loop_protocol::rpc::CompactParams = parse(params)?;
+            service
+                .compact(&p.session, p.instructions.as_deref())
+                .await
+                .map(|r| to_value(&r))
+        }
+        methods::SESSION_STATS => {
+            let Some(service) = backend
+                .session_stats()
+                .filter(|_| capabilities.session_stats)
+            else {
+                return unsupported("session statistics");
+            };
+            let SessionParams { session } = parse(params)?;
+            service.stats(&session).await.map(|stats| {
+                let busy = backend.is_busy(&session);
+                to_value(&loop_protocol::rpc::StatsResult {
+                    total_tokens: stats.total_tokens,
+                    context_tokens: stats.context_tokens,
+                    context_window: stats.context_window,
+                    report: stats.report,
+                    turn_state: stats
+                        .turn_state
+                        .unwrap_or_else(|| if busy { "busy" } else { "idle" }.into()),
+                    usage: stats.usage,
+                    taken_at_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis() as u64),
+                })
+            })
+        }
+        _ => {
+            let Some(service) = backend.local_shell().filter(|_| capabilities.local_shell) else {
+                return unsupported("running shell commands");
+            };
+            let p: loop_protocol::rpc::ShellParams = parse(params)?;
+            service
+                .run(&p.session, &p.command, p.timeout_ms)
                 .await
                 .map(|r| to_value(&r))
         }

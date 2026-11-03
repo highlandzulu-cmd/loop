@@ -92,6 +92,18 @@ pub mod methods {
     /// Client → server request: [`super::SetModeParams`] →
     /// [`crate::MutationResult`]. Needs the `modes` capability.
     pub const SESSION_SET_MODE: &str = "session/set_mode";
+    /// Client → server request: [`super::CompactParams`] →
+    /// [`crate::CompactionReport`]. Needs the `compaction` capability.
+    pub const SESSION_COMPACT: &str = "session/compact";
+    /// Client → server request: [`super::SessionParams`] →
+    /// [`super::StatsResult`]. Needs the `session_stats` capability.
+    pub const SESSION_STATS: &str = "session/stats";
+    /// Client → server request: [`super::ShellParams`] →
+    /// [`crate::ShellResult`]. Needs the `local_shell` capability.
+    pub const SESSION_SHELL: &str = "session/shell";
+    /// Client → server request: [`super::TtfbParams`] →
+    /// [`super::TtfbResult`]. Needs the `session_ttfb` capability.
+    pub const SESSION_TTFB: &str = "session/ttfb";
 }
 
 /// Who is on the other end, for logs. Never used for feature checks.
@@ -693,6 +705,13 @@ pub fn json_schema() -> Value {
     let set_effort = reference(generator.subschema_for::<SetEffortParams>());
     let set_mode = reference(generator.subschema_for::<SetModeParams>());
     let mutation = reference(generator.subschema_for::<crate::MutationResult>());
+    let compact = reference(generator.subschema_for::<CompactParams>());
+    let compacted = reference(generator.subschema_for::<crate::CompactionReport>());
+    let stats = reference(generator.subschema_for::<StatsResult>());
+    let shell = reference(generator.subschema_for::<ShellParams>());
+    let shell_result = reference(generator.subschema_for::<crate::ShellResult>());
+    let ttfb = reference(generator.subschema_for::<TtfbParams>());
+    let ttfb_result = reference(generator.subschema_for::<TtfbResult>());
     let empty = serde_json::json!({"type": "object"});
     let method = |direction: &str, kind: &str, params: &Value, result: Option<&Value>| {
         let mut method = serde_json::json!({
@@ -712,7 +731,7 @@ pub fn json_schema() -> Value {
         "title": "loop-protocol",
         "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
         "protocol_version": PROTOCOL_VERSION,
-        "limits": {"session_transfer_bytes":SESSION_TRANSFER_LIMIT,"encoded_response_bytes":SESSION_RESPONSE_LIMIT,"page_default":100,"page_max":1000},
+        "limits": {"session_transfer_bytes":SESSION_TRANSFER_LIMIT,"encoded_response_bytes":SESSION_RESPONSE_LIMIT,"page_default":100,"page_max":1000,"shell_output_bytes":crate::SHELL_OUTPUT_LIMIT},
         "methods": {
             methods::INITIALIZE: method(up, "request", &initialize_params, Some(&initialize_result)),
             methods::SESSION_NEW: method(up, "request", &spec, Some(&session)),
@@ -767,6 +786,22 @@ pub fn json_schema() -> Value {
         (
             methods::SESSION_SET_MODE,
             method(up, "request", &set_mode, Some(&mutation)),
+        ),
+        (
+            methods::SESSION_COMPACT,
+            method(up, "request", &compact, Some(&compacted)),
+        ),
+        (
+            methods::SESSION_STATS,
+            method(up, "request", &session_params, Some(&stats)),
+        ),
+        (
+            methods::SESSION_SHELL,
+            method(up, "request", &shell, Some(&shell_result)),
+        ),
+        (
+            methods::SESSION_TTFB,
+            method(up, "request", &ttfb, Some(&ttfb_result)),
         ),
     ];
     for (name, entry) in s3_methods {
@@ -865,6 +900,111 @@ pub struct ViewResult {
     pub branch_revision: u64,
     /// Event Log high-water mark at capture.
     pub at_seq: u64,
+}
+/// `session/compact` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CompactParams {
+    /// Session reference.
+    pub session: SessionRef,
+    /// Guidance for the summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+/// `session/stats` result. Unknown values are omitted.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct StatsResult {
+    /// All tokens billed in the Session.
+    pub total_tokens: u64,
+    /// Tokens in the current context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    /// The Session model's context window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    /// Multi-line report for display.
+    pub report: String,
+    /// Idle, busy or parked.
+    pub turn_state: String,
+    /// Usage of the latest model call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::Usage>,
+    /// When the server read these values, in Unix milliseconds.
+    pub taken_at_ms: u64,
+}
+impl From<StatsResult> for crate::StatsSummary {
+    fn from(r: StatsResult) -> Self {
+        Self {
+            total_tokens: r.total_tokens,
+            context_tokens: r.context_tokens,
+            context_window: r.context_window,
+            report: r.report,
+            turn_state: Some(r.turn_state),
+            usage: r.usage,
+        }
+    }
+}
+/// `session/shell` params.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ShellParams {
+    /// Session reference.
+    pub session: SessionRef,
+    /// The command line, run by the Session's shell.
+    pub command: String,
+    /// At most this long; the default and the maximum are the host's
+    /// `bash.maxTimeoutMs` (600 s unless configured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+/// `session/ttfb` params. Without `timeout_ms` or `clear_override` it reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TtfbParams {
+    /// Session reference.
+    pub session: SessionRef,
+    /// New override in ms; 0 waits indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Remove the override and inherit the default. Not with `timeout_ms`.
+    #[serde(default)]
+    pub clear_override: bool,
+    /// Fail with a conflict unless the Session is at this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+}
+impl TtfbParams {
+    /// The requested change: `None` reads, `Some(None)` clears.
+    pub fn change(&self) -> Result<Option<Option<u64>>, crate::BackendError> {
+        match (self.timeout_ms, self.clear_override) {
+            (Some(_), true) => Err(crate::BackendError::failed(
+                crate::ErrorCategory::Protocol,
+                "give either timeout_ms or clear_override, not both",
+            )),
+            (Some(ms), false) => Ok(Some(Some(ms))),
+            (None, true) => Ok(Some(None)),
+            (None, false) => Ok(None),
+        }
+    }
+}
+/// `session/ttfb` result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct TtfbResult {
+    /// The Session's override, when it has one; 0 waits indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_ms: Option<u64>,
+    /// The timeout the next turn uses; 0 waits indefinitely.
+    pub effective_ms: u64,
+    /// The Session revision.
+    pub revision: u64,
+    /// The update sequence that announced a change; absent for a read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// The change waits for the running turn to end.
+    #[serde(default)]
+    pub pending: bool,
 }
 /// Move the active branch. None means before its first entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

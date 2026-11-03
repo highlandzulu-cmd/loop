@@ -15,9 +15,10 @@ use loop_protocol::rpc::{
     SetModeParams, SetModelParams,
 };
 use loop_protocol::{
-    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
-    ErrorCategory, ErrorInfo, HostServices, InteractionRequest, ModelChoices, ModelControl,
-    MutationResult, SessionKey, SessionRef, SessionSpec, SessionUpdate, TurnHandle, TurnOutcome,
+    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
+    CompactionReport, ContentBlock, ErrorCategory, ErrorInfo, HostServices, InteractionRequest,
+    LocalShell, ModelChoices, ModelControl, MutationResult, SessionKey, SessionRef, SessionSpec,
+    SessionStats, SessionUpdate, ShellResult, StatsSummary, TurnHandle, TurnOutcome,
     UpdateEnvelope, PROTOCOL_VERSION,
 };
 use parking_lot::Mutex;
@@ -382,7 +383,69 @@ impl AgentBackend for RemoteBackend {
 
     fn model_control(&self) -> Option<&dyn ModelControl> {
         let c = self.capabilities;
-        (c.set_model || c.efforts || c.modes).then_some(self as &dyn ModelControl)
+        (c.set_model || c.efforts || c.modes || c.session_ttfb).then_some(self as &dyn ModelControl)
+    }
+
+    fn compaction(&self) -> Option<&dyn Compaction> {
+        self.capabilities
+            .compaction
+            .then_some(self as &dyn Compaction)
+    }
+
+    fn session_stats(&self) -> Option<&dyn SessionStats> {
+        self.capabilities
+            .session_stats
+            .then_some(self as &dyn SessionStats)
+    }
+
+    fn local_shell(&self) -> Option<&dyn LocalShell> {
+        self.capabilities
+            .local_shell
+            .then_some(self as &dyn LocalShell)
+    }
+}
+
+#[async_trait]
+impl Compaction for RemoteBackend {
+    async fn compact(
+        &self,
+        session: &SessionRef,
+        instructions: Option<&str>,
+    ) -> BackendResult<CompactionReport> {
+        let params = loop_protocol::rpc::CompactParams {
+            session: session.clone(),
+            instructions: instructions.map(str::to_owned),
+        };
+        call(&self.conn, methods::SESSION_COMPACT, &params).await
+    }
+}
+
+#[async_trait]
+impl SessionStats for RemoteBackend {
+    async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call::<loop_protocol::rpc::StatsResult>(&self.conn, methods::SESSION_STATS, &params)
+            .await
+            .map(StatsSummary::from)
+    }
+}
+
+#[async_trait]
+impl LocalShell for RemoteBackend {
+    async fn run(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult> {
+        let params = loop_protocol::rpc::ShellParams {
+            session: session.clone(),
+            command: command.to_owned(),
+            timeout_ms,
+        };
+        call(&self.conn, methods::SESSION_SHELL, &params).await
     }
 }
 
@@ -397,6 +460,25 @@ fn offered(offered: bool, what: &str) -> BackendResult<()> {
 
 #[async_trait]
 impl ModelControl for RemoteBackend {
+    async fn ttfb(
+        &self,
+        session: &SessionRef,
+        change: Option<Option<u64>>,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        offered(
+            self.capabilities.session_ttfb,
+            "changing the response timeout",
+        )?;
+        let params = loop_protocol::rpc::TtfbParams {
+            session: session.clone(),
+            timeout_ms: change.flatten(),
+            clear_override: matches!(change, Some(None)),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_TTFB, &params).await
+    }
+
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
         offered(self.capabilities.set_model, "choosing a model")?;
         self.session_models(session).await.map(ModelChoices::from)

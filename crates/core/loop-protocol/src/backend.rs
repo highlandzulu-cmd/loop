@@ -272,6 +272,20 @@ pub trait ModelControl: Send + Sync {
             "choosing a reasoning effort".into(),
         ))
     }
+    /// Read the Session's response-timeout override, or change it: set
+    /// `Some(ms)` (0 waits indefinitely) or clear it (`None`) to inherit the
+    /// default. A change during a turn applies to the next one. It never
+    /// changes the default for new Sessions.
+    async fn ttfb(
+        &self,
+        _session: &SessionRef,
+        _change: Option<Option<u64>>,
+        _expected_revision: Option<u64>,
+    ) -> BackendResult<crate::rpc::TtfbResult> {
+        Err(BackendError::Unsupported(
+            "changing the response timeout".into(),
+        ))
+    }
     /// The approval and sandbox modes the session offers, as choices.
     async fn modes(&self, _session: &SessionRef) -> BackendResult<ModelChoices> {
         Err(BackendError::Unsupported("choosing a mode".into()))
@@ -392,13 +406,23 @@ pub trait HostTerminals: Send + Sync {
     async fn release(&self, session: &SessionRef, terminal_id: &str) -> BackendResult<()>;
 }
 
-/// Result of compacting a conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of compacting a conversation (`session/compact`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CompactionReport {
     /// Estimated tokens before compaction, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_before: Option<u64>,
     /// The summary that replaced the earlier conversation.
     pub summary: String,
+    /// The committed branch revision after compaction; 0 when the backend
+    /// does not count branch changes.
+    #[serde(default)]
+    pub branch_revision: u64,
+    /// The update sequence that announced the compaction; 0 when the
+    /// backend keeps no ordered Event Log.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Shrink a session's context by summarizing it.
@@ -413,7 +437,7 @@ pub trait Compaction: Send + Sync {
 }
 
 /// Token counts and a readable report for a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatsSummary {
     /// All tokens billed in the session.
     pub total_tokens: u64,
@@ -423,6 +447,10 @@ pub struct StatsSummary {
     pub context_window: Option<u64>,
     /// Multi-line report for display.
     pub report: String,
+    /// Idle, busy or parked, when the backend knows better than `is_busy`.
+    pub turn_state: Option<String>,
+    /// Usage of the latest model call, when known.
+    pub usage: Option<crate::update::Usage>,
 }
 
 /// Session statistics.
@@ -432,20 +460,66 @@ pub trait SessionStats: Send + Sync {
     async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary>;
 }
 
-/// Output of a command run for the user.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Output of a command run for the user (`session/shell`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ShellResult {
-    /// Standard output.
+    /// Standard output, at most [`SHELL_OUTPUT_LIMIT`] bytes.
     pub stdout: String,
-    /// Standard error.
+    /// Standard error, at most [`SHELL_OUTPUT_LIMIT`] bytes.
     pub stderr: String,
     /// Exit code.
     pub exit_code: i32,
+    /// A stream was cut at [`SHELL_OUTPUT_LIMIT`].
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// The most output `session/shell` keeps per stream, in bytes.
+pub const SHELL_OUTPUT_LIMIT: usize = 1024 * 1024;
+
+impl ShellResult {
+    /// Cut each stream to [`SHELL_OUTPUT_LIMIT`] on a character boundary,
+    /// marking the result truncated when anything was cut.
+    pub fn bounded(mut self) -> Self {
+        for stream in [&mut self.stdout, &mut self.stderr] {
+            if stream.len() > SHELL_OUTPUT_LIMIT {
+                let mut end = SHELL_OUTPUT_LIMIT;
+                while !stream.is_char_boundary(end) {
+                    end -= 1;
+                }
+                stream.truncate(end);
+                self.truncated = true;
+            }
+        }
+        self
+    }
+}
+
+/// Check a requested shell timeout against the host's `max_ms` (its
+/// `bash.maxTimeoutMs`): the maximum when none is named, and a failure for
+/// zero or more than the maximum.
+pub fn shell_timeout(requested: Option<u64>, max_ms: u64) -> BackendResult<u64> {
+    match requested {
+        None => Ok(max_ms),
+        Some(ms) if (1..=max_ms).contains(&ms) => Ok(ms),
+        Some(_) => Err(BackendError::failed(
+            ErrorCategory::Agent,
+            format!("the shell timeout must be between 1 and {max_ms} ms"),
+        )),
+    }
 }
 
 /// Run a command the user typed, in the session's execution environment.
 #[async_trait]
 pub trait LocalShell: Send + Sync {
-    /// Run `command` and wait for it to finish.
-    async fn run(&self, session: &SessionRef, command: &str) -> BackendResult<ShellResult>;
+    /// Run `command` and wait for it to finish, for at most `timeout_ms`;
+    /// by default the host's bash maximum (see [`shell_timeout`]). Output is
+    /// bounded per stream.
+    async fn run(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult>;
 }

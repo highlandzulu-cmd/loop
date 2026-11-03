@@ -247,10 +247,14 @@ struct TokenBarState {
 
 impl TokenBarState {
     fn from_model(runtime: &CliRuntime) -> Self {
-        let context_window = runtime
-            .selected_model
-            .as_ref()
-            .map_or(0, |m| m.context_window);
+        // A stats service reports the window; until it does, it is unknown.
+        let context_window = match runtime.backend.session_stats() {
+            Some(_) => 0,
+            None => runtime
+                .selected_model
+                .as_ref()
+                .map_or(0, |m| m.context_window),
+        };
         Self {
             total_tokens: 0,
             context_tokens: Some(0),
@@ -270,15 +274,25 @@ impl TokenBarState {
             return;
         };
         if let Ok(stats) = service.stats(&runtime.session_ref()).await {
-            self.total_tokens = stats.total_tokens;
-            if let Some(window) = stats.context_window {
-                self.context_tokens = stats.context_tokens;
-                self.context_window = window;
-            }
+            self.apply_stats(&stats);
         }
     }
 
+    /// The Session's own numbers. Its context window is the Session
+    /// model's, which may differ from this Surface's selected model.
+    fn apply_stats(&mut self, stats: &loop_protocol::StatsSummary) {
+        self.total_tokens = stats.total_tokens;
+        if stats.context_tokens.is_some() {
+            self.context_tokens = stats.context_tokens;
+        }
+        self.context_window = stats.context_window.unwrap_or(0);
+    }
+
+    /// Without a stats service, the local selected model is all there is.
     fn sync_window(&mut self, runtime: &CliRuntime) {
+        if runtime.backend.session_stats().is_some() {
+            return;
+        }
         if let Some(m) = &runtime.selected_model {
             self.context_window = m.context_window;
         }
@@ -2273,15 +2287,18 @@ async fn run_bang_command(
         *status = "shell unavailable".into();
         return;
     };
-    let item = match shell.run(&runtime.session_ref(), command).await {
+    let item = match shell.run(&runtime.session_ref(), command, None).await {
         Ok(out) => {
-            let combined = if out.stderr.is_empty() {
+            let mut combined = if out.stderr.is_empty() {
                 out.stdout
             } else if out.stdout.is_empty() {
                 out.stderr
             } else {
                 format!("{}\n{}", out.stdout, out.stderr)
             };
+            if out.truncated {
+                combined.push_str("\n[output truncated at 1 MiB]");
+            }
             *status = if out.exit_code == 0 {
                 "done".into()
             } else {
@@ -5507,7 +5524,8 @@ async fn apply_effect(
             Some(raw) => match parse_response_header_timeout(&raw) {
                 Ok(ms) => {
                     runtime.settings.response_header_timeout_ms = ms;
-                    runtime.harness.set_response_header_timeout_ms(ms).await;
+                    // The saved default; a Session override still wins.
+                    runtime.native.set_default_response_timeout(ms).await;
                     let _ = runtime.save_settings();
                     let label = if ms == 0 {
                         "off (unlimited — for long-running workflows)".into()
@@ -6168,7 +6186,8 @@ async fn choose_model(
                 runtime.use_native().await;
                 chat.push(sys("back to Loop's own agent"));
             }
-            token_bar.sync_window(runtime);
+            // The Session's stats name the new model's window.
+            token_bar.refresh(runtime).await;
             chat.push(sys(format!("model → {}/{}", model.provider, model.id)));
         }
         Err(err) => chat.push(error_item(format!("{err:#}"))),
@@ -6317,6 +6336,35 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn token_bar_takes_the_context_window_from_session_stats() {
+        // This Surface selected a 1M model; the attached Session runs 200k.
+        let mut bar = TokenBarState {
+            total_tokens: 0,
+            context_tokens: Some(0),
+            context_window: 1_000_000,
+        };
+        bar.apply_stats(&loop_protocol::StatsSummary {
+            total_tokens: 50,
+            context_tokens: Some(40),
+            context_window: Some(200_000),
+            ..Default::default()
+        });
+        assert_eq!(
+            (bar.total_tokens, bar.context_tokens, bar.context_window),
+            (50, Some(40), 200_000)
+        );
+        // An unknown window stays unknown rather than falling back locally.
+        bar.apply_stats(&loop_protocol::StatsSummary {
+            total_tokens: 60,
+            ..Default::default()
+        });
+        assert_eq!(
+            (bar.total_tokens, bar.context_tokens, bar.context_window),
+            (60, Some(40), 0)
+        );
     }
 
     #[tokio::test]

@@ -19,9 +19,10 @@ use loop_app_core::{
 };
 use loop_protocol::{
     rpc::{SessionInfo, SessionSnapshot},
-    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ConfigChanged,
-    ContentBlock, ErrorCategory, ModelChoices, ModelControl, MutationResult, Origin, SessionKey,
-    SessionMetadata, SessionRef, SessionSpec, SessionUpdate, TurnHandle, TurnOutcome,
+    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
+    CompactionReport, ConfigChanged, ContentBlock, ErrorCategory, LocalShell, ModelChoices,
+    ModelControl, MutationResult, Origin, SessionKey, SessionMetadata, SessionRef, SessionSpec,
+    SessionStats, SessionUpdate, ShellResult, StatsSummary, TurnHandle, TurnOutcome,
     UpdateEnvelope,
 };
 use loop_wire::control::EscalationRecipient;
@@ -1798,6 +1799,107 @@ impl Runtime {
     }
 }
 
+impl Runtime {
+    /// Mark an idle Session busy for a turn or a user command, capturing
+    /// its settled output for snapshots taken meanwhile. Caller holds the
+    /// lifecycle lock and has checked the Session is open.
+    async fn reserve(&self, live: &LiveSession) -> BackendResult<()> {
+        if !live.busy.load(Ordering::Acquire) {
+            self.announce_control(live, None).await?;
+            // The pump's committed point, without waiting on the Event
+            // Log: anything still queued before this turn is a config
+            // update, which transcript views leave out.
+            let published = live.announced.lock().unwrap().published;
+            live.turn_start_seq.store(published, Ordering::Release);
+            *live.committed.lock().await =
+                Some(live.opened.harness.export_session().await.map_err(failed)?);
+        }
+        if live
+            .busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(BackendError::Busy);
+        }
+        Ok(())
+    }
+    /// Run a user command in the Session's environment while it is idle.
+    /// The command holds the Session busy, not its lifecycle lock, and a
+    /// cancel or forced close stops it.
+    async fn shell(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult> {
+        let live = self.loaded(session).await?;
+        // Checked before the Session is reserved.
+        let timeout_ms = live.opened.native.shell_timeout(timeout_ms)?;
+        let mut cancelled = live.cancel.subscribe();
+        {
+            let _lifecycle = live.lifecycle.lock().await;
+            self.check_tree_live(&live)?;
+            self.reserve(&live).await?;
+        }
+        // Owned by the Runtime: a dropped request still clears `busy`.
+        let session = session.clone();
+        let command = command.to_owned();
+        let task = tokio::spawn(async move {
+            let result = tokio::select! {
+                result = live.opened.native.run(&session, &command, Some(timeout_ms)) => result,
+                _ = cancelled.changed() => Err(BackendError::failed(
+                    ErrorCategory::Cancelled,
+                    "the command was cancelled",
+                )),
+            };
+            let _lifecycle = live.lifecycle.lock().await;
+            live.busy.store(false, Ordering::Release);
+            result
+        });
+        task.await.map_err(failed)?
+    }
+}
+
+#[async_trait]
+impl Compaction for Runtime {
+    async fn compact(
+        &self,
+        session: &SessionRef,
+        instructions: Option<&str>,
+    ) -> BackendResult<CompactionReport> {
+        Runtime::compact(self, session, instructions).await
+    }
+}
+
+#[async_trait]
+impl SessionStats for Runtime {
+    async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary> {
+        let live = self.loaded(session).await?;
+        let mut stats = live.opened.native.stats(session).await?;
+        let turn_state = if live.escalations.has_pending().await {
+            "parked"
+        } else if live.busy.load(Ordering::Acquire) {
+            "busy"
+        } else {
+            "idle"
+        };
+        stats.turn_state = Some(turn_state.into());
+        Ok(stats)
+    }
+}
+
+#[async_trait]
+impl LocalShell for Runtime {
+    async fn run(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult> {
+        self.shell(session, command, timeout_ms).await
+    }
+}
+
 #[async_trait]
 impl ModelControl for Runtime {
     async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
@@ -1840,6 +1942,46 @@ impl ModelControl for Runtime {
         let live = self.loaded(session).await?;
         Self::control(&live)?.modes(session).await
     }
+    async fn ttfb(
+        &self,
+        session: &SessionRef,
+        change: Option<Option<u64>>,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        if change.is_none() {
+            let live = self.loaded(session).await?;
+            return Self::control(&live)?.ttfb(session, None, None).await;
+        }
+        // During a turn the change waits for the next one.
+        let read = Mutex::new(None);
+        let mutation = self
+            .set_config(session, false, |live| {
+                let read = &read;
+                async move {
+                    let result = Self::control(&live)?
+                        .ttfb(session, change, expected_revision)
+                        .await?;
+                    let mutation = MutationResult {
+                        revision: result.revision,
+                        seq: result.seq.unwrap_or(0),
+                        pending: result.pending,
+                        applies_after_turn: None,
+                    };
+                    *read.lock().unwrap() = Some(result);
+                    Ok(mutation)
+                }
+            })
+            .await?;
+        let mut result = read
+            .into_inner()
+            .unwrap()
+            .ok_or_else(|| failed("the change was not recorded"))?;
+        // The Runtime's own sequence, committed in its Event Log.
+        result.revision = mutation.revision;
+        result.seq = Some(mutation.seq);
+        result.pending = mutation.pending;
+        Ok(result)
+    }
     async fn set_mode(
         &self,
         session: &SessionRef,
@@ -1874,6 +2016,10 @@ impl AgentBackend for Runtime {
             images: true,
             set_model: true,
             efforts: true,
+            compaction: true,
+            session_stats: true,
+            local_shell: true,
+            session_ttfb: true,
             ..Capabilities::default()
         }
     }
@@ -1881,6 +2027,15 @@ impl AgentBackend for Runtime {
         self.updates.subscribe()
     }
     fn model_control(&self) -> Option<&dyn ModelControl> {
+        Some(self)
+    }
+    fn compaction(&self) -> Option<&dyn Compaction> {
+        Some(self)
+    }
+    fn session_stats(&self) -> Option<&dyn SessionStats> {
+        Some(self)
+    }
+    fn local_shell(&self) -> Option<&dyn LocalShell> {
         Some(self)
     }
     async fn new_session(&self, spec: SessionSpec) -> BackendResult<SessionRef> {
@@ -1934,23 +2089,7 @@ impl AgentBackend for Runtime {
             if let Some(error) = live.failure.lock().unwrap().clone() {
                 return Err(failed(error));
             }
-            if !live.busy.load(Ordering::Acquire) {
-                self.announce_control(&live, None).await?;
-                // The pump's committed point, without waiting on the Event
-                // Log: anything still queued before this turn is a config
-                // update, which transcript views leave out.
-                let published = live.announced.lock().unwrap().published;
-                live.turn_start_seq.store(published, Ordering::Release);
-                *live.committed.lock().await =
-                    Some(live.opened.harness.export_session().await.map_err(failed)?);
-            }
-            if live
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                return Err(BackendError::Busy);
-            }
+            self.reserve(&live).await?;
             drop(lifecycle);
             break live;
         };

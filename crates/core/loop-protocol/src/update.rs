@@ -219,6 +219,10 @@ pub struct SessionConfig {
     /// Backend mode id, as `session/modes` names it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// The Session's response-timeout override in ms (`session/ttfb`);
+    /// absent inherits the default, 0 waits indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_timeout_ms: Option<u64>,
 }
 
 /// Who wrote a message.

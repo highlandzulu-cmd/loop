@@ -73,6 +73,10 @@
           "description": "Serves immutable transcript pages.",
           "type": "boolean"
         },
+        "compaction": {
+          "description": "Compacts the Session's context on request (`session/compact`).",
+          "type": "boolean"
+        },
         "efforts": {
           "default": false,
           "description": "Has selectable reasoning effort levels (`session/efforts`).",
@@ -91,6 +95,10 @@
         "load_session": {
           "default": false,
           "description": "Can reopen a past session, replaying its history.",
+          "type": "boolean"
+        },
+        "local_shell": {
+          "description": "Runs a user command in the Session's environment (`session/shell`).",
           "type": "boolean"
         },
         "modes": {
@@ -116,12 +124,20 @@
           "description": "Changes Session metadata.",
           "type": "boolean"
         },
+        "session_stats": {
+          "description": "Reports Session token statistics (`session/stats`).",
+          "type": "boolean"
+        },
         "session_transfer": {
           "description": "Transfers bounded Session payloads.",
           "type": "boolean"
         },
         "session_tree": {
           "description": "Lists and navigates Session branches.",
+          "type": "boolean"
+        },
+        "session_ttfb": {
+          "description": "Reads and overrides the Session's response timeout (`session/ttfb`).",
           "type": "boolean"
         },
         "set_model": {
@@ -268,6 +284,62 @@
       },
       "required": [
         "session"
+      ],
+      "type": "object"
+    },
+    "CompactParams": {
+      "description": "`session/compact` params.",
+      "properties": {
+        "instructions": {
+          "description": "Guidance for the summary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "CompactionReport": {
+      "description": "Result of compacting a conversation (`session/compact`).",
+      "properties": {
+        "branch_revision": {
+          "default": 0,
+          "description": "The committed branch revision after compaction; 0 when the backend\ndoes not count branch changes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "default": 0,
+          "description": "The update sequence that announced the compaction; 0 when the\nbackend keeps no ordered Event Log.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "summary": {
+          "description": "The summary that replaced the earlier conversation.",
+          "type": "string"
+        },
+        "tokens_before": {
+          "description": "Estimated tokens before compaction, when known.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "summary"
       ],
       "type": "object"
     },
@@ -1655,6 +1727,15 @@
             "string",
             "null"
           ]
+        },
+        "response_timeout_ms": {
+          "description": "The Session's response-timeout override in ms (`session/ttfb`);\nabsent inherits the default, 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         }
       },
       "type": "object"
@@ -2368,6 +2449,123 @@
       ],
       "type": "object"
     },
+    "ShellParams": {
+      "description": "`session/shell` params.",
+      "properties": {
+        "command": {
+          "description": "The command line, run by the Session's shell.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "timeout_ms": {
+          "description": "At most this long; the default and the maximum are the host's\n`bash.maxTimeoutMs` (600 s unless configured).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session",
+        "command"
+      ],
+      "type": "object"
+    },
+    "ShellResult": {
+      "description": "Output of a command run for the user (`session/shell`).",
+      "properties": {
+        "exit_code": {
+          "description": "Exit code.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "stderr": {
+          "description": "Standard error, at most [`SHELL_OUTPUT_LIMIT`] bytes.",
+          "type": "string"
+        },
+        "stdout": {
+          "description": "Standard output, at most [`SHELL_OUTPUT_LIMIT`] bytes.",
+          "type": "string"
+        },
+        "truncated": {
+          "default": false,
+          "description": "A stream was cut at [`SHELL_OUTPUT_LIMIT`].",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "stdout",
+        "stderr",
+        "exit_code"
+      ],
+      "type": "object"
+    },
+    "StatsResult": {
+      "description": "`session/stats` result. Unknown values are omitted.",
+      "properties": {
+        "context_tokens": {
+          "description": "Tokens in the current context.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "The Session model's context window.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "report": {
+          "description": "Multi-line report for display.",
+          "type": "string"
+        },
+        "taken_at_ms": {
+          "description": "When the server read these values, in Unix milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_tokens": {
+          "description": "All tokens billed in the Session.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn_state": {
+          "description": "Idle, busy or parked.",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Usage of the latest model call."
+        }
+      },
+      "required": [
+        "total_tokens",
+        "report",
+        "turn_state",
+        "taken_at_ms"
+      ],
+      "type": "object"
+    },
     "StopReason": {
       "description": "Why a turn ended.",
       "oneOf": [
@@ -2869,6 +3067,87 @@
       ],
       "type": "object"
     },
+    "TtfbParams": {
+      "description": "`session/ttfb` params. Without `timeout_ms` or `clear_override` it reads.",
+      "properties": {
+        "clear_override": {
+          "default": false,
+          "description": "Remove the override and inherit the default. Not with `timeout_ms`.",
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "timeout_ms": {
+          "description": "New override in ms; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "TtfbResult": {
+      "description": "`session/ttfb` result.",
+      "properties": {
+        "effective_ms": {
+          "description": "The timeout the next turn uses; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "override_ms": {
+          "description": "The Session's override, when it has one; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pending": {
+          "default": false,
+          "description": "The change waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "The update sequence that announced a change; absent for a read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "effective_ms",
+        "revision"
+      ],
+      "type": "object"
+    },
     "TurnId": {
       "description": "One user prompt and everything the agent does in response.",
       "type": "string"
@@ -3089,7 +3368,8 @@
     "encoded_response_bytes": 16777216,
     "page_default": 100,
     "page_max": 1000,
-    "session_transfer_bytes": 8388608
+    "session_transfer_bytes": 8388608,
+    "shell_output_bytes": 1048576
   },
   "methods": {
     "host/interact": {
@@ -3174,6 +3454,16 @@
       },
       "result": {
         "type": "object"
+      }
+    },
+    "session/compact": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/CompactParams"
+      },
+      "result": {
+        "$ref": "#/$defs/CompactionReport"
       }
     },
     "session/detach": {
@@ -3339,6 +3629,26 @@
         "$ref": "#/$defs/MutationResult"
       }
     },
+    "session/shell": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ShellParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ShellResult"
+      }
+    },
+    "session/stats": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/StatsResult"
+      }
+    },
     "session/transcript": {
       "direction": "client_to_server",
       "kind": "request",
@@ -3360,6 +3670,16 @@
       },
       "result": {
         "$ref": "#/$defs/TreeResult"
+      }
+    },
+    "session/ttfb": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TtfbParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TtfbResult"
       }
     },
     "session/update": {

@@ -828,3 +828,167 @@ async fn a_legacy_reattach_recovers_the_current_branch() {
     .await
     .unwrap();
 }
+
+/// Compaction resets the branch: only a reset-capable watcher receives
+/// BranchReset, a legacy one is detached, and the revision it carries is
+/// the one a reopened Session counts from its tree.
+#[tokio::test]
+async fn compaction_resets_capable_watchers_and_detaches_legacy_ones() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::ClientCapabilities;
+        use loop_protocol::{BackendError, ModelControl, SessionUpdate};
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log.clone()).await;
+        let (legacy, _legacy_server) = connect(&rt).await;
+        let source = legacy.new_session(SessionSpec::default()).await.unwrap();
+        // Enough earlier context to leave something behind the kept tail.
+        say(&legacy, &source, &"early context ".repeat(8000)).await;
+        say(&legacy, &source, "recent").await;
+        let (server, client) = memory();
+        let _capable_server = serve_with_control(
+            rt.clone(),
+            rt.clone(),
+            server,
+            info(),
+            ServeOptions {
+                owns_backend: false,
+            },
+        );
+        let capable = RemoteBackend::connect_with_capabilities(
+            client,
+            info(),
+            Arc::new(Reject),
+            ClientCapabilities {
+                interact: true,
+                branch_reset: true,
+            },
+        )
+        .await
+        .unwrap();
+        capable
+            .attach(&source, log.latest_seq(&source.key).await.unwrap())
+            .await
+            .unwrap();
+        let mut legacy_rx = legacy.subscribe();
+        let mut capable_rx = capable.subscribe();
+        let report = capable
+            .compaction()
+            .expect("the Runtime offers compaction")
+            .compact(&source, Some("keep it short"))
+            .await
+            .unwrap();
+        assert!(report.tokens_before.is_some_and(|t| t > 0));
+        assert!(report.branch_revision >= 1);
+        let events = collect(&mut capable_rx, &source.key, report.seq).await;
+        let revision = events
+            .iter()
+            .find_map(|e| match &e.update {
+                SessionUpdate::BranchReset {
+                    revision,
+                    branch_revision,
+                    reason,
+                    ..
+                } if e.seq == report.seq => {
+                    assert_eq!(reason, "compact");
+                    assert_eq!(*branch_revision, report.branch_revision);
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .expect("the capable watcher receives BranchReset");
+        let legacy_events = collect(&mut legacy_rx, &source.key, report.seq).await;
+        assert_eq!(detach_notices(&legacy_events), 1);
+        assert!(!legacy_events
+            .iter()
+            .any(|e| matches!(e.update, SessionUpdate::BranchReset { .. })));
+
+        let stats = capable
+            .session_stats()
+            .unwrap()
+            .stats(&source)
+            .await
+            .unwrap();
+        assert_eq!(stats.turn_state.as_deref(), Some("idle"));
+        assert!(stats.context_window.is_some_and(|w| w > 0));
+
+        // A user command holds the Session busy: compaction and prompts
+        // are refused meanwhile, and a cancel stops the command.
+        let shell = tokio::spawn({
+            let capable = capable.clone();
+            let source = source.clone();
+            async move {
+                capable
+                    .local_shell()
+                    .unwrap()
+                    .run(&source, "sleep 30", None)
+                    .await
+            }
+        });
+        while !rt.is_busy(&source) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            capable
+                .compaction()
+                .unwrap()
+                .compact(&source, None)
+                .await
+                .unwrap_err(),
+            BackendError::Busy
+        );
+        assert!(matches!(
+            rt.prompt(&source, vec![ContentBlock::text("no")]).await,
+            Err(BackendError::Busy)
+        ));
+        capable.cancel(&source);
+        let stopped = shell.await.unwrap().unwrap_err();
+        assert!(stopped.to_string().contains("cancelled"), "{stopped}");
+        assert!(!rt.is_busy(&source));
+        let out = capable
+            .local_shell()
+            .unwrap()
+            .run(&source, "printf ok", None)
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "ok");
+        // In-process Runtime and Remote answer alike.
+        let command = "printf out; printf err >&2; exit 4";
+        assert_eq!(
+            rt.local_shell()
+                .unwrap()
+                .run(&source, command, None)
+                .await
+                .unwrap(),
+            capable
+                .local_shell()
+                .unwrap()
+                .run(&source, command, None)
+                .await
+                .unwrap()
+        );
+        let here = rt.session_stats().unwrap().stats(&source).await.unwrap();
+        let there = capable
+            .session_stats()
+            .unwrap()
+            .stats(&source)
+            .await
+            .unwrap();
+        assert_eq!(
+            (here.total_tokens, here.context_window, here.turn_state),
+            (there.total_tokens, there.context_window, there.turn_state)
+        );
+
+        // Reopened from its tree, the Session counts the same revision.
+        capable.detach(&source).await.unwrap();
+        legacy.detach(&source).await.unwrap();
+        rt.close(&source.key, false).await.unwrap();
+        rt.load_session(&source, SessionSpec::default())
+            .await
+            .unwrap();
+        assert_eq!(rt.models(&source).await.unwrap().revision, revision);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

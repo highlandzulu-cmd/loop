@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 use crate::effort::{effective_effort, native_efforts, parse_thinking, NATIVE_EFFORTS};
 use crate::harness::agent_harness::AgentHarness;
 use crate::harness::session::format_session_stats;
-use crate::harness::session::types::PendingSessionWrite;
+use crate::harness::session::types::{PendingSessionWrite, RESPONSE_TIMEOUT_ENTRY};
 use crate::harness::types::{AgentHarnessError, AgentHarnessPhase, ShellExecOptions};
 use crate::protocol_events::{replay, turn_outcome, NativeEventMapper};
 use crate::types::AgentThinkingLevel;
@@ -53,6 +53,8 @@ pub struct NativeBackend {
     default_effort: Mutex<AgentThinkingLevel>,
     /// Model for a new Session, or one that never chose one.
     default_model: Mutex<Option<loop_ai::Model>>,
+    /// Response timeout for a Session without an override (0 = unlimited).
+    default_response_timeout: Mutex<u64>,
     /// Held while a turn is admitted or the model changes, so a model
     /// change never lands between the busy check and a turn's start.
     admission: tokio::sync::Mutex<()>,
@@ -129,6 +131,7 @@ pub fn session_config(model: Option<&loop_ai::Model>, level: AgentThinkingLevel)
         model: model.map(model_id),
         effort: Some(effective_effort(model, level)),
         mode: None,
+        response_timeout_ms: None,
     }
 }
 
@@ -175,6 +178,7 @@ impl NativeBackend {
         }));
         let level = harness.thinking_level().await;
         let default_model = harness.model().await;
+        let default_response_timeout = harness.response_header_timeout_ms().await;
         let backend = Arc::new(Self {
             instance: BackendInstanceId::from(NATIVE_INSTANCE),
             harness: Arc::clone(&harness),
@@ -193,6 +197,7 @@ impl NativeBackend {
             setting: tokio::sync::Mutex::new(()),
             default_effort: Mutex::new(level),
             default_model: Mutex::new(default_model),
+            default_response_timeout: Mutex::new(default_response_timeout),
             admission: tokio::sync::Mutex::new(()),
         });
         backend.read_config().await;
@@ -271,13 +276,28 @@ impl NativeBackend {
         Ok(())
     }
 
+    /// Response timeout for Sessions without an override (0 = unlimited).
+    /// The current Session picks it up unless it has its own override.
+    pub async fn set_default_response_timeout(&self, ms: u64) {
+        *self.default_response_timeout.lock() = ms;
+        let own = self.config.lock().config.response_timeout_ms;
+        self.harness
+            .set_response_header_timeout_ms(own.unwrap_or(ms))
+            .await;
+    }
+
     /// Read the current Session's config from the harness and its tree.
     async fn read_config(&self) {
         let session = SessionKey(self.harness.session_id().await);
         let recorded = self.harness.session_config().await.unwrap_or_default();
         let model = self.harness.model().await;
         let level = self.harness.thinking_level().await;
-        let config = session_config(model.as_ref(), level);
+        let mut config = session_config(model.as_ref(), level);
+        config.response_timeout_ms = recorded.response_timeout_ms;
+        let timeout = recorded
+            .response_timeout_ms
+            .unwrap_or(*self.default_response_timeout.lock());
+        self.harness.set_response_header_timeout_ms(timeout).await;
         *self.config.lock() = ConfigState {
             session,
             revision: recorded.revision,
@@ -308,7 +328,9 @@ impl NativeBackend {
         let mut state = self.config.lock();
         state.revision += 1;
         state.level = level;
+        let timeout = state.config.response_timeout_ms;
         state.config = session_config(model.as_ref(), level);
+        state.config.response_timeout_ms = timeout;
         let current_turn = self.stream.lock().mapper.current_turn().cloned();
         match current_turn.filter(|_| running) {
             Some(turn) => state.pending = Some(turn),
@@ -573,6 +595,10 @@ impl AgentBackend for NativeBackend {
             efforts: true,
             usage: true,
             images: true,
+            compaction: true,
+            session_stats: true,
+            local_shell: true,
+            session_ttfb: true,
             ..Capabilities::default()
         }
     }
@@ -853,6 +879,48 @@ impl ModelControl for NativeBackend {
         self.harness.set_thinking_level(thinking_level).await;
         Ok(self.announce_change().await)
     }
+
+    async fn ttfb(
+        &self,
+        session: &SessionRef,
+        change: Option<Option<u64>>,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        let _setting = self.setting.lock().await;
+        self.current_config(session).await?;
+        let mut seq = None;
+        let mut pending = self.config.lock().pending.is_some();
+        if let Some(timeout) = change {
+            self.check_revision(expected_revision)?;
+            self.harness
+                .record_config(PendingSessionWrite::Custom {
+                    custom_type: RESPONSE_TIMEOUT_ENTRY.into(),
+                    data: serde_json::json!({ "timeout_ms": timeout }),
+                })
+                .await
+                .map_err(harness_error)?;
+            let default = *self.default_response_timeout.lock();
+            // A running turn keeps the timeout it started with.
+            self.harness
+                .set_response_header_timeout_ms(timeout.unwrap_or(default))
+                .await;
+            self.config.lock().config.response_timeout_ms = timeout;
+            let result = self.announce_change().await;
+            seq = Some(result.seq);
+            pending = result.pending;
+        }
+        let state = self.config.lock();
+        Ok(loop_protocol::rpc::TtfbResult {
+            override_ms: state.config.response_timeout_ms,
+            effective_ms: state
+                .config
+                .response_timeout_ms
+                .unwrap_or(*self.default_response_timeout.lock()),
+            revision: state.revision,
+            seq,
+            pending,
+        })
+    }
 }
 
 #[async_trait]
@@ -868,10 +936,44 @@ impl Compaction for NativeBackend {
             .compact(instructions)
             .await
             .map_err(harness_error)?;
+        // The tree counts the compaction in the Session revision.
+        self.record_change(None);
         Ok(CompactionReport {
             tokens_before: Some(result.tokens_before),
             summary: result.summary,
+            ..CompactionReport::default()
         })
+    }
+}
+
+impl NativeBackend {
+    /// Check a user command's timeout: by default, and at most, the
+    /// `bash.maxTimeoutMs` limit.
+    pub fn shell_timeout(&self, requested: Option<u64>) -> BackendResult<u64> {
+        loop_protocol::shell_timeout(requested, self.harness.bash_limits().max_timeout_ms)
+    }
+
+    /// Prepare a compaction for a caller that commits the returned tree
+    /// write itself and then calls [`Self::record_change`].
+    pub async fn prepare_compaction(
+        &self,
+        session: &SessionRef,
+        instructions: Option<&str>,
+    ) -> BackendResult<(CompactionReport, PendingSessionWrite)> {
+        self.check_session(session).await?;
+        let (result, write) = self
+            .harness
+            .prepare_compaction(instructions)
+            .await
+            .map_err(harness_error)?;
+        Ok((
+            CompactionReport {
+                tokens_before: Some(result.tokens_before),
+                summary: result.summary,
+                ..CompactionReport::default()
+            },
+            write,
+        ))
     }
 }
 
@@ -880,28 +982,49 @@ impl SessionStats for NativeBackend {
     async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary> {
         self.check_session(session).await?;
         let stats = self.harness.session_stats().await.map_err(harness_error)?;
+        // The window is the Session model's, known before any usage is.
+        let window = match stats.context_usage.as_ref() {
+            Some(usage) => Some(usage.context_window),
+            None => self.harness.model().await.map(|m| m.context_window),
+        };
         Ok(StatsSummary {
             total_tokens: stats.tokens.total_tokens(),
             context_tokens: stats.context_usage.as_ref().and_then(|c| c.tokens),
-            context_window: stats.context_usage.as_ref().map(|c| c.context_window),
+            context_window: window.filter(|w| *w > 0),
             report: format_session_stats(&stats),
+            turn_state: Some(if self.is_busy_now() { "busy" } else { "idle" }.into()),
+            usage: None,
         })
     }
 }
 
 #[async_trait]
 impl LocalShell for NativeBackend {
-    async fn run(&self, session: &SessionRef, command: &str) -> BackendResult<ShellResult> {
+    async fn run(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult> {
+        let timeout_ms = self.shell_timeout(timeout_ms)?;
         self.check_session(session).await?;
         let env = self.harness.tool_env().await.map_err(harness_error)?;
         let out = env
-            .exec(command, ShellExecOptions::default())
+            .exec(
+                command,
+                ShellExecOptions {
+                    timeout_ms: Some(timeout_ms),
+                    ..ShellExecOptions::default()
+                },
+            )
             .await
             .map_err(|e| BackendError::failed(ErrorCategory::Agent, e.to_string()))?;
         Ok(ShellResult {
             stdout: out.stdout,
             stderr: out.stderr,
             exit_code: out.exit_code,
-        })
+            truncated: out.truncated,
+        }
+        .bounded())
     }
 }

@@ -526,6 +526,44 @@ impl Runtime {
             seq,
         })
     }
+    /// Compact while idle: commit the summary as a branch change, then
+    /// announce the compacted branch's immutable replacement.
+    pub async fn compact(
+        &self,
+        session: &SessionRef,
+        instructions: Option<&str>,
+    ) -> BackendResult<loop_protocol::CompactionReport> {
+        let live = self.loaded(session).await?;
+        let _guard = live.lifecycle.lock().await;
+        self.check_tree_live(&live)?;
+        if live.busy.load(Ordering::Acquire) {
+            return Err(BackendError::Busy);
+        }
+        barrier(&live).await?;
+        let slot = self.reserve_view(session, true)?;
+        let (mut report, write) = live
+            .opened
+            .native
+            .prepare_compaction(session, instructions)
+            .await?;
+        // No `summary` key: that would add a branch summary entry.
+        let marker = json!({"id":loop_ai::new_id(),"kind":"compact"}).to_string();
+        let state = self
+            .store
+            .control_mutation(
+                &session.native_id,
+                self.identity.clone(),
+                true,
+                write,
+                marker,
+            )
+            .await
+            .map_err(failed)?;
+        live.opened.native.record_change(None);
+        report.seq = self.announce_control(&live, Some(slot)).await?;
+        report.branch_revision = state.branch_revision;
+        Ok(report)
+    }
     /// Finish an unannounced committed tree write before admitting work or snapshots.
     /// A navigation passes the view it reserved; recovery reserves its own.
     pub(super) async fn announce_control(
@@ -569,7 +607,8 @@ impl Runtime {
                 revision,
                 branch_revision: state.branch_revision,
                 view_id,
-                reason: "navigate".into(),
+                // A recovered marker keeps the reason it was written with.
+                reason: marker_value["kind"].as_str().unwrap_or("navigate").into(),
             }
         };
         let (tx, rx) = oneshot::channel();
