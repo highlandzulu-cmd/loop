@@ -104,6 +104,21 @@ async fn reload_reaches_idle_sessions_now_and_busy_ones_when_their_turn_ends() {
         let busy = rt.new_session(SessionSpec::default()).await.unwrap();
         let turn = park(&rt, &log, &busy).await;
 
+        // The Runtime panel sees one idle and one parked Session.
+        let panel = admin(&rt).sessions().await.unwrap();
+        assert_eq!(panel.totals.sessions, 2);
+        assert_eq!(panel.totals.busy, 1);
+        let state = |key: &SessionKey| {
+            panel
+                .sessions
+                .iter()
+                .find(|row| &row.session.key == key)
+                .map(|row| row.state.clone())
+        };
+        assert_eq!(state(&idle.key).as_deref(), Some("idle"));
+        assert_eq!(state(&busy.key).as_deref(), Some("parked"));
+        assert_eq!(panel.sessions[0].workspace_id, workspace(dir.path()));
+
         write_skill(dir.path(), "notes");
         let reloaded = admin(&rt)
             .reload(ReloadParams {
@@ -358,4 +373,50 @@ async fn sandbox_status_reports_off_and_a_bad_mode_is_refused() {
 /// The admin service, past `Runtime`'s own `reload`.
 fn admin(rt: &Runtime) -> &dyn RuntimeAdmin {
     rt
+}
+
+async fn tools_and_prompt(rt: &Runtime, session: &SessionRef) -> (Vec<String>, String) {
+    let live = rt.route(session).unwrap();
+    let mut names: Vec<String> = live
+        .opened
+        .harness
+        .get_tools()
+        .await
+        .into_iter()
+        .map(|t| t.name)
+        .collect();
+    names.sort();
+    (names, live.opened.harness.system_prompt().await)
+}
+
+#[tokio::test]
+async fn a_reloaded_session_matches_a_fresh_one_and_keeps_runtime_tools() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _log) = runtime(dir.path()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let before = tools_and_prompt(&rt, &session).await;
+        assert!(
+            before.0.iter().any(|n| n == subagent::TOOL),
+            "{:?}",
+            before.0
+        );
+        let snapshot = rt.snapshot(&session).await.unwrap();
+        assert_eq!(snapshot.workspace_revision, 0);
+        admin(&rt)
+            .reload(ReloadParams {
+                workspace_id: workspace(dir.path()),
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(tools_and_prompt(&rt, &session).await, before);
+        let fresh = rt.new_session(SessionSpec::default()).await.unwrap();
+        assert_eq!(tools_and_prompt(&rt, &fresh).await, before);
+        // Snapshots report the workspace revision admin results use.
+        assert_eq!(rt.snapshot(&session).await.unwrap().workspace_revision, 1);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
 }

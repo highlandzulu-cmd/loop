@@ -153,6 +153,10 @@
           "description": "Can reopen a past session without replaying history.",
           "type": "boolean"
         },
+        "runtime_sessions": {
+          "description": "Lists loaded Sessions for the Runtime panel (`runtime/sessions`).",
+          "type": "boolean"
+        },
         "session_fork": {
           "description": "Creates separately leased forks and clones.",
           "type": "boolean"
@@ -2011,6 +2015,109 @@
       "required": [
         "code",
         "message"
+      ],
+      "type": "object"
+    },
+    "RuntimeSessionRow": {
+      "description": "One loaded Session in `runtime/sessions`.",
+      "properties": {
+        "model": {
+          "description": "Selected model, `provider/id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "state": {
+          "description": "`idle`, `busy`, or `parked` (waiting on an Escalation).",
+          "type": "string"
+        },
+        "tokens": {
+          "description": "Tokens billed so far; absent when unknown.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "workspace_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "RuntimeSessionTotals": {
+      "description": "Totals over the listed rows only.",
+      "properties": {
+        "busy": {
+          "description": "Sessions with work running.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessions": {
+          "description": "Loaded Sessions, children counted separately.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tokens": {
+          "description": "Known tokens over the rows.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unknown_tokens": {
+          "description": "Rows whose tokens are unknown.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessions",
+        "busy",
+        "tokens",
+        "unknown_tokens"
+      ],
+      "type": "object"
+    },
+    "RuntimeSessionsResult": {
+      "description": "`runtime/sessions` result: the Runtime panel.",
+      "properties": {
+        "sessions": {
+          "description": "One row per loaded Session.",
+          "items": {
+            "$ref": "#/$defs/RuntimeSessionRow"
+          },
+          "type": "array"
+        },
+        "taken_at_ms": {
+          "description": "When the rows were read, in ms since the epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totals": {
+          "$ref": "#/$defs/RuntimeSessionTotals",
+          "description": "Totals for these rows."
+        }
+      },
+      "required": [
+        "sessions",
+        "totals",
+        "taken_at_ms"
       ],
       "type": "object"
     },
@@ -4264,6 +4371,16 @@
       },
       "result": {
         "$ref": "#/$defs/DefaultsResult"
+      }
+    },
+    "runtime/sessions": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "$ref": "#/$defs/RuntimeSessionsResult"
       }
     },
     "runtime/status": {

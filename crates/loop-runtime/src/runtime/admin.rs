@@ -17,6 +17,9 @@ use loop_wire::RuntimeAdmin;
 
 use super::*;
 
+/// Tools the Runtime adds to its Sessions, kept across a reload.
+const RUNTIME_TOOLS: &[&str] = &[super::subagent::TOOL];
+
 /// A workspace reload a busy Session applies when its work ends.
 pub(super) struct PendingWorkspace {
     resources: Arc<WorkspaceResources>,
@@ -47,11 +50,42 @@ impl LiveSession {
     pub(super) async fn apply_pending(&self) {
         let pending = self.pending_workspace.lock().unwrap().take();
         if let Some(pending) = pending {
-            if let Err(error) = self.opened.apply_workspace(&pending.resources).await {
+            if let Err(error) = self
+                .opened
+                .apply_workspace(&pending.resources, RUNTIME_TOOLS)
+                .await
+            {
                 eprintln!("Runtime: could not apply the reloaded workspace: {error}");
             }
             if let Some(retiring) = pending.retiring {
                 retiring.release().await;
+            }
+        }
+    }
+}
+
+impl Runtime {
+    /// Release what admin gave a closing Session: its place in a pending
+    /// reload, and a sandbox of its own (never the workspace's shared one).
+    pub(super) async fn release_admin(&self, live: &LiveSession) {
+        let pending = live.pending_workspace.lock().unwrap().take();
+        if let Some(retiring) = pending.and_then(|p| p.retiring) {
+            retiring.release().await;
+        }
+        let shared = self
+            .workspaces
+            .lock()
+            .unwrap()
+            .get(&live.opened.workspace.cwd)
+            .and_then(|state| state.sandbox.clone());
+        let own = live
+            .opened
+            .harness
+            .replace_sandbox(SandboxMode::Disabled)
+            .await;
+        if let SandboxMode::Enabled { sandbox } = own {
+            if !shared.is_some_and(|shared| Arc::ptr_eq(&shared, &sandbox)) {
+                let _ = sandbox.destroy().await;
             }
         }
     }
@@ -81,7 +115,7 @@ impl Runtime {
             .ok_or_else(|| protocol(format!("unknown workspace {id}")))
     }
 
-    fn workspace_revision(&self, cwd: &Path) -> u64 {
+    pub(super) fn workspace_revision(&self, cwd: &Path) -> u64 {
         self.workspaces
             .lock()
             .unwrap()
@@ -181,7 +215,7 @@ impl Runtime {
                 }
                 continue;
             }
-            match live.opened.apply_workspace(&fresh).await {
+            match live.opened.apply_workspace(&fresh, RUNTIME_TOOLS).await {
                 Ok(applied) => {
                     for notice in applied {
                         if !notices.contains(&notice) {
@@ -327,8 +361,50 @@ impl RuntimeAdmin for Runtime {
             workspace_trust: true,
             session_sandbox: true,
             permission_mode: true,
+            runtime_sessions: true,
             ..Capabilities::default()
         }
+    }
+
+    async fn sessions(&self) -> BackendResult<RuntimeSessionsResult> {
+        let live: Vec<Arc<LiveSession>> = self.sessions.lock().unwrap().values().cloned().collect();
+        let mut rows = Vec::with_capacity(live.len());
+        let mut totals = RuntimeSessionTotals::default();
+        for live in live {
+            let busy = live.busy.load(Ordering::Acquire);
+            let state = if busy && live.escalations.has_pending().await {
+                "parked"
+            } else if busy {
+                "busy"
+            } else {
+                "idle"
+            };
+            let tokens = SessionStats::stats(self, &live.reference)
+                .await
+                .ok()
+                .map(|s| s.total_tokens);
+            totals.sessions += 1;
+            totals.busy += u32::from(busy);
+            match tokens {
+                Some(tokens) => totals.tokens += tokens,
+                None => totals.unknown_tokens += 1,
+            }
+            rows.push(RuntimeSessionRow {
+                session: live.reference.clone(),
+                workspace_id: tree::workspace_id(&live.opened.workspace.cwd),
+                state: state.into(),
+                model: live.announced.lock().unwrap().latest.config.model.clone(),
+                tokens,
+            });
+        }
+        rows.sort_by(|a, b| a.session.key.0.cmp(&b.session.key.0));
+        Ok(RuntimeSessionsResult {
+            sessions: rows,
+            totals,
+            taken_at_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as u64),
+        })
     }
 
     async fn mcp(&self, params: McpParams) -> BackendResult<McpResult> {
@@ -556,7 +632,7 @@ impl RuntimeAdmin for Runtime {
                 }
             }
             live.opened
-                .apply_workspace(&workspace)
+                .apply_workspace(&workspace, RUNTIME_TOOLS)
                 .await
                 .map_err(failed)?;
             let sandboxed = choice.mode == "local";

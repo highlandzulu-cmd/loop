@@ -374,6 +374,7 @@ fn admin_methods_are_in_the_schema_and_host_only_ones_are_marked() {
         methods::SESSION_PERMISSION_MODE,
         methods::RUNTIME_USAGE,
         methods::RUNTIME_DEFAULTS,
+        methods::RUNTIME_SESSIONS,
     ] {
         let entry = &schema["methods"][method];
         assert_eq!(entry["kind"], "request", "{method}");

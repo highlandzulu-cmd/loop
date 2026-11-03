@@ -206,6 +206,10 @@ pub trait RuntimeAdmin: Send + Sync {
     ) -> BackendResult<admin::PermissionModeResult> {
         Err(BackendError::Unsupported("session/permission_mode".into()))
     }
+    /// `runtime/sessions`.
+    async fn sessions(&self) -> BackendResult<admin::RuntimeSessionsResult> {
+        Err(BackendError::Unsupported("runtime/sessions".into()))
+    }
     /// `runtime/usage` (host-only).
     async fn usage(&self, _params: admin::UsageParams) -> BackendResult<admin::UsageResult> {
         Err(BackendError::Unsupported("runtime/usage".into()))

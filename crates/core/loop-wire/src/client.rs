@@ -686,6 +686,14 @@ impl crate::control::RuntimeAdmin for RemoteBackend {
         )
         .await
     }
+    async fn sessions(&self) -> BackendResult<admin::RuntimeSessionsResult> {
+        self.admin_call(
+            |c| c.runtime_sessions,
+            methods::RUNTIME_SESSIONS,
+            &serde_json::json!({}),
+        )
+        .await
+    }
     async fn usage(&self, params: admin::UsageParams) -> BackendResult<admin::UsageResult> {
         self.admin_call(|c| c.host_usage, methods::RUNTIME_USAGE, &params)
             .await

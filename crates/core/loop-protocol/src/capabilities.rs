@@ -91,4 +91,7 @@ pub struct Capabilities {
     /// Reads and saves new-Session defaults (`runtime/defaults`); host-local only.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub host_defaults: bool,
+    /// Lists loaded Sessions for the Runtime panel (`runtime/sessions`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_sessions: bool,
 }

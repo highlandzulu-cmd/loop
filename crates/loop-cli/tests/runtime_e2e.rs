@@ -1161,6 +1161,10 @@ async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket()
             .unwrap();
         assert_eq!(reloaded.revision, 1);
         assert_eq!(reloaded.pending_sessions, 0);
+        assert!(offered.runtime_sessions);
+        let panel = client.sessions().await.unwrap();
+        assert_eq!(panel.totals.sessions, 1);
+        assert_eq!(panel.sessions[0].workspace_id, workspace_id);
 
         let saved = client
             .defaults(DefaultsParams {

@@ -301,6 +301,19 @@ async fn admin_is_the_same_over_the_wire_on_a_host_local_connection() {
             .await
             .unwrap();
         assert_eq!(saved.response_header_timeout_ms, Some(0));
+        // Reserved host-only names are not served, even host-locally.
+        let conn = raw(served(&fake, Authority::HostLocal)).await;
+        for method in [
+            methods::RUNTIME_PROVIDERS,
+            methods::RUNTIME_MCP_AUTH,
+            methods::RUNTIME_TRACING,
+        ] {
+            assert!(
+                matches!(conn.request(method, json!({})).await, Err(RpcError::Remote { code, .. })
+                    if code == loop_protocol::rpc::error_codes::UNSUPPORTED),
+                "{method}"
+            );
+        }
         // A service the owner does not serve answers Unsupported.
         assert!(matches!(
             remote

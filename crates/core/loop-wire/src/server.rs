@@ -247,6 +247,7 @@ async fn run(
                             capabilities.workspace_trust = offered.workspace_trust;
                             capabilities.session_sandbox = offered.session_sandbox;
                             capabilities.permission_mode = offered.permission_mode;
+                            capabilities.runtime_sessions = offered.runtime_sessions;
                             capabilities.host_usage = offered.host_usage && host;
                             capabilities.host_defaults = offered.host_defaults && host;
                             let result = InitializeResult {
@@ -575,6 +576,10 @@ async fn handle(
                 Err(error) => return conn.respond(id, Err(error)),
             }
         }
+        // Reserved host-only names; refused remotely before dispatch.
+        methods::RUNTIME_PROVIDERS | methods::RUNTIME_MCP_AUTH | methods::RUNTIME_TRACING => {
+            Err(loop_protocol::BackendError::Unsupported(method.into()))
+        }
         methods::WORKSPACE_MCP
         | methods::WORKSPACE_WEB_SEARCH
         | methods::WORKSPACE_SKILLS
@@ -583,6 +588,7 @@ async fn handle(
         | methods::WORKSPACE_TRUST
         | methods::SESSION_SANDBOX
         | methods::SESSION_PERMISSION_MODE
+        | methods::RUNTIME_SESSIONS
         | methods::RUNTIME_USAGE
         | methods::RUNTIME_DEFAULTS => {
             match admin(admin_offered(runtime), runtime, method, params).await {
@@ -779,6 +785,7 @@ async fn admin(
         methods::WORKSPACE_TRUST => capabilities.workspace_trust,
         methods::SESSION_SANDBOX => capabilities.session_sandbox,
         methods::SESSION_PERMISSION_MODE => capabilities.permission_mode,
+        methods::RUNTIME_SESSIONS => capabilities.runtime_sessions,
         methods::RUNTIME_USAGE => capabilities.host_usage,
         _ => capabilities.host_defaults,
     };
@@ -799,6 +806,7 @@ async fn admin(
             .permission_mode(parse(params)?)
             .await
             .map(|r| to_value(&r)),
+        methods::RUNTIME_SESSIONS => admin.sessions().await.map(|r| to_value(&r)),
         methods::RUNTIME_USAGE => admin.usage(parse(params)?).await.map(|r| to_value(&r)),
         _ => admin.defaults(parse(params)?).await.map(|r| to_value(&r)),
     })

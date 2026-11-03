@@ -312,12 +312,20 @@ impl OpenedSession {
     /// Point this Session at `workspace`, a reload of its own: skills and
     /// templates, tools (web, bash limits), system prompt, hooks, MCP
     /// tools and timeouts, as a Session opened there now would have them.
-    /// Its execution env, model, effort, permission mode and grants stay.
+    /// Its execution env, model, effort, permission mode and grants stay,
+    /// and so do the tools named in `keep`, which its owner added.
     pub async fn apply_workspace(
         &self,
         workspace: &WorkspaceResources,
+        keep: &[&str],
     ) -> anyhow::Result<Vec<String>> {
         let harness = &self.harness;
+        let kept: Vec<_> = harness
+            .get_tools()
+            .await
+            .into_iter()
+            .filter(|tool| keep.contains(&tool.name.as_str()))
+            .collect();
         let settings = &workspace.settings;
         harness
             .set_resources(AgentHarnessResources {
@@ -353,6 +361,7 @@ impl OpenedSession {
             )
             .await,
         );
+        tools.extend(kept);
         harness
             .set_tools(tools)
             .await

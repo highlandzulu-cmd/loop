@@ -763,6 +763,8 @@ fn workspace_admin_and_host_only_methods_wire() {
     assert_eq!(methods::SESSION_PERMISSION_MODE, "session/permission_mode");
     assert_eq!(methods::RUNTIME_USAGE, "runtime/usage");
     assert_eq!(methods::RUNTIME_DEFAULTS, "runtime/defaults");
+    assert_eq!(methods::RUNTIME_SESSIONS, "runtime/sessions");
+    assert!(!methods::HOST_ONLY.contains(&methods::RUNTIME_SESSIONS));
     for method in [
         methods::RUNTIME_STOP,
         methods::RUNTIME_USAGE,

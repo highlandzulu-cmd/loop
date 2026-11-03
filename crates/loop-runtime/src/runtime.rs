@@ -1226,6 +1226,7 @@ impl Runtime {
             live.busy.store(false, Ordering::Release);
         }
         let _ = tokio::time::timeout(grace, live.opened.native.shutdown()).await;
+        self.release_admin(&live).await;
         let (tx, rx) = oneshot::channel();
         let _ = live.commands.send(Command::Stop(tx));
         let stopped = tokio::time::timeout(grace, rx).await.is_ok();
@@ -1700,7 +1701,12 @@ impl Runtime {
             capabilities: self.capabilities(),
             turn_state: None,
             stats: serde_json::Value::Null,
-            workspace_revision: changed.workspace_revision,
+            workspace_revision: self
+                .route(session)
+                .ok()
+                .map_or(changed.workspace_revision, |live| {
+                    self.workspace_revision(&live.opened.workspace.cwd)
+                }),
         }
     }
     /// A Session's config as its tree records it, without loading it.

@@ -135,6 +135,9 @@ pub mod methods {
     /// Host-only request: [`crate::admin::DefaultsParams`] →
     /// [`crate::admin::DefaultsResult`]. Needs `host_defaults`.
     pub const RUNTIME_DEFAULTS: &str = "runtime/defaults";
+    /// Client → server request: `{}` → [`crate::admin::RuntimeSessionsResult`].
+    /// Needs `runtime_sessions`.
+    pub const RUNTIME_SESSIONS: &str = "runtime/sessions";
     /// Host-only request: provider login and logout. Reserved.
     pub const RUNTIME_PROVIDERS: &str = "runtime/providers";
     /// Host-only request: MCP OAuth login and logout. Reserved.
@@ -821,6 +824,11 @@ pub fn json_schema() -> Value {
                 methods::RUNTIME_DEFAULTS,
                 r(generator.subschema_for::<DefaultsParams>()),
                 r(generator.subschema_for::<DefaultsResult>()),
+            ),
+            (
+                methods::RUNTIME_SESSIONS,
+                serde_json::json!({"type": "object"}),
+                r(generator.subschema_for::<RuntimeSessionsResult>()),
             ),
         ]
     };

@@ -322,6 +322,9 @@ impl loop_wire::RuntimeAdmin for Control {
     async fn mcp(&self, p: admin::McpParams) -> BackendResult<admin::McpResult> {
         self.runtime.mcp(p).await
     }
+    async fn sessions(&self) -> BackendResult<admin::RuntimeSessionsResult> {
+        loop_wire::RuntimeAdmin::sessions(self.runtime.as_ref()).await
+    }
     async fn web_search(&self, p: admin::WebSearchParams) -> BackendResult<admin::WebSearchResult> {
         self.runtime.web_search(p).await
     }

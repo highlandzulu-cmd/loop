@@ -399,3 +399,47 @@ pub struct DefaultsResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_header_timeout_ms: Option<u64>,
 }
+
+/// One loaded Session in `runtime/sessions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeSessionRow {
+    /// Session reference.
+    pub session: SessionRef,
+    /// Host workspace id.
+    pub workspace_id: String,
+    /// `idle`, `busy`, or `parked` (waiting on an Escalation).
+    pub state: String,
+    /// Selected model, `provider/id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Tokens billed so far; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<u64>,
+}
+
+/// Totals over the listed rows only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeSessionTotals {
+    /// Loaded Sessions, children counted separately.
+    pub sessions: u32,
+    /// Sessions with work running.
+    pub busy: u32,
+    /// Known tokens over the rows.
+    pub tokens: u64,
+    /// Rows whose tokens are unknown.
+    pub unknown_tokens: u32,
+}
+
+/// `runtime/sessions` result: the Runtime panel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RuntimeSessionsResult {
+    /// One row per loaded Session.
+    pub sessions: Vec<RuntimeSessionRow>,
+    /// Totals for these rows.
+    pub totals: RuntimeSessionTotals,
+    /// When the rows were read, in ms since the epoch.
+    pub taken_at_ms: u64,
+}
