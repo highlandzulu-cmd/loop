@@ -535,7 +535,6 @@ async fn run_loop(
                     items: &chat,
                     working,
                     turn_step: &turn_step,
-                    token_bar: &token_bar,
                 };
                 match dashboard::Screen::open(runtime, state).await {
                     Ok(screen) => dashboard = Some(screen),
@@ -581,7 +580,6 @@ async fn run_loop(
                     items: &chat,
                     working,
                     turn_step: &turn_step,
-                    token_bar: &token_bar,
                 };
                 screen.refresh(runtime, state).await?;
                 continue;
@@ -5373,13 +5371,8 @@ async fn apply_effect(
             chat.push(sys(commands::help_text(&extra)));
         }
         CommandEffect::SessionInfo => {
-            let stats = match runtime.backend().session_stats() {
-                Some(service) => service
-                    .stats(&runtime.session_ref())
-                    .await
-                    .map_err(|e| e.to_string()),
-                None => Err("this agent does not report session statistics".into()),
-            };
+            let stats = runtime.stats().await.map_err(|e| e.to_string());
+            let _ = runtime.session_config().await?;
             match stats {
                 Ok(stats) => {
                     let mut report = stats.report;
@@ -5406,31 +5399,9 @@ async fn apply_effect(
             }
         }
         CommandEffect::Settings => {
-            let mut perms = String::new();
-            for (k, v) in &runtime.legacy().settings().tool_permissions {
-                perms.push_str(&format!("\n    {k}: {v}"));
-            }
-            chat.push(sys(format!(
-                "settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  permissionMode: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}",
-                crate::config::paths::settings_path(runtime.agent_dir()).display(),
-                runtime.selected_model_spec().unwrap_or_else(|| "none".into()),
-                runtime.legacy().settings().theme,
-                runtime.legacy().settings().default_thinking_level,
-                runtime.legacy().settings().sandbox.display(),
-                runtime.permission_mode().as_str(),
-                runtime.legacy().settings()
-                    .diff_editor
-                    .as_deref()
-                    .unwrap_or("(auto)"),
-                runtime.legacy().settings().response_header_timeout_ms,
-                if runtime.legacy().settings().response_header_timeout_ms == 0 {
-                    " (off)"
-                } else {
-                    ""
-                },
-                runtime.legacy().settings().ui_mode,
-            )));
+            chat.push(sys(runtime.settings_report().await?));
         }
+
         CommandEffect::Trust(arg) => {
             let decision = match arg.as_deref() {
                 Some("yes") | Some("y") => true,
@@ -5729,7 +5700,7 @@ async fn apply_effect(
         CommandEffect::ScopedModels => {
             chat.push(sys(format!(
                 "enabledModels: {:?}\nEdit settings.json to change Ctrl+P cycle set.",
-                runtime.legacy().settings().enabled_models
+                runtime.effective_settings().await?.enabled_models
             )));
         }
         CommandEffect::Fork => {

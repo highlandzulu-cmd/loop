@@ -157,6 +157,10 @@
           "description": "Lists loaded Sessions for the Runtime panel (`runtime/sessions`).",
           "type": "boolean"
         },
+        "session_config": {
+          "description": "Returns the current Session snapshot without attaching.",
+          "type": "boolean"
+        },
         "session_fork": {
           "description": "Creates separately leased forks and clones.",
           "type": "boolean"
@@ -219,6 +223,10 @@
         },
         "workspace_reload": {
           "description": "Rereads workspace definitions (`workspace/reload`).",
+          "type": "boolean"
+        },
+        "workspace_settings": {
+          "description": "Reads redacted effective workspace settings.",
           "type": "boolean"
         },
         "workspace_skills": {
@@ -3092,6 +3100,56 @@
       ],
       "type": "object"
     },
+    "SettingsParams": {
+      "description": "Read the effective, redacted workspace settings.",
+      "properties": {
+        "workspace_id": {
+          "description": "Opaque host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "SettingsResult": {
+      "description": "Public workspace settings and resource counts.",
+      "properties": {
+        "effective": {
+          "description": "Explicitly whitelisted effective settings; credentials are excluded."
+        },
+        "enabled_models": {
+          "description": "Model cycle filter.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "resource_counts": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Resource counts by kind.",
+          "type": "object"
+        },
+        "revision": {
+          "description": "Workspace generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "effective",
+        "enabled_models",
+        "resource_counts"
+      ],
+      "type": "object"
+    },
     "ShellParams": {
       "description": "`session/shell` params.",
       "properties": {
@@ -4231,6 +4289,9 @@
           "items": true,
           "type": "array"
         },
+        "summary": {
+          "description": "Full dashboard aggregates for the selected period, when offered."
+        },
         "taken_at_ms": {
           "description": "When the log was read, in ms since the epoch.",
           "format": "uint64",
@@ -4731,6 +4792,16 @@
         "$ref": "#/$defs/CompactionReport"
       }
     },
+    "session/config": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionSnapshot"
+      }
+    },
     "session/detach": {
       "direction": "client_to_server",
       "kind": "request",
@@ -5032,6 +5103,16 @@
       },
       "result": {
         "$ref": "#/$defs/ReloadResult"
+      }
+    },
+    "workspace/settings": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SettingsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SettingsResult"
       }
     },
     "workspace/skills": {

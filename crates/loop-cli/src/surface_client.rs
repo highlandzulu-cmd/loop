@@ -1495,3 +1495,80 @@ impl SurfaceClient {
             .map(|(s, _)| s.path.display().to_string())
     }
 }
+
+impl SurfaceClient {
+    pub async fn effective_settings(
+        &mut self,
+    ) -> anyhow::Result<loop_protocol::admin::SettingsResult> {
+        use loop_wire::RuntimeAdmin;
+        let p = loop_protocol::admin::SettingsParams {
+            workspace_id: self.workspace_id.clone(),
+        };
+        Ok(self.admin().settings(p).await?)
+    }
+    pub async fn session_config(&self) -> anyhow::Result<SessionSnapshot> {
+        Ok(self
+            .sessions
+            .config(SessionParams {
+                session: self.host.inner.native.current_session().await,
+            })
+            .await?)
+    }
+    pub async fn stats(&self) -> anyhow::Result<loop_protocol::StatsSummary> {
+        let service = self
+            .backend()
+            .session_stats()
+            .ok_or_else(|| anyhow::anyhow!("this agent does not report session statistics"))?;
+        Ok(service.stats(&self.session_ref()).await?)
+    }
+    #[cfg(feature = "usage")]
+    pub async fn usage_history(
+        &mut self,
+        days: Option<u32>,
+    ) -> anyhow::Result<loop_protocol::admin::UsageResult> {
+        use loop_wire::RuntimeAdmin;
+        Ok(self
+            .admin()
+            .usage(loop_protocol::admin::UsageParams {
+                days,
+                ..Default::default()
+            })
+            .await?)
+    }
+    pub async fn loaded_sessions(
+        &mut self,
+    ) -> anyhow::Result<loop_protocol::admin::RuntimeSessionsResult> {
+        use loop_wire::RuntimeAdmin;
+        Ok(self.admin().sessions().await?)
+    }
+}
+
+impl SurfaceClient {
+    pub fn agent_label(&self, id: &str) -> Option<String> {
+        self.host
+            .inner
+            .agents
+            .entry(id)
+            .map(|e| e.display_name().to_string())
+    }
+    pub fn web_label(&self) -> String {
+        self.host.inner.web_tools().status()
+    }
+    #[cfg(feature = "telemetry")]
+    pub fn usage_log_status(&self) -> Option<(String, Option<String>)> {
+        self.host
+            .inner
+            .usage_log()
+            .map(|log| (log.path.display().to_string(), log.last_error))
+    }
+    pub async fn settings_report(&mut self) -> anyhow::Result<String> {
+        let view = self.effective_settings().await?;
+        let config = self.session_config().await?;
+        let settings: crate::config::Settings = serde_json::from_value(view.effective)?;
+        let mut perms = String::new();
+        for (k, v) in &settings.tool_permissions {
+            perms.push_str(&format!("\n    {k}: {v}"));
+        }
+        Ok(format!("settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  permissionMode: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}\n  Theme and UI preferences are Surface-local.", crate::config::paths::settings_path(self.agent_dir()).display(), config.config.model.unwrap_or_else(|| "none".into()), self.theme().name, config.config.effort.unwrap_or(settings.default_thinking_level), settings.sandbox.display(), self.permission_mode().as_str(), settings.diff_editor.as_deref().unwrap_or("(auto)"), settings.response_header_timeout_ms, if settings.response_header_timeout_ms == 0 { " (off)" } else { "" }, self.host.inner.settings.ui_mode))
+    }
+}

@@ -27,6 +27,14 @@ pub struct Attachment {
 /// Session management for a Runtime shared by many connections.
 #[async_trait]
 pub trait RuntimeControl: Send + Sync {
+    /// Current public Session snapshot.
+    async fn config(
+        &self,
+        _params: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::SessionSnapshot> {
+        Err(BackendError::Unsupported("session/config".into()))
+    }
+
     /// Activate a Session skill.
     async fn skill(
         &self,
@@ -174,6 +182,14 @@ pub trait RuntimeControl: Send + Sync {
 /// host-only calls without host-local authority before calling these.
 #[async_trait]
 pub trait RuntimeAdmin: Send + Sync {
+    /// Redacted workspace settings.
+    async fn settings(
+        &self,
+        _params: admin::SettingsParams,
+    ) -> BackendResult<admin::SettingsResult> {
+        Err(BackendError::Unsupported("workspace/settings".into()))
+    }
+
     /// The admin and host-only capability flags this service serves; the
     /// server advertises these (host-only ones only host-locally) and
     /// ignores the backend's own admin flags.

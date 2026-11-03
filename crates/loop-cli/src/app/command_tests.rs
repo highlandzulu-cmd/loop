@@ -1027,3 +1027,26 @@ async fn workflow_planning_holds_session_busy_and_cancellation_ends_its_stream()
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn session_settings_and_usage_commands_keep_their_reports_and_local_state() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        prompt(&runtime, "hello").await;
+        ui.effect(&mut runtime, CommandEffect::SessionInfo).await;
+        assert!(ui.text().contains("Theme:"));
+        assert!(ui.text().contains("faux/faux-model"));
+        ui.effect(&mut runtime, CommandEffect::Settings).await;
+        assert!(ui.text().contains("permissionMode: ask"));
+        assert!(ui.text().contains("responseHeaderTimeoutMs:"));
+        #[cfg(feature = "usage")]
+        {
+            ui.effect(&mut runtime, CommandEffect::Usage).await;
+            assert!(runtime.usage_requested);
+        }
+    })
+    .await
+    .unwrap();
+}

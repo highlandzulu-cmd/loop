@@ -439,6 +439,7 @@ impl Runtime {
 impl RuntimeAdmin for Runtime {
     fn offered(&self) -> Capabilities {
         Capabilities {
+            workspace_settings: true,
             workspace_mcp: true,
             workspace_web_search: true,
             workspace_skills: true,
@@ -452,6 +453,24 @@ impl RuntimeAdmin for Runtime {
         }
     }
 
+    async fn settings(&self, p: SettingsParams) -> BackendResult<SettingsResult> {
+        let cwd = self.resolve_workspace(&p.workspace_id)?;
+        let workspace = self.workspace_now(&cwd).await?;
+        Ok(SettingsResult {
+            revision: self.workspace_revision(&cwd),
+            effective: workspace.settings.public_view(),
+            enabled_models: workspace.settings.enabled_models.clone(),
+            resource_counts: std::collections::BTreeMap::from([
+                ("skills".into(), workspace.resources.skills.len() as u32),
+                ("templates".into(), workspace.resources.prompts.len() as u32),
+                ("hooks".into(), workspace.resources.hook_paths.len() as u32),
+                (
+                    "extensions".into(),
+                    workspace.resources.extension_paths.len() as u32,
+                ),
+            ]),
+        })
+    }
     async fn sessions(&self) -> BackendResult<RuntimeSessionsResult> {
         let live: Vec<Arc<LiveSession>> = self.sessions.lock().unwrap().values().cloned().collect();
         let mut rows = Vec::with_capacity(live.len());

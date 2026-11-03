@@ -669,6 +669,13 @@ pub fn set_skill_disabled(list: &mut Vec<String>, name: &str, enabled: bool) {
     set_disabled_name(list, name, enabled);
 }
 
+impl Settings {
+    /// Public effective values for workspace/settings. Credentials and telemetry destinations are excluded.
+    pub fn public_view(&self) -> serde_json::Value {
+        serde_json::json!({ "defaultThinkingLevel": self.default_thinking_level, "sandbox": self.sandbox, "permissionMode": self.permission_mode, "toolPermissions": self.tool_permissions, "diffEditor": self.diff_editor, "responseHeaderTimeoutMs": self.response_header_timeout_ms })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

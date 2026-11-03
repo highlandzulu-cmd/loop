@@ -27,6 +27,9 @@ impl RuntimeAdmin for NativeAdmin<'_> {
     fn offered(&self) -> Capabilities {
         Capabilities {
             workspace_mcp: true,
+            workspace_settings: true,
+            runtime_sessions: true,
+            host_usage: cfg!(feature = "usage"),
             workspace_skills: true,
             workspace_templates: true,
             workspace_reload: true,
@@ -34,6 +37,76 @@ impl RuntimeAdmin for NativeAdmin<'_> {
             permission_mode: true,
             ..Default::default()
         }
+    }
+    async fn settings(&self, p: SettingsParams) -> BackendResult<SettingsResult> {
+        let guard = self.0.lock().await;
+        let r = &**guard;
+        Self::workspace(r, &p.workspace_id)?;
+        Ok(SettingsResult {
+            effective: r.settings.public_view(),
+            enabled_models: r.settings.enabled_models.clone(),
+            resource_counts: std::collections::BTreeMap::from([
+                ("skills".into(), r.resources.skills.len() as u32),
+                ("templates".into(), r.resources.prompts.len() as u32),
+            ]),
+            ..Default::default()
+        })
+    }
+    async fn sessions(&self) -> BackendResult<RuntimeSessionsResult> {
+        let guard = self.0.lock().await;
+        let r = &**guard;
+        let mut sessions = vec![];
+        let native = r.native.current_session().await;
+        let active = r.session_ref();
+        let mut loaded: Vec<(Arc<dyn AgentBackend>, SessionRef)> =
+            vec![(r.native.clone(), native.clone())];
+        if active != native {
+            loaded.push((r.backend.clone(), active));
+        }
+        let mut totals = RuntimeSessionTotals::default();
+        for (backend, session) in loaded {
+            let stats = match backend.session_stats() {
+                Some(s) => s.stats(&session).await.ok(),
+                None => None,
+            };
+            let busy = backend.is_busy(&session);
+            let tokens = stats.as_ref().map(|s| s.total_tokens);
+            let state = stats.and_then(|s| s.turn_state).unwrap_or_else(|| {
+                if busy {
+                    "busy".into()
+                } else {
+                    "idle".into()
+                }
+            });
+            totals.sessions += 1;
+            totals.busy += u32::from(busy);
+            if let Some(tokens) = tokens {
+                totals.tokens += tokens;
+            } else {
+                totals.unknown_tokens += 1;
+            }
+            sessions.push(RuntimeSessionRow {
+                session,
+                workspace_id: loop_runtime::workspace_id(
+                    &r.cwd.canonicalize().unwrap_or_else(|_| r.cwd.clone()),
+                ),
+                state,
+                model: r.selected_model_spec(),
+                tokens,
+            });
+        }
+        Ok(RuntimeSessionsResult {
+            sessions,
+            totals,
+            taken_at_ms: chrono::Utc::now().timestamp_millis() as u64,
+        })
+    }
+    #[cfg(feature = "usage")]
+    async fn usage(&self, p: UsageParams) -> BackendResult<UsageResult> {
+        let guard = self.0.lock().await;
+        let r = &**guard;
+        r.flush_usage_log();
+        crate::runtime_cmd::usage_page(&crate::config::paths::usage_dir(&r.agent_dir), &p)
     }
     async fn skills(&self, p: SkillsParams) -> BackendResult<SkillsResult> {
         let mut guard = self.0.lock().await;

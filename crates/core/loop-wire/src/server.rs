@@ -239,6 +239,7 @@ async fn run(
                             }
                             let offered = admin_offered(runtime.as_deref());
                             let host = options.authority == Authority::HostLocal;
+                            capabilities.workspace_settings = offered.workspace_settings;
                             capabilities.workspace_mcp = offered.workspace_mcp;
                             capabilities.workspace_web_search = offered.workspace_web_search;
                             capabilities.workspace_skills = offered.workspace_skills;
@@ -357,6 +358,16 @@ async fn handle(
             Err(error) => return conn.respond(id, Err(error)),
         },
         // Session-tree dispatch stays grouped for parallel protocol additions.
+        methods::SESSION_CONFIG if runtime.is_some() => {
+            if !backend.capabilities().session_config {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse(params) {
+                    Ok(p) => runtime.unwrap().config(p).await.map(|r| to_value(&r)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
         methods::SESSION_SKILL if runtime.is_some() => {
             if !backend.capabilities().session_skills {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))
@@ -600,7 +611,8 @@ async fn handle(
         methods::RUNTIME_PROVIDERS | methods::RUNTIME_MCP_AUTH | methods::RUNTIME_TRACING => {
             Err(loop_protocol::BackendError::Unsupported(method.into()))
         }
-        methods::WORKSPACE_MCP
+        methods::WORKSPACE_SETTINGS
+        | methods::WORKSPACE_MCP
         | methods::WORKSPACE_WEB_SEARCH
         | methods::WORKSPACE_SKILLS
         | methods::WORKSPACE_TEMPLATES
@@ -797,6 +809,7 @@ async fn admin(
     params: Value,
 ) -> Result<BackendResult<Value>, (i64, String)> {
     let offered = match method {
+        methods::WORKSPACE_SETTINGS => capabilities.workspace_settings,
         methods::WORKSPACE_MCP => capabilities.workspace_mcp,
         methods::WORKSPACE_WEB_SEARCH => capabilities.workspace_web_search,
         methods::WORKSPACE_SKILLS => capabilities.workspace_skills,
@@ -813,6 +826,7 @@ async fn admin(
         return Ok(Err(loop_protocol::BackendError::Unsupported(method.into())));
     };
     Ok(match method {
+        methods::WORKSPACE_SETTINGS => admin.settings(parse(params)?).await.map(|r| to_value(&r)),
         methods::WORKSPACE_MCP => admin.mcp(parse(params)?).await.map(|r| to_value(&r)),
         methods::WORKSPACE_WEB_SEARCH => {
             admin.web_search(parse(params)?).await.map(|r| to_value(&r))

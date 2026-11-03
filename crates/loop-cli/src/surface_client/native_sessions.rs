@@ -232,6 +232,27 @@ impl NativeSessions {
 
 #[async_trait]
 impl RuntimeControl for NativeSessions {
+    async fn config(&self, p: SessionParams) -> BackendResult<SessionSnapshot> {
+        self.check(&p.session).await?;
+        let changed = self.native.config();
+        Ok(SessionSnapshot {
+            session: p.session,
+            workspace_id: self.workspace_id.clone(),
+            at_seq: 0,
+            revision: changed.revision,
+            branch_revision: 0,
+            view_id: None,
+            metadata: changed.metadata,
+            config: changed.config,
+            effective: changed.effective,
+            pending: changed.pending,
+            capabilities: self.capabilities(),
+            turn_state: None,
+            stats: serde_json::Value::Null,
+            workspace_revision: 0,
+        })
+    }
+
     async fn skill(
         &self,
         p: loop_protocol::session_services::SkillParams,
@@ -558,6 +579,7 @@ impl AgentBackend for NativeSessions {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            session_config: true,
             session_tree: true,
             session_rename: true,
             session_fork: true,

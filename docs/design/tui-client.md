@@ -722,8 +722,10 @@ These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
   autocomplete; workspace changes use RuntimeAdmin. Skill activation and
   workflows use Session services, with ordered WorkflowProgress updates.
   Planning reserves the Session; cancellation drains task execution.
-- Group 5: usage/dashboard host data, tracing-backed usage logs and the effective
-  settings/session diagnostics that still combine local and host values.
+- Group 5 migrated: dashboards read Session stats and typed RuntimeAdmin
+  history/loaded-Session data. Host-fed dashboards never open local log files
+  and hide history when it is unavailable. Settings and Session diagnostics
+  use public config/settings views and label Surface-local preferences.
 - Group 6: provider login/logout, catalog refresh, ACP startup/sign-in and tracing
   setup. ACP keeps its existing in-process startup path until S3.7.
 - Local theme/preferences still use the old settings persistence while the

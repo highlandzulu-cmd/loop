@@ -17,6 +17,10 @@ use crate::update::StopReason;
 
 /// Method names.
 pub mod methods {
+    /// Current Session snapshot.
+    pub const SESSION_CONFIG: &str = "session/config";
+    /// Redacted workspace settings.
+    pub const WORKSPACE_SETTINGS: &str = "workspace/settings";
     /// Session skill activation.
     pub const SESSION_SKILL: &str = "session/skill";
     /// Start a workflow; progress is streamed.
@@ -779,10 +783,16 @@ pub fn json_schema() -> Value {
     let workflow = reference(generator.subschema_for::<crate::session_services::WorkflowParams>());
     let workflow_result =
         reference(generator.subschema_for::<crate::session_services::WorkflowResult>());
+    let snapshot = reference(generator.subschema_for::<SessionSnapshot>());
     let admin = {
         use crate::admin::*;
         let r = |schema| reference(schema);
         vec![
+            (
+                methods::WORKSPACE_SETTINGS,
+                r(generator.subschema_for::<SettingsParams>()),
+                r(generator.subschema_for::<SettingsResult>()),
+            ),
             (
                 methods::WORKSPACE_MCP,
                 r(generator.subschema_for::<McpParams>()),
@@ -891,6 +901,10 @@ pub fn json_schema() -> Value {
     });
     // Added separately: one `json!` this large exceeds the macro recursion limit.
     let s3_methods = [
+        (
+            methods::SESSION_CONFIG,
+            method(up, "request", &session_params, Some(&snapshot)),
+        ),
         (
             methods::SESSION_SKILL,
             method(up, "request", &skill, Some(&mutation)),

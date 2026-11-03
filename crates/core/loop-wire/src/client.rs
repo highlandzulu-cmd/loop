@@ -49,6 +49,17 @@ pub struct RemoteBackend {
 }
 
 impl RemoteBackend {
+    /// Current public Session snapshot.
+    pub async fn config(
+        &self,
+        p: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::SessionSnapshot> {
+        if !self.capabilities.session_config {
+            return Err(BackendError::Unsupported(methods::SESSION_CONFIG.into()));
+        }
+        call(&self.conn, methods::SESSION_CONFIG, &p).await
+    }
+
     /// Activate a Session skill.
     pub async fn skill(
         &self,
@@ -651,6 +662,11 @@ async fn read(
 /// one on a remote connection comes back Forbidden.
 #[async_trait]
 impl crate::control::RuntimeAdmin for RemoteBackend {
+    async fn settings(&self, p: admin::SettingsParams) -> BackendResult<admin::SettingsResult> {
+        self.admin_call(|c| c.workspace_settings, methods::WORKSPACE_SETTINGS, &p)
+            .await
+    }
+
     fn offered(&self) -> Capabilities {
         self.capabilities()
     }

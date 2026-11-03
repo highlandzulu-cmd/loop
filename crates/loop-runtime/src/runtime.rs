@@ -1492,6 +1492,10 @@ impl Runtime {
 }
 #[async_trait]
 impl loop_wire::RuntimeControl for Runtime {
+    async fn config(&self, p: loop_protocol::rpc::SessionParams) -> BackendResult<SessionSnapshot> {
+        self.snapshot(&p.session).await
+    }
+
     async fn skill(
         &self,
         p: loop_protocol::session_services::SkillParams,
@@ -2100,6 +2104,7 @@ impl AgentBackend for Runtime {
     }
     fn capabilities(&self) -> Capabilities {
         Capabilities {
+            session_config: true,
             session_skills: true,
             workflow: cfg!(feature = "orchestration"),
             session_tree: true,

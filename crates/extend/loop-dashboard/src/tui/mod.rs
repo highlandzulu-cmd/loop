@@ -205,6 +205,21 @@ pub struct Dashboard {
 impl Dashboard {
     /// Switch to the alternate screen and load the usage log.
     pub fn open(options: Options) -> io::Result<Self> {
+        Self::open_inner(options, None)
+    }
+
+    /// Open with host-supplied history and Runtime rows; never reads local log files.
+    pub fn open_served(
+        options: Options,
+        summary: Option<Summary>,
+        runtime: loop_protocol::admin::RuntimeSessionsResult,
+    ) -> io::Result<Self> {
+        Self::open_inner(options, Some((summary, runtime)))
+    }
+    fn open_inner(
+        options: Options,
+        served: Option<(Option<Summary>, loop_protocol::admin::RuntimeSessionsResult)>,
+    ) -> io::Result<Self> {
         execute!(io::stdout(), EnterAlternateScreen, crossterm::cursor::Hide)?;
         let terminal = match Terminal::new(CrosstermBackend::new(io::stdout())) {
             Ok(terminal) => terminal,
@@ -214,7 +229,14 @@ impl Dashboard {
             }
         };
         let mut app = App::new(options);
-        app.reload();
+        if let Some((summary, runtime)) = served {
+            app.served = true;
+            app.history_available = summary.is_some();
+            app.summary = summary.unwrap_or_default();
+            app.runtime = Some(runtime);
+        } else {
+            app.reload();
+        }
         Ok(Self {
             terminal,
             app,
@@ -249,6 +271,25 @@ impl Dashboard {
         }
     }
 
+    /// Selected history period, for the host query.
+    pub fn period_days(&self) -> Option<u32> {
+        self.app.range.days()
+    }
+    /// Replace host data. An absent summary hides host-only history tabs.
+    pub fn set_host_data(
+        &mut self,
+        summary: Option<Summary>,
+        runtime: loop_protocol::admin::RuntimeSessionsResult,
+    ) {
+        self.app.history_available = summary.is_some();
+        if !self.app.history_available && self.app.view.is_history() {
+            self.app.view = View::Now;
+        }
+        self.app.summary = summary.unwrap_or_default();
+        self.app.runtime = Some(runtime);
+        self.app.loaded_at = Instant::now();
+        self.dirty = true;
+    }
     /// Re-read the usage log when due, and redraw if anything changed.
     pub fn tick(&mut self) -> io::Result<()> {
         if self.app.loaded_at.elapsed() >= RELOAD_EVERY {
@@ -285,16 +326,18 @@ pub enum View {
     Tools,
     Agents,
     Sessions,
+    Runtime,
 }
 
 impl View {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Now,
         Self::Usage,
         Self::Models,
         Self::Tools,
         Self::Agents,
         Self::Sessions,
+        Self::Runtime,
     ];
 
     fn label(self) -> &'static str {
@@ -305,16 +348,13 @@ impl View {
             Self::Tools => "Tools",
             Self::Agents => "Agents",
             Self::Sessions => "Sessions",
+            Self::Runtime => "Runtime",
         }
-    }
-
-    fn index(self) -> usize {
-        Self::ALL.iter().position(|v| *v == self).unwrap_or(0)
     }
 
     /// Whether the view shows history (and so the period selector applies).
     fn is_history(self) -> bool {
-        self != Self::Now
+        self != Self::Now && self != Self::Runtime
     }
 }
 
@@ -361,6 +401,9 @@ enum Action {
 }
 
 struct App {
+    served: bool,
+    history_available: bool,
+    runtime: Option<loop_protocol::admin::RuntimeSessionsResult>,
     options: Options,
     view: View,
     range: Range,
@@ -379,6 +422,9 @@ impl App {
             View::Usage
         };
         Self {
+            served: false,
+            history_available: true,
+            runtime: None,
             options,
             view,
             range: Range::Month,
@@ -392,12 +438,20 @@ impl App {
     /// Re-read the log files that changed and summarize again, so rolling periods move
     /// forward even when nothing new was written. Returns whether anything changed.
     fn reload(&mut self) -> bool {
+        if self.served {
+            self.loaded_at = Instant::now();
+            return false;
+        }
         self.cache.refresh(&self.options.dir);
         self.resummarize()
     }
 
     /// Summarize the cached log for the current period; returns whether anything changed.
     fn resummarize(&mut self) -> bool {
+        if self.served {
+            self.loaded_at = Instant::now();
+            return false;
+        }
         let mut summary = self.cache.summarize(self.range.days(), Utc::now());
         self.loaded_at = Instant::now();
         // `generated_at` always moves; compare the data only.
@@ -410,13 +464,19 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let views = View::ALL.len();
+        let choices = self.views();
+        let views = choices.len();
+        let index = choices.iter().position(|v| *v == self.view).unwrap_or(0);
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
             KeyCode::Char('c') if ctrl => return Action::Quit,
-            KeyCode::Tab => self.set_view(View::ALL[(self.view.index() + 1) % views]),
-            KeyCode::BackTab => self.set_view(View::ALL[(self.view.index() + views - 1) % views]),
-            KeyCode::Char(c @ '1'..='6') => self.set_view(View::ALL[c as usize - '1' as usize]),
+            KeyCode::Tab => self.set_view(choices[(index + 1) % views]),
+            KeyCode::BackTab => self.set_view(choices[(index + views - 1) % views]),
+            KeyCode::Char(c @ '1'..='7') => {
+                if let Some(view) = choices.get(c as usize - '1' as usize) {
+                    self.set_view(*view);
+                }
+            }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Char(']') => {
                 self.set_range(Range::ALL[(self.range.index() + 1).min(3)]);
             }
@@ -436,6 +496,15 @@ impl App {
         Action::Continue
     }
 
+    fn views(&self) -> Vec<View> {
+        View::ALL
+            .into_iter()
+            .filter(|v| {
+                (!v.is_history() || self.history_available)
+                    && (*v != View::Runtime || self.runtime.is_some())
+            })
+            .collect()
+    }
     fn set_view(&mut self, view: View) {
         self.view = view;
         self.table.select(Some(0));
@@ -454,6 +523,7 @@ impl App {
             View::Models => self.summary.models.len(),
             View::Tools => self.summary.tools.len(),
             View::Sessions => self.summary.sessions.len(),
+            View::Runtime => self.runtime.as_ref().map_or(0, |r| r.sessions.len()),
             View::Now | View::Usage | View::Agents => 0,
         }
     }

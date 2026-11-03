@@ -192,6 +192,7 @@ impl RuntimeAdmin for Fake {
     async fn usage(&self, _params: UsageParams) -> BackendResult<UsageResult> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(UsageResult {
+            summary: None,
             rows: vec![json!({"session_id": "a"})],
             totals: json!({"llm_calls": 1}),
             next_cursor: None,

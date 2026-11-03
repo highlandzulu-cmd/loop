@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Capabilities {
+    /// Returns the current Session snapshot without attaching.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_config: bool,
+    /// Reads redacted effective workspace settings.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_settings: bool,
     /// Activates Session skills.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub session_skills: bool,
