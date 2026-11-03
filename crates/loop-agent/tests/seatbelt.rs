@@ -710,6 +710,24 @@ fn scratch() -> (tempfile::TempDir, PathBuf) {
     (root, path)
 }
 
+/// The system git shim can discover its cache directory without Xcode warnings.
+#[tokio::test]
+async fn system_git_status_is_quiet_inside_the_sandbox() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (_guard, root) = scratch();
+        let project = root.join("project");
+        git(&project, &["init", "-q"]);
+        let sandbox = seatbelt(&project, &root, json!({})).await.unwrap();
+        let out = run(&sandbox, "/usr/bin/git status --porcelain").await;
+        assert_eq!(out.exit_code, 0, "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(out.stderr.is_empty(), "{out:?}");
+        sandbox.destroy().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// Git metadata that runs commands is protected in every repository the
 /// sandbox can write: the project, its submodules and nested repositories,
 /// including metadata created later. No `.git` entry can be created or
@@ -820,6 +838,23 @@ async fn git_metadata_in_every_repository_is_protected() {
     .unwrap();
 }
 
+/// Refusal explains the protected ancestor, rather than just the project path.
+#[tokio::test]
+async fn a_project_in_a_protected_folder_explains_why_it_cannot_start() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (_guard, root) = scratch();
+        let protected = root.join("home/.claude");
+        let project = protected.join("projects/example");
+        std::fs::create_dir_all(&project).unwrap();
+        let error = seatbelt(&project, &root, json!({})).await.err().unwrap();
+        assert!(error.contains(protected.to_str().unwrap()), "{error}");
+        assert!(error.contains("protected folder"), "{error}");
+        assert!(error.contains("credentials"), "{error}");
+    })
+    .await
+    .unwrap();
+}
+
 /// A project whose `.git` the sandbox cannot cover does not start.
 #[tokio::test]
 async fn a_git_symlink_or_outside_pointer_refuses_to_start() {
@@ -913,6 +948,51 @@ async fn deny_home_reads_keeps_only_listed_home_paths_readable() {
     .unwrap();
 }
 
+/// A concurrent collector must never mistake a starting sandbox for a stale one.
+#[tokio::test]
+async fn sandbox_start_survives_concurrent_stale_cleanup() {
+    struct Cleaners {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Cleaners {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Release);
+            for thread in self.threads.drain(..) {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _cleaners = Cleaners {
+            threads: (0..4)
+                .map(|_| {
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                            loop_agent::harness::sandbox::seatbelt::clean_stale_temp_dirs();
+                            std::thread::yield_now();
+                        }
+                    })
+                })
+                .collect(),
+            stop,
+        };
+        let (_guard, root) = scratch();
+        for _ in 0..50 {
+            let sandbox = seatbelt(&root.join("project"), &root, json!({}))
+                .await
+                .unwrap();
+            assert_eq!(run(&sandbox, "true").await.exit_code, 0);
+            sandbox.destroy().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+}
+
 /// Sandbox start removes this user's abandoned temporary directories and
 /// keeps those still in use.
 #[tokio::test]
@@ -928,8 +1008,13 @@ async fn stale_temporary_directories_are_removed_at_start() {
             std::fs::write(dir.join("left"), "x").unwrap();
         }
         std::fs::write(stale.join(".loop-lock"), "").unwrap();
-        let lock = std::fs::File::create(held.join(".loop-lock")).unwrap();
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let lock = tempfile::NamedTempFile::new_in(&held).unwrap();
+        rustix::fs::flock(
+            lock.as_file(),
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .unwrap();
+        let lock = lock.persist_noclobber(held.join(".loop-lock")).unwrap();
         let (_guard, root) = scratch();
         let sandbox = seatbelt(&root.join("project"), &root, json!({}))
             .await
@@ -938,10 +1023,10 @@ async fn stale_temporary_directories_are_removed_at_start() {
         assert!(held.exists(), "a locked directory is in use");
         assert!(fresh.exists(), "a recent directory without a lock is kept");
         sandbox.destroy().await.unwrap();
-        drop(lock);
         for dir in [&held, &fresh] {
             std::fs::remove_dir_all(dir).unwrap();
         }
+        drop(lock);
     })
     .await
     .unwrap();

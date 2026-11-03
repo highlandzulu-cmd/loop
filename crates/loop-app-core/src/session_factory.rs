@@ -409,6 +409,31 @@ impl SessionFactory {
         let models = Arc::clone(&globals.models);
         let credentials = Arc::clone(&globals.credentials);
         let mut settings = workspace.settings.clone();
+        // A cold custom catalog must resolve an explicit choice before the
+        // background refresh has a chance to finish.
+        let explicit = opts.model.as_deref().and_then(|model| {
+            opts.provider
+                .as_deref()
+                .map(|provider| (provider, model))
+                .or_else(|| model.split_once('/'))
+        });
+        if let Some((provider, id)) = explicit {
+            if settings.providers.iter().any(|entry| entry.id == provider)
+                && models.get_model(provider, id).is_none()
+                && !credentials.is_logged_out(provider)
+            {
+                let refreshed = models
+                    .refresh(ModelsRefreshOptions {
+                        allow_network: Some(true),
+                        force: true,
+                        provider_id: Some(provider.into()),
+                    })
+                    .await;
+                if let Some(error) = refreshed.errors.get(provider) {
+                    bail!("could not load models for provider {provider}: {error}");
+                }
+            }
+        }
         let (mut model, mut model_note) = self.startup_model(&workspace, opts)?;
         if let Some(m) = &model {
             settings.set_selected_model(&m.provider, &m.id);
