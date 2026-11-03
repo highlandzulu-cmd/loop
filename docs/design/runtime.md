@@ -15,10 +15,9 @@ for views, replay and audit. The first **Subagent** runs as a child Session.
 Loop supports Linux and macOS only. Windows is not supported, and the build fails
 there with a compile error.
 
-Not in S2:
-- the TUI as a Runtime client, `--connect`, and URL or QR remote control (S3);
-- ACP Sessions inside the Runtime (S3);
-- model control over the wire (S3);
+Not in S2 (the TUI as a Runtime client, `--connect` and model control over the wire were delivered in S3):
+- URL or QR remote control;
+- ACP Sessions inside the Runtime (ACP agents still run in-process);
 - one Policy gate across all execution paths (S4);
 - the Task Board, Mailboxes and coordination MCP (Phase 2);
 - cloud hosting and Postgres;

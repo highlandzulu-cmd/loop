@@ -116,8 +116,21 @@ paths. Host web/MCP capabilities are separate from the shell sandbox. See
 
 ### Shared Runtime (Linux and macOS)
 
-Run one long-lived Runtime and attach to its Sessions from any terminal. Work
-keeps running when you detach, and approvals wait until a Surface answers.
+Plain `loop` is a Runtime client. It reuses the Runtime for your agent
+directory, or starts one, and opens a new Session in the current folder. Work
+keeps running when you quit, and approvals wait until a Surface answers.
+`loop --continue` and `loop --resume` attach to an existing Session, and
+`loop --connect <socket|ws://…>` picks a particular Runtime. `--print`, ACP
+agents and a Runtime that won't start use the in-process path instead.
+
+```bash
+loop                       # new Session; starts the Runtime if needed
+loop --continue            # attach to this folder's latest Session
+loop --resume              # choose a Session
+loop --connect ws://127.0.0.1:8765 --token-file ~/runtime.token
+```
+
+You can also manage the Runtime yourself:
 
 ```bash
 loop runtime start         # start the Runtime (foreground; Ctrl+C stops it)
@@ -130,7 +143,8 @@ loop runtime stop          # stop the Runtime from another terminal
 ```
 
 After a crash, restarting `loop runtime start` marks interrupted turns as uncertain
-instead of retrying them. See [The Runtime](docs/runtime.md).
+instead of retrying them. See [The Runtime](docs/runtime.md) for remote use,
+environment rules and idle shutdown.
 
 ## Supported models
 

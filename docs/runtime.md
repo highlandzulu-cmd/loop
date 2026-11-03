@@ -72,8 +72,8 @@ Session. When versions differ, it replaces only an empty local owner known to
 have been auto-started from this agent directory. Explicit owners and owners
 with loaded Sessions stay running; Loop reports both versions, suggests
 `loop runtime restart`, and uses the in-process path for this run. A startup,
-connection or Session-open failure also prints one warning and falls back. Subscription/ACP agents and ordinary `--print` runs
-continue to use the in-process path. If an owner dies while the TUI is open,
+connection or Session-open failure also prints one warning and falls back.
+Subscription/ACP agents and ordinary `--print` runs use the in-process path. If an owner dies while the TUI is open,
 a recovery banner suggests `loop --continue`; quitting still succeeds.
 
 ## Start the Runtime
@@ -91,7 +91,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | Flag | Default | Meaning |
 |---|---|---|
 | `--socket PATH` | `~/.loop/agent/run/runtime.sock` | Where Surfaces connect |
-| `--listen IP:PORT` | off | Also serve authenticated WebSockets on a loopback address |
+| `--listen IP:PORT` | off | Also serve authenticated WebSockets. Loopback addresses only; other binds are refused until TLS exists |
 | `--max-sessions N` | `runtime.maxSessions`, else 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
 | `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits` or `full-access` |
@@ -138,7 +138,11 @@ its pid may now belong to another program.
   the socket to go and fails if it is still there. With no Runtime answering
   it prints `No Runtime running at …` and exits 0.
 
-### WebSocket clients
+### Remote use and WebSocket clients
+
+To use a Runtime from another machine, start it with `--listen 127.0.0.1:PORT`,
+open an SSH tunnel to that port, and copy the token file (see below). The TUI
+then connects with `loop --connect ws://127.0.0.1:PORT --token-file FILE`.
 
 ```bash
 loop runtime start --listen 127.0.0.1:8080
@@ -157,8 +161,8 @@ takes precedence. Tokens are required even on loopback.
 Only loopback binds are supported until TLS is available. For another host, use
 an SSH tunnel to its loopback listener and keep any copied token in a private
 directory. Authenticated WebSocket clients have remote authority: host-only
-methods, including Runtime stop, credentials, saved defaults and usage history,
-and workspace trust writes are refused. The host's protected Unix socket still
+methods, including Runtime stop, provider and MCP credentials, tracing, saved
+defaults and usage history, and workspace trust writes are refused. The host's protected Unix socket still
 serves those operations. A slow WebSocket client is disconnected when its queues
 fill and can attach again to replay missed events.
 
@@ -349,4 +353,6 @@ when that is set.
 | `sessions.db` | Sessions, with a `runtime.lock` beside it. `LOOP_CODING_AGENT_SESSION_DIR` moves this file, but not `events.db` |
 
 The wire protocol that Surfaces speak is described in
-[`design/protocol-wire.md`](design/protocol-wire.md#11-runtime-methods-s2).
+[`design/protocol-wire.md`](design/protocol-wire.md#11-runtime-methods-s2); the
+methods added for the TUI are in
+[§12](design/protocol-wire.md#12-session-and-workspace-methods-s3).
