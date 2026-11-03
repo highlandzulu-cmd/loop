@@ -1265,6 +1265,26 @@ pub fn build_models(
     Ok(models)
 }
 
+/// Reread `models.json` and the settings' custom providers into `models`,
+/// replacing providers of the same id, then rehydrate from the local
+/// catalog cache. Never touches the network.
+pub async fn reload_model_definitions(
+    agent_dir: &Path,
+    models: &Models,
+    custom: &[crate::config::CustomProviderEntry],
+) -> anyhow::Result<()> {
+    crate::config::providers::register_providers(models, custom);
+    load_custom_models_json(agent_dir, models, custom)?;
+    let _ = models
+        .refresh(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: false,
+            provider_id: None,
+        })
+        .await;
+    Ok(())
+}
+
 fn load_custom_models_json(
     agent_dir: &Path,
     models: &Models,

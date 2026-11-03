@@ -61,4 +61,37 @@ pub struct Capabilities {
     /// Reads and overrides the Session's response timeout (`session/ttfb`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub session_ttfb: bool,
+    /// Lists and toggles workspace MCP servers (`workspace/mcp`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_mcp: bool,
+    /// Reads and changes workspace web search (`workspace/web_search`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_web_search: bool,
+    /// Lists and toggles workspace skills (`workspace/skills`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_skills: bool,
+    /// Lists and renders prompt templates (`workspace/templates`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_templates: bool,
+    /// Rereads workspace definitions (`workspace/reload`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_reload: bool,
+    /// Reads workspace trust; changes it host-locally (`workspace/trust`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_trust: bool,
+    /// Reads and replaces the Session's sandbox (`session/sandbox`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_sandbox: bool,
+    /// Reads and sets the Session's permission mode (`session/permission_mode`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub permission_mode: bool,
+    /// Pages the host's usage log (`runtime/usage`); host-local only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub host_usage: bool,
+    /// Reads and saves new-Session defaults (`runtime/defaults`); host-local only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub host_defaults: bool,
+    /// Lists loaded Sessions for the Runtime panel (`runtime/sessions`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub runtime_sessions: bool,
 }

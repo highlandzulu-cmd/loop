@@ -358,3 +358,58 @@ fn compact_stats_and_shell_are_in_the_schema() {
         assert!(errors.is_empty(), "{definition}: {errors:?}\n{message}");
     }
 }
+
+#[test]
+fn admin_methods_are_in_the_schema_and_host_only_ones_are_marked() {
+    use loop_protocol::rpc::methods;
+    let schema = json_schema();
+    for method in [
+        methods::WORKSPACE_MCP,
+        methods::WORKSPACE_WEB_SEARCH,
+        methods::WORKSPACE_SKILLS,
+        methods::WORKSPACE_TEMPLATES,
+        methods::WORKSPACE_RELOAD,
+        methods::WORKSPACE_TRUST,
+        methods::SESSION_SANDBOX,
+        methods::SESSION_PERMISSION_MODE,
+        methods::RUNTIME_USAGE,
+        methods::RUNTIME_DEFAULTS,
+        methods::RUNTIME_SESSIONS,
+    ] {
+        let entry = &schema["methods"][method];
+        assert_eq!(entry["kind"], "request", "{method}");
+        assert!(entry.get("result").is_some(), "{method}");
+        let host_only = methods::HOST_ONLY.contains(&method);
+        assert_eq!(entry.get("host_only").is_some(), host_only, "{method}");
+    }
+    assert_eq!(schema["methods"][methods::RUNTIME_STOP]["host_only"], true);
+    let session = json!({"instance": "loop", "key": "s", "native_id": "s"});
+    for (definition, message) in [
+        (
+            "McpParams",
+            json!({"workspace_id": "w", "action": "enable", "name": "docs"}),
+        ),
+        ("TrustParams", json!({"workspace_id": "w", "trusted": true})),
+        (
+            "ReloadResult",
+            json!({"revision": 1, "notices": [], "pending_sessions": 1}),
+        ),
+        (
+            "SandboxParams",
+            json!({"session": session, "action": "set", "config": {"mode": "off"}}),
+        ),
+        (
+            "PermissionModeParams",
+            json!({"session": session, "mode": "plan"}),
+        ),
+        (
+            "UsageResult",
+            json!({"rows": [{"session_id": "a"}], "totals": {}, "taken_at_ms": 1,
+                               "log_status": "ok"}),
+        ),
+    ] {
+        let validator = validator(definition);
+        assert!(validator.is_valid(&message), "{definition}: {message}");
+    }
+    assert!(!validator("McpParams").is_valid(&json!({"workspace_id": "w", "action": "nuke"})));
+}

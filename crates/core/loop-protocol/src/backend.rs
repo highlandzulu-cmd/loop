@@ -43,6 +43,9 @@ pub enum BackendError {
     },
     /// The operation failed.
     Failed(ErrorInfo),
+    /// The transport may not call this method: a host-only method, or a
+    /// trust change, arrived on a connection without host-local authority.
+    Forbidden(String),
 }
 
 impl BackendError {
@@ -63,6 +66,10 @@ impl fmt::Display for BackendError {
                 "the Session changed meanwhile (now at revision {revision}); read it again"
             ),
             Self::Failed(info) => f.write_str(&info.message),
+            Self::Forbidden(method) => write!(
+                f,
+                "{method} is only available on the Runtime host; run it there"
+            ),
         }
     }
 }
