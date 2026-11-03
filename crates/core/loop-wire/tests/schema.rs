@@ -180,6 +180,49 @@ fn runtime_methods_and_messages_are_in_the_schema() {
 }
 
 #[test]
+fn session_tree_contracts_have_schema_entries_and_validate() {
+    use loop_protocol::rpc::methods;
+    let schema = json_schema();
+    for method in [
+        methods::SESSION_TREE,
+        methods::SESSION_VIEW,
+        methods::SESSION_NAVIGATE,
+        methods::SESSION_RENAME,
+        methods::SESSION_FORK,
+        methods::SESSION_CLONE,
+        methods::SESSION_EXPORT,
+        methods::SESSION_IMPORT,
+    ] {
+        assert_eq!(schema["methods"][method]["kind"], "request");
+    }
+    let session = json!({"instance":"native","key":"s","native_id":"s"});
+    for (definition, value) in [
+        ("TreeParams", json!({"session":session,"limit":100})),
+        ("ViewParams", json!({"session":session,"view_id":"view"})),
+        ("NavigateParams", json!({"session":session})),
+        ("RenameParams", json!({"session":session,"name":"new name"})),
+        (
+            "ForkParams",
+            json!({"session":session,"before_entry_id":"user-1","request_id":"request-1"}),
+        ),
+        (
+            "CloneParams",
+            json!({"session":session,"request_id":"request-2"}),
+        ),
+        (
+            "ImportParams",
+            json!({"workspace_id":"workspace-1","jsonl":"payload","request_id":"request-3"}),
+        ),
+        (
+            "SessionUpdate",
+            json!({"type":"branch_reset","revision":1,"branch_revision":1,"view_id":"view","reason":"navigate"}),
+        ),
+    ] {
+        validator(definition).validate(&value).unwrap();
+    }
+}
+
+#[test]
 fn model_control_methods_and_messages_are_in_the_schema() {
     use loop_protocol::rpc::methods;
     let schema = json_schema();

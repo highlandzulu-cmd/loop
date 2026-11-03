@@ -216,7 +216,7 @@ pub struct ModelChoices {
     pub current: Option<String>,
     /// Every model on offer.
     pub models: Vec<ModelChoice>,
-    /// The Session's config revision these choices were read at. Zero when
+    /// The Session revision these choices were read at. Zero when
     /// the backend does not track revisions.
     pub revision: u64,
 }
@@ -225,7 +225,7 @@ pub struct ModelChoices {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MutationResult {
-    /// The Session's config revision after the change.
+    /// The Session revision after the change.
     pub revision: u64,
     /// Sequence of the `config_changed` update that announced it; zero when
     /// the backend publishes no such update.

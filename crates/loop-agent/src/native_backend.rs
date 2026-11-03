@@ -213,6 +213,25 @@ impl NativeBackend {
         self.config.lock().changed()
     }
 
+    /// Check `expected` against the Session revision, for a change its
+    /// owner commits itself (a rename or a branch move). The owner
+    /// serializes it with this backend's setters.
+    pub fn check_session_revision(&self, expected: Option<u64>) -> BackendResult<()> {
+        self.check_revision(expected)
+    }
+
+    /// Count a committed rename or branch move in the Session revision and
+    /// return the new revision. `name` is a rename's new name, which later
+    /// announcements carry.
+    pub fn record_change(&self, name: Option<Option<String>>) -> u64 {
+        let mut state = self.config.lock();
+        state.revision += 1;
+        if let Some(name) = name {
+            state.name = name;
+        }
+        state.revision
+    }
+
     /// Effort for Sessions that never chose one, used when one is restored.
     pub fn set_default_effort(&self, level: AgentThinkingLevel) {
         *self.default_effort.lock() = level;

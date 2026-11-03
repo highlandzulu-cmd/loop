@@ -54,6 +54,25 @@ impl RemoteBackend {
         client: PeerInfo,
         host: Arc<dyn HostServices>,
     ) -> BackendResult<Arc<Self>> {
+        Self::connect_with_capabilities(
+            transport,
+            client,
+            host,
+            ClientCapabilities {
+                interact: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Connect with the Surface's actual reset and interaction support.
+    pub async fn connect_with_capabilities(
+        transport: Transport,
+        client: PeerInfo,
+        host: Arc<dyn HostServices>,
+        client_capabilities: ClientCapabilities,
+    ) -> BackendResult<Arc<Self>> {
         let (conn, incoming) = Connection::new(transport);
         let (updates, _) = broadcast::channel(UPDATE_BUFFER);
         let busy: Arc<Mutex<HashSet<SessionKey>>> = Arc::default();
@@ -67,7 +86,7 @@ impl RemoteBackend {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
             client_info: client,
-            client_capabilities: ClientCapabilities { interact: true },
+            client_capabilities,
         };
         let result: InitializeResult = call(&conn, methods::INITIALIZE, &params).await?;
         if result.protocol_version > PROTOCOL_VERSION || result.protocol_version == 0 {
@@ -89,6 +108,94 @@ impl RemoteBackend {
             busy,
             local: Arc::default(),
         }))
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn tree(
+        &self,
+        params: loop_protocol::rpc::TreeParams,
+    ) -> BackendResult<loop_protocol::rpc::TreeResult> {
+        if !self.capabilities.session_tree {
+            return Err(BackendError::Unsupported(methods::SESSION_TREE.into()));
+        }
+        call(&self.conn, methods::SESSION_TREE, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn view(
+        &self,
+        params: loop_protocol::rpc::ViewParams,
+    ) -> BackendResult<loop_protocol::rpc::ViewResult> {
+        if !self.capabilities.branch_snapshot {
+            return Err(BackendError::Unsupported(methods::SESSION_VIEW.into()));
+        }
+        call(&self.conn, methods::SESSION_VIEW, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn navigate(
+        &self,
+        params: loop_protocol::rpc::NavigateParams,
+    ) -> BackendResult<loop_protocol::rpc::NavigateResult> {
+        if !self.capabilities.session_tree {
+            return Err(BackendError::Unsupported(methods::SESSION_NAVIGATE.into()));
+        }
+        call(&self.conn, methods::SESSION_NAVIGATE, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn rename(
+        &self,
+        params: loop_protocol::rpc::RenameParams,
+    ) -> BackendResult<loop_protocol::rpc::MutationResult> {
+        if !self.capabilities.session_rename {
+            return Err(BackendError::Unsupported(methods::SESSION_RENAME.into()));
+        }
+        call(&self.conn, methods::SESSION_RENAME, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn fork(
+        &self,
+        params: loop_protocol::rpc::ForkParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        if !self.capabilities.session_fork {
+            return Err(BackendError::Unsupported(methods::SESSION_FORK.into()));
+        }
+        call(&self.conn, methods::SESSION_FORK, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn clone_session(
+        &self,
+        params: loop_protocol::rpc::CloneParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        if !self.capabilities.session_fork {
+            return Err(BackendError::Unsupported(methods::SESSION_CLONE.into()));
+        }
+        call(&self.conn, methods::SESSION_CLONE, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn export(
+        &self,
+        params: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::ExportResult> {
+        if !self.capabilities.session_transfer {
+            return Err(BackendError::Unsupported(methods::SESSION_EXPORT.into()));
+        }
+        call(&self.conn, methods::SESSION_EXPORT, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn import(
+        &self,
+        params: loop_protocol::rpc::ImportParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        if !self.capabilities.session_transfer {
+            return Err(BackendError::Unsupported(methods::SESSION_IMPORT.into()));
+        }
+        call(&self.conn, methods::SESSION_IMPORT, &params).await
     }
 
     /// The server, as it introduced itself.

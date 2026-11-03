@@ -30,6 +30,21 @@ pub struct Capabilities {
     pub multi_session: bool,
     /// Supports attach, cursor replay and detach.
     pub attach: bool,
+    /// Lists and navigates Session branches.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_tree: bool,
+    /// Changes Session metadata.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_rename: bool,
+    /// Creates separately leased forks and clones.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_fork: bool,
+    /// Transfers bounded Session payloads.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_transfer: bool,
+    /// Serves immutable transcript pages.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub branch_snapshot: bool,
     /// Has selectable reasoning effort levels (`session/efforts`).
     pub efforts: bool,
     /// `session/attach` returns a Session snapshot with its result.

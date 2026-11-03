@@ -804,6 +804,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grant_labels_live_in_the_namespace_copies_drop() {
+        assert!(AUTO_APPROVE_LABEL_PREFIX
+            .starts_with(loop_agent::harness::session::TOOL_APPROVAL_LABEL_NAMESPACE));
+    }
+
+    #[test]
     fn policy_and_permissions() {
         assert_eq!(ApprovalPolicy::parse("off"), ApprovalPolicy::Never);
         assert_eq!(ApprovalPolicy::parse("x"), ApprovalPolicy::NewSession);

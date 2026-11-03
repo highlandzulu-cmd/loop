@@ -4567,7 +4567,8 @@ fn handle_update(
         // Approvals arrive through HostServices, not the update stream;
         // this TUI changes model and effort itself and shows them from its
         // own state; unknown updates come from newer backends.
-        SessionUpdate::InteractionRequested { .. }
+        SessionUpdate::BranchReset { .. }
+        | SessionUpdate::InteractionRequested { .. }
         | SessionUpdate::InteractionResolved { .. }
         | SessionUpdate::ConfigChanged(_)
         | SessionUpdate::Unknown(_) => {}

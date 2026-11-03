@@ -170,6 +170,7 @@ fn session_list_info_wire() {
     use loop_protocol::rpc::SessionInfo;
     roundtrip(
         &vec![SessionInfo {
+            summary: Default::default(),
             r#ref: session(),
             cwd: "/work/repo".into(),
             name: Some("Review".into()),
@@ -335,6 +336,55 @@ fn interactions_route_to_a_session_and_withdraw_by_native_id() {
 }
 
 #[test]
+fn session_tree_v1_capabilities_and_event_goldens() {
+    use loop_protocol::rpc::*;
+    use loop_protocol::SessionUpdate;
+    let legacy: ClientCapabilities = serde_json::from_value(json!({"interact":true})).unwrap();
+    assert!(!legacy.branch_reset);
+    let capabilities: Capabilities = serde_json::from_value(json!({})).unwrap();
+    assert!(
+        !capabilities.session_tree
+            && !capabilities.branch_snapshot
+            && !capabilities.session_transfer
+    );
+    roundtrip(
+        &NavigateParams {
+            session: session(),
+            target_entry_id: None,
+            summarize: false,
+            expected_revision: Some(2),
+        },
+        json!({"session":session(),"target_entry_id":null,"summarize":false,"expected_revision":2}),
+    );
+    roundtrip(
+        &SessionUpdate::BranchReset {
+            revision: 5,
+            branch_revision: 3,
+            view_id: "view-1".into(),
+            reason: "navigate".into(),
+        },
+        json!({"type":"branch_reset","revision":5,"branch_revision":3,"view_id":"view-1","reason":"navigate"}),
+    );
+    roundtrip(
+        &NavigateResult {
+            revision: 5,
+            branch_revision: 3,
+            seq: 9,
+        },
+        json!({"revision":5,"branch_revision":3,"seq":9}),
+    );
+}
+
+#[test]
+fn revision_conflicts_preserve_the_current_revision_over_the_wire() {
+    let error = loop_protocol::BackendError::Conflict { revision: 7 };
+    let body = loop_protocol::rpc::RpcErrorBody::from(&error);
+    assert_eq!(body.code, loop_protocol::rpc::error_codes::CONFLICT);
+    assert_eq!(body.data, Some(json!({"revision":7})));
+    assert_eq!(body.into_backend_error(), error);
+}
+
+#[test]
 fn model_control_methods_wire() {
     use loop_protocol::rpc::{
         methods, ChoiceInfo, ChoicesResult, ModelInfo, ModelsResult, SetEffortParams,
@@ -492,6 +542,12 @@ fn config_changed_and_attach_snapshot_wire() {
             effective: config,
             pending: false,
             capabilities: Capabilities::default(),
+            workspace_id: String::new(),
+            branch_revision: 0,
+            view_id: None,
+            turn_state: None,
+            stats: serde_json::Value::Null,
+            workspace_revision: 0,
         }),
     };
     let value = serde_json::to_value(&attached).unwrap();

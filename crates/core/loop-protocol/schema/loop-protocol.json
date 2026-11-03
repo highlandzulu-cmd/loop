@@ -69,6 +69,10 @@
           "description": "`session/attach` returns a Session snapshot with its result.",
           "type": "boolean"
         },
+        "branch_snapshot": {
+          "description": "Serves immutable transcript pages.",
+          "type": "boolean"
+        },
         "efforts": {
           "default": false,
           "description": "Has selectable reasoning effort levels (`session/efforts`).",
@@ -102,6 +106,22 @@
         "resume_session": {
           "default": false,
           "description": "Can reopen a past session without replaying history.",
+          "type": "boolean"
+        },
+        "session_fork": {
+          "description": "Creates separately leased forks and clones.",
+          "type": "boolean"
+        },
+        "session_rename": {
+          "description": "Changes Session metadata.",
+          "type": "boolean"
+        },
+        "session_transfer": {
+          "description": "Transfers bounded Session payloads.",
+          "type": "boolean"
+        },
+        "session_tree": {
+          "description": "Lists and navigates Session branches.",
           "type": "boolean"
         },
         "set_model": {
@@ -181,7 +201,7 @@
           ]
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -196,12 +216,42 @@
     "ClientCapabilities": {
       "description": "What a client can do for the server.",
       "properties": {
+        "branch_reset": {
+          "description": "Replaces its transcript when a branch reset arrives.",
+          "type": "boolean"
+        },
         "interact": {
           "default": false,
           "description": "Answers `host/interact` (permission prompts, questions).",
           "type": "boolean"
         }
       },
+      "type": "object"
+    },
+    "CloneParams": {
+      "description": "Copy a whole committed active branch into a new Session.",
+      "properties": {
+        "name": {
+          "default": null,
+          "description": "Session display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "description": "Stable retry id; reuse only for identical parameters.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session",
+        "request_id"
+      ],
       "type": "object"
     },
     "CloseParams": {
@@ -256,7 +306,7 @@
           "type": "boolean"
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -348,6 +398,40 @@
       ],
       "description": "A unit of content."
     },
+    "DestinationResult": {
+      "description": "A newly admitted destination; source subscriptions are unchanged.",
+      "properties": {
+        "draft": {
+          "description": "Excluded user message to restore in the initiating composer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "source_branch_revision": {
+          "description": "Source revision captured by a copy.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "workspace_id"
+      ],
+      "type": "object"
+    },
     "ErrorCategory": {
       "description": "Why a turn failed, as far as Loop can tell.",
       "oneOf": [
@@ -418,6 +502,122 @@
         "category",
         "retryable",
         "message"
+      ],
+      "type": "object"
+    },
+    "ExportResult": {
+      "description": "Bounded payloads written to files by the Surface.",
+      "properties": {
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "format_version": {
+          "description": "Session JSONL format version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jsonl": {
+          "description": "UTF-8 versioned Session payload.",
+          "type": "string"
+        },
+        "markdown": {
+          "description": "Readable branch transcript.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "format_version",
+        "markdown",
+        "jsonl",
+        "branch_revision"
+      ],
+      "type": "object"
+    },
+    "ForkParams": {
+      "description": "Create a new Session before a user message on the source branch.",
+      "properties": {
+        "before_entry_id": {
+          "description": "User message excluded from the destination branch.",
+          "type": "string"
+        },
+        "name": {
+          "default": null,
+          "description": "Session display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "description": "Stable retry id; reuse only for identical parameters.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session",
+        "before_entry_id",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "ForkPoint": {
+      "description": "A user-message fork point returned with its tree page.",
+      "properties": {
+        "entry_id": {
+          "description": "Persisted user-message entry id.",
+          "type": "string"
+        },
+        "index": {
+          "description": "One-based user-message index.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preview": {
+          "description": "Short display text.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Full draft text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "index",
+        "text",
+        "preview"
+      ],
+      "type": "object"
+    },
+    "ImportParams": {
+      "description": "Import bytes into a known host workspace, never a supplied host path.",
+      "properties": {
+        "jsonl": {
+          "description": "UTF-8 versioned Session payload.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Stable retry id; reuse only for identical parameters.",
+          "type": "string"
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "jsonl",
+        "request_id"
       ],
       "type": "object"
     },
@@ -980,7 +1180,7 @@
           "type": "array"
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1012,7 +1212,7 @@
           "type": "boolean"
         },
         "revision": {
-          "description": "The Session's config revision after the change.",
+          "description": "The Session revision after the change.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1026,6 +1226,71 @@
       },
       "required": [
         "revision",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "NavigateParams": {
+      "description": "Move the active branch. None means before its first entry.",
+      "properties": {
+        "expected_revision": {
+          "default": null,
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "summarize": {
+          "default": false,
+          "description": "Add a summary of the previous branch.",
+          "type": "boolean"
+        },
+        "target_entry_id": {
+          "default": null,
+          "description": "Destination entry, or None for the root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "NavigateResult": {
+      "description": "Ordered branch mutation result.",
+      "properties": {
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "description": "The Session revision after the branch change.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "Committed update sequence.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "branch_revision",
         "seq"
       ],
       "type": "object"
@@ -1233,6 +1498,34 @@
       ],
       "type": "object"
     },
+    "RenameParams": {
+      "description": "Change only the Session display name.",
+      "properties": {
+        "expected_revision": {
+          "default": null,
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Session display name.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session",
+        "name"
+      ],
+      "type": "object"
+    },
     "Role": {
       "description": "Who wrote a message.",
       "oneOf": [
@@ -1369,6 +1662,20 @@
     "SessionInfo": {
       "description": "One Session in the Runtime's list, including closed Sessions.",
       "properties": {
+        "availability": {
+          "description": "Loaded, loadable or owned_elsewhere.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backend": {
+          "description": "Backend kind.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "busy": {
           "description": "Whether a turn is running.",
           "type": "boolean"
@@ -1383,6 +1690,24 @@
           "description": "Working directory.",
           "type": "string"
         },
+        "first_prompt": {
+          "description": "First user prompt preview.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fork_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source Session for a fork or clone."
+        },
         "last_active_ms": {
           "description": "Last activity time in milliseconds since the Unix epoch.",
           "format": "uint64",
@@ -1393,9 +1718,25 @@
           "description": "Whether the Runtime currently holds this Session open.",
           "type": "boolean"
         },
+        "message_count": {
+          "description": "Number of user and assistant messages.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "name": {
           "default": null,
           "description": "Display name, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_kind": {
+          "description": "Current lease owner kind, when leased.",
           "type": [
             "string",
             "null"
@@ -1416,6 +1757,20 @@
         "ref": {
           "$ref": "#/$defs/SessionRef",
           "description": "The full Session reference."
+        },
+        "selected_model": {
+          "description": "Selected provider/model id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -1490,6 +1845,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "branch_revision": {
+          "default": 0,
+          "description": "The active branch's revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "capabilities": {
           "$ref": "#/$defs/Capabilities",
           "default": {
@@ -1530,7 +1892,7 @@
           "type": "boolean"
         },
         "revision": {
-          "description": "The Session's config revision.",
+          "description": "The Session revision.",
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
@@ -1538,6 +1900,34 @@
         "session": {
           "$ref": "#/$defs/SessionRef",
           "description": "The Session."
+        },
+        "stats": {
+          "description": "Public stats; unknown values are omitted."
+        },
+        "turn_state": {
+          "description": "Idle, busy or parked, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view_id": {
+          "description": "Immutable transcript view at `at_seq`, for servers with the\n`branch_snapshot` capability.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity, when the server reports one.",
+          "type": "string"
+        },
+        "workspace_revision": {
+          "default": 0,
+          "description": "Revision of the workspace definitions the Session uses.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -1569,6 +1959,43 @@
     },
     "SessionUpdate": {
       "anyOf": [
+        {
+          "description": "Replace the transcript with an immutable branch view.",
+          "properties": {
+            "branch_revision": {
+              "description": "Committed transcript revision.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reason": {
+              "description": "Why the transcript was replaced.",
+              "type": "string"
+            },
+            "revision": {
+              "description": "The Session revision after the branch change.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "branch_reset",
+              "type": "string"
+            },
+            "view_id": {
+              "description": "Immutable transcript view id; expires explicitly.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "branch_revision",
+            "view_id",
+            "reason"
+          ],
+          "type": "object"
+        },
         {
           "description": "A turn began.",
           "properties": {
@@ -2311,6 +2738,137 @@
       ],
       "type": "object"
     },
+    "TreeEntry": {
+      "description": "One tree row, including its branch membership and editable user text.",
+      "properties": {
+        "current": {
+          "description": "Whether this is the current position.",
+          "type": "boolean"
+        },
+        "depth": {
+          "description": "Indentation level.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "entry_id": {
+          "description": "Persisted entry id.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "User, assistant or summary.",
+          "type": "string"
+        },
+        "on_branch": {
+          "description": "Whether this row is on the active branch.",
+          "type": "boolean"
+        },
+        "parent_id": {
+          "description": "Parent entry, or the root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "description": "Short display text.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Full editable prompt, for user rows.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entry_id",
+        "depth",
+        "kind",
+        "preview",
+        "on_branch",
+        "current"
+      ],
+      "type": "object"
+    },
+    "TreeParams": {
+      "description": "A page of tree entries; cursors are offsets within the captured tree revision.",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Opaque continuation cursor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Page size: defaults to 100, at most 1000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "TreeResult": {
+      "description": "Tree rows and fork points use the native tree's versioned JSON entry format.",
+      "properties": {
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "entries": {
+          "description": "Tree rows in display order.",
+          "items": {
+            "$ref": "#/$defs/TreeEntry"
+          },
+          "type": "array"
+        },
+        "family": {
+          "description": "Related Session references.",
+          "items": {
+            "$ref": "#/$defs/SessionRef"
+          },
+          "type": "array"
+        },
+        "fork_points": {
+          "description": "User-message fork points.",
+          "items": {
+            "$ref": "#/$defs/ForkPoint"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Continuation cursor, absent at the end.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entries",
+        "fork_points",
+        "family",
+        "branch_revision"
+      ],
+      "type": "object"
+    },
     "TurnId": {
       "description": "One user prompt and everything the agent does in response.",
       "type": "string"
@@ -2447,12 +3005,91 @@
         "total_tokens"
       ],
       "type": "object"
+    },
+    "ViewParams": {
+      "description": "An immutable transcript page request.",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Opaque continuation cursor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Page size: defaults to 100, at most 1000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "view_id": {
+          "description": "Immutable transcript view id; expires explicitly.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "view_id"
+      ],
+      "type": "object"
+    },
+    "ViewResult": {
+      "description": "A page from an immutable transcript view.",
+      "properties": {
+        "at_seq": {
+          "description": "Event Log high-water mark at capture.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "next_cursor": {
+          "description": "Continuation cursor, absent at the end.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updates": {
+          "description": "Transcript projection for this page.",
+          "items": {
+            "$ref": "#/$defs/SessionUpdate"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "updates",
+        "branch_revision",
+        "at_seq"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
   "error": {
     "$ref": "#/$defs/RpcErrorBody"
+  },
+  "limits": {
+    "encoded_response_bytes": 16777216,
+    "page_default": 100,
+    "page_max": 1000,
+    "session_transfer_bytes": 8388608
   },
   "methods": {
     "host/interact": {
@@ -2519,6 +3156,16 @@
         "$ref": "#/$defs/SessionParams"
       }
     },
+    "session/clone": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/CloneParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DestinationResult"
+      }
+    },
     "session/close": {
       "direction": "client_to_server",
       "kind": "request",
@@ -2547,6 +3194,36 @@
       },
       "result": {
         "$ref": "#/$defs/ChoicesResult"
+      }
+    },
+    "session/export": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ExportResult"
+      }
+    },
+    "session/fork": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ForkParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DestinationResult"
+      }
+    },
+    "session/import": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ImportParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DestinationResult"
       }
     },
     "session/list": {
@@ -2592,6 +3269,16 @@
         "$ref": "#/$defs/ChoicesResult"
       }
     },
+    "session/navigate": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/NavigateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/NavigateResult"
+      }
+    },
     "session/new": {
       "direction": "client_to_server",
       "kind": "request",
@@ -2610,6 +3297,16 @@
       },
       "result": {
         "$ref": "#/$defs/PromptResult"
+      }
+    },
+    "session/rename": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/RenameParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
       }
     },
     "session/set_effort": {
@@ -2655,11 +3352,31 @@
         "type": "array"
       }
     },
+    "session/tree": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TreeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TreeResult"
+      }
+    },
     "session/update": {
       "direction": "server_to_client",
       "kind": "notification",
       "params": {
         "$ref": "#/$defs/UpdateEnvelope"
+      }
+    },
+    "session/view": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ViewParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ViewResult"
       }
     },
     "shutdown": {

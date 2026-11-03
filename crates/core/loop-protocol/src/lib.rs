@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Versioned event model shared by every Loop agent backend and surface.
 //!
 //! Backends (Loop's own agent, or an external agent over the Agent Client

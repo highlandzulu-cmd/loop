@@ -232,7 +232,7 @@ change is pending. JSON spellings use snake_case, as the existing wire types do.
 | `session/ttfb` | `{session:s,timeout_ms?,clear_override:false,expected_revision?}` | `{override_ms?,effective_ms,revision,seq?,pending}` | `session_ttfb` |
 | `session/shell` | `{session:s,command,timeout_ms?}` | `{stdout,stderr,exit_code,truncated}` | `local_shell` |
 | `session/tree` | `{session:s,cursor?,limit?}` | `{entries,fork_points,family,branch_revision,next_cursor?}` | `session_tree` |
-| `session/navigate` | `{session:s,target_entry_id?,summarize:false,expected_revision?}` | `{branch_revision,seq}` | `session_tree` |
+| `session/navigate` | `{session:s,target_entry_id?,summarize:false,expected_revision?}` | `{revision,branch_revision,seq}` | `session_tree` |
 | `session/view` | `{session:s,view_id,cursor?,limit?}` | `{updates,next_cursor?,branch_revision,at_seq}` | `branch_snapshot` |
 | `session/rename` | `{session:s,name,expected_revision?}` | `MutationResult`; emits ConfigChanged metadata, never BranchReset | `session_rename` |
 | `session/fork` | `{session:s,before_entry_id,name?,request_id}` | `{session:s,workspace_id,source_branch_revision}` | `session_fork` |
@@ -258,7 +258,12 @@ change is pending. JSON spellings use snake_case, as the existing wire types do.
 | `runtime/usage` | `{filter?,cursor?,limit?}` | `{rows,totals,next_cursor?,taken_at_ms,log_status}` | `host_usage` |
 | `runtime/sessions` | `{}` | `{sessions:[{session,workspace_id,state,model,tokens}],totals,taken_at_ms}` | `runtime_sessions` |
 
-`MutationResult = {revision,seq,pending,applies_after_turn?}`. Validate choice ids,
+`MutationResult = {revision,seq,pending,applies_after_turn?}`. Each Session has one
+revision. Every committed model, effort, mode, name or branch change advances it,
+and every Session `expected_revision` checks it. Snapshots, ConfigChanged,
+BranchReset and setter results report it. It is counted from the Session's tree,
+so it survives a restart and a cold read agrees with a loaded one.
+`branch_revision` separately counts active-branch moves. Validate choice ids,
 limits and expected revisions before changing state. A revision conflict returns
 a typed conflict error with the current revision. Unsupported services return a
 typed Unsupported error. Host-only calls over WebSocket return forbidden, even
@@ -303,7 +308,7 @@ Add typed `SessionUpdate` variants. Current variants are at
 | Update | Payload and effect |
 |---|---|
 | `ConfigChanged` / `config_changed` | `{revision,metadata:{name},config,effective,pending,applies_after_turn?,workspace_revision}`. Carries Session metadata and the complete public config, including model, effort, backend mode, permission mode, sandbox, response-timeout override and active skills. Replaces the previous metadata/config view. Rename changes `metadata.name`, not the branch. |
-| `BranchReset` / `branch_reset` | `{branch_revision,view_id,reason}`. Replaces the chat projection using the immutable paged view. Reasons include navigate and compact. Never append the replacement transcript to the old one. |
+| `BranchReset` / `branch_reset` | `{revision,branch_revision,view_id,reason}`. Replaces the chat projection using the immutable paged view. Reasons include navigate and compact. Never append the replacement transcript to the old one. |
 | `WorkflowProgress` / `workflow_progress` | `{workflow_id,state,task_id?,description?,outline?,mermaid?,output?,error?}`. States cover planned, task_started, task_completed, task_failed and ended. Shares Session ordering and replay. |
 
 All use the existing durable `UpdateEnvelope`. They consume contiguous
