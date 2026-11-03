@@ -936,3 +936,57 @@ async fn an_attach_snapshot_holds_turn_settlement_until_it_is_captured() {
     .await
     .unwrap();
 }
+
+async fn resets(log: &MemoryEventLog, session: &SessionRef) -> usize {
+    log.read_after(&session.key, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|record| {
+            matches!(&record.event.kind, EventKind::Update(envelope)
+                if matches!(envelope.update, SessionUpdate::BranchReset { .. }))
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn navigation_at_the_view_limit_changes_nothing() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_protocol::rpc::NavigateParams;
+        use loop_wire::RuntimeControl;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, log) = runtime(dir.path(), 2).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        run(&rt, &source, "keep this branch").await;
+        for connection in 0..tree::VIEW_LIMIT as u64 {
+            rt.attach_snapshot_watching(connection, &source, 0)
+                .await
+                .unwrap();
+        }
+        let before = rt.store.control_state(&source.native_id).await.unwrap();
+        let navigate = || NavigateParams {
+            session: source.clone(),
+            target_entry_id: None,
+            summarize: false,
+            expected_revision: None,
+        };
+        assert_eq!(
+            rt.navigate(navigate()).await.unwrap_err(),
+            BackendError::Busy
+        );
+        let after = rt.store.control_state(&source.native_id).await.unwrap();
+        assert_eq!(after.branch_revision, before.branch_revision);
+        assert_eq!(after.pending, None);
+        assert_eq!(resets(&log, &source).await, 0);
+        assert!(matches!(
+            run(&rt, &source, "still on the old branch").await,
+            TurnOutcome::Completed { .. }
+        ));
+        rt.views.lock().unwrap().clear();
+        rt.navigate(navigate()).await.unwrap();
+        assert_eq!(resets(&log, &source).await, 1);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
