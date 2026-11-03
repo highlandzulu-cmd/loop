@@ -67,6 +67,8 @@ Common settings in `settings.json`:
 | `mcpServers`, `disabledMcpServers` | empty | MCP servers (stdio `command` or remote `url`) |
 | `providers` | empty | Custom providers added with `/login custom` |
 | `runtime.maxSessions`, `runtime.maxActiveTurns` | `16`, `8` | Limits of `loop runtime start`; see [the Runtime](runtime.md#start-the-runtime). Each must be a whole number of at least 1. A command-line flag overrides it (global only) |
+| `runtime.idleShutdownMinutes` | `10` | Minutes an auto-started Runtime waits with nothing attached or running before it exits. `0` disables it. An owner from `loop runtime start` never idles out (global only) |
+| `runtime.forwardEnv` | empty | Extra environment variable names a Surface forwards to a Runtime over WebSocket, on top of the built-in allowlist. Unix sockets forward the full environment. Values are never logged (global only) |
 
 On macOS, `/sandbox local` starts Seatbelt after a preflight. Shell commands may
 write the real project, private sandbox temp directory and `sandbox.allowWrite`; file tools

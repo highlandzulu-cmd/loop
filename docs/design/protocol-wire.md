@@ -1,6 +1,6 @@
 # Phase 0 Lane B · loop-protocol on the wire: design draft
 
-Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model control comes in S3. All five PRs in §9 are built. User docs: [Running Loop from scripts](../print-mode.md).
+Status: approved 2026-10-29 (method set, `loop-wire` crate, exit codes). Model control and the other TUI methods arrived in S3 (§12). All five PRs in §9 are built. User docs: [Running Loop from scripts](../print-mode.md).
 
 Goal: `loop-protocol` runs over a real connection. This is S1, the first step
 of the spine: the Runtime (S2) and the TUI as a Runtime client (S3) build on
@@ -202,3 +202,62 @@ sets both.
 ```json
 {"jsonrpc":"2.0","method":"session/update","params":{"v":1,"instance":"loop","generation":4,"session":"s1","turn":"turn-2","seq":43,"origin":"replay","update":{"type":"turn_ended","turn_id":"turn-2","stop":"runtime_restarted"}}}
 ```
+
+## 12. Session and workspace methods (S3)
+
+S3 makes the TUI a Runtime client, so the TUI's controls became wire methods.
+`PROTOCOL_VERSION` stays 1. Each method needs the `Capabilities` flag shown;
+without it the server returns `-32002` (unsupported). All are client → server
+requests, and the Runtime sets every flag. `crates/core/loop-protocol/src/rpc.rs`
+has the params and results, and the checked-in schema lists them.
+
+**Host-only** methods are served only on the Runtime's protected Unix socket.
+Over an authenticated WebSocket they are refused with `-32006` (forbidden).
+The list is `methods::HOST_ONLY` in `rpc.rs`.
+
+| Method | Capability | Host-only |
+|---|---|---|
+| `session/models`, `session/set_model` | `set_model` | no |
+| `session/efforts`, `session/set_effort` | `efforts` | no |
+| `session/modes`, `session/set_mode` | `modes` | no |
+| `session/compact` | `compaction` | no |
+| `session/stats` | `session_stats` | no |
+| `session/shell` | `local_shell` | no |
+| `session/ttfb` | `session_ttfb` | no |
+| `session/config` | `session_config` | no |
+| `session/skill` | `session_skills` | no |
+| `session/workflow` (progress is streamed) | `workflow` | no |
+| `session/tree`, `session/navigate` | `session_tree` | no |
+| `session/view` (transcript pages) | `branch_snapshot` | no |
+| `session/rename` | `session_rename` | no |
+| `session/fork`, `session/clone` | `session_fork` | no |
+| `session/export`, `session/import` | `session_transfer` | no |
+| `session/sandbox` | `session_sandbox` | no |
+| `session/permission_mode` | `permission_mode` | no |
+| `workspace/settings` (redacted) | `workspace_settings` | no |
+| `workspace/mcp` | `workspace_mcp` | no |
+| `workspace/web_search` | `workspace_web_search` | no |
+| `workspace/skills` | `workspace_skills` | no |
+| `workspace/templates` | `workspace_templates` | no |
+| `workspace/reload` | `workspace_reload` | no |
+| `workspace/trust` | `workspace_trust` | writes only; reads work over WebSocket |
+| `runtime/sessions` | `runtime_sessions` | no |
+| `runtime/usage` | `host_usage` | yes |
+| `runtime/defaults` | `host_defaults` | yes |
+| `runtime/providers` (login and logout) | `host_providers` | yes |
+| `runtime/mcp_auth` (MCP OAuth) | `host_mcp_auth` | yes |
+| `runtime/tracing` | `host_tracing` | yes |
+| `runtime/stop_empty` (stop only when no Session is loaded) | `runtime_stop_empty` | yes |
+
+Other S3 additions:
+
+- **`session/new` environment.** `session_environment` says `session/new`
+  accepts the caller's environment. A Unix socket may send all of it. Over a
+  WebSocket the client sends only an allowlist plus names the user listed in
+  `runtime.forwardEnv`. The environment is never logged or stored. See
+  [`../runtime.md`](../runtime.md).
+- **`attach_snapshot`.** `session/attach` also returns a Session snapshot.
+- **Size limits.** `session/export` and `session/import` payloads are limited to
+  `SESSION_TRANSFER_LIMIT` (8 MiB), and any response to `SESSION_RESPONSE_LIMIT`
+  (16 MiB).
+- **New error codes.** `-32005` conflict and `-32006` forbidden join the S1 codes.
