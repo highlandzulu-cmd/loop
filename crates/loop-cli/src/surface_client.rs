@@ -59,6 +59,37 @@ pub struct SurfaceClient {
     pub usage_requested: bool,
 }
 
+/// `/default` over a Runtime: save `model` (`provider/id`) and `effort` for
+/// new Sessions with the host-only `runtime/defaults`. Returns what was
+/// saved, as `model · effort`. A connection without host-local authority
+/// (a WebSocket) is told to run it on the Runtime host.
+pub async fn save_defaults_on(
+    admin: &dyn loop_wire::RuntimeAdmin,
+    model: &str,
+    effort: &str,
+) -> anyhow::Result<String> {
+    let patch = loop_protocol::admin::DefaultsPatch {
+        model: Some(model.to_owned()),
+        effort: Some(effort.to_owned()),
+        ..Default::default()
+    };
+    match admin
+        .defaults(loop_protocol::admin::DefaultsParams {
+            patch: Some(patch),
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(_) => Ok(format!("{model} · {effort}")),
+        // Refused by the host, or not even offered: host-only methods are
+        // advertised only on a host-local connection.
+        Err(
+            loop_protocol::BackendError::Forbidden(_) | loop_protocol::BackendError::Unsupported(_),
+        ) => anyhow::bail!("run this on the Runtime host"),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl From<CliRuntime> for SurfaceClient {
     fn from(runtime: CliRuntime) -> Self {
         let CliRuntime {
@@ -580,7 +611,7 @@ impl SurfaceClient {
     /// defaults for new Sessions. Returns what was saved, as `model · effort`.
     ///
     /// Today this writes the host settings in process. Over a Runtime it is
-    /// `runtime/defaults` (see [`save_defaults_on`]), which is host-only.
+    /// `runtime/defaults` ([`save_defaults_on`]), which is host-only.
     pub async fn save_defaults(&mut self) -> anyhow::Result<String> {
         let effort = self.session_effort().await?;
         let label = match self.active_agent().clone() {
@@ -919,6 +950,140 @@ mod review_tests {
             let two = test_support::fixture(dir.path()).await;
             assert_eq!(two.workspace_id, expected);
             two.shutdown().run().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod runtime_default_tests {
+    use super::*;
+    use loop_app_core::runtime::{BootstrapOpts, GlobalResources};
+    use loop_wire::server::{serve_with_control, ServeOptions};
+    use loop_wire::{Authority, RemoteBackend};
+    use std::time::Duration;
+
+    struct NoHost;
+    #[async_trait::async_trait]
+    impl loop_protocol::HostServices for NoHost {
+        async fn interact(
+            &self,
+            _: loop_protocol::InteractionRequest,
+        ) -> loop_protocol::InteractionOutcome {
+            loop_protocol::InteractionOutcome::Cancelled
+        }
+    }
+
+    async fn connect(dir: &std::path::Path, authority: Authority) -> Arc<RemoteBackend> {
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(loop_ai::providers::faux_provider(
+            loop_ai::providers::FauxScript::new(),
+        ));
+        let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
+        let opts = BootstrapOpts {
+            cwd: dir.into(),
+            provider: Some("faux".into()),
+            model: Some("faux-model".into()),
+            theme: None,
+            system_prompt: None,
+            append_system_prompt: None,
+            no_context_files: true,
+            interactive: false,
+            session_id: None,
+            no_web: true,
+            permission_mode: Some("ask".into()),
+            agent: None,
+        };
+        let log = Arc::new(loop_runtime::log::MemoryEventLog::new());
+        let rt = loop_runtime::Runtime::new(globals, opts, log, Default::default())
+            .await
+            .unwrap()
+            .into_shared();
+        struct Host(Arc<loop_runtime::Runtime>);
+        #[async_trait::async_trait]
+        impl RuntimeControl for Host {
+            async fn list(&self) -> loop_protocol::BackendResult<Vec<SessionInfo>> {
+                self.0.list().await
+            }
+            async fn close(&self, s: &SessionRef, f: bool) -> loop_protocol::BackendResult<()> {
+                RuntimeControl::close(self.0.as_ref(), s, f).await
+            }
+            async fn attach(
+                &self,
+                s: &SessionRef,
+                after: u64,
+            ) -> loop_protocol::BackendResult<loop_wire::Attachment> {
+                RuntimeControl::attach(self.0.as_ref(), s, after).await
+            }
+            fn admin(&self) -> Option<&dyn loop_wire::RuntimeAdmin> {
+                Some(self)
+            }
+        }
+        #[async_trait::async_trait]
+        impl loop_wire::RuntimeAdmin for Host {
+            fn offered(&self) -> loop_protocol::Capabilities {
+                loop_protocol::Capabilities {
+                    host_defaults: true,
+                    ..Default::default()
+                }
+            }
+            async fn defaults(
+                &self,
+                p: loop_protocol::admin::DefaultsParams,
+            ) -> loop_protocol::BackendResult<loop_protocol::admin::DefaultsResult> {
+                self.0.update_defaults(p).await
+            }
+        }
+        let (server, client) = loop_wire::transport::memory();
+        let _ = serve_with_control(
+            rt.clone(),
+            Arc::new(Host(rt)),
+            server,
+            PeerInfo {
+                name: "t".into(),
+                version: "t".into(),
+            },
+            ServeOptions {
+                owns_backend: false,
+                authority,
+            },
+        );
+        RemoteBackend::connect(
+            client,
+            PeerInfo {
+                name: "t".into(),
+                version: "t".into(),
+            },
+            Arc::new(NoHost),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn default_over_a_runtime_saves_host_defaults_only_host_locally() {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let dir = tempfile::tempdir().unwrap();
+            let remote = connect(dir.path(), Authority::Remote).await;
+            let refused = save_defaults_on(remote.as_ref(), "faux/faux-model", "high")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(refused, "run this on the Runtime host");
+
+            let local = connect(dir.path(), Authority::HostLocal).await;
+            let saved = save_defaults_on(local.as_ref(), "faux/faux-model", "high")
+                .await
+                .unwrap();
+            assert_eq!(saved, "faux/faux-model · high");
+            let settings: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("agent/settings.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(settings["defaultProvider"], "faux");
+            assert_eq!(settings["defaultModel"], "faux-model");
+            assert_eq!(settings["defaultThinkingLevel"], "high");
         })
         .await
         .unwrap();

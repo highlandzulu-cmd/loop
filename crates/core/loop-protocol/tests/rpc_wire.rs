@@ -865,10 +865,19 @@ fn workspace_admin_and_host_only_methods_wire() {
             workspace_id: None,
             patch: Some(DefaultsPatch {
                 response_header_timeout_ms: Some(0),
+                ..DefaultsPatch::default()
             }),
             expected_revision: None,
         },
         json!({"patch":{"response_header_timeout_ms":0}}),
+    );
+    roundtrip(
+        &DefaultsPatch {
+            model: Some("faux/second".into()),
+            effort: Some("high".into()),
+            response_header_timeout_ms: None,
+        },
+        json!({"model":"faux/second","effort":"high"}),
     );
 }
 

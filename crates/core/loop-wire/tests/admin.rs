@@ -295,6 +295,7 @@ async fn admin_is_the_same_over_the_wire_on_a_host_local_connection() {
             .defaults(DefaultsParams {
                 patch: Some(DefaultsPatch {
                     response_header_timeout_ms: Some(0),
+                    ..DefaultsPatch::default()
                 }),
                 ..DefaultsParams::default()
             })
