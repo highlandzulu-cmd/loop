@@ -17,6 +17,10 @@ use crate::update::StopReason;
 
 /// Method names.
 pub mod methods {
+    /// Session skill activation.
+    pub const SESSION_SKILL: &str = "session/skill";
+    /// Start a workflow; progress is streamed.
+    pub const SESSION_WORKFLOW: &str = "session/workflow";
     // Session-tree operations.
     /// Session-tree RPC method.
     pub const SESSION_TREE: &str = "session/tree";
@@ -771,6 +775,10 @@ pub fn json_schema() -> Value {
     let shell_result = reference(generator.subschema_for::<crate::ShellResult>());
     let ttfb = reference(generator.subschema_for::<TtfbParams>());
     let ttfb_result = reference(generator.subschema_for::<TtfbResult>());
+    let skill = reference(generator.subschema_for::<crate::session_services::SkillParams>());
+    let workflow = reference(generator.subschema_for::<crate::session_services::WorkflowParams>());
+    let workflow_result =
+        reference(generator.subschema_for::<crate::session_services::WorkflowResult>());
     let admin = {
         use crate::admin::*;
         let r = |schema| reference(schema);
@@ -883,6 +891,14 @@ pub fn json_schema() -> Value {
     });
     // Added separately: one `json!` this large exceeds the macro recursion limit.
     let s3_methods = [
+        (
+            methods::SESSION_SKILL,
+            method(up, "request", &skill, Some(&mutation)),
+        ),
+        (
+            methods::SESSION_WORKFLOW,
+            method(up, "request", &workflow, Some(&workflow_result)),
+        ),
         (
             methods::SESSION_MODELS,
             method(up, "request", &session_params, Some(&models)),

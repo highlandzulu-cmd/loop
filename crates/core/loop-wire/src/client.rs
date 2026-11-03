@@ -49,6 +49,27 @@ pub struct RemoteBackend {
 }
 
 impl RemoteBackend {
+    /// Activate a Session skill.
+    pub async fn skill(
+        &self,
+        params: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        if !self.capabilities.session_skills {
+            return Err(BackendError::Unsupported(methods::SESSION_SKILL.into()));
+        }
+        call(&self.conn, methods::SESSION_SKILL, &params).await
+    }
+    /// Start a workflow; progress arrives through subscribe.
+    pub async fn workflow(
+        &self,
+        params: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        if !self.capabilities.workflow {
+            return Err(BackendError::Unsupported(methods::SESSION_WORKFLOW.into()));
+        }
+        call(&self.conn, methods::SESSION_WORKFLOW, &params).await
+    }
+
     /// Connect over `transport` and agree on a version. `host` answers the
     /// server's `host/interact` requests.
     pub async fn connect(

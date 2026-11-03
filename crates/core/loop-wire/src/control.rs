@@ -27,6 +27,20 @@ pub struct Attachment {
 /// Session management for a Runtime shared by many connections.
 #[async_trait]
 pub trait RuntimeControl: Send + Sync {
+    /// Activate a Session skill.
+    async fn skill(
+        &self,
+        _params: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        Err(BackendError::Unsupported("session/skill".into()))
+    }
+    /// Start a workflow and return its identity; progress uses Session updates.
+    async fn workflow(
+        &self,
+        _params: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        Err(BackendError::Unsupported("session/workflow".into()))
+    }
     /// Session-tree service; unsupported unless advertised by the backend.
     async fn tree(
         &self,

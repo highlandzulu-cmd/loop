@@ -2,7 +2,7 @@
 //!
 //! The host is private and there is no Deref to CliRuntime or Runtime. Deferred
 //! groups have an explicit, temporary `legacy` escape hatch (see the design TODO).
-use loop_protocol::{rpc::*, AgentBackend, SessionRef, SessionSpec};
+use loop_protocol::{rpc::*, session_services::*, AgentBackend, SessionRef, SessionSpec};
 use loop_wire::RuntimeControl;
 use std::sync::Arc;
 mod native_admin;
@@ -308,6 +308,7 @@ impl SurfaceClient {
             self.host.inner.models.get_model(provider, id)
         });
         self.host.inner.model_note = None;
+        self.host.inner.active_skills = config.config.active_skills;
     }
 
     pub async fn new_session(&mut self) -> anyhow::Result<()> {
@@ -1345,5 +1346,152 @@ impl SurfaceClient {
             },
             plan.label(),
         ))
+    }
+}
+
+/// Immutable workspace definitions for local pickers and autocomplete.
+#[derive(Default)]
+pub struct ResourceView {
+    pub skills: Vec<loop_protocol::admin::SkillStatus>,
+    pub templates: Vec<loop_protocol::admin::TemplateInfo>,
+    pub active_skills: Vec<String>,
+    pub extensions: usize,
+    pub hooks: usize,
+}
+impl SurfaceClient {
+    pub fn resource_view(&self) -> ResourceView {
+        let r = &self.host.inner;
+        ResourceView {
+            skills: r
+                .resources
+                .all_skills()
+                .into_iter()
+                .map(|(skill, enabled)| loop_protocol::admin::SkillStatus {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    enabled,
+                })
+                .collect(),
+            templates: r
+                .resources
+                .prompts
+                .iter()
+                .map(|p| loop_protocol::admin::TemplateInfo {
+                    name: p.name.clone(),
+                    description: p.argument_hint.as_ref().map_or_else(
+                        || "prompt template".into(),
+                        |h| format!("{h} — prompt template"),
+                    ),
+                })
+                .collect(),
+            active_skills: r.active_skills.clone(),
+            extensions: r.resources.extension_paths.len(),
+            hooks: r.resources.hook_paths.len(),
+        }
+    }
+    pub async fn set_skill_enabled(&mut self, name: &str, enabled: bool) -> anyhow::Result<bool> {
+        use loop_protocol::admin::*;
+        use loop_wire::RuntimeAdmin;
+        if !self.resource_view().skills.iter().any(|s| s.name == name) {
+            return Ok(false);
+        }
+        let params = SkillsParams {
+            workspace_id: self.workspace_id.clone(),
+            action: if enabled {
+                AdminAction::Enable
+            } else {
+                AdminAction::Disable
+            },
+            name: Some(name.into()),
+            expected_revision: None,
+        };
+        self.admin().skills(params).await?;
+        Ok(true)
+    }
+    pub async fn render_template(
+        &mut self,
+        name: &str,
+        args: &str,
+    ) -> anyhow::Result<Option<String>> {
+        use loop_protocol::admin::*;
+        use loop_wire::RuntimeAdmin;
+        if !self
+            .resource_view()
+            .templates
+            .iter()
+            .any(|s| s.name == name)
+        {
+            return Ok(None);
+        }
+        let params = TemplatesParams {
+            workspace_id: self.workspace_id.clone(),
+            name: Some(name.into()),
+            args: loop_agent::harness::prompt_templates::parse_command_args(args),
+        };
+        Ok(self.admin().templates(params).await?.text)
+    }
+    pub async fn reload(&mut self) -> anyhow::Result<()> {
+        use loop_wire::RuntimeAdmin;
+        let params = loop_protocol::admin::ReloadParams {
+            workspace_id: self.workspace_id.clone(),
+            expected_revision: None,
+        };
+        self.admin().reload(params).await?;
+        Ok(())
+    }
+    pub async fn activate_skill(&mut self, name: &str) -> anyhow::Result<bool> {
+        if !self
+            .resource_view()
+            .skills
+            .iter()
+            .any(|s| s.name == name && s.enabled)
+        {
+            return Ok(false);
+        }
+        self.sessions
+            .skill(SkillParams {
+                session: self.host.inner.native.current_session().await,
+                name: name.into(),
+                active: true,
+                expected_revision: None,
+            })
+            .await?;
+        if !self.host.inner.active_skills.iter().any(|n| n == name) {
+            self.host.inner.active_skills.push(name.into());
+        }
+        Ok(true)
+    }
+    #[cfg(feature = "orchestration")]
+    pub async fn workflow(
+        &self,
+        goal: &str,
+        concurrency: Option<usize>,
+    ) -> anyhow::Result<WorkflowResult> {
+        if !self.is_native() {
+            anyhow::bail!(
+                "workflows run with Loop's own agent · pick a Loop model with /model first"
+            );
+        }
+        Ok(self
+            .sessions
+            .workflow(WorkflowParams {
+                session: self.session_ref(),
+                goal: goal.into(),
+                concurrency: concurrency.map(|n| n as u32),
+                request_id: loop_ai::new_id(),
+            })
+            .await?)
+    }
+}
+
+impl SurfaceClient {
+    pub fn skill_source(&self, name: &str) -> Option<String> {
+        self.host
+            .inner
+            .resources
+            .all_skills()
+            .into_iter()
+            .find(|(s, _)| s.name == name)
+            .map(|(s, _)| s.path.display().to_string())
     }
 }

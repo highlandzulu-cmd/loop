@@ -232,6 +232,22 @@ impl NativeSessions {
 
 #[async_trait]
 impl RuntimeControl for NativeSessions {
+    async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<MutationResult> {
+        let _operation = self.operation.lock().await;
+        self.native.skill(p).await
+    }
+    #[cfg(feature = "orchestration")]
+    async fn workflow(
+        &self,
+        p: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        let _operation = self.operation.lock().await;
+        self.native.workflow(p).await
+    }
+
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         let mut summaries: HashMap<_, _> =
             list_session_summaries(self.store()?.as_ref(), Some(&self.cwd.to_string_lossy()))
@@ -554,6 +570,9 @@ impl AgentBackend for NativeSessions {
     }
     async fn new_session(&self, spec: SessionSpec) -> BackendResult<SessionRef> {
         let _operation = self.operation.lock().await;
+        if self.native.is_busy(&self.native.current_session().await) {
+            return Err(BackendError::Busy);
+        }
         self.native.new_session(spec).await
     }
     async fn load_session(

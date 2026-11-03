@@ -27,10 +27,110 @@ impl RuntimeAdmin for NativeAdmin<'_> {
     fn offered(&self) -> Capabilities {
         Capabilities {
             workspace_mcp: true,
+            workspace_skills: true,
+            workspace_templates: true,
+            workspace_reload: true,
             workspace_trust: true,
             permission_mode: true,
             ..Default::default()
         }
+    }
+    async fn skills(&self, p: SkillsParams) -> BackendResult<SkillsResult> {
+        let mut guard = self.0.lock().await;
+        let r = &mut **guard;
+        Self::workspace(r, &p.workspace_id)?;
+        match p.action {
+            AdminAction::Enable | AdminAction::Disable => {
+                let name = p.name.ok_or_else(|| failed("missing skill name"))?;
+                if p.action == AdminAction::Disable && r.active_skills.contains(&name) {
+                    r.native
+                        .skill(loop_protocol::session_services::SkillParams {
+                            session: r.native.current_session().await,
+                            name: name.clone(),
+                            active: false,
+                            expected_revision: None,
+                        })
+                        .await?;
+                }
+                if !r
+                    .set_skill_enabled(&name, p.action == AdminAction::Enable)
+                    .await
+                    .map_err(failed)?
+                {
+                    return Err(failed(format!("skill not found: {name}")));
+                }
+            }
+            AdminAction::Reload => return Err(failed("use workspace/reload")),
+            AdminAction::List => {}
+        }
+        Ok(SkillsResult {
+            skills: r
+                .resources
+                .all_skills()
+                .into_iter()
+                .map(|(s, enabled)| SkillStatus {
+                    name: s.name.clone(),
+                    description: s.description.clone(),
+                    enabled,
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+    async fn templates(&self, p: TemplatesParams) -> BackendResult<TemplatesResult> {
+        let guard = self.0.lock().await;
+        let r = &**guard;
+        Self::workspace(r, &p.workspace_id)?;
+        match p.name {
+            Some(name) => {
+                let template = r
+                    .resources
+                    .prompts
+                    .iter()
+                    .find(|t| t.name == name)
+                    .ok_or_else(|| failed(format!("template not found: {name}")))?;
+                Ok(TemplatesResult {
+                    text: Some(loop_agent::harness::prompt_templates::substitute_args(
+                        &template.body,
+                        &p.args,
+                    )),
+                    ..Default::default()
+                })
+            }
+            None => Ok(TemplatesResult {
+                templates: Some(
+                    r.resources
+                        .prompts
+                        .iter()
+                        .map(|p| TemplateInfo {
+                            name: p.name.clone(),
+                            description: p.argument_hint.as_ref().map_or_else(
+                                || "prompt template".into(),
+                                |h| format!("{h} — prompt template"),
+                            ),
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+        }
+    }
+    async fn reload(&self, p: ReloadParams) -> BackendResult<ReloadResult> {
+        let mut guard = self.0.lock().await;
+        let r = &mut **guard;
+        Self::workspace(r, &p.workspace_id)?;
+        let _ = r
+            .models
+            .refresh(loop_ai::ModelsRefreshOptions {
+                allow_network: Some(true),
+                force: true,
+                provider_id: None,
+            })
+            .await;
+        r.resources =
+            crate::resources::load_resources(&r.agent_dir, &r.cwd, r.project_trusted, &r.settings);
+        r.sync_harness_resources().await;
+        Ok(ReloadResult::default())
     }
     async fn mcp(&self, p: McpParams) -> BackendResult<McpResult> {
         let mut guard = self.0.lock().await;

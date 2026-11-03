@@ -420,6 +420,19 @@ fn usage_page(
 #[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_wire::RuntimeControl for Control {
+    async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        self.runtime.skill(p).await
+    }
+    async fn workflow(
+        &self,
+        p: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        self.runtime.workflow(p).await
+    }
+
     fn admin(&self) -> Option<&dyn loop_wire::RuntimeAdmin> {
         Some(self)
     }

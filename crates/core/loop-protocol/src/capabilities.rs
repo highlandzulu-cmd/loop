@@ -8,6 +8,12 @@ use serde::{Deserialize, Serialize};
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct Capabilities {
+    /// Activates Session skills.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_skills: bool,
+    /// Starts workflows and streams progress.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workflow: bool,
     /// Can reopen a past session, replaying its history.
     pub load_session: bool,
     /// Can reopen a past session without replaying history.

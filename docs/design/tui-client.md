@@ -718,8 +718,10 @@ These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
   timeout/default handling move with group 6. Characterization covers the
   full-access confirmation, review help, sandbox validation, MCP picker
   toggles and failed connections, missing OAuth servers, and trust choices.
-- Group 4: skills, prompt templates, dynamic command discovery, workflows and
-  the current native workflow event bridge.
+- Group 4 migrated: immutable resource views supply skills, templates and
+  autocomplete; workspace changes use RuntimeAdmin. Skill activation and
+  workflows use Session services, with ordered WorkflowProgress updates.
+  Planning reserves the Session; cancellation drains task execution.
 - Group 5: usage/dashboard host data, tracing-backed usage logs and the effective
   settings/session diagnostics that still combine local and host values.
 - Group 6: provider login/logout, catalog refresh, ACP startup/sign-in and tracing

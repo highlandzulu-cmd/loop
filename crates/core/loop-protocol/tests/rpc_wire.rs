@@ -508,6 +508,7 @@ fn config_changed_and_attach_snapshot_wire() {
         effort: Some("off".into()),
         mode: None,
         response_timeout_ms: None,
+        active_skills: vec![],
     };
     let update = SessionUpdate::ConfigChanged(ConfigChanged {
         revision: 3,
@@ -906,4 +907,31 @@ fn forbidden_error_and_admin_capabilities_wire() {
     .unwrap();
     assert_eq!(some["workspace_reload"], json!(true));
     assert_eq!(some["host_usage"], json!(true));
+}
+
+#[test]
+fn skill_and_workflow_requests_and_progress_have_stable_wire_shapes() {
+    use loop_protocol::session_services::*;
+    let session =
+        serde_json::from_value(json!({"instance":"loop","key":"s","native_id":"s"})).unwrap();
+    let request = WorkflowParams {
+        session,
+        goal: "inspect".into(),
+        concurrency: Some(2),
+        request_id: "once".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        json!({"session":{"instance":"loop","key":"s","native_id":"s"},"goal":"inspect","concurrency":2,"request_id":"once"})
+    );
+    let progress: loop_protocol::SessionUpdate = serde_json::from_value(json!({"type":"workflow_progress","workflow_id":"wf","state":"task_started","task_id":"t","description":"Inspect"})).unwrap();
+    assert!(matches!(
+        progress,
+        loop_protocol::SessionUpdate::WorkflowProgress(WorkflowProgress {
+            state: WorkflowState::TaskStarted,
+            ..
+        })
+    ));
+    let flags: loop_protocol::Capabilities = serde_json::from_value(json!({})).unwrap();
+    assert!(!flags.workflow && !flags.session_skills);
 }

@@ -357,6 +357,26 @@ async fn handle(
             Err(error) => return conn.respond(id, Err(error)),
         },
         // Session-tree dispatch stays grouped for parallel protocol additions.
+        methods::SESSION_SKILL if runtime.is_some() => {
+            if !backend.capabilities().session_skills {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse(params) {
+                    Ok(p) => runtime.unwrap().skill(p).await.map(|r| to_value(&r)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
+        methods::SESSION_WORKFLOW if runtime.is_some() => {
+            if !backend.capabilities().workflow {
+                Err(loop_protocol::BackendError::Unsupported(method.into()))
+            } else {
+                match parse(params) {
+                    Ok(p) => runtime.unwrap().workflow(p).await.map(|r| to_value(&r)),
+                    Err(error) => return conn.respond(id, Err(error)),
+                }
+            }
+        }
         methods::SESSION_TREE if runtime.is_some() => {
             if !backend.capabilities().session_tree {
                 Err(loop_protocol::BackendError::Unsupported(method.into()))

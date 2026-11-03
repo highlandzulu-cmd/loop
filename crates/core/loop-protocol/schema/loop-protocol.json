@@ -169,6 +169,10 @@
           "description": "Reads and replaces the Session's sandbox (`session/sandbox`).",
           "type": "boolean"
         },
+        "session_skills": {
+          "description": "Activates Session skills.",
+          "type": "boolean"
+        },
         "session_stats": {
           "description": "Reports Session token statistics (`session/stats`).",
           "type": "boolean"
@@ -203,6 +207,10 @@
         "usage": {
           "default": false,
           "description": "Reports token usage.",
+          "type": "boolean"
+        },
+        "workflow": {
+          "description": "Starts workflows and streams progress.",
           "type": "boolean"
         },
         "workspace_mcp": {
@@ -2321,6 +2329,13 @@
     "SessionConfig": {
       "description": "A Session's public config. Absent fields are not offered by the backend\nor not known yet. Never holds secrets.",
       "properties": {
+        "active_skills": {
+          "description": "Skills activated in this Session.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "effort": {
           "description": "Reasoning effort id, as `session/efforts` names it.",
           "type": [
@@ -2977,6 +2992,20 @@
           "type": "object"
         },
         {
+          "$ref": "#/$defs/WorkflowProgress",
+          "description": "Ordered workflow progress, including its final result.",
+          "properties": {
+            "type": {
+              "const": "workflow_progress",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
           "description": "An update with a `type` this reader does not know. The raw JSON is kept."
         }
       ],
@@ -3116,6 +3145,39 @@
         "stdout",
         "stderr",
         "exit_code"
+      ],
+      "type": "object"
+    },
+    "SkillParams": {
+      "description": "Activate or deactivate one Session skill.",
+      "properties": {
+        "active": {
+          "default": true,
+          "description": "Activate when true; deactivate when false.",
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "default": null,
+          "description": "Optimistic Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Discovered skill name.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Target Session."
+        }
+      },
+      "required": [
+        "session",
+        "name"
       ],
       "type": "object"
     },
@@ -4334,6 +4396,199 @@
         "pending_sessions"
       ],
       "type": "object"
+    },
+    "WorkflowCompletion": {
+      "description": "Final workflow output.",
+      "properties": {
+        "artifacts": {
+          "description": "Written artifacts.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "completed_count": {
+          "description": "Successful task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed_count": {
+          "description": "Failed task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "description": "Combined output.",
+          "type": "string"
+        },
+        "success": {
+          "description": "All tasks succeeded.",
+          "type": "boolean"
+        },
+        "total_count": {
+          "description": "Total task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "success",
+        "completed_count",
+        "failed_count",
+        "total_count",
+        "output",
+        "artifacts"
+      ],
+      "type": "object"
+    },
+    "WorkflowParams": {
+      "description": "Start a workflow. Repeating the same request id returns the same workflow.",
+      "properties": {
+        "concurrency": {
+          "description": "Maximum parallel tasks, from 1 through 64.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "goal": {
+          "description": "Goal to plan and execute.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Caller-generated id for deduplication.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Target Session."
+        }
+      },
+      "required": [
+        "session",
+        "goal",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "WorkflowProgress": {
+      "description": "Progress through the same ordered stream as all Session updates.",
+      "properties": {
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowCompletion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Final result, only on ended."
+        },
+        "description": {
+          "description": "Task description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Failure message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mermaid": {
+          "description": "Mermaid graph.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outline": {
+          "description": "Planned outline.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Task output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/WorkflowState",
+          "description": "Lifecycle state."
+        },
+        "task_id": {
+          "description": "Task identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "description": "Workflow identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "WorkflowResult": {
+      "description": "An accepted workflow; execution reports on the Session update stream.",
+      "properties": {
+        "workflow_id": {
+          "description": "Stable workflow id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id"
+      ],
+      "type": "object"
+    },
+    "WorkflowState": {
+      "description": "Workflow lifecycle state.",
+      "oneOf": [
+        {
+          "const": "planned",
+          "description": "Planning completed.",
+          "type": "string"
+        },
+        {
+          "const": "task_started",
+          "description": "A task started.",
+          "type": "string"
+        },
+        {
+          "const": "task_completed",
+          "description": "A task succeeded.",
+          "type": "string"
+        },
+        {
+          "const": "task_failed",
+          "description": "A task failed.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "Execution ended, including planning errors and cancellation.",
+          "type": "string"
+        }
+      ]
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -4669,6 +4924,16 @@
         "$ref": "#/$defs/ShellResult"
       }
     },
+    "session/skill": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SkillParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
     "session/stats": {
       "direction": "client_to_server",
       "kind": "request",
@@ -4727,6 +4992,16 @@
       },
       "result": {
         "$ref": "#/$defs/ViewResult"
+      }
+    },
+    "session/workflow": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/WorkflowParams"
+      },
+      "result": {
+        "$ref": "#/$defs/WorkflowResult"
       }
     },
     "shutdown": {

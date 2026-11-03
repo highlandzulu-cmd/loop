@@ -856,3 +856,174 @@ async fn mcp_picker_toggles_a_configured_server_and_reports_connection_failure()
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn skills_picker_activation_arguments_and_disabling_preserve_the_composer() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        runtime
+            .legacy_mut()
+            .resources_mut()
+            .skills
+            .push(loop_agent::harness::types::Skill {
+                name: "inspect".into(),
+                description: "Inspect code".into(),
+                body: "Inspect carefully".into(),
+                path: dir.path().join("SKILL.md"),
+                disable_model_invocation: false,
+            });
+        runtime.legacy().sync_harness_resources().await;
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::Skills(SkillsCommand::List))
+            .await;
+        assert!(ui.text().contains("inspect"));
+        ui.effect(&mut runtime, CommandEffect::Skills(SkillsCommand::Picker))
+            .await;
+        assert_eq!(ui.skill.as_ref().unwrap().selected_name(), Some("inspect"));
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Skill {
+                name: "inspect".into(),
+                args: "  this module  ".into(),
+            },
+        )
+        .await;
+        assert_eq!(ui.input.as_str(), "this module");
+        assert!(ui.text().contains("skill `inspect` is active (inspect)"));
+        assert!(!ui.working);
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Skills(SkillsCommand::Disable("inspect".into())),
+        )
+        .await;
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Skill {
+                name: "inspect".into(),
+                args: String::new(),
+            },
+        )
+        .await;
+        assert!(ui
+            .text()
+            .contains("skill `inspect` is disabled. Enable it with /skills enable inspect"));
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Skills(SkillsCommand::Enable("inspect".into())),
+        )
+        .await;
+        assert!(ui.text().contains("skill `inspect` enabled"));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn prompt_template_arguments_are_rendered_and_queued_while_busy() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        runtime.legacy_mut().resources_mut().prompts.push(
+            loop_agent::harness::types::PromptTemplate {
+                name: "inspect".into(),
+                body: "Check $1 with $2".into(),
+                path: dir.path().join("inspect.md"),
+                argument_hint: Some("<file> <detail>".into()),
+            },
+        );
+        let mut ui = Driver {
+            working: true,
+            ..Default::default()
+        };
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Template {
+                name: "inspect".into(),
+                args: "'file with spaces' carefully".into(),
+            },
+        )
+        .await;
+        assert_eq!(ui.queue.len(), 1);
+        assert_eq!(
+            ui.queue.front().unwrap().prompt,
+            "Check file with spaces with carefully"
+        );
+        assert!(dynamic_command_entries(&runtime)
+            .iter()
+            .any(|(name, hint)| name == "inspect" && hint == "<file> <detail> — prompt template"));
+        ui.effect(
+            &mut runtime,
+            CommandEffect::Template {
+                name: "missing".into(),
+                args: String::new(),
+            },
+        )
+        .await;
+        assert!(ui.text().contains("template not found: missing"));
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn reload_refreshes_resources_and_reports_completion() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("prompts")).unwrap();
+        std::fs::write(dir.path().join("prompts/s35-reload.md"), "Hello $1").unwrap();
+        let mut runtime = fixture(dir.path()).await;
+        let mut ui = Driver::default();
+        ui.effect(&mut runtime, CommandEffect::Reload).await;
+        assert!(ui
+            .text()
+            .contains("reloaded models, skills, prompts, themes"));
+        assert!(dynamic_command_entries(&runtime)
+            .iter()
+            .any(|(name, _)| name == "s35-reload"));
+    })
+    .await
+    .unwrap();
+}
+
+#[cfg(feature = "orchestration")]
+#[tokio::test]
+async fn workflow_planning_holds_session_busy_and_cancellation_ends_its_stream() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = fixture(dir.path()).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        crate::surface_client::test_support::pause_provider(&runtime, started.clone(), finish);
+        let mut updates = runtime.backend().subscribe();
+        let request = loop_protocol::session_services::WorkflowParams {
+            session: runtime.session_ref(),
+            goal: "inspect".into(),
+            concurrency: Some(1),
+            request_id: "once".into(),
+        };
+        let first = runtime.sessions().workflow(request.clone()).await.unwrap();
+        started.notified().await;
+        assert!(runtime.backend().is_busy(&runtime.session_ref()));
+        assert!(runtime
+            .backend()
+            .new_session(Default::default())
+            .await
+            .is_err());
+        assert_eq!(runtime.sessions().workflow(request).await.unwrap(), first);
+        runtime.backend().cancel(&runtime.session_ref());
+        loop {
+            let envelope = updates.recv().await.unwrap();
+            if let SessionUpdate::WorkflowProgress(p) = envelope.update {
+                if p.state == loop_protocol::session_services::WorkflowState::Ended {
+                    assert_eq!(p.workflow_id, first.workflow_id);
+                    assert!(p.error.is_some());
+                    break;
+                }
+            }
+        }
+        runtime.shutdown().run().await.unwrap();
+    })
+    .await
+    .unwrap();
+}

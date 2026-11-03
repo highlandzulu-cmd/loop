@@ -162,6 +162,8 @@ pub enum SessionUpdate {
     /// The Session's metadata or public config changed. Replaces the
     /// previous metadata and config view; the transcript is unchanged.
     ConfigChanged(ConfigChanged),
+    /// Ordered workflow progress, including its final result.
+    WorkflowProgress(crate::session_services::WorkflowProgress),
     /// An update with a `type` this reader does not know. The raw JSON is kept.
     #[serde(untagged)]
     Unknown(Value),
@@ -210,6 +212,9 @@ pub struct SessionMetadata {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(default)]
 pub struct SessionConfig {
+    /// Skills activated in this Session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_skills: Vec<String>,
     /// Model id, as `session/models` names it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

@@ -17,7 +17,6 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
-use loop_agent::harness::format_prompt_template_invocation;
 use loop_ai::providers::SOKET_BASE_URL;
 use loop_ai::{calculate_context_tokens, CredentialStore, Usage};
 use loop_app_core::interaction::{
@@ -52,8 +51,6 @@ use crate::tracing_setup::TracingSetup;
 use crate::tui::attachments::{
     clipboard_image, image_file, mentioned_images, pasted_image_path, Attachments,
 };
-#[cfg(feature = "orchestration")]
-use crate::tui::find_workflow_task_index;
 use crate::tui::{
     consume_frozen_lines, filter_files, find_at_mention, find_tool_index, footer_live_height,
     format_item_lines, format_live_lines, format_token_usage_line, insert_text, item_is_committed,
@@ -88,33 +85,6 @@ enum UiEvent {
     CompactDone(Result<String, String>),
     /// `/sandbox` enable/disable finished.
     SandboxDone(Result<SandboxDoneOk, String>),
-    /// Multi-agent workflow progress update.
-    #[cfg(feature = "orchestration")]
-    WorkflowDone(Result<WorkflowDoneOk, String>),
-    /// Planned task graph ready to display.
-    #[cfg(feature = "orchestration")]
-    WorkflowGraph {
-        outline: String,
-        mermaid: String,
-    },
-    /// Workflow task started executing.
-    #[cfg(feature = "orchestration")]
-    WorkflowTaskStarted {
-        task_id: String,
-        description: String,
-    },
-    /// Workflow task completed.
-    #[cfg(feature = "orchestration")]
-    WorkflowTaskCompleted {
-        task_id: String,
-        output: String,
-    },
-    /// Workflow task failed.
-    #[cfg(feature = "orchestration")]
-    WorkflowTaskFailed {
-        task_id: String,
-        error: String,
-    },
     /// `/mcp login` has an authorization URL ready to show.
     McpAuthUrl {
         name: String,
@@ -126,17 +96,6 @@ enum UiEvent {
         name: String,
         result: Result<loop_mcp::OAuthLoginOutcome, String>,
     },
-}
-
-/// Successful workflow completion info.
-#[cfg(feature = "orchestration")]
-struct WorkflowDoneOk {
-    success: bool,
-    completed_count: usize,
-    failed_count: usize,
-    total_count: usize,
-    output: String,
-    artifacts: Vec<String>,
 }
 
 /// Successful sandbox switch applied on the UI thread.
@@ -768,9 +727,12 @@ async fn run_loop(
                     .filter_map(|&i| p.skills.get(i))
                     .map(|(name, desc)| {
                         let enabled = runtime
-                            .legacy()
-                            .resources()
+                            .resource_view()
                             .skills
+                            .iter()
+                            .filter(|s| s.enabled)
+                            .cloned()
+                            .collect::<Vec<_>>()
                             .iter()
                             .any(|s| &s.name == name);
                         PickerRow {
@@ -912,8 +874,8 @@ async fn run_loop(
             parts.join(" · ")
         } else if !message_queue.is_empty() {
             format!("{} queued · sending…", message_queue.len())
-        } else if !runtime.legacy().active_skills().is_empty() {
-            let names = runtime.legacy().active_skills().join(", ");
+        } else if !runtime.resource_view().active_skills.is_empty() {
+            let names = runtime.resource_view().active_skills.join(", ");
             format!("skill(s) active: {names} · type your message")
         } else {
             status.clone()
@@ -1344,8 +1306,15 @@ fn print_welcome(
         runtime.model_note().as_deref(),
         &endpoint,
         runtime.session_id(),
-        runtime.legacy().resources().skills.len(),
-        runtime.legacy().resources().prompts.len(),
+        runtime
+            .resource_view()
+            .skills
+            .iter()
+            .filter(|s| s.enabled)
+            .cloned()
+            .collect::<Vec<_>>()
+            .len(),
+        runtime.resource_view().templates.len(),
         runtime.needs_provider_setup(),
         width,
     );
@@ -1357,27 +1326,21 @@ fn print_welcome(
 
 /// Dynamic `(name, description)` command entries for skills and prompt templates.
 fn dynamic_command_entries(runtime: &SurfaceClient) -> Vec<(String, String)> {
-    let mut extra: Vec<(String, String)> = runtime
-        .legacy()
-        .resources()
+    let view = runtime.resource_view();
+    let mut extra: Vec<_> = view
         .skills
-        .iter()
+        .into_iter()
+        .filter(|s| s.enabled)
         .map(|s| {
-            let desc = if s.description.is_empty() {
-                "skill".to_string()
+            let description = if s.description.is_empty() {
+                "skill".into()
             } else {
                 format!("skill — {}", s.description)
             };
-            (format!("skill:{}", s.name), desc)
+            (format!("skill:{}", s.name), description)
         })
         .collect();
-    extra.extend(runtime.legacy().resources().prompts.iter().map(|p| {
-        let desc = match &p.argument_hint {
-            Some(h) => format!("{h} — prompt template"),
-            None => "prompt template".to_string(),
-        };
-        (p.name.clone(), desc)
-    }));
+    extra.extend(view.templates.into_iter().map(|p| (p.name, p.description)));
     extra
 }
 
@@ -1699,86 +1662,6 @@ async fn drain_ui_events(
                     Err(e) => {
                         chat.push(sys(e));
                         *status = "ready".into();
-                    }
-                }
-            }
-            #[cfg(feature = "orchestration")]
-            UiEvent::WorkflowDone(result) => {
-                *working = false;
-                turn_step.clear();
-                match result {
-                    Ok(info) => {
-                        let msg = if info.success {
-                            format!(
-                                "workflow done — {}/{} tasks completed",
-                                info.completed_count, info.total_count,
-                            )
-                        } else {
-                            format!(
-                                "workflow failed — {} completed, {} failed out of {} tasks",
-                                info.completed_count, info.failed_count, info.total_count,
-                            )
-                        };
-                        chat.push(sys(msg));
-                        if !info.output.is_empty() {
-                            chat.push(ChatItem::Assistant { text: info.output });
-                        } else if info.success {
-                            chat.push(sys("workflow produced no output"));
-                        }
-                        if !info.artifacts.is_empty() {
-                            chat.push(sys(format!("wrote: {}", info.artifacts.join(", "))));
-                        }
-                        *status = "ready".into();
-                    }
-                    Err(e) => {
-                        chat.push(sys(format!("workflow error: {e}")));
-                        *status = "ready".into();
-                    }
-                }
-            }
-            #[cfg(feature = "orchestration")]
-            UiEvent::WorkflowGraph { outline, mermaid } => {
-                chat.push(sys(format!(
-                    "task graph:\n{outline}\n\n```mermaid\n{mermaid}\n```"
-                )));
-            }
-            #[cfg(feature = "orchestration")]
-            UiEvent::WorkflowTaskStarted {
-                task_id,
-                description,
-            } => {
-                chat.push(ChatItem::WorkflowTask {
-                    task_id,
-                    description,
-                    status: CardStatus::Pending,
-                    output: String::new(),
-                });
-            }
-            #[cfg(feature = "orchestration")]
-            UiEvent::WorkflowTaskCompleted { task_id, output } => {
-                if let Some(idx) = find_workflow_task_index(chat, &task_id) {
-                    if let Some(ChatItem::WorkflowTask {
-                        status: s,
-                        output: o,
-                        ..
-                    }) = chat.get_mut(idx)
-                    {
-                        *s = CardStatus::Success;
-                        *o = output;
-                    }
-                }
-            }
-            #[cfg(feature = "orchestration")]
-            UiEvent::WorkflowTaskFailed { task_id, error } => {
-                if let Some(idx) = find_workflow_task_index(chat, &task_id) {
-                    if let Some(ChatItem::WorkflowTask {
-                        status: s,
-                        output: o,
-                        ..
-                    }) = chat.get_mut(idx)
-                    {
-                        *s = CardStatus::Error;
-                        *o = error;
                     }
                 }
             }
@@ -2771,9 +2654,12 @@ async fn handle_key(
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(name) = picker.selected_name().map(str::to_string) {
                     let enabled = !runtime
-                        .legacy()
-                        .resources()
+                        .resource_view()
                         .skills
+                        .iter()
+                        .filter(|s| s.enabled)
+                        .cloned()
+                        .collect::<Vec<_>>()
                         .iter()
                         .any(|s| s.name == name);
                     set_skill_enabled(runtime, &name, enabled, chat, status).await;
@@ -3238,16 +3124,18 @@ async fn handle_key(
                     .await;
                 } else if line.starts_with('/') {
                     let skill_names: Vec<_> = runtime
-                        .legacy()
-                        .resources()
+                        .resource_view()
                         .skills
+                        .iter()
+                        .filter(|s| s.enabled)
+                        .cloned()
+                        .collect::<Vec<_>>()
                         .iter()
                         .map(|s| s.name.clone())
                         .collect();
                     let template_names: Vec<_> = runtime
-                        .legacy()
-                        .resources()
-                        .prompts
+                        .resource_view()
+                        .templates
                         .iter()
                         .map(|p| p.name.clone())
                         .collect();
@@ -3826,11 +3714,10 @@ struct SkillPickerState {
 }
 
 impl SkillPickerState {
-    fn new(resources: &crate::resources::LoadedResources) -> Self {
-        let skills: Vec<_> = resources
-            .all_skills()
+    fn new(skills: Vec<loop_protocol::admin::SkillStatus>) -> Self {
+        let skills: Vec<_> = skills
             .into_iter()
-            .map(|(s, _)| (s.name.clone(), s.description.clone()))
+            .map(|s| (s.name, s.description))
             .collect();
         let filtered = (0..skills.len()).collect();
         Self {
@@ -4120,7 +4007,7 @@ async fn set_skill_enabled(
     status: &mut String,
 ) {
     let state = if enabled { "enabled" } else { "disabled" };
-    match runtime.legacy_mut().set_skill_enabled(name, enabled).await {
+    match runtime.set_skill_enabled(name, enabled).await {
         Ok(true) => *status = format!("skill `{name}` {state}"),
         Ok(false) => chat.push(sys(format!("skill not found: {name} (see /skills list)"))),
         Err(e) => chat.push(error_item(format!(
@@ -4256,6 +4143,28 @@ fn handle_update(
 ) {
     let live = origin == Origin::Live;
     match update {
+        SessionUpdate::WorkflowProgress(progress) => {
+            use loop_protocol::session_services::WorkflowState;
+            let id = progress.task_id.unwrap_or_default();
+            match progress.state {
+                WorkflowState::Planned => chat.push(sys(format!("task graph:\n{}\n\n```mermaid\n{}\n```", progress.outline.unwrap_or_default(), progress.mermaid.unwrap_or_default()))),
+                WorkflowState::TaskStarted => chat.push(ChatItem::WorkflowTask { task_id: id, description: progress.description.unwrap_or_default(), status: CardStatus::Pending, output: String::new() }),
+                WorkflowState::TaskCompleted | WorkflowState::TaskFailed => {
+                    if let Some(ChatItem::WorkflowTask { status, output, .. }) = chat.iter_mut().find(|item| matches!(item, ChatItem::WorkflowTask { task_id, .. } if task_id == &id)) {
+                        *status = if progress.state == WorkflowState::TaskCompleted { CardStatus::Success } else { CardStatus::Error };
+                        *output = progress.output.or(progress.error).unwrap_or_default();
+                    }
+                }
+                WorkflowState::Ended => {
+                    if live { *working = false; turn_step.clear(); *status = "ready".into(); }
+                    if let Some(info) = progress.completion {
+                        chat.push(sys(if info.success { format!("workflow done — {}/{} tasks completed", info.completed_count, info.total_count) } else { format!("workflow failed — {} completed, {} failed out of {} tasks", info.completed_count, info.failed_count, info.total_count) }));
+                        if !info.output.is_empty() { chat.push(ChatItem::Assistant { text: info.output }); } else if info.success { chat.push(sys("workflow produced no output")); }
+                        if !info.artifacts.is_empty() { chat.push(sys(format!("wrote: {}", info.artifacts.join(", ")))); }
+                    } else if let Some(error) = progress.error { chat.push(sys(format!("workflow error: {error}"))); }
+                }
+            }
+        }
         SessionUpdate::Notice { level, text } => match level {
             NoticeLevel::Error => {
                 push_before_queued(chat, error_item(format!("error: {text}")));
@@ -5536,22 +5445,18 @@ async fn apply_effect(
             chat.push(sys(format!("project trust → {decision}")));
         }
         CommandEffect::Reload => {
-            runtime.legacy().refresh_models().await;
-            *runtime.legacy_mut().resources_mut() = crate::resources::load_resources(
-                runtime.agent_dir(),
-                runtime.cwd(),
-                runtime.project_trusted(),
-                runtime.legacy().settings(),
-            );
-            runtime.legacy().sync_harness_resources().await;
+            runtime.reload().await?;
             chat.push(sys("reloaded models, skills, prompts, themes"));
         }
         CommandEffect::Skills(SkillsCommand::Enable(name)) => {
             set_skill_enabled(runtime, &name, true, chat, status).await;
             if runtime
-                .legacy()
-                .resources()
+                .resource_view()
                 .skills
+                .iter()
+                .filter(|s| s.enabled)
+                .cloned()
+                .collect::<Vec<_>>()
                 .iter()
                 .any(|s| s.name == name)
             {
@@ -5561,9 +5466,12 @@ async fn apply_effect(
         CommandEffect::Skills(SkillsCommand::Disable(name)) => {
             set_skill_enabled(runtime, &name, false, chat, status).await;
             if runtime
-                .legacy()
-                .resources()
-                .disabled_skills
+                .resource_view()
+                .skills
+                .iter()
+                .filter(|s| !s.enabled)
+                .cloned()
+                .collect::<Vec<_>>()
                 .iter()
                 .any(|s| s.name == name)
             {
@@ -5571,18 +5479,32 @@ async fn apply_effect(
             }
         }
         CommandEffect::Skills(SkillsCommand::Picker)
-            if runtime.legacy().resources().skills.len()
-                + runtime.legacy().resources().disabled_skills.len()
+            if runtime
+                .resource_view()
+                .skills
+                .iter()
+                .filter(|s| s.enabled)
+                .cloned()
+                .collect::<Vec<_>>()
+                .len()
+                + runtime
+                    .resource_view()
+                    .skills
+                    .iter()
+                    .filter(|s| !s.enabled)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .len()
                 > 0 =>
         {
             *model_picker = None;
             *fork_picker = None;
             *mcp_picker = None;
-            *skill_picker = Some(SkillPickerState::new(runtime.legacy().resources()));
+            *skill_picker = Some(SkillPickerState::new(runtime.resource_view().skills));
             *status = "skills · toggle on or off".into();
         }
         CommandEffect::Skills(SkillsCommand::Picker | SkillsCommand::List) => {
-            let all = runtime.legacy().resources().all_skills();
+            let all = runtime.resource_view().skills;
             if all.is_empty() {
                 chat.push(sys(format!(
                     "No skills loaded.\n\nAdd folders containing a SKILL.md (with YAML frontmatter: name, description) under:\n  {}/skills\n  ~/.agents/skills or ~/.claude/skills\n  .agents/skills, .claude/skills, or .loop/skills in trusted projects\nor list extra paths under \"skills\" in settings.json,\nthen run /reload.",
@@ -5591,10 +5513,25 @@ async fn apply_effect(
             } else {
                 let mut text = format!(
                     "Skills ({} enabled, {} disabled)\n",
-                    runtime.legacy().resources().skills.len(),
-                    runtime.legacy().resources().disabled_skills.len()
+                    runtime
+                        .resource_view()
+                        .skills
+                        .iter()
+                        .filter(|s| s.enabled)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .len(),
+                    runtime
+                        .resource_view()
+                        .skills
+                        .iter()
+                        .filter(|s| !s.enabled)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .len()
                 );
-                for (s, enabled) in all {
+                for s in all {
+                    let enabled = s.enabled;
                     let desc = if s.description.is_empty() {
                         "(no description)".to_string()
                     } else {
@@ -5605,7 +5542,7 @@ async fn apply_effect(
                         "\n  /skill:{}{state} — {}\n      {}",
                         s.name,
                         desc,
-                        s.path.display()
+                        runtime.skill_source(&s.name).unwrap_or_default()
                     ));
                 }
                 text.push_str("\n\nActivate with /skill:<name> [optional args for the input]. Skills stay active until /new; the model sees them under <available_skills> and can read SKILL.md when relevant.\nToggle with /skills (picker) or /skills enable|disable <name>. Disabled skills are hidden from the model.");
@@ -5874,11 +5811,8 @@ async fn apply_effect(
         }
 
         CommandEffect::Skill { name, args } => {
-            if runtime.legacy().harness().activate_skill(&name).await {
-                if !runtime.legacy().active_skills().iter().any(|n| n == &name) {
-                    runtime.legacy_mut().active_skills_mut().push(name.clone());
-                }
-                let list = runtime.legacy().active_skills().join(", ");
+            if runtime.activate_skill(&name).await? {
+                let list = runtime.resource_view().active_skills.join(", ");
                 chat.push(sys(format!(
                     "skill `{name}` is active ({list}). Type your message when ready."
                 )));
@@ -5892,9 +5826,12 @@ async fn apply_effect(
                     input.insert_str(args);
                 }
             } else if runtime
-                .legacy()
-                .resources()
-                .disabled_skills
+                .resource_view()
+                .skills
+                .iter()
+                .filter(|s| !s.enabled)
+                .cloned()
+                .collect::<Vec<_>>()
                 .iter()
                 .any(|s| s.name == name)
             {
@@ -5906,14 +5843,7 @@ async fn apply_effect(
             }
         }
         CommandEffect::Template { name, args } => {
-            if let Some(tmpl) = runtime
-                .legacy()
-                .resources()
-                .prompts
-                .iter()
-                .find(|p| p.name == name)
-            {
-                let prompt = format_prompt_template_invocation(tmpl, &args);
+            if let Some(prompt) = runtime.render_template(&name, &args).await? {
                 let display = format!("/{name} {args}");
                 if agent_is_busy(runtime, *working) {
                     enqueue_user_message(chat, message_queue, display, prompt, Vec::new());
@@ -5960,71 +5890,19 @@ async fn start_workflow(
     goal: &str,
     concurrency: Option<usize>,
 ) {
-    use loop_agent::harness::orchestration::WorkflowProgressEvent;
-    use loop_orchestration::scheduler::SchedulerConfig;
-
     chat.push(sys(format!("starting workflow: {goal}")));
-    *working = true;
-    *status = "workflow · planning…".into();
-
-    let harness = Arc::clone(runtime.legacy().harness());
-    let goal = goal.to_string();
-
-    let config = concurrency.map(|n| SchedulerConfig {
-        max_concurrency: n,
-        fail_fast: false,
-    });
-
-    let (progress_tx, mut progress_rx) =
-        tokio::sync::mpsc::unbounded_channel::<WorkflowProgressEvent>();
-
-    let tx_for_progress = tx.clone();
-    tokio::spawn(async move {
-        while let Some(event) = progress_rx.recv().await {
-            let ui_event = match event {
-                WorkflowProgressEvent::GraphPlanned { outline, mermaid } => {
-                    UiEvent::WorkflowGraph { outline, mermaid }
-                }
-                WorkflowProgressEvent::TaskStarted {
-                    task_id,
-                    description,
-                } => UiEvent::WorkflowTaskStarted {
-                    task_id,
-                    description,
-                },
-                WorkflowProgressEvent::TaskCompleted { task_id, output } => {
-                    UiEvent::WorkflowTaskCompleted { task_id, output }
-                }
-                WorkflowProgressEvent::TaskFailed { task_id, error } => {
-                    UiEvent::WorkflowTaskFailed { task_id, error }
-                }
-            };
-            if tx_for_progress.send(ui_event).is_err() {
-                break;
-            }
+    match runtime.workflow(goal, concurrency).await {
+        Ok(_) => {
+            *working = true;
+            *status = "workflow · planning…".into();
         }
-    });
-
-    let tx_for_done = tx.clone();
-    tokio::spawn(async move {
-        let result = harness
-            .start_workflow_from_goal(&goal, None, config, Some(progress_tx))
-            .await;
-
-        let event = match result {
-            Ok(wf_result) => UiEvent::WorkflowDone(Ok(WorkflowDoneOk {
-                success: wf_result.success,
-                completed_count: wf_result.task_results.len(),
-                failed_count: wf_result.failed_tasks.len(),
-                total_count: wf_result.total_task_count,
-                output: wf_result.output_text(),
-                artifacts: wf_result.artifact_paths(),
-            })),
-            Err(e) => UiEvent::WorkflowDone(Err(e.to_string())),
-        };
-
-        let _ = tx_for_done.send(event);
-    });
+        Err(error) => {
+            chat.push(sys(format!("workflow error: {error}")));
+            *working = false;
+            *status = "ready".into();
+        }
+    }
+    let _ = tx;
 }
 
 async fn cycle_model(

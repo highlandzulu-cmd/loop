@@ -35,6 +35,8 @@ fn info(name: &str) -> PeerInfo {
 
 fn admin_flags() -> Capabilities {
     Capabilities {
+        session_skills: true,
+        workflow: true,
         workspace_mcp: true,
         workspace_web_search: true,
         workspace_skills: true,
@@ -95,6 +97,28 @@ impl AgentBackend for Fake {
 
 #[async_trait]
 impl loop_wire::RuntimeControl for Fake {
+    async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        assert_eq!(p.name, "inspect");
+        Ok(loop_protocol::MutationResult {
+            revision: 2,
+            seq: 3,
+            pending: false,
+            applies_after_turn: None,
+        })
+    }
+    async fn workflow(
+        &self,
+        p: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        assert_eq!(p.goal, "inspect code");
+        Ok(loop_protocol::session_services::WorkflowResult {
+            workflow_id: "wf1".into(),
+        })
+    }
+
     async fn list(&self) -> BackendResult<Vec<SessionInfo>> {
         Ok(vec![])
     }
@@ -475,4 +499,41 @@ async fn a_server_without_a_runtime_offers_no_admin() {
     })
     .await
     .expect("timed out");
+}
+
+#[tokio::test]
+async fn skill_and_workflow_services_are_available_over_session_authority() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fake = fake().await;
+        let remote = RemoteBackend::connect(
+            served(&fake, Authority::Remote),
+            info("client"),
+            Arc::new(NoHost),
+        )
+        .await
+        .unwrap();
+        let session = fake.inner.current_session().await;
+        let skill = remote
+            .skill(loop_protocol::session_services::SkillParams {
+                session: session.clone(),
+                name: "inspect".into(),
+                active: true,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!((skill.revision, skill.seq), (2, 3));
+        let workflow = remote
+            .workflow(loop_protocol::session_services::WorkflowParams {
+                session,
+                goal: "inspect code".into(),
+                concurrency: Some(2),
+                request_id: "once".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(workflow.workflow_id, "wf1");
+    })
+    .await
+    .unwrap();
 }

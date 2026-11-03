@@ -15,6 +15,7 @@ mod error;
 mod ids;
 mod interaction;
 pub mod rpc;
+pub mod session_services;
 mod update;
 
 pub use backend::shell_timeout;
