@@ -172,6 +172,8 @@ pub struct ShellOutput {
     pub stderr: String,
     /// Exit code.
     pub exit_code: i32,
+    /// Output was cut at the environment's cap.
+    pub truncated: bool,
 }
 
 /// Filesystem capability (Result-based, never panics).

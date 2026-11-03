@@ -573,6 +573,9 @@ impl AgentBackend for NativeBackend {
             efforts: true,
             usage: true,
             images: true,
+            compaction: true,
+            session_stats: true,
+            local_shell: true,
             ..Capabilities::default()
         }
     }
@@ -868,10 +871,38 @@ impl Compaction for NativeBackend {
             .compact(instructions)
             .await
             .map_err(harness_error)?;
+        // The tree counts the compaction in the Session revision.
+        self.record_change(None);
         Ok(CompactionReport {
             tokens_before: Some(result.tokens_before),
             summary: result.summary,
+            ..CompactionReport::default()
         })
+    }
+}
+
+impl NativeBackend {
+    /// Prepare a compaction for a caller that commits the returned tree
+    /// write itself and then calls [`Self::record_change`].
+    pub async fn prepare_compaction(
+        &self,
+        session: &SessionRef,
+        instructions: Option<&str>,
+    ) -> BackendResult<(CompactionReport, PendingSessionWrite)> {
+        self.check_session(session).await?;
+        let (result, write) = self
+            .harness
+            .prepare_compaction(instructions)
+            .await
+            .map_err(harness_error)?;
+        Ok((
+            CompactionReport {
+                tokens_before: Some(result.tokens_before),
+                summary: result.summary,
+                ..CompactionReport::default()
+            },
+            write,
+        ))
     }
 }
 
@@ -880,28 +911,49 @@ impl SessionStats for NativeBackend {
     async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary> {
         self.check_session(session).await?;
         let stats = self.harness.session_stats().await.map_err(harness_error)?;
+        // The window is the Session model's, known before any usage is.
+        let window = match stats.context_usage.as_ref() {
+            Some(usage) => Some(usage.context_window),
+            None => self.harness.model().await.map(|m| m.context_window),
+        };
         Ok(StatsSummary {
             total_tokens: stats.tokens.total_tokens(),
             context_tokens: stats.context_usage.as_ref().and_then(|c| c.tokens),
-            context_window: stats.context_usage.as_ref().map(|c| c.context_window),
+            context_window: window.filter(|w| *w > 0),
             report: format_session_stats(&stats),
+            turn_state: Some(if self.is_busy_now() { "busy" } else { "idle" }.into()),
+            usage: None,
         })
     }
 }
 
 #[async_trait]
 impl LocalShell for NativeBackend {
-    async fn run(&self, session: &SessionRef, command: &str) -> BackendResult<ShellResult> {
+    async fn run(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult> {
+        let timeout_ms = loop_protocol::shell_timeout(timeout_ms)?;
         self.check_session(session).await?;
         let env = self.harness.tool_env().await.map_err(harness_error)?;
         let out = env
-            .exec(command, ShellExecOptions::default())
+            .exec(
+                command,
+                ShellExecOptions {
+                    timeout_ms: Some(timeout_ms),
+                    ..ShellExecOptions::default()
+                },
+            )
             .await
             .map_err(|e| BackendError::failed(ErrorCategory::Agent, e.to_string()))?;
         Ok(ShellResult {
             stdout: out.stdout,
             stderr: out.stderr,
             exit_code: out.exit_code,
-        })
+            truncated: out.truncated,
+        }
+        .bounded())
     }
 }

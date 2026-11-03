@@ -49,4 +49,13 @@ pub struct Capabilities {
     pub efforts: bool,
     /// `session/attach` returns a Session snapshot with its result.
     pub attach_snapshot: bool,
+    /// Compacts the Session's context on request (`session/compact`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub compaction: bool,
+    /// Reports Session token statistics (`session/stats`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub session_stats: bool,
+    /// Runs a user command in the Session's environment (`session/shell`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub local_shell: bool,
 }

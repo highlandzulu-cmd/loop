@@ -562,3 +562,126 @@ fn config_changed_and_attach_snapshot_wire() {
     let old: AttachResult = serde_json::from_value(json!({"latest_seq":8,"generation":2})).unwrap();
     assert_eq!(old.snapshot, None);
 }
+
+#[test]
+fn compact_stats_and_shell_methods_wire() {
+    use loop_protocol::rpc::{methods, CompactParams, ShellParams, StatsResult};
+    use loop_protocol::{Capabilities, CompactionReport, ShellResult, StatsSummary};
+    let reference = json!({"instance":"native","key":"s1","native_id":"n1"});
+    let session: loop_protocol::SessionRef = serde_json::from_value(reference.clone()).unwrap();
+    assert_eq!(
+        [
+            methods::SESSION_COMPACT,
+            methods::SESSION_STATS,
+            methods::SESSION_SHELL
+        ],
+        ["session/compact", "session/stats", "session/shell"]
+    );
+    roundtrip(
+        &CompactParams {
+            session: session.clone(),
+            instructions: Some("keep the plan".into()),
+        },
+        json!({"session":reference,"instructions":"keep the plan"}),
+    );
+    roundtrip(
+        &CompactParams {
+            session: session.clone(),
+            instructions: None,
+        },
+        json!({"session":reference}),
+    );
+    roundtrip(
+        &CompactionReport {
+            tokens_before: Some(1200),
+            summary: "Earlier work".into(),
+            branch_revision: 2,
+            seq: 9,
+        },
+        json!({"tokens_before":1200,"summary":"Earlier work","branch_revision":2,"seq":9}),
+    );
+    let stats = StatsResult {
+        total_tokens: 40,
+        context_tokens: Some(30),
+        context_window: Some(200_000),
+        report: "Tokens: 40".into(),
+        turn_state: "idle".into(),
+        usage: None,
+        taken_at_ms: 5,
+    };
+    roundtrip(
+        &stats,
+        json!({"total_tokens":40,"context_tokens":30,"context_window":200000,
+            "report":"Tokens: 40","turn_state":"idle","taken_at_ms":5}),
+    );
+    // Unknown values stay unknown.
+    let unknown: StatsResult = serde_json::from_value(
+        json!({"total_tokens":0,"report":"","turn_state":"busy","taken_at_ms":1}),
+    )
+    .unwrap();
+    assert_eq!(unknown.context_window, None);
+    let summary = StatsSummary::from(stats);
+    assert_eq!(summary.context_window, Some(200_000));
+    assert_eq!(summary.turn_state.as_deref(), Some("idle"));
+    roundtrip(
+        &ShellParams {
+            session: session.clone(),
+            command: "ls".into(),
+            timeout_ms: Some(1000),
+        },
+        json!({"session":reference,"command":"ls","timeout_ms":1000}),
+    );
+    roundtrip(
+        &ShellResult {
+            stdout: "a\n".into(),
+            stderr: String::new(),
+            exit_code: 0,
+            truncated: false,
+        },
+        json!({"stdout":"a\n","stderr":"","exit_code":0,"truncated":false}),
+    );
+    // Old servers omit the new flags; they mean false and are not written.
+    let old: Capabilities = serde_json::from_value(json!({"attach":true})).unwrap();
+    assert!(!old.compaction && !old.session_stats && !old.local_shell);
+    let value = serde_json::to_value(Capabilities::default()).unwrap();
+    assert!(value.get("compaction").is_none() && value.get("local_shell").is_none());
+    let value = serde_json::to_value(Capabilities {
+        compaction: true,
+        session_stats: true,
+        local_shell: true,
+        ..Capabilities::default()
+    })
+    .unwrap();
+    assert_eq!(value["compaction"], true);
+    assert_eq!(value["session_stats"], true);
+    assert_eq!(value["local_shell"], true);
+}
+
+#[test]
+fn shell_bounds() {
+    use loop_protocol::{shell_timeout, ShellResult, SHELL_MAX_TIMEOUT_MS, SHELL_OUTPUT_LIMIT};
+    assert_eq!(shell_timeout(None).unwrap(), 120_000);
+    assert_eq!(shell_timeout(Some(1)).unwrap(), 1);
+    assert_eq!(
+        shell_timeout(Some(SHELL_MAX_TIMEOUT_MS)).unwrap(),
+        SHELL_MAX_TIMEOUT_MS
+    );
+    assert!(shell_timeout(Some(0)).is_err());
+    assert!(shell_timeout(Some(SHELL_MAX_TIMEOUT_MS + 1)).is_err());
+    // A cut never splits a character, and only a cut marks truncation.
+    let exact = ShellResult {
+        stdout: "a".repeat(SHELL_OUTPUT_LIMIT),
+        ..ShellResult::default()
+    }
+    .bounded();
+    assert!(!exact.truncated);
+    let mut long = "a".repeat(SHELL_OUTPUT_LIMIT - 1);
+    long.push('é');
+    let cut = ShellResult {
+        stderr: long,
+        ..ShellResult::default()
+    }
+    .bounded();
+    assert!(cut.truncated);
+    assert_eq!(cut.stderr.len(), SHELL_OUTPUT_LIMIT - 1);
+}

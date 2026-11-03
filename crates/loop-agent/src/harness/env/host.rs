@@ -264,14 +264,16 @@ pub(crate) async fn exec_command(
             .unwrap_or_else(Instant::now),
     ));
     let on_output = options.on_output.clone();
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut stdout_task = PipeTask({
         let combined = Arc::clone(&combined);
         let stdout_acc = Arc::clone(&stdout_acc);
         let last_emit = Arc::clone(&last_emit);
         let on_output = on_output.clone();
+        let cut = Arc::clone(&cut);
         tokio::spawn(async move {
-            read_stream(stdout, combined, stdout_acc, last_emit, on_output).await;
+            read_stream(stdout, combined, stdout_acc, last_emit, on_output, cut).await;
         })
     });
     let mut stderr_task = PipeTask({
@@ -279,8 +281,9 @@ pub(crate) async fn exec_command(
         let stderr_acc = Arc::clone(&stderr_acc);
         let last_emit = Arc::clone(&last_emit);
         let on_output = on_output.clone();
+        let cut = Arc::clone(&cut);
         tokio::spawn(async move {
-            read_stream(stderr, combined, stderr_acc, last_emit, on_output).await;
+            read_stream(stderr, combined, stderr_acc, last_emit, on_output, cut).await;
         })
     });
 
@@ -377,6 +380,7 @@ pub(crate) async fn exec_command(
         stdout: stdout_text,
         stderr: stderr_text,
         exit_code: status.code().unwrap_or(-1),
+        truncated: cut.load(std::sync::atomic::Ordering::Acquire),
     })
 }
 
@@ -445,12 +449,14 @@ impl Drop for TreeKiller {
 // Keep draining after the cap, so a noisy command never blocks on a full pipe.
 const OUTPUT_CAP: usize = 1024 * 1024;
 
-fn push_capped(acc: &mut String, chunk: &str) {
+/// Append what fits under the cap; false when part of `chunk` was dropped.
+fn push_capped(acc: &mut String, chunk: &str) -> bool {
     let mut end = chunk.len().min(OUTPUT_CAP.saturating_sub(acc.len()));
     while !chunk.is_char_boundary(end) {
         end -= 1;
     }
     acc.push_str(&chunk[..end]);
+    end == chunk.len()
 }
 
 async fn read_stream<R: AsyncReadExt + Unpin>(
@@ -459,6 +465,7 @@ async fn read_stream<R: AsyncReadExt + Unpin>(
     stream_acc: Arc<Mutex<String>>,
     last_emit: Arc<Mutex<Instant>>,
     on_output: Option<crate::harness::types::ShellOutputCallback>,
+    cut: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -468,11 +475,13 @@ async fn read_stream<R: AsyncReadExt + Unpin>(
                 let chunk = sanitize_binary_output(&buf[..n]);
                 {
                     let mut acc = stream_acc.lock().await;
-                    push_capped(&mut acc, &chunk);
+                    if !push_capped(&mut acc, &chunk) {
+                        cut.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 let snapshot = {
                     let mut c = combined.lock().await;
-                    push_capped(&mut c, &chunk);
+                    let _ = push_capped(&mut c, &chunk);
                     c.clone()
                 };
                 if let Some(cb) = &on_output {

@@ -297,3 +297,64 @@ fn model_control_methods_and_messages_are_in_the_schema() {
         assert!(errors.is_empty(), "{definition}: {errors:?}\n{message}");
     }
 }
+
+#[test]
+fn compact_stats_and_shell_are_in_the_schema() {
+    use loop_protocol::rpc::methods;
+    let schema = json_schema();
+    for method in [
+        methods::SESSION_COMPACT,
+        methods::SESSION_STATS,
+        methods::SESSION_SHELL,
+    ] {
+        assert_eq!(schema["methods"][method]["direction"], "client_to_server");
+        assert_eq!(schema["methods"][method]["kind"], "request");
+        assert!(
+            schema["methods"][method].get("result").is_some(),
+            "{method}"
+        );
+    }
+    assert_eq!(schema["limits"]["shell_output_bytes"], 1024 * 1024);
+    assert_eq!(schema["limits"]["shell_timeout_max_ms"], 600_000);
+    let reference = json!({"instance": "loop", "key": "s", "native_id": "s"});
+    let cases = [
+        (
+            "CompactParams",
+            json!({"session": reference, "instructions": "keep the plan"}),
+        ),
+        ("CompactParams", json!({"session": reference})),
+        (
+            "CompactionReport",
+            json!({"tokens_before": 900, "summary": "Earlier work", "branch_revision": 2, "seq": 7}),
+        ),
+        (
+            "StatsResult",
+            json!({"total_tokens": 40, "context_tokens": 30, "context_window": 200000,
+                   "report": "Tokens", "turn_state": "idle", "taken_at_ms": 5}),
+        ),
+        (
+            "StatsResult",
+            json!({"total_tokens": 0, "report": "", "turn_state": "busy", "taken_at_ms": 5}),
+        ),
+        (
+            "ShellParams",
+            json!({"session": reference, "command": "ls", "timeout_ms": 1000}),
+        ),
+        (
+            "ShellResult",
+            json!({"stdout": "a", "stderr": "", "exit_code": 0, "truncated": true}),
+        ),
+        (
+            "Capabilities",
+            json!({"compaction": true, "session_stats": true, "local_shell": true}),
+        ),
+    ];
+    for (definition, message) in cases {
+        let validator = validator(definition);
+        let errors: Vec<String> = validator
+            .iter_errors(&message)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{definition}: {errors:?}\n{message}");
+    }
+}

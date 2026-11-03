@@ -392,13 +392,23 @@ pub trait HostTerminals: Send + Sync {
     async fn release(&self, session: &SessionRef, terminal_id: &str) -> BackendResult<()>;
 }
 
-/// Result of compacting a conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Result of compacting a conversation (`session/compact`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CompactionReport {
     /// Estimated tokens before compaction, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens_before: Option<u64>,
     /// The summary that replaced the earlier conversation.
     pub summary: String,
+    /// The committed branch revision after compaction; 0 when the backend
+    /// does not count branch changes.
+    #[serde(default)]
+    pub branch_revision: u64,
+    /// The update sequence that announced the compaction; 0 when the
+    /// backend keeps no ordered Event Log.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// Shrink a session's context by summarizing it.
@@ -413,7 +423,7 @@ pub trait Compaction: Send + Sync {
 }
 
 /// Token counts and a readable report for a session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct StatsSummary {
     /// All tokens billed in the session.
     pub total_tokens: u64,
@@ -423,6 +433,10 @@ pub struct StatsSummary {
     pub context_window: Option<u64>,
     /// Multi-line report for display.
     pub report: String,
+    /// Idle, busy or parked, when the backend knows better than `is_busy`.
+    pub turn_state: Option<String>,
+    /// Usage of the latest model call, when known.
+    pub usage: Option<crate::update::Usage>,
 }
 
 /// Session statistics.
@@ -432,20 +446,71 @@ pub trait SessionStats: Send + Sync {
     async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary>;
 }
 
-/// Output of a command run for the user.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Output of a command run for the user (`session/shell`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ShellResult {
-    /// Standard output.
+    /// Standard output, at most [`SHELL_OUTPUT_LIMIT`] bytes.
     pub stdout: String,
-    /// Standard error.
+    /// Standard error, at most [`SHELL_OUTPUT_LIMIT`] bytes.
     pub stderr: String,
     /// Exit code.
     pub exit_code: i32,
+    /// A stream was cut at [`SHELL_OUTPUT_LIMIT`].
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// The most output `session/shell` keeps per stream, in bytes.
+pub const SHELL_OUTPUT_LIMIT: usize = 1024 * 1024;
+/// How long a user command runs when the caller names no timeout.
+pub const SHELL_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// The longest timeout a user command may ask for.
+pub const SHELL_MAX_TIMEOUT_MS: u64 = 600_000;
+
+impl ShellResult {
+    /// Cut each stream to [`SHELL_OUTPUT_LIMIT`] on a character boundary,
+    /// marking the result truncated when anything was cut.
+    pub fn bounded(mut self) -> Self {
+        for stream in [&mut self.stdout, &mut self.stderr] {
+            if stream.len() > SHELL_OUTPUT_LIMIT {
+                let mut end = SHELL_OUTPUT_LIMIT;
+                while !stream.is_char_boundary(end) {
+                    end -= 1;
+                }
+                stream.truncate(end);
+                self.truncated = true;
+            }
+        }
+        self
+    }
+}
+
+/// Check a requested shell timeout: the default when none is named, and a
+/// failure for zero or more than [`SHELL_MAX_TIMEOUT_MS`].
+pub fn shell_timeout(requested: Option<u64>) -> BackendResult<u64> {
+    match requested {
+        None => Ok(SHELL_DEFAULT_TIMEOUT_MS),
+        Some(ms) if (1..=SHELL_MAX_TIMEOUT_MS).contains(&ms) => Ok(ms),
+        Some(_) => Err(BackendError::failed(
+            ErrorCategory::Agent,
+            format!(
+                "the shell timeout must be between 1 and {} ms",
+                SHELL_MAX_TIMEOUT_MS
+            ),
+        )),
+    }
 }
 
 /// Run a command the user typed, in the session's execution environment.
 #[async_trait]
 pub trait LocalShell: Send + Sync {
-    /// Run `command` and wait for it to finish.
-    async fn run(&self, session: &SessionRef, command: &str) -> BackendResult<ShellResult>;
+    /// Run `command` and wait for it to finish, for at most `timeout_ms`
+    /// (see [`shell_timeout`]). Output is bounded per stream.
+    async fn run(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult>;
 }

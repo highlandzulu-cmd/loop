@@ -253,7 +253,7 @@ async fn services_are_available() {
     let shell = backend
         .local_shell()
         .unwrap()
-        .run(&session, "echo native-shell")
+        .run(&session, "echo native-shell", None)
         .await
         .unwrap();
     assert_eq!(shell.exit_code, 0);

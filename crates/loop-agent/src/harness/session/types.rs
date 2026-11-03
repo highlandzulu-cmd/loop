@@ -498,8 +498,8 @@ pub struct SessionConfigEntries {
     pub thinking_level: Option<AgentThinkingLevel>,
     /// Name last given to the Session.
     pub name: Option<String>,
-    /// How many model, effort, name and branch changes the Session ever
-    /// recorded: its one Session revision, stable across restarts.
+    /// How many model, effort, name, branch and compaction changes the
+    /// Session ever recorded: its one Session revision, stable across restarts.
     pub revision: u64,
 }
 
@@ -515,6 +515,7 @@ pub fn config_from_entries(
         match entry {
             SessionTreeEntry::ModelChange { .. }
             | SessionTreeEntry::ThinkingLevelChange { .. }
+            | SessionTreeEntry::Compaction { .. }
             | SessionTreeEntry::Leaf { .. } => {
                 config.revision += 1;
             }
