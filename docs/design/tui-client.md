@@ -715,7 +715,9 @@ These remaining accesses are explicitly behind `SurfaceClient::legacy()` or
   trust reloads resources through the native admin adapter. MCP list/connect/
   toggle and OAuth use facade services. Approval setup and grants stay private
   to the native owner. Settings diagnostics move with group 5; web search and
-  timeout/default handling move with group 6.
+  timeout/default handling move with group 6. Characterization covers the
+  full-access confirmation, review help, sandbox validation, MCP picker
+  toggles and failed connections, missing OAuth servers, and trust choices.
 - Group 4: skills, prompt templates, dynamic command discovery, workflows and
   the current native workflow event bridge.
 - Group 5: usage/dashboard host data, tracing-backed usage logs and the effective
