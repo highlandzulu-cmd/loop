@@ -2347,6 +2347,10 @@
     "RuntimeStatus": {
       "description": "`runtime/status` result: the Runtime process and its Session counts.",
       "properties": {
+        "auto_started": {
+          "description": "True only for an owner started automatically by a Surface.",
+          "type": "boolean"
+        },
         "busy": {
           "description": "Loaded Sessions with a turn running.",
           "format": "uint64",

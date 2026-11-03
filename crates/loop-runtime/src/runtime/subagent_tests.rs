@@ -534,7 +534,7 @@ fn payload<'a>(events: &'a [LoggedEvent], key: &SessionKey, kind: &str) -> Optio
 }
 
 #[cfg(unix)]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::test]
 async fn cancelling_the_parent_cancels_its_descendants() {
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
@@ -573,11 +573,14 @@ async fn cancelling_the_parent_cancels_its_descendants() {
             "sleep 30",
         )
         .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
         assert!(
             !rt.is_idle().await,
-            "running descendants prevent idle shutdown"
+            "running descendants and their bash tool prevent idle shutdown"
         );
         assert!(!rt.shutdown_if_idle().await);
+        tokio::time::resume();
         let list = rt.list().await.unwrap();
         let middle = children(&list, &root).pop().unwrap().r#ref.key;
 

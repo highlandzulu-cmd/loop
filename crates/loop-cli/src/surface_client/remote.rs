@@ -200,9 +200,27 @@ impl SurfaceClient {
             loop_app_core::interaction::InteractionQueue::new()
         }
     }
+    pub fn connection_closed(
+        &self,
+    ) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
+        self.remote
+            .clone()
+            .map(|remote| async move { remote.closed().await })
+    }
     pub async fn finish(&self) -> anyhow::Result<()> {
         if let Some(remote) = &self.remote {
-            remote.detach(&self.session_ref()).await?;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                remote.detach(&self.session_ref()),
+            )
+            .await;
+            remote.disconnect();
+            match result {
+                Ok(Err(loop_protocol::BackendError::Failed(info)))
+                    if info.category == loop_protocol::ErrorCategory::Network => {}
+                Ok(Err(error)) => return Err(error.into()),
+                Ok(Ok(())) | Err(_) => {}
+            }
         }
         self.shutdown().run().await
     }
@@ -432,9 +450,17 @@ impl SurfaceClient {
         *client.remote_updates.lock().unwrap() = Some(remote.subscribe());
         client.native_backend = remote.clone();
         client.sessions = Arc::new(RemoteSessions(remote.clone()));
+        client
+            .host
+            .inner
+            .startup_notices
+            .extend(remote.take_connection_notices());
         client.remote = Some(remote);
         client.remote_host = Some(host);
         client.attach_remote(session).await?;
+        if resumed {
+            client.host.inner.startup_notices.push("Attached Session keeps its original cwd and tool environment; after a Runtime restart it uses the Runtime's environment.".into());
+        }
         if let Some(snapshot) = &client.remote_snapshot {
             client
                 .host
@@ -627,7 +653,10 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let rt = runtime(dir.path()).await;
             let (remote, _) = remote(&rt, "0.0.1").await;
-            assert!(!crate::runtime_launch::compatible(&remote).await.unwrap());
+            assert!(
+                crate::runtime_launch::compatible(&remote).await.is_err(),
+                "explicit owners must not be replaced"
+            );
             rt.new_session(SessionSpec::default()).await.unwrap();
             let error = crate::runtime_launch::compatible(&remote)
                 .await

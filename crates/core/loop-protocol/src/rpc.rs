@@ -257,6 +257,9 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct RuntimeStatus {
+    /// True only for an owner started automatically by a Surface.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_started: bool,
     /// The Runtime's process id.
     pub pid: u32,
     /// The socket this connection reached.

@@ -542,7 +542,7 @@ impl std::fmt::Debug for SessionSpec {
         f.debug_struct("SessionSpec")
             .field("cwd", &self.cwd)
             .field("name", &self.name)
-            .field("env", &self.env.as_ref().map(|_| "[redacted]"))
+            .field("env_keys", &self.env.as_ref().map(|env| env.len()))
             .finish()
     }
 }

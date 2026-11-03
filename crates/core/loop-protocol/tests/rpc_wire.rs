@@ -243,6 +243,7 @@ fn runtime_status_wire() {
     use loop_protocol::rpc::RuntimeStatus;
     roundtrip(
         &RuntimeStatus {
+            auto_started: false,
             pid: 42,
             socket: "/a/run/runtime.sock".into(),
             listen_url: None,
@@ -259,6 +260,7 @@ fn runtime_status_wire() {
     );
     roundtrip(
         &RuntimeStatus {
+            auto_started: true,
             pid: 42,
             socket: "/s".into(),
             listen_url: Some("ws://127.0.0.1:1234/".into()),
@@ -270,7 +272,7 @@ fn runtime_status_wire() {
             max_sessions_from: Some("settings".into()),
             max_active_turns_from: Some("default".into()),
         },
-        json!({"pid":42,"socket":"/s","listen_url":"ws://127.0.0.1:1234/","generation":3,"loaded":0,"busy":0,
+        json!({"auto_started":true,"pid":42,"socket":"/s","listen_url":"ws://127.0.0.1:1234/","generation":3,"loaded":0,"busy":0,
             "max_sessions":3,"max_active_turns":8,
             "max_sessions_from":"settings","max_active_turns_from":"default"}),
     );
@@ -995,4 +997,18 @@ fn empty_owner_stop_is_an_optional_host_only_capability() {
         .unwrap()
         .get("runtime_stop_empty")
         .is_none());
+}
+
+#[test]
+fn session_environment_debug_exposes_only_the_key_count() {
+    let spec = SessionSpec {
+        env: Some(std::collections::BTreeMap::from([(
+            "SECRET_NAME".into(),
+            "sentinel-secret".into(),
+        )])),
+        ..Default::default()
+    };
+    let debug = format!("{spec:?}");
+    assert!(debug.contains("env_keys: Some(1)"), "{debug}");
+    assert!(!debug.contains("SECRET_NAME") && !debug.contains("sentinel-secret"));
 }

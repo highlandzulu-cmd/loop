@@ -62,7 +62,10 @@ async fn auto_start_and_second_client_reuse_one_owner() {
             let session = one
                 .new_session(SessionSpec {
                     cwd: Some(dir.path().canonicalize().unwrap()),
-                    env: Some(Default::default()),
+                    env: Some(std::collections::BTreeMap::from([(
+                        "S36_SENTINEL".into(),
+                        "S36_SENTINEL_DO_NOT_PERSIST".into(),
+                    )])),
                     ..Default::default()
                 })
                 .await
@@ -80,6 +83,24 @@ async fn auto_start_and_second_client_reuse_one_owner() {
         })
         .await
         .unwrap();
+        fn assert_secret_absent(dir: &Path) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    assert_secret_absent(&path);
+                } else if path.is_file() {
+                    let bytes = std::fs::read(&path).unwrap();
+                    assert!(
+                        !bytes
+                            .windows(b"S36_SENTINEL_DO_NOT_PERSIST".len())
+                            .any(|w| w == b"S36_SENTINEL_DO_NOT_PERSIST"),
+                        "secret persisted in {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert_secret_absent(&agent);
         result
     })
     .await
@@ -99,6 +120,149 @@ async fn start_failure_is_returned_for_the_callers_in_process_fallback() {
         )
         .await;
         assert!(error.is_err());
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn sentinel_environment_never_appears_in_wire_logs_or_frame_debug() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        use std::io::Write;
+        #[derive(Clone)]
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> { self.0.lock().unwrap().extend_from_slice(bytes); Ok(bytes.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let capture = Capture(Arc::new(std::sync::Mutex::new(vec![])));
+        let writer = capture.clone();
+        let subscriber = tracing_subscriber::fmt().with_ansi(false).with_max_level(tracing::Level::TRACE).with_writer(move || writer.clone()).finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (server, client) = loop_wire::transport::memory();
+        let (connection, mut incoming) = loop_wire::connection::Connection::new(server);
+        let sentinel = "S36_SENTINEL_DO_NOT_LOG";
+        client.outgoing.send(format!("{{bad-json env SECRET={sentinel}" )).unwrap();
+        client.outgoing.send(serde_json::json!({"jsonrpc":"2.0","id":1,"method":"session/new", "params":{"env":{"SECRET":sentinel}}}).to_string()).unwrap();
+        let frame = incoming.recv().await.unwrap();
+        tracing::debug!(?frame, "received frame");
+        connection.close();
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(!logs.contains(sentinel), "wire logs exposed the sentinel");
+        assert!(!format!("{frame:?}").contains(sentinel));
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn four_concurrent_launchers_connect_to_one_owner() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dir = tempfile::Builder::new()
+            .prefix("s36race")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let agent = dir.path().join("agent");
+        let socket = loop_cli::config::paths::runtime_socket_path(&agent).unwrap();
+        let mut starts = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let (agent, socket, cwd) = (agent.clone(), socket.clone(), dir.path().to_owned());
+            starts.spawn(async move {
+                runtime_launch::start_and_connect(
+                    Path::new(env!("CARGO_BIN_EXE_loop")),
+                    &agent,
+                    &cwd,
+                    &socket,
+                    Arc::new(RemoteHost::default()),
+                )
+                .await
+            });
+        }
+        let mut clients = vec![];
+        while let Some(client) = starts.join_next().await {
+            clients.push(client.unwrap().unwrap());
+        }
+        let pid = clients[0].status().await.unwrap().pid;
+        for client in &clients {
+            assert_eq!(client.status().await.unwrap().pid, pid);
+        }
+        assert!(clients[0].status().await.unwrap().auto_started);
+        clients[0].stop().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_held_runtime_lock_waits_for_its_owner_without_spawning() {
+    tokio::time::timeout(Duration::from_secs(45), async {
+        let dir = tempfile::Builder::new()
+            .prefix("s36lock")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let agent = dir.path().join("agent");
+        let socket = loop_cli::config::paths::runtime_socket_path(&agent).unwrap();
+        let lock = loop_app_core::runtime_instance::RuntimeInstanceLock::acquire(&agent).unwrap();
+        let waiting = runtime_launch::start_and_connect(
+            Path::new("/must/not/be/spawned"),
+            &agent,
+            dir.path(),
+            &socket,
+            Arc::new(RemoteHost::default()),
+        );
+        tokio::pin!(waiting);
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(lock);
+        let owner = runtime_launch::spawn(
+            Path::new(env!("CARGO_BIN_EXE_loop")),
+            &agent,
+            dir.path(),
+            &socket,
+        )
+        .unwrap();
+        let client = waiting.await.unwrap();
+        assert_eq!(client.status().await.unwrap().pid, owner.id());
+        client.stop().await.unwrap();
+        std::thread::spawn(move || {
+            let mut owner = owner;
+            let _ = owner.wait();
+        });
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn discovery_ignores_stale_sockets_and_bounds_a_silent_peer() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let dir = tempfile::Builder::new()
+            .prefix("s36discovery")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let socket = loop_cli::config::paths::runtime_socket_path(dir.path()).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        drop(listener);
+        assert!(runtime_launch::discover(dir.path())
+            .await
+            .unwrap()
+            .is_empty());
+        std::fs::remove_file(&socket).unwrap();
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let agent = dir.path().to_owned();
+        let discovery = tokio::spawn(async move { runtime_launch::discover(&agent).await });
+        let (_probe, _) = listener.accept().await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let error = discovery.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("discovery handshake timed out"));
+        tokio::time::resume();
+        assert!(
+            socket.exists(),
+            "discovery must not replace a foreign socket"
+        );
     })
     .await
     .unwrap();

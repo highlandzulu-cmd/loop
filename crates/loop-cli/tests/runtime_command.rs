@@ -127,6 +127,23 @@ async fn websocket_publishes_only_its_url_and_keeps_a_private_fresh_token() {
             )
             .await
             .unwrap();
+            assert!(remote.is_websocket());
+            assert!(!remote.status().await.unwrap().auto_started);
+            let mut env_token = Command::new(env!("CARGO_BIN_EXE_loop"));
+            env_token
+                .args(["session", "list", "--url", url, "--json"])
+                .env("LOOP_RUNTIME_TOKEN", token.trim());
+            let output = env_token.output().await.unwrap();
+            assert!(output.status.success(), "{output:?}");
+            let output = Command::new(env!("CARGO_BIN_EXE_loop"))
+                .args(["session", "list", "--url", url, "--json"])
+                .env_remove("LOOP_RUNTIME_TOKEN")
+                .output()
+                .await
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr)
+                .contains("require LOOP_RUNTIME_TOKEN or --token-file"));
             assert_eq!(remote.server().version, env!("CARGO_PKG_VERSION"));
             assert_eq!(remote.status().await.unwrap().pid, child.id().unwrap());
             drop(remote);

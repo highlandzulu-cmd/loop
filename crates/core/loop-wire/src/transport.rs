@@ -18,10 +18,17 @@ pub const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Most whole messages queued in either direction on a WebSocket.
 pub const SOCKET_QUEUE_MESSAGES: usize = 128;
 
-#[derive(Debug)]
 struct QueuedMessage {
     text: String,
     _permit: OwnedSemaphorePermit,
+}
+
+impl std::fmt::Debug for QueuedMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueuedMessage")
+            .field("bytes", &self.text.len())
+            .finish()
+    }
 }
 
 /// Nonblocking message sender. Bounded sockets disconnect on overflow so a
@@ -131,6 +138,8 @@ pub(crate) fn bounded(closed: CancellationToken) -> (MessageSender, MessageRecei
 /// messages to send.
 #[derive(Debug)]
 pub struct Transport {
+    /// This endpoint crosses an authenticated WebSocket transport.
+    pub is_websocket: bool,
     /// Messages from the peer, in order. Closes when the peer's side ends.
     pub incoming: MessageReceiver,
     /// Messages to the peer. Dropping it closes the output.
@@ -145,10 +154,12 @@ pub fn memory() -> (Transport, Transport) {
         Transport {
             incoming: b_rx.into(),
             outgoing: a_tx.into(),
+            is_websocket: false,
         },
         Transport {
             incoming: a_rx.into(),
             outgoing: b_tx.into(),
+            is_websocket: false,
         },
     )
 }
@@ -197,6 +208,7 @@ where
     Transport {
         incoming: incoming.into(),
         outgoing: outgoing.into(),
+        is_websocket: false,
     }
 }
 

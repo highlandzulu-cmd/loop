@@ -227,6 +227,7 @@ mod unix {
         let notices = events_tx.clone();
         let closed = tokio_util::sync::CancellationToken::new();
         let pump_closed = closed.clone();
+        let is_websocket = transport.is_websocket;
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -268,6 +269,7 @@ mod unix {
             Transport {
                 incoming: incoming.into(),
                 outgoing: outgoing.into(),
+                is_websocket,
             },
             PeerInfo {
                 name: "loop session".into(),

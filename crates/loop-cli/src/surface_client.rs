@@ -358,7 +358,10 @@ impl SurfaceClient {
                 .native_backend
                 .new_session(SessionSpec {
                     cwd: Some(self.cwd().clone()),
-                    env: Some(std::env::vars().collect()),
+                    env: Some(crate::runtime_launch::session_environment(
+                        self.remote.as_ref().unwrap(),
+                        self.agent_dir(),
+                    )?),
                     ..Default::default()
                 })
                 .await?;

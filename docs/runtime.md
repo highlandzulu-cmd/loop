@@ -14,11 +14,14 @@ Interactive `loop` connects to the Runtime for the current agent directory and
 opens a new Session in the caller's working directory. If none is reachable,
 it starts a detached owner and waits for its socket. A second terminal reuses
 that owner. Discovery currently checks one agent directory; when discovery
-returns several reachable owners, Loop asks you to select one.
+returns several reachable owners, Loop asks you to select one. With piped
+input it chooses the first owner. `--continue` starts a new Session with a
+notice when this folder has no history.
 
 ```bash
 loop                                # new Session, auto-start if needed
-loop -c                             # attach to this folder's latest Session
+loop --continue                     # attach to this folder's latest Session
+loop -c                             # skip AGENTS.md / CLAUDE.md context files
 loop --resume                       # choose an existing Session
 loop --resume SESSION_ID             # attach by id or unique prefix
 loop --connect /path/to/runtime.sock # choose a particular owner
@@ -34,6 +37,28 @@ Each new Session receives the caller's cwd and environment for tools and
 exported provider API key differs; it never shows the key. Runtime bearer tokens
 and built-in provider key variables are removed from tool environments.
 
+Resuming keeps the Session's original cwd and tool environment, so attaching a
+second Surface cannot change tools that are already running. The TUI says so on
+resume. Environments are held in memory only; after a Runtime restart, an old
+Session uses the Runtime's environment. Credential-difference notices compare
+the attaching shell with the selected provider's actual Runtime credentials.
+
+Unix sockets can forward the full environment. WebSockets forward only `PATH`,
+`HOME`, `USER`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `VIRTUAL_ENV` and
+`CONDA_PREFIX`. Add explicit variable names in the Surface's global settings:
+
+```json
+{ "runtime": { "forwardEnv": ["TASK_VALUE"] } }
+```
+
+Names in `forwardEnv` are an explicit choice to share those values with the
+remote owner. Environment maps are redacted from diagnostics and never saved in
+the Event Log or settings.
+
+Project trust is prompted locally only for the default owner. An explicit
+`--connect` target uses the Runtime host's recorded trust; its startup notice
+reports an untrusted workspace, and `/trust` uses that host's service.
+
 Quitting detaches the TUI. It keeps the Session, running work and parked
 approvals alive. Another Surface can attach and answer a parked request.
 
@@ -43,11 +68,13 @@ active turns, parked approvals and running Subagents prevent idle shutdown.
 An owner started explicitly with `loop runtime start` never idles out.
 
 Loop checks the owner's application version before creating or attaching a
-Session. It restarts an empty local owner from this agent directory when the
-versions differ. With live Sessions, it reports both versions and uses the
-in-process path for this run. A startup or connection failure also prints one
-warning and falls back. Subscription/ACP agents and ordinary `--print` runs
-continue to use the in-process path.
+Session. When versions differ, it replaces only an empty local owner known to
+have been auto-started from this agent directory. Explicit owners and owners
+with loaded Sessions stay running; Loop reports both versions, suggests
+`loop runtime restart`, and uses the in-process path for this run. A startup,
+connection or Session-open failure also prints one warning and falls back. Subscription/ACP agents and ordinary `--print` runs
+continue to use the in-process path. If an owner dies while the TUI is open,
+a recovery banner suggests `loop --continue`; quitting still succeeds.
 
 ## Start the Runtime
 

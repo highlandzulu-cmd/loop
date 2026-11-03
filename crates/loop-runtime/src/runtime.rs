@@ -85,6 +85,7 @@ pub struct Runtime {
     admission: AsyncMutex<()>,
     stopped: AtomicBool,
     idle_epoch: std::sync::atomic::AtomicU64,
+    /// In-memory only: caller environments must never enter persistent logs or settings.
     launch_specs: Mutex<HashMap<SessionKey, SessionSpec>>,
     log: Arc<dyn EventLog>,
     generation: u64,
@@ -239,6 +240,7 @@ struct LiveSession {
     announced: Mutex<Announced>,
     /// A workspace reload waiting for the current turn or command to end.
     pending_workspace: Mutex<Option<Arc<admin::Generation>>>,
+    credential_notice: Mutex<Option<String>>,
     /// The workspace generation the Session uses, held until it switches.
     generation: Mutex<Option<Arc<admin::Generation>>>,
     /// The sandbox the Session runs in (`session/sandbox`).
@@ -538,6 +540,7 @@ impl Runtime {
             .filter(|s| s.busy.load(Ordering::Acquire))
             .count();
         loop_protocol::rpc::RuntimeStatus {
+            auto_started: false,
             pid: std::process::id(),
             socket: PathBuf::new(),
             listen_url: None,
@@ -590,12 +593,46 @@ impl Runtime {
         self.idle_epoch.load(Ordering::Acquire)
     }
 
+    async fn credential_notice(
+        &self,
+        model: Option<&str>,
+        env: Option<&std::collections::BTreeMap<String, String>>,
+    ) -> Option<String> {
+        let (provider, _) = model?.split_once('/')?;
+        let preset = loop_ai::providers::PROVIDER_PRESETS
+            .iter()
+            .find(|preset| preset.id == provider)?;
+        let exported = preset
+            .api_key_envs
+            .iter()
+            .find_map(|key| env?.get(*key).filter(|value| !value.trim().is_empty()))?;
+        let configured = self.factory.globals.models.get_provider(provider)?;
+        let actual = loop_ai::auth::resolve_provider_auth(
+            provider,
+            &configured.auth,
+            self.factory.globals.credentials.as_ref(),
+            None,
+        )
+        .await
+        .ok();
+        if actual.as_ref().and_then(|auth| auth.api_key.as_deref()) == Some(exported.as_str()) {
+            return None;
+        }
+        Some(format!("This shell's {provider} API key differs from the Runtime's credential; the Runtime credential is used."))
+    }
+
     async fn open(
         &self,
         existing: Option<&SessionRef>,
         mut spec: SessionSpec,
         child: Option<subagent::ChildOpen>,
     ) -> BackendResult<SessionRef> {
+        // An attach checks this Surface's credentials, but never changes an
+        // existing Session's environment while another Surface may use it.
+        let caller_env = spec.env.clone();
+        if existing.is_some() {
+            spec.env = None;
+        }
         let _admission = loop {
             let admission = self.admission.lock().await;
             if self.stopped.load(Ordering::Acquire) {
@@ -614,7 +651,14 @@ impl Runtime {
                     drop(admission);
                     self.wait_removed(&live).await;
                 }
-                Ok(live) => return Ok(live.reference.clone()),
+                Ok(live) => {
+                    let model = live.opened.native.config().config.model;
+                    let notice = self
+                        .credential_notice(model.as_deref(), caller_env.as_ref())
+                        .await;
+                    *live.credential_notice.lock().unwrap() = notice;
+                    return Ok(live.reference.clone());
+                }
                 Err(_) => break admission,
             }
         };
@@ -741,24 +785,17 @@ impl Runtime {
         };
         opts.session_id = Some(id.clone());
         let result = async {
-            let mut opened = self.factory.open_with_environment(workspace, &opts, spec.env.as_ref()).await.map_err(failed)?;
-            if let Some(env) = &spec.env {
-                use loop_ai::CredentialStore;
-                for preset in loop_ai::providers::PROVIDER_PRESETS {
-                    let exported = preset.api_key_envs.iter().find_map(|key| env.get(*key)).filter(|v| !v.trim().is_empty());
-                    if let Some(exported) = exported {
-                        let saved = self.factory.globals.credentials.get(preset.id);
-                        let actual = match &saved {
-                            Some(loop_ai::Credential::ApiKey { key }) => Some(key.clone()),
-                            _ => preset.api_key_envs.iter().find_map(|key| std::env::var(key).ok()),
-                        };
-                        if actual.as_deref() != Some(exported.as_str()) {
-                            opened.startup_notices.push("This shell exports a provider API key that differs from the Runtime's credential; the Runtime credential is used.".into());
-                            break;
-                        }
-                    }
-                }
-            }
+            let mut opened = self
+                .factory
+                .open_with_environment(workspace, &opts, spec.env.as_ref())
+                .await
+                .map_err(failed)?;
+            let credential_notice = self
+                .credential_notice(
+                    opened.native.config().config.model.as_deref(),
+                    caller_env.as_ref(),
+                )
+                .await;
             let sandbox = opened
                 .harness
                 .ensure_sandbox_ready()
@@ -890,6 +927,7 @@ impl Runtime {
                     receipts: HashMap::new(),
                 }),
                 pending_workspace: Mutex::new(None),
+                credential_notice: Mutex::new(credential_notice),
                 generation: Mutex::new(None),
                 sandbox_choice: Mutex::new(sandbox_choice),
             });
@@ -943,7 +981,10 @@ impl Runtime {
                 .unwrap()
                 .insert(reference.key.clone(), live.clone());
             self.unloaded.lock().unwrap().remove(&reference.key);
-            self.launch_specs.lock().unwrap().insert(reference.key.clone(), saved_spec);
+            self.launch_specs
+                .lock()
+                .unwrap()
+                .insert(reference.key.clone(), saved_spec);
             self.idle_epoch.fetch_add(1, Ordering::AcqRel);
             lease.armed = false;
             Ok(reference)
@@ -1906,7 +1947,11 @@ impl Runtime {
         SessionSnapshot {
             notices: self
                 .route(session)
-                .map(|live| live.opened.startup_notices.clone())
+                .map(|live| {
+                    let mut notices = live.opened.startup_notices.clone();
+                    notices.extend(live.credential_notice.lock().unwrap().clone());
+                    notices
+                })
                 .unwrap_or_default(),
             session: session.clone(),
             workspace_id: self

@@ -34,11 +34,24 @@ impl Target {
 /// inventory so additional registries can supply the same reachable targets.
 pub async fn discover(agent_dir: &Path) -> anyhow::Result<Vec<Target>> {
     let socket = crate::config::paths::runtime_socket_path(agent_dir)?;
-    Ok(if tokio::net::UnixStream::connect(&socket).await.is_ok() {
-        vec![Target::Unix(socket)]
-    } else {
-        vec![]
-    })
+    if tokio::net::UnixStream::connect(&socket).await.is_err() {
+        return Ok(vec![]);
+    }
+    let target = Target::Unix(socket);
+    let remote = tokio::time::timeout(
+        Duration::from_secs(2),
+        connect(
+            &target,
+            None,
+            Arc::new(crate::surface_client::RemoteHost::default()),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("Runtime discovery handshake timed out; check the socket or use --connect")
+    })??;
+    remote.disconnect();
+    Ok(vec![target])
 }
 
 pub fn select(
@@ -56,21 +69,33 @@ pub fn select(
     }
 }
 
+/// Read one bounded numeric selection; EOF and invalid input are explicit errors.
+pub fn read_choice(mut input: impl std::io::BufRead, count: usize) -> anyhow::Result<usize> {
+    let mut answer = String::new();
+    if input.read_line(&mut answer)? == 0 {
+        anyhow::bail!("selection input closed");
+    }
+    let choice = answer
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|n| *n >= 1 && *n <= count)
+        .ok_or_else(|| anyhow::anyhow!("invalid selection; enter a number from 1 to {count}"))?;
+    Ok(choice - 1)
+}
+
 pub fn pick(targets: &[Target]) -> anyhow::Result<usize> {
-    use std::io::Write;
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return Ok(0);
+    }
     eprintln!("Choose a Runtime:");
     for (i, target) in targets.iter().enumerate() {
         eprintln!("  {}. {}", i + 1, target.label());
     }
     eprint!("> ");
     std::io::stderr().flush()?;
-    let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
-    answer
-        .trim()
-        .parse::<usize>()?
-        .checked_sub(1)
-        .ok_or_else(|| anyhow::anyhow!("invalid Runtime selection"))
+    read_choice(std::io::stdin().lock(), targets.len())
 }
 
 pub async fn connect(
@@ -102,6 +127,47 @@ pub async fn connect(
     })
     .await
     .map_err(|_| anyhow::anyhow!("Runtime connection timed out"))?
+}
+
+/// Limit WebSocket environment forwarding to portable context and explicit names.
+pub fn caller_environment(
+    websocket: bool,
+    forward: &[String],
+    vars: impl IntoIterator<Item = (String, String)>,
+) -> std::collections::BTreeMap<String, String> {
+    vars.into_iter()
+        .filter(|(key, _)| {
+            !websocket
+                || matches!(
+                    key.as_str(),
+                    "PATH"
+                        | "HOME"
+                        | "USER"
+                        | "SHELL"
+                        | "LANG"
+                        | "TERM"
+                        | "TMPDIR"
+                        | "VIRTUAL_ENV"
+                        | "CONDA_PREFIX"
+                )
+                || key.starts_with("LC_")
+                || forward.contains(key)
+        })
+        .collect()
+}
+
+/// Capture this Surface's environment under its local forwarding policy.
+pub fn session_environment(
+    remote: &RemoteBackend,
+    agent_dir: &Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let settings =
+        crate::config::Settings::load_file(&crate::config::paths::settings_path(agent_dir))?;
+    Ok(caller_environment(
+        remote.is_websocket(),
+        &settings.runtime.forward_env,
+        std::env::vars(),
+    ))
 }
 
 /// `setsid` plus closed stdin separates the owner from this terminal's lifetime.
@@ -167,18 +233,27 @@ async fn start_owner(
     host: Arc<dyn loop_protocol::HostServices>,
     auto_started: bool,
 ) -> anyhow::Result<Arc<RemoteBackend>> {
-    let mut child = spawn_owner(executable, agent_dir, cwd, socket, auto_started)?;
+    let mut child = if loop_app_core::runtime_instance::RuntimeInstanceLock::is_held(agent_dir)? {
+        None
+    } else {
+        Some(
+            spawn_owner(executable, agent_dir, cwd, socket, auto_started).map_err(|error| {
+                anyhow::anyhow!(
+                    "could not start Runtime: {error}; see {}",
+                    agent_dir.join("logs/runtime.log").display()
+                )
+            })?,
+        )
+    };
     let result = tokio::time::timeout(CONNECT_WAIT, async {
         loop {
             if let Ok(remote) = connect(&Target::Unix(socket.into()), None, host.clone()).await {
                 break Ok(remote);
             }
-            if let Some(status) = child.try_wait()? {
-                // Another launcher may have won the Runtime lock. Its socket
-                // may still be starting; wait for it under the same deadline.
-                if status.success() {
-                    anyhow::bail!("Runtime exited before accepting connections");
-                }
+            // Even a cleanly exited contender may have lost to a starting
+            // owner. Keep waiting for that owner's socket under one deadline.
+            if let Some(child) = &mut child {
+                let _ = child.try_wait()?;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -188,9 +263,11 @@ async fn start_owner(
     .and_then(|result| result);
     // Reap a child owned by this client without making it a Tokio child that
     // could be killed when the Surface exits.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    if let Some(mut child) = child {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
     result
 }
 
@@ -220,7 +297,7 @@ pub async fn compatible(remote: &RemoteBackend) -> anyhow::Result<bool> {
     if remote.server().version == env!("CARGO_PKG_VERSION") {
         return Ok(true);
     }
-    if remote.status().await?.loaded == 0 {
+    if replaceable(&remote.status().await?) {
         return Ok(false);
     }
     anyhow::bail!(
@@ -228,6 +305,10 @@ pub async fn compatible(remote: &RemoteBackend) -> anyhow::Result<bool> {
         remote.server().version,
         env!("CARGO_PKG_VERSION")
     )
+}
+
+fn replaceable(status: &loop_protocol::rpc::RuntimeStatus) -> bool {
+    status.auto_started && status.loaded == 0
 }
 
 pub async fn launch(
@@ -239,7 +320,10 @@ pub async fn launch(
 ) -> anyhow::Result<Arc<RemoteBackend>> {
     let target = match explicit {
         Some(value) => Some(Target::parse(value)),
-        None => select(&discover(agent_dir).await?, pick)?,
+        None => {
+            let targets = discover(agent_dir).await?;
+            tokio::task::spawn_blocking(move || select(&targets, pick)).await??
+        }
     };
     let executable = std::env::current_exe()?;
     let remote = match &target {
@@ -292,11 +376,13 @@ pub async fn launch(
     })
     .await
     .map_err(|_| anyhow::anyhow!("Runtime did not stop"))?;
-    eprintln!(
-        "loop: restarted an idle Runtime to use v{}",
+    let previous_version = remote.server().version.clone();
+    let replacement = start_and_connect(&executable, agent_dir, cwd, &socket, host).await?;
+    replacement.add_connection_notice(format!(
+        "Restarted an auto-started Runtime from v{previous_version} to v{}.",
         env!("CARGO_PKG_VERSION")
-    );
-    start_and_connect(&executable, agent_dir, cwd, &socket, host).await
+    ));
+    Ok(replacement)
 }
 
 /// Resolve an attach request before creating anything. Prefix ambiguity is an
@@ -324,7 +410,10 @@ pub fn resume_session(
         .collect();
     choices.sort_by_key(|info| std::cmp::Reverse(info.last_active_ms));
     if choices.is_empty() {
-        anyhow::bail!("no matching Session");
+        if id.is_some_and(|id| !id.is_empty()) {
+            anyhow::bail!("no Session matches that id; use --resume to choose one");
+        }
+        return Ok(None);
     }
     if latest {
         return Ok(Some(choices[0].r#ref.clone()));
@@ -348,15 +437,17 @@ pub async fn open(
     resume: Option<&str>,
     latest: bool,
 ) -> anyhow::Result<crate::SurfaceClient> {
-    let resumed = resume.is_some() || latest;
-    let session = if resumed {
-        resume_session(
-            &remote.list().await?,
-            &opts.cwd,
-            resume,
-            latest,
-            |choices| {
-                use std::io::Write;
+    let requested_resume = resume.is_some() || latest;
+    let selected = if requested_resume {
+        let infos = remote.list().await?;
+        let cwd = opts.cwd.clone();
+        let resume = resume.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            resume_session(&infos, &cwd, resume.as_deref(), latest, |choices| {
+                use std::io::{IsTerminal, Write};
+                if !std::io::stdin().is_terminal() {
+                    return Ok(0);
+                }
                 eprintln!("Choose a Session:");
                 for (i, info) in choices.iter().enumerate() {
                     eprintln!(
@@ -371,16 +462,33 @@ pub async fn open(
                 }
                 eprint!("> ");
                 std::io::stderr().flush()?;
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                answer
-                    .trim()
-                    .parse::<usize>()?
-                    .checked_sub(1)
-                    .ok_or_else(|| anyhow::anyhow!("invalid Session selection"))
-            },
-        )?
-        .unwrap()
+                read_choice(std::io::stdin().lock(), choices.len())
+            })
+        })
+        .await??
+    } else {
+        None
+    };
+    let resumed = selected.is_some();
+    if requested_resume && !resumed {
+        remote.add_connection_notice(
+            "No previous Sessions in this folder; started a new Session.".into(),
+        );
+    }
+    let session = if let Some(session) = selected {
+        remote
+            .load_session(
+                &session,
+                loop_protocol::SessionSpec {
+                    env: Some(session_environment(
+                        &remote,
+                        &crate::config::paths::get_agent_dir(),
+                    )?),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        session
     } else {
         if !remote.capabilities().session_environment {
             anyhow::bail!("Runtime does not accept per-Session environments");
@@ -388,7 +496,10 @@ pub async fn open(
         remote
             .new_session(loop_protocol::SessionSpec {
                 cwd: Some(opts.cwd.clone()),
-                env: Some(std::env::vars().collect()),
+                env: Some(session_environment(
+                    &remote,
+                    &crate::config::paths::get_agent_dir(),
+                )?),
                 name: None,
                 options: Some(loop_protocol::SessionOptions {
                     provider: opts.provider.clone(),
@@ -482,5 +593,65 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[test]
+    fn websocket_environment_uses_the_allowlist_and_explicit_forward_env_names() {
+        let vars = [
+            ("PATH", "/bin"),
+            ("HOME", "/home/test"),
+            ("USER", "test"),
+            ("SHELL", "/bin/sh"),
+            ("LANG", "en"),
+            ("LC_CTYPE", "en"),
+            ("TERM", "xterm"),
+            ("TMPDIR", "/tmp"),
+            ("VIRTUAL_ENV", "/venv"),
+            ("CONDA_PREFIX", "/conda"),
+            ("TASK_VALUE", "approved"),
+            ("SENTINEL_SECRET", "do-not-forward"),
+            ("OPENAI_API_KEY", "do-not-forward"),
+            ("LOOP_RUNTIME_TOKEN", "do-not-forward"),
+        ];
+        let vars = || {
+            vars.iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+        };
+        let remote = caller_environment(true, &["TASK_VALUE".into()], vars());
+        assert_eq!(remote.len(), 11);
+        assert_eq!(remote["TASK_VALUE"], "approved");
+        assert!(!remote.contains_key("SENTINEL_SECRET"));
+        assert!(!remote.contains_key("OPENAI_API_KEY"));
+        assert!(!remote.contains_key("LOOP_RUNTIME_TOKEN"));
+        assert_eq!(caller_environment(false, &[], vars()).len(), 14);
+    }
+    #[test]
+    fn missing_history_and_picker_input_have_friendly_results() {
+        assert!(
+            resume_session(&[], Path::new("/work"), None, true, |_| panic!())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(read_choice(std::io::Cursor::new("2\n"), 2).unwrap(), 1);
+        for input in ["", "0\n", "9\n", "abc\n"] {
+            let error = read_choice(std::io::Cursor::new(input), 2)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("selection") || error.contains("closed"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_known_auto_started_empty_owner_can_be_version_replaced() {
+        let mut status: loop_protocol::rpc::RuntimeStatus = serde_json::from_value(serde_json::json!({
+            "pid":1,"socket":"/tmp/runtime.sock","generation":1,"loaded":0,"busy":0,"max_sessions":16,"max_active_turns":8
+        })).unwrap();
+        assert!(!replaceable(&status));
+        status.auto_started = true;
+        assert!(replaceable(&status));
+        status.loaded = 1;
+        assert!(!replaceable(&status));
     }
 }

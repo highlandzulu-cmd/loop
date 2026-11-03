@@ -59,6 +59,7 @@ use crate::{PendingAgent, StartupSessions, SurfaceClient};
 use loop_app_core::permissions::PermissionMode;
 
 enum UiEvent {
+    RuntimeLost,
     UpdateAvailable(String),
     /// `/changelog` loaded the running version's release notes (or failed).
     Changelog(Result<String, String>),
@@ -381,6 +382,13 @@ async fn run_loop(
             if let Err(error) = result {
                 tracing::debug!(%error, "Update check skipped");
             }
+        });
+    }
+    if let Some(closed) = runtime.connection_closed() {
+        let closed_tx = tx.clone();
+        tokio::spawn(async move {
+            closed.await;
+            let _ = closed_tx.send(UiEvent::RuntimeLost);
         });
     }
     ensure_forwarding(runtime, runtime.backend().as_ref(), &tx);
@@ -1520,6 +1528,15 @@ async fn drain_ui_events(
 ) {
     while let Ok(ev) = rx.try_recv() {
         match ev {
+            UiEvent::RuntimeLost => {
+                *working = false;
+                turn_step.clear();
+                *status = "Runtime disconnected".into();
+                push_before_queued(
+                    chat,
+                    sys("Runtime connection lost; run `loop --continue` to reattach"),
+                );
+            }
             UiEvent::UpdateAvailable(message) => {
                 push_before_queued(chat, sys(message));
             }

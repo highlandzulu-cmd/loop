@@ -186,6 +186,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         #[cfg(feature = "usage")]
         agent_dir: agent_dir.clone(),
         listen_url,
+        auto_started: args.auto_started,
     });
 
     let info = PeerInfo {
@@ -356,6 +357,7 @@ impl Limits {
 /// The Runtime as one socket serves it: `runtime/status` names this socket
 /// and `runtime/stop` ends the accept loop like a signal does.
 struct Control {
+    auto_started: bool,
     runtime: Arc<loop_runtime::Runtime>,
     socket: PathBuf,
     stop: tokio_util::sync::CancellationToken,
@@ -632,6 +634,7 @@ impl loop_wire::RuntimeControl for Control {
     }
     async fn status(&self) -> loop_protocol::BackendResult<loop_protocol::rpc::RuntimeStatus> {
         let mut status = self.runtime.status();
+        status.auto_started = self.auto_started;
         status.socket = self.socket.clone();
         status.listen_url = self.listen_url.clone();
         status.max_sessions_from = Some(self.limits.max_sessions.1.into());

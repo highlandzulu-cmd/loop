@@ -42,7 +42,7 @@ struct Cli {
     append_system_prompt: Option<String>,
 
     /// Do not load AGENTS.md / CLAUDE.md context files.
-    #[arg(long, global = true)]
+    #[arg(long, short = 'c', global = true)]
     no_context_files: bool,
 
     /// Resume a session by id (Loop's own or an external agent's). With no
@@ -51,12 +51,7 @@ struct Cli {
     resume: Option<String>,
 
     /// Resume the most recent session in this folder.
-    #[arg(
-        long = "continue",
-        short = 'c',
-        global = true,
-        conflicts_with = "resume"
-    )]
+    #[arg(long = "continue", global = true, conflicts_with = "resume")]
     continue_last: bool,
 
     /// Run without the web_search and web_fetch tools.
@@ -571,40 +566,34 @@ async fn real_main() -> anyhow::Result<()> {
             session_id: cli.resume.clone(),
             agent: None,
         };
-        let connected =
-            async {
-                // Trust must be recorded on the host before the daemon loads any
-                // project settings or hooks for a newly opened local workspace.
-                if cli.connect.as_ref().is_none_or(|target| {
-                    !target.starts_with("ws://") && !target.starts_with("wss://")
-                }) {
-                    let mut trust =
-                        config::trust::TrustStore::load(config::paths::trust_path(&agent_dir))?;
-                    let settings =
-                        config::Settings::load_file(&config::paths::settings_path(&agent_dir))?;
-                    loop_app_core::runtime::resolve_trust(&mut trust, &opts.cwd, &settings, true)?;
-                }
-                let host = std::sync::Arc::new(loop_cli::surface_client::RemoteHost::default());
-                let remote = loop_cli::runtime_launch::launch(
-                    cli.connect.as_deref(),
-                    cli.token_file.as_deref(),
-                    &agent_dir,
-                    &opts.cwd,
-                    host.clone(),
-                )
-                .await?;
-                Ok::<_, anyhow::Error>((remote, host))
+        let connected = async {
+            // Trust must be recorded on the host before the daemon loads any
+            // project settings or hooks for a newly opened local workspace.
+            if cli.connect.is_none() {
+                let mut trust =
+                    config::trust::TrustStore::load(config::paths::trust_path(&agent_dir))?;
+                let settings =
+                    config::Settings::load_file(&config::paths::settings_path(&agent_dir))?;
+                loop_app_core::runtime::resolve_trust(&mut trust, &opts.cwd, &settings, true)?;
             }
-            .await;
+            let host = std::sync::Arc::new(loop_cli::surface_client::RemoteHost::default());
+            let remote = loop_cli::runtime_launch::launch(
+                cli.connect.as_deref(),
+                cli.token_file.as_deref(),
+                &agent_dir,
+                &opts.cwd,
+                host.clone(),
+            )
+            .await?;
+            let resume = match startup_sessions {
+                Some(loop_cli::StartupSessions::Pick) => Some(""),
+                _ => cli.resume.as_deref(),
+            };
+            loop_cli::runtime_launch::open(remote, host, &opts, resume, cli.continue_last).await
+        }
+        .await;
         match connected {
-            Ok((remote, host)) => {
-                let resume = match startup_sessions {
-                    Some(loop_cli::StartupSessions::Pick) => Some(""),
-                    _ => cli.resume.as_deref(),
-                };
-                let mut client =
-                    loop_cli::runtime_launch::open(remote, host, &opts, resume, cli.continue_last)
-                        .await?;
+            Ok(mut client) => {
                 client.debug = debug;
                 client.debug_log_path = debug_log_path;
                 let result = loop_cli::app::run(client).await;
@@ -729,9 +718,12 @@ mod tests {
     #[test]
     fn interactive_connection_and_continue_flags_parse() {
         let cli = parse(&["loop", "-c", "--connect", "/tmp/runtime.sock"]);
-        assert!(cli.continue_last);
-        assert!(!cli.no_context_files);
+        assert!(!cli.continue_last);
+        assert!(cli.no_context_files);
         assert_eq!(cli.connect.as_deref(), Some("/tmp/runtime.sock"));
+        assert!(parse(&["loop", "-c", "--resume", "id"]).no_context_files);
+        assert!(parse(&["loop", "--continue"]).continue_last);
+
         let cli = parse(&[
             "loop",
             "--resume",
