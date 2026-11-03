@@ -5,10 +5,14 @@ use std::{collections::HashMap, sync::Arc};
 #[cfg(test)]
 use tokio::sync::{oneshot, Notify};
 
+/// Where an armed pause reports arrival, and how it is released.
+#[cfg(test)]
+type Armed = (Arc<Notify>, oneshot::Receiver<bool>);
+
 #[derive(Default)]
 pub(super) struct Pauses {
     #[cfg(test)]
-    armed: std::sync::Mutex<HashMap<&'static str, (Arc<Notify>, oneshot::Receiver<bool>)>>,
+    armed: std::sync::Mutex<HashMap<&'static str, Armed>>,
     #[cfg(test)]
     signals: std::sync::Mutex<HashMap<&'static str, Arc<Notify>>>,
 }
