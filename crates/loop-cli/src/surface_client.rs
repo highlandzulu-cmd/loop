@@ -35,6 +35,9 @@ use native_host::NativeHost;
 /// ```
 pub struct SurfaceClient {
     host: NativeHost,
+    /// Tests start their own sandboxes instead of a platform one.
+    #[cfg(test)]
+    pub(crate) sandbox_starter: Option<native_admin::SandboxStarter>,
     confirm_timeout_default: Option<u64>,
     sessions: Arc<dyn RuntimeControl>,
     native_sessions: Arc<native_sessions::NativeSessions>,
@@ -128,6 +131,8 @@ impl From<CliRuntime> for SurfaceClient {
             native_backend: native,
             workspace_id,
             host: NativeHost { inner },
+            #[cfg(test)]
+            sandbox_starter: None,
             confirm_timeout_default: None,
             keybindings,
             debug,
@@ -299,6 +304,7 @@ impl SurfaceClient {
         self.host.inner.active_skills.clear();
         self.refresh_native_model();
         self.host.restore_session_approvals().await;
+        self.restore_sandbox().await;
         Ok(())
     }
 
@@ -532,18 +538,19 @@ impl SurfaceClient {
         &mut self,
         provider: &str,
         id: &str,
-    ) -> anyhow::Result<loop_ai::Model> {
+    ) -> anyhow::Result<(loop_ai::Model, bool)> {
         if loop_ai::CredentialStore::is_logged_out(self.host.inner.credentials.as_ref(), provider) {
             anyhow::bail!("{provider} is logged out; run /login {provider}");
         }
         let model = self.resolve_model(&format!("{provider}/{id}")).await?;
         let session = self.host.inner.native.current_session().await;
-        self.native_control()?
+        let changed = self
+            .native_control()?
             .set_model(&session, &format!("{provider}/{id}"), None)
             .await?;
         self.host.inner.selected_model = Some(model.clone());
         self.host.inner.model_note = None;
-        Ok(model)
+        Ok((model, changed.pending))
     }
 
     pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {
@@ -663,6 +670,9 @@ impl SurfaceClient {
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+mod sandbox_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1135,8 +1145,11 @@ impl SurfaceClient {
         self.backend().capabilities().session_ttfb && self.backend().model_control().is_some()
     }
     pub fn sandbox_service(&self) -> Arc<dyn loop_wire::RuntimeAdmin> {
+        Arc::new(self.native_sandbox())
+    }
+    fn native_sandbox(&self) -> native_admin::NativeSandbox {
         let r = &self.host.inner;
-        Arc::new(native_admin::NativeSandbox {
+        native_admin::NativeSandbox {
             native: r.native.clone(),
             harness: r.harness.clone(),
             cwd: r.cwd.clone(),
@@ -1145,7 +1158,24 @@ impl SurfaceClient {
             web: r.web_tools(),
             search: r.tool_gate.search_filter(),
             bash: r.bash_limits(),
-        })
+            #[cfg(test)]
+            starter: self.sandbox_starter.clone(),
+        }
+    }
+    /// Put the opened Session back in the sandbox it last chose. A failure
+    /// is shown with the other startup notices; the Session keeps the
+    /// sandbox it has.
+    pub async fn restore_sandbox(&mut self) {
+        if !self.is_native() {
+            return;
+        }
+        if let Err(error) = self.native_sandbox().restore().await {
+            tracing::warn!("could not restore the Session's sandbox: {error}");
+            self.host
+                .inner
+                .startup_notices
+                .push(format!("Could not restore this Session's sandbox: {error}"));
+        }
     }
     pub fn clear_session_approvals(&self) {
         self.host.clear_session_approvals();

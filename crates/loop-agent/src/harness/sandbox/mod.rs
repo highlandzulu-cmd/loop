@@ -4,6 +4,7 @@ mod krun;
 mod podman;
 mod registry;
 pub mod seatbelt;
+mod tagged;
 mod traits;
 
 pub use krun::{
@@ -15,6 +16,7 @@ pub use podman::{
     RealPodmanClient,
 };
 pub use registry::SandboxRegistry;
+pub use tagged::TaggedSandbox;
 pub use traits::{
     Sandbox, SandboxConfig, SandboxError, SandboxFactory, SandboxInfo, SandboxMode, SandboxStatus,
 };

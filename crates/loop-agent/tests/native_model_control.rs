@@ -515,14 +515,13 @@ async fn an_acknowledged_change_during_a_turn_is_already_recorded() {
                 ..
             }
         )));
-        // The model never changes mid-turn, here as on a Runtime.
-        assert_eq!(
-            control
-                .set_model(&session, "faux/two/with-slash", None)
-                .await
-                .unwrap_err(),
-            BackendError::Busy
-        );
+        // The model never changes mid-turn: it is accepted and waits.
+        let model = control
+            .set_model(&session, "faux/two/with-slash", None)
+            .await
+            .unwrap();
+        assert!(model.pending);
+        assert_eq!(harness.model().await.unwrap().id, "one");
         backend.cancel(&session);
         turn.outcome().await;
         control
@@ -663,4 +662,366 @@ async fn tool_running(rx: &mut broadcast::Receiver<UpdateEnvelope>) {
             return;
         }
     }
+}
+
+/// A model chosen during a turn is recorded and reported as pending, the
+/// running turn keeps its model, and the next turn starts on the new one.
+#[tokio::test]
+async fn a_model_change_during_a_turn_applies_from_the_next_turn() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(
+            vec![
+                FauxResponse::ToolCalls(vec![ToolCall {
+                    id: "w1".into(),
+                    name: "wait".into(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }]),
+                FauxResponse::Text("after".into()),
+                FauxResponse::Text("next".into()),
+            ],
+            vec![wait_tool()],
+        )
+        .await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let session = backend.current_session().await;
+        let mut rx = backend.subscribe();
+        let handle = backend
+            .prompt(&session, vec![ContentBlock::text("wait")])
+            .await
+            .unwrap();
+        tool_running(&mut rx).await;
+        let control = backend.model_control().unwrap();
+        let result = control
+            .set_model(&session, "faux/two/with-slash", None)
+            .await
+            .unwrap();
+        assert!(result.pending);
+        assert!(result.applies_after_turn.is_some());
+        let (_, changed) = config_changed(&mut rx).await;
+        assert!(changed.pending);
+        assert_eq!(changed.config.model.as_deref(), Some("faux/two/with-slash"));
+        assert_eq!(changed.effective.model.as_deref(), Some("faux/one"));
+        // The running turn is unaffected.
+        assert_eq!(harness.model().await.unwrap().id, "one");
+        let entries = harness.read_session_entries().await.unwrap();
+        assert!(entries.iter().any(|e| matches!(
+            e,
+            SessionTreeEntry::ModelChange { model_id, .. } if model_id == "two/with-slash"
+        )));
+
+        backend.cancel(&session);
+        tokio::time::timeout(Duration::from_secs(5), handle.outcome())
+            .await
+            .unwrap();
+        let changed = loop {
+            let (_, changed) = config_changed(&mut rx).await;
+            if !changed.pending {
+                break changed;
+            }
+        };
+        assert_eq!(
+            changed.effective.model.as_deref(),
+            Some("faux/two/with-slash")
+        );
+
+        let next = backend
+            .prompt(&session, vec![ContentBlock::text("again")])
+            .await
+            .unwrap();
+        assert_eq!(harness.model().await.unwrap().id, "two/with-slash");
+        tokio::time::timeout(Duration::from_secs(5), next.outcome())
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Work filed during a turn waits for the next one; a newer job of the same
+/// key replaces it (and is told); an idle backend hands the job back.
+#[tokio::test]
+async fn work_filed_during_a_turn_runs_when_the_next_turn_starts() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex as StdMutex;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(
+            vec![
+                FauxResponse::ToolCalls(vec![ToolCall {
+                    id: "w1".into(),
+                    name: "wait".into(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }]),
+                FauxResponse::Text("after".into()),
+                FauxResponse::Text("next".into()),
+            ],
+            vec![wait_tool()],
+        )
+        .await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let session = backend.current_session().await;
+        let log = Arc::new(StdMutex::new(Vec::<(u32, bool)>::new()));
+        let ran = Arc::new(AtomicU32::new(0));
+        let job = |id: u32| -> loop_agent::native_backend::NextTurnJob {
+            let log = Arc::clone(&log);
+            let ran = Arc::clone(&ran);
+            Box::new(move |apply| {
+                Box::pin(async move {
+                    ran.fetch_add(1, Ordering::SeqCst);
+                    log.lock().unwrap().push((id, apply));
+                })
+            })
+        };
+        // Idle: handed back, nothing runs.
+        assert!(backend.after_turn("k", job(0)).await.is_some());
+        assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+        let mut rx = backend.subscribe();
+        let handle = backend
+            .prompt(&session, vec![ContentBlock::text("wait")])
+            .await
+            .unwrap();
+        tool_running(&mut rx).await;
+        assert!(backend.after_turn("k", job(1)).await.is_none());
+        assert!(backend.after_turn("k", job(2)).await.is_none());
+        // The replaced job was released; the kept one has not run.
+        assert_eq!(*log.lock().unwrap(), vec![(1, false)]);
+
+        backend.cancel(&session);
+        tokio::time::timeout(Duration::from_secs(5), handle.outcome())
+            .await
+            .unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1, "waits for the next turn");
+        let next = backend
+            .prompt(&session, vec![ContentBlock::text("again")])
+            .await
+            .unwrap();
+        assert_eq!(*log.lock().unwrap(), vec![(1, false), (2, true)]);
+        tokio::time::timeout(Duration::from_secs(5), next.outcome())
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
+
+fn running_prompt_responses() -> Vec<FauxResponse> {
+    vec![
+        FauxResponse::ToolCalls(vec![ToolCall {
+            id: "w1".into(),
+            name: "wait".into(),
+            arguments: json!({}),
+            thought_signature: None,
+        }]),
+        FauxResponse::Text("after".into()),
+        FauxResponse::Text("next".into()),
+    ]
+}
+
+/// An older queued job never outlives a newer choice of its key, even when
+/// the newer one arrives with the backend idle.
+#[tokio::test]
+async fn an_idle_job_releases_an_older_queued_one_of_its_key() {
+    use std::sync::Mutex as StdMutex;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(running_prompt_responses(), vec![wait_tool()]).await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let session = backend.current_session().await;
+        let log = Arc::new(StdMutex::new(Vec::<(u32, bool)>::new()));
+        let job = |id: u32| -> loop_agent::native_backend::NextTurnJob {
+            let log = Arc::clone(&log);
+            Box::new(move |apply| Box::pin(async move { log.lock().unwrap().push((id, apply)) }))
+        };
+        let mut rx = backend.subscribe();
+        let handle = backend
+            .prompt(&session, vec![ContentBlock::text("wait")])
+            .await
+            .unwrap();
+        tool_running(&mut rx).await;
+        assert!(backend.after_turn("k", job(1)).await.is_none());
+        backend.cancel(&session);
+        tokio::time::timeout(Duration::from_secs(5), handle.outcome())
+            .await
+            .unwrap();
+        // Idle again: the newer job is handed back and the older one released.
+        let mut idle = false;
+        for _ in 0..100 {
+            if !backend.is_busy(&session) {
+                idle = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(idle);
+        assert!(backend.after_turn("k", job(2)).await.is_some());
+        assert_eq!(*log.lock().unwrap(), vec![(1, false)]);
+        let next = backend
+            .prompt(&session, vec![ContentBlock::text("again")])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), next.outcome())
+            .await
+            .unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![(1, false)],
+            "the stale job does not run at the next prompt"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A job that is still preparing when the user cancels stops the prompt
+/// before its first model call.
+#[tokio::test]
+async fn cancelling_while_the_next_turn_prepares_stops_the_prompt() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(running_prompt_responses(), vec![wait_tool()]).await;
+        let backend = Arc::new(NativeBackend::new(Arc::clone(&harness)).await);
+        let session = backend.current_session().await;
+        let mut rx = backend.subscribe();
+        let handle = backend
+            .prompt(&session, vec![ContentBlock::text("wait")])
+            .await
+            .unwrap();
+        tool_running(&mut rx).await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = std::sync::Mutex::new(Some(started_tx));
+        let job: loop_agent::native_backend::NextTurnJob = Box::new(move |apply| {
+            Box::pin(async move {
+                if apply {
+                    if let Some(tx) = started_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    let _ = release_rx.await;
+                }
+            })
+        });
+        assert!(backend.after_turn("k", job).await.is_none());
+        backend.cancel(&session);
+        tokio::time::timeout(Duration::from_secs(5), handle.outcome())
+            .await
+            .unwrap();
+        let prompting = {
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            tokio::spawn(async move {
+                backend
+                    .prompt(&session, vec![ContentBlock::text("again")])
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // The job is paused mid-preparation: there is no turn to abort yet.
+        backend.cancel(&session);
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), prompting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err(), "the cancelled prompt must not start");
+        // Only the first turn's model call (and its tool follow-up) happened.
+        let entries = harness.read_session_entries().await.unwrap();
+        assert!(!entries
+            .iter()
+            .any(|e| format!("{e:?}").contains("\"again\"")));
+        assert!(!backend.is_busy(&session));
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Shutdown waits for a job that is preparing and releases the ones still
+/// queued, once each.
+#[tokio::test]
+async fn shutdown_releases_queued_jobs_and_waits_for_a_preparing_one() {
+    use std::sync::Mutex as StdMutex;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(running_prompt_responses(), vec![wait_tool()]).await;
+        let backend = Arc::new(NativeBackend::new(Arc::clone(&harness)).await);
+        let session = backend.current_session().await;
+        let log = Arc::new(StdMutex::new(Vec::<(&'static str, bool)>::new()));
+        let mut rx = backend.subscribe();
+        let handle = backend
+            .prompt(&session, vec![ContentBlock::text("wait")])
+            .await
+            .unwrap();
+        tool_running(&mut rx).await;
+        let queued = {
+            let log = Arc::clone(&log);
+            Box::new(move |apply| {
+                Box::pin(async move { log.lock().unwrap().push(("queued", apply)) })
+                    as futures::future::BoxFuture<'static, ()>
+            }) as loop_agent::native_backend::NextTurnJob
+        };
+        assert!(backend.after_turn("k", queued).await.is_none());
+        backend.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(5), handle.outcome())
+            .await
+            .unwrap();
+        assert_eq!(*log.lock().unwrap(), vec![("queued", false)]);
+        backend.shutdown().await;
+        assert_eq!(log.lock().unwrap().len(), 1, "released once");
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A recorded sandbox choice is announced as pending then effective, is
+/// saved in the Session, and is read back when the Session is restored.
+#[tokio::test]
+async fn a_sandbox_choice_is_recorded_announced_and_restored() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(running_prompt_responses(), vec![wait_tool()]).await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let session = backend.current_session().await;
+        let mut rx = backend.subscribe();
+        let handle = backend
+            .prompt(&session, vec![ContentBlock::text("wait")])
+            .await
+            .unwrap();
+        tool_running(&mut rx).await;
+        let choice = json!({"mode": "local", "isolation": "full"});
+        let result = backend
+            .record_sandbox(&session, choice.clone(), None, true)
+            .await
+            .unwrap();
+        assert!(result.pending);
+        let (_, changed) = config_changed(&mut rx).await;
+        assert!(changed.pending);
+        assert_eq!(changed.config.sandbox.as_deref(), Some("local/full"));
+        assert_eq!(changed.effective.sandbox, None);
+
+        backend.cancel(&session);
+        tokio::time::timeout(Duration::from_secs(5), handle.outcome())
+            .await
+            .unwrap();
+        // The turn ended, but the sandbox is not installed until the next one.
+        loop {
+            let (_, changed) = config_changed(&mut rx).await;
+            if !changed.pending {
+                assert_eq!(changed.effective.sandbox, None);
+                break;
+            }
+        }
+        backend.sandbox_applied();
+        let (_, changed) = config_changed(&mut rx).await;
+        assert_eq!(changed.effective.sandbox.as_deref(), Some("local/full"));
+        assert_eq!(changed.config.sandbox.as_deref(), Some("local/full"));
+
+        backend.restore_config().await.unwrap();
+        assert_eq!(backend.recorded_sandbox(), Some(choice));
+        assert_eq!(
+            backend.config().config.sandbox.as_deref(),
+            Some("local/full")
+        );
+    })
+    .await
+    .expect("test timed out");
 }

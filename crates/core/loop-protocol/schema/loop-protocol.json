@@ -2565,6 +2565,13 @@
             "integer",
             "null"
           ]
+        },
+        "sandbox": {
+          "description": "The sandbox chosen for the Session: `off`, or `local` followed by\nits isolation and runtime when set (`local/full/krun`). Absent uses\nthe workspace default.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "type": "object"
