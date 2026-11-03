@@ -646,3 +646,105 @@ async fn export_limits_the_whole_encoded_response() {
     .await
     .unwrap();
 }
+
+/// Open `session` the way a standalone (non-Runtime) process resumes it.
+async fn open_standalone(rt: &Runtime, session: &str) -> OpenedSession {
+    let d = &rt.defaults;
+    let opts = BootstrapOpts {
+        cwd: d.cwd.clone(),
+        provider: d.provider.clone(),
+        model: d.model.clone(),
+        theme: None,
+        system_prompt: None,
+        append_system_prompt: None,
+        no_context_files: true,
+        interactive: false,
+        session_id: Some(session.into()),
+        no_web: true,
+        permission_mode: d.permission_mode.clone(),
+        agent: None,
+    };
+    let workspace = rt.factory.workspace(&opts).await.unwrap();
+    rt.factory.open(workspace, &opts).await.unwrap()
+}
+
+#[tokio::test]
+async fn copied_and_imported_sessions_never_restore_approval_grants() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_protocol::rpc::*;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 8).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        run(&rt, &source, "granted").await;
+        let store = rt.factory.globals.repository.store();
+        for group in ["bash", "file"] {
+            store
+                .append_entry(
+                    &source.native_id,
+                    loop_agent::harness::session::PendingSessionWrite::Label {
+                        label: format!(
+                            "{}{group}",
+                            loop_app_core::tool_approval::AUTO_APPROVE_LABEL_PREFIX
+                        ),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let exported = rt.export(&source).await.unwrap();
+        assert!(exported.jsonl.contains("loop.toolApproval:auto:bash"));
+        let cloned = rt
+            .clone_session(CloneParams {
+                session: source.clone(),
+                name: None,
+                request_id: "grant-clone".into(),
+            })
+            .await
+            .unwrap();
+        let tree = rt
+            .tree(TreeParams {
+                session: source.clone(),
+                cursor: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let forked = rt
+            .fork(ForkParams {
+                session: source.clone(),
+                before_entry_id: tree.fork_points[0].entry_id.clone(),
+                name: None,
+                request_id: "grant-fork".into(),
+            })
+            .await
+            .unwrap();
+        let imported = rt
+            .import(ImportParams {
+                workspace_id: cloned.workspace_id.clone(),
+                jsonl: exported.jsonl,
+                request_id: "grant-import".into(),
+            })
+            .await
+            .unwrap();
+        rt.shutdown().await;
+        let standalone = open_standalone(&rt, &source.native_id).await;
+        assert!(
+            !standalone.approval_bridge.should_ask("bash"),
+            "the source keeps its own grant"
+        );
+        drop(standalone);
+        for copy in [cloned, forked, imported] {
+            let opened = open_standalone(&rt, &copy.session.native_id).await;
+            assert!(opened.approval_bridge.auto_approve_groups().is_empty());
+            assert!(opened.approval_bridge.should_ask("bash"));
+            let entries = opened.harness.read_session_entries().await.unwrap();
+            assert!(!entries.iter().any(|entry| matches!(
+                entry,
+                loop_agent::harness::session::SessionTreeEntry::Label { label, .. }
+                    if label.starts_with("loop.toolApproval:")
+            )));
+        }
+    })
+    .await
+    .unwrap();
+}

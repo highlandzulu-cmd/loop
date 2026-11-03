@@ -1374,6 +1374,9 @@ impl SqliteSessionStore {
                     SessionTreeEntry::ThinkingLevelChange { thinking_level, .. } => PendingSessionWrite::ThinkingLevelChange { thinking_level },
                     SessionTreeEntry::ModelChange { provider, model_id, .. } => PendingSessionWrite::ModelChange { provider, model_id },
                     SessionTreeEntry::ActiveToolsChange { tool_names, .. } => PendingSessionWrite::ActiveToolsChange { tool_names },
+                    // Approval grants belong to the source Session, never to a copy.
+                    SessionTreeEntry::Label { label, .. }
+                        if label.starts_with(super::super::TOOL_APPROVAL_LABEL_NAMESPACE) => continue,
                     SessionTreeEntry::Label { label, .. } => PendingSessionWrite::Label { label },
                     SessionTreeEntry::SessionInfo { .. } => continue,
                     SessionTreeEntry::Compaction { summary, first_kept_entry_id, .. } => PendingSessionWrite::Compaction {

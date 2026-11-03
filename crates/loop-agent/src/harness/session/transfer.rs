@@ -298,6 +298,10 @@ fn markdown_message(out: &mut String, message: &AgentMessage) {
     }
 }
 
+/// Label namespace for Session approval grants. Grants are live authority of
+/// the Session that recorded them; a copy, fork or import never carries them.
+pub const TOOL_APPROVAL_LABEL_NAMESPACE: &str = "loop.toolApproval:";
+
 /// Write `file`'s entries into a new Session in `store`, opened in `cwd`,
 /// and return its id.
 ///
