@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod agent_loop;
+pub mod effort;
 pub mod harness;
 pub mod messages;
 pub mod native_backend;

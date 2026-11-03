@@ -377,7 +377,7 @@ impl AgentManager {
             let control = backend
                 .model_control()
                 .ok_or_else(|| anyhow!("{id} does not let Loop choose its model"))?;
-            control.set_model(&session, model).await?;
+            control.set_model(&session, model, None).await?;
         }
         // Carry the last chosen effort over when this model offers it.
         if let (Some(effort), Some(control)) = (self.effort(id), backend.model_control()) {
@@ -386,7 +386,7 @@ impl AgentManager {
                 .await
                 .is_ok_and(|e| e.models.iter().any(|m| m.id == effort));
             if offered {
-                let _ = control.set_effort(&session, &effort).await;
+                let _ = control.set_effort(&session, &effort, None).await;
             }
         }
         self.record(AgentSessionRecord {

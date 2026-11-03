@@ -4565,9 +4565,11 @@ fn handle_update(
         // Within a turn only the latest checklist shows, in place.
         SessionUpdate::Plan { entries } => *live_plan = Some(entries),
         // Approvals arrive through HostServices, not the update stream;
-        // unknown updates come from newer backends.
+        // this TUI changes model and effort itself and shows them from its
+        // own state; unknown updates come from newer backends.
         SessionUpdate::InteractionRequested { .. }
         | SessionUpdate::InteractionResolved { .. }
+        | SessionUpdate::ConfigChanged(_)
         | SessionUpdate::Unknown(_) => {}
     }
 }

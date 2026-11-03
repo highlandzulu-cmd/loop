@@ -99,7 +99,6 @@ pub type ToolFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
 /// Agent harness.
 pub struct AgentHarness {
-    #[allow(dead_code)]
     models: Arc<Models>,
     stream_fn: StreamFn,
     session: Arc<tokio::sync::Mutex<Session>>,
@@ -120,6 +119,10 @@ pub struct AgentHarness {
     sandbox: RwLock<SandboxMode>,
     phase: Mutex<AgentHarnessPhase>,
     pending_writes: Arc<Mutex<Vec<PendingSessionWrite>>>,
+    /// Model and effort choices made during a turn. Unlike `pending_writes`
+    /// they are kept when the turn is cancelled: they are the Session's
+    /// config, not the turn's output.
+    pending_config: Mutex<Vec<PendingSessionWrite>>,
     steering: Arc<Mutex<VecDeque<AgentMessage>>>,
     follow_up: Arc<Mutex<VecDeque<AgentMessage>>>,
     next_turn: Mutex<VecDeque<AgentMessage>>,
@@ -170,6 +173,7 @@ impl AgentHarness {
             sandbox: RwLock::new(options.sandbox),
             phase: Mutex::new(AgentHarnessPhase::Idle),
             pending_writes: Arc::new(Mutex::new(Vec::new())),
+            pending_config: Mutex::new(Vec::new()),
             steering: Arc::new(Mutex::new(VecDeque::new())),
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             next_turn: Mutex::new(VecDeque::new()),
@@ -523,6 +527,55 @@ impl AgentHarness {
     /// Set thinking level.
     pub async fn set_thinking_level(&self, level: AgentThinkingLevel) {
         *self.thinking_level.write().await = level;
+    }
+
+    /// The thinking level the next turn starts with.
+    pub async fn thinking_level(&self) -> AgentThinkingLevel {
+        *self.thinking_level.read().await
+    }
+
+    /// The model registry the harness resolves models from.
+    pub fn models(&self) -> &Arc<Models> {
+        &self.models
+    }
+
+    /// Record a model or effort choice in the active Session's tree
+    /// (immediately when idle, after the running turn otherwise).
+    pub async fn record_config(&self, write: PendingSessionWrite) -> Result<(), AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        if *self.phase.lock() == AgentHarnessPhase::Idle {
+            let session = self.session.lock().await;
+            session
+                .store()
+                .append_entry(&session.metadata().id, write)
+                .await
+                .map_err(AgentHarnessError::Session)?;
+        } else {
+            self.pending_config.lock().push(write);
+        }
+        Ok(())
+    }
+
+    /// The active Session's recorded model, effort, name and config revision.
+    pub async fn session_config(
+        &self,
+    ) -> Result<crate::harness::session::types::SessionConfigEntries, AgentHarnessError> {
+        let session = self.session.lock().await;
+        let reader = session.reader();
+        let head = reader
+            .read_head()
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let entries = reader
+            .read_entries(None)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let mut config =
+            crate::harness::session::types::config_from_entries(&entries, head.as_deref());
+        if config.name.is_none() {
+            config.name = session.metadata().name.clone();
+        }
+        Ok(config)
     }
 
     /// Set native streaming deadline settings.
@@ -1301,9 +1354,16 @@ impl AgentHarness {
         let result = self.run_turn_inner(input, token.clone()).await;
 
         let writes = std::mem::take(&mut *self.pending_writes.lock());
+        let config = std::mem::take(&mut *self.pending_config.lock());
         // Aborted turns should leave no session footprint so a follow-up prompt
-        // (or UI "stop") behaves as if the turn never ran.
-        if !token.is_cancelled() {
+        // (or UI "stop") behaves as if the turn never ran. Config chosen
+        // meanwhile is kept either way.
+        let writes = if token.is_cancelled() {
+            config
+        } else {
+            writes.into_iter().chain(config).collect()
+        };
+        if !writes.is_empty() {
             let session = self.session.lock().await;
             let store = session.store();
             let sid = session.metadata().id.clone();

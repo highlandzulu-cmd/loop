@@ -420,24 +420,38 @@ impl SessionFactory {
                 .map_err(|e| session_error("create session", e))?
         };
 
-        // Restore model from the session branch when resuming (unless CLI overrides).
+        // A resumed Session gets back the model and effort it recorded: the
+        // model unless the command line names one, the effort when it chose
+        // one (an explicit off stays off). The saved defaults are untouched.
+        let default_effort = loop_agent::effort::parse_thinking(&settings.default_thinking_level);
+        let mut effort = default_effort;
         if resumed {
-            if let Ok(ctx) = session.build_context().await {
+            let recorded = async {
+                let reader = session.reader();
+                let head = reader.read_head().await?;
+                let entries = reader.read_entries(None).await?;
+                Ok::<_, loop_agent::harness::types::SessionError>(
+                    loop_agent::harness::session::types::config_from_entries(
+                        &entries,
+                        head.as_deref(),
+                    ),
+                )
+            }
+            .await;
+            if let Ok(recorded) = recorded {
                 if opts.provider.is_none() && opts.model.is_none() {
-                    if let Some((p, m)) = &ctx.model {
+                    if let Some((p, m)) = &recorded.model {
                         if let Some(resolved) = models
                             .get_model(p, m)
                             .filter(|_| !credentials.is_logged_out(p))
                         {
-                            settings.set_selected_model(p, m);
                             model = Some(resolved);
                             model_note = None;
                         }
                     }
                 }
-                // Thinking-level changes are recorded on the branch when present.
-                if !matches!(ctx.thinking_level, AgentThinkingLevel::Off) {
-                    settings.default_thinking_level = thinking_label(ctx.thinking_level).into();
+                if let Some(level) = recorded.thinking_level {
+                    effort = level;
                 }
             }
         }
@@ -481,9 +495,7 @@ impl SessionFactory {
                 prompt_templates: workspace.resources.prompts.clone(),
             },
         }));
-        harness
-            .set_thinking_level(parse_thinking(&settings.default_thinking_level))
-            .await;
+        harness.set_thinking_level(effort).await;
         harness.set_bash_limits(bash_limits);
         harness
             .set_response_header_timeout_ms(settings.response_header_timeout_ms)
@@ -496,6 +508,7 @@ impl SessionFactory {
             .await;
 
         let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
+        native.set_default_effort(default_effort);
 
         tool_gate.install(&harness);
         let mut startup_notices = workspace.startup_notices.clone();

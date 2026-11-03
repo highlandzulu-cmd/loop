@@ -9,14 +9,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use loop_protocol::rpc::{
-    methods, AttachParams, AttachResult, ClientCapabilities, CloseParams, InitializeParams,
-    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
-    RuntimeStatus, SessionInfo, SessionParams,
+    methods, AttachParams, AttachResult, ChoicesResult, ClientCapabilities, CloseParams,
+    InitializeParams, InitializeResult, LoadParams, ModelsResult, PeerInfo, PromptParams,
+    PromptResult, RpcErrorBody, RuntimeStatus, SessionInfo, SessionParams, SetEffortParams,
+    SetModeParams, SetModelParams,
 };
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
-    ErrorCategory, ErrorInfo, HostServices, InteractionRequest, SessionKey, SessionRef,
-    SessionSpec, SessionUpdate, TurnHandle, TurnOutcome, UpdateEnvelope, PROTOCOL_VERSION,
+    ErrorCategory, ErrorInfo, HostServices, InteractionRequest, ModelChoices, ModelControl,
+    MutationResult, SessionKey, SessionRef, SessionSpec, SessionUpdate, TurnHandle, TurnOutcome,
+    UpdateEnvelope, PROTOCOL_VERSION,
 };
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -143,6 +145,24 @@ impl RemoteBackend {
             .map(|_| ())
     }
 
+    /// The models a Session can use, with their backends (`session/models`).
+    /// Needs the `set_model` capability.
+    pub async fn session_models(&self, session: &SessionRef) -> BackendResult<ModelsResult> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call(&self.conn, methods::SESSION_MODELS, &params).await
+    }
+
+    async fn choices(&self, method: &str, session: &SessionRef) -> BackendResult<ModelChoices> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call::<ChoicesResult>(&self.conn, method, &params)
+            .await
+            .map(ModelChoices::from)
+    }
+
     /// Close a Session; a busy one needs `force`.
     pub async fn close(&self, session: &SessionRef, force: bool) -> BackendResult<()> {
         let params = CloseParams {
@@ -251,6 +271,83 @@ impl AgentBackend for RemoteBackend {
             .request(methods::SHUTDOWN, Value::Object(Default::default()))
             .await;
         self.conn.close();
+    }
+
+    fn model_control(&self) -> Option<&dyn ModelControl> {
+        let c = self.capabilities;
+        (c.set_model || c.efforts || c.modes).then_some(self as &dyn ModelControl)
+    }
+}
+
+/// Unsupported unless the server advertised `offered`.
+fn offered(offered: bool, what: &str) -> BackendResult<()> {
+    if offered {
+        Ok(())
+    } else {
+        Err(BackendError::Unsupported(what.into()))
+    }
+}
+
+#[async_trait]
+impl ModelControl for RemoteBackend {
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        offered(self.capabilities.set_model, "choosing a model")?;
+        self.session_models(session).await.map(ModelChoices::from)
+    }
+
+    async fn set_model(
+        &self,
+        session: &SessionRef,
+        model: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        offered(self.capabilities.set_model, "choosing a model")?;
+        let params = SetModelParams {
+            session: session.clone(),
+            model: model.into(),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_SET_MODEL, &params).await
+    }
+
+    async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        offered(self.capabilities.efforts, "choosing a reasoning effort")?;
+        self.choices(methods::SESSION_EFFORTS, session).await
+    }
+
+    async fn set_effort(
+        &self,
+        session: &SessionRef,
+        effort: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        offered(self.capabilities.efforts, "choosing a reasoning effort")?;
+        let params = SetEffortParams {
+            session: session.clone(),
+            effort: effort.into(),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_SET_EFFORT, &params).await
+    }
+
+    async fn modes(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        offered(self.capabilities.modes, "choosing a mode")?;
+        self.choices(methods::SESSION_MODES, session).await
+    }
+
+    async fn set_mode(
+        &self,
+        session: &SessionRef,
+        mode: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        offered(self.capabilities.modes, "choosing a mode")?;
+        let params = SetModeParams {
+            session: session.clone(),
+            mode: mode.into(),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_SET_MODE, &params).await
     }
 }
 
