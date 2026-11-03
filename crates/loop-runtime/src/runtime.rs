@@ -60,6 +60,7 @@ mod subagent_tests;
 #[cfg(test)]
 mod unload_tests;
 
+mod pause;
 mod tree;
 
 /// One Runtime owns all live native Sessions and their durable update streams.
@@ -94,6 +95,7 @@ pub struct Runtime {
     watchers: Mutex<HashMap<SessionKey, HashSet<u64>>>,
     views: Mutex<HashMap<String, tree::BranchView>>,
     destinations: AsyncMutex<()>,
+    pauses: Arc<pause::Pauses>,
 }
 /// Newest event timestamp per Session, kept in memory so listing never scans the log.
 type Activity = Arc<Mutex<HashMap<SessionKey, i64>>>;
@@ -183,6 +185,7 @@ struct LiveSession {
     lifecycle: AsyncMutex<()>,
     committed: AsyncMutex<Option<loop_agent::harness::session::SessionFile>>,
     turn_start_seq: std::sync::atomic::AtomicU64,
+    pauses: Arc<pause::Pauses>,
     opened: OpenedSession,
     escalations: crate::EscalationHost,
     reference: SessionRef,
@@ -295,6 +298,7 @@ impl Runtime {
             watchers: Mutex::new(HashMap::new()),
             views: Mutex::new(HashMap::new()),
             destinations: AsyncMutex::new(()),
+            pauses: Arc::default(),
         })
     }
     /// Share the Runtime. Only a shared Runtime offers its Sessions the
@@ -670,6 +674,7 @@ impl Runtime {
                 lifecycle: AsyncMutex::new(()),
                 committed: AsyncMutex::new(None),
                 turn_start_seq: std::sync::atomic::AtomicU64::new(0),
+                pauses: self.pauses.clone(),
                 opened,
                 escalations,
                 reference: reference.clone(),
@@ -1645,6 +1650,7 @@ impl AgentBackend for Runtime {
             }
             .await;
             live.permit.lock().await.take();
+            live.pauses.signal("turn_settling");
             live.busy.store(false, Ordering::Release);
             let outcome = match result {
                 Ok(outcome) => outcome,

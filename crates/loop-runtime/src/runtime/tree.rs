@@ -114,6 +114,7 @@ impl Runtime {
         at_seq: u64,
     ) -> BackendResult<String> {
         let file = self.committed_file(live).await?;
+        self.pauses.wait("view_capture").await;
         let entries = match file
             .entries
             .iter()
@@ -644,7 +645,21 @@ impl Runtime {
         self.destination(file, cwd, None, params.request_id, fingerprint, None, None)
             .await
     }
+    /// Answer a retried request from its receipt. A receipt commits before its
+    /// Session is admitted, so wait until no admission is in flight: one that
+    /// fails rolls the receipt back.
     async fn retry_destination(
+        &self,
+        kind: &str,
+        request_id: &str,
+        fingerprint: &str,
+    ) -> BackendResult<Option<DestinationResult>> {
+        self.pauses.signal("destination_retry_wait");
+        let _destinations = self.destinations.lock().await;
+        self.receipt(kind, request_id, fingerprint).await
+    }
+    /// Read a receipt. Caller holds the destination lock.
+    async fn receipt(
         &self,
         kind: &str,
         request_id: &str,
@@ -676,10 +691,7 @@ impl Runtime {
         }
         let _destinations = self.destinations.lock().await;
         let kind = if parent.is_some() { "copy" } else { "import" };
-        if let Some(result) = self
-            .retry_destination(kind, &request_id, &fingerprint)
-            .await?
-        {
+        if let Some(result) = self.receipt(kind, &request_id, &fingerprint).await? {
             return Ok(result);
         }
         // Reserve room before creating anything; a full Runtime leaves no orphan row.
@@ -707,10 +719,14 @@ impl Runtime {
             .map_err(failed)?;
         let id = created.id.clone();
         let session = reference(&id);
-        if let Err(error) = self
-            .open(Some(&session), SessionSpec::default(), None)
-            .await
-        {
+        let injected = self.pauses.wait("destination_admit").await;
+        let admitted = if injected {
+            Err(failed("injected admission failure"))
+        } else {
+            self.open(Some(&session), SessionSpec::default(), None)
+                .await
+        };
+        if let Err(error) = admitted {
             created.rollback().await.map_err(failed)?;
             return Err(error);
         }

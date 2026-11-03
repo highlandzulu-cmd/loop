@@ -838,3 +838,50 @@ async fn tree_cursors_reject_a_row_set_changed_by_a_turn() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn a_retry_never_answers_with_a_destination_admission_will_roll_back() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_protocol::rpc::CloneParams;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 8).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        run(&rt, &source, "copy me").await;
+        let params = CloneParams {
+            session: source.clone(),
+            name: None,
+            request_id: "lost-response".into(),
+        };
+        let (reached, release) = rt.pauses.arm("destination_admit");
+        let first = tokio::spawn({
+            let (rt, params) = (rt.clone(), params.clone());
+            async move { rt.clone_session(params).await }
+        });
+        reached.notified().await;
+        // The receipt is committed but its Session is not admitted yet.
+        let waiting = rt.pauses.watch("destination_retry_wait");
+        let mut retry = tokio::spawn({
+            let (rt, params) = (rt.clone(), params.clone());
+            async move { rt.clone_session(params).await }
+        });
+        tokio::select! {
+            result = &mut retry => panic!("a retry answered before admission settled: {result:?}"),
+            () = waiting.notified() => {}
+        }
+        release.send(true).unwrap();
+        assert!(first.await.unwrap().is_err());
+        let retried = retry.await.unwrap().unwrap();
+        assert!(rt.route(&retried.session).is_ok());
+        assert!(rt
+            .store
+            .list(None)
+            .await
+            .unwrap()
+            .iter()
+            .any(|meta| meta.id == retried.session.native_id));
+        assert_eq!(rt.clone_session(params).await.unwrap(), retried);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
