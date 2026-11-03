@@ -20,8 +20,8 @@ use loop_app_core::{
 use loop_protocol::{
     rpc::{SessionInfo, SessionSnapshot},
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ConfigChanged,
-    ContentBlock, ErrorCategory, ModelChoices, ModelControl, MutationResult, Origin, SessionConfig,
-    SessionKey, SessionMetadata, SessionRef, SessionSpec, SessionUpdate, TurnHandle, TurnOutcome,
+    ContentBlock, ErrorCategory, ModelChoices, ModelControl, MutationResult, Origin, SessionKey,
+    SessionMetadata, SessionRef, SessionSpec, SessionUpdate, TurnHandle, TurnOutcome,
     UpdateEnvelope,
 };
 use loop_wire::control::EscalationRecipient;
@@ -215,28 +215,43 @@ struct Announced {
     published: u64,
     /// The newest committed config (or the config the Session opened with).
     latest: ConfigChanged,
-    /// Sequence of the first committed update of each recent revision.
-    seqs: VecDeque<(u64, u64)>,
+    /// Receipts of committed changes whose setters have not read them yet:
+    /// revision to sequence. Each setter takes its own, so any number may be
+    /// outstanding while the Event Log is slow.
+    receipts: HashMap<u64, u64>,
+    /// The newest revision committed. A later update with the same revision
+    /// (a pending change taking effect) is not a new change.
+    revision: u64,
 }
 impl Announced {
     fn commit(&mut self, seq: u64, changed: &ConfigChanged) {
-        if !self
-            .seqs
-            .iter()
-            .any(|(revision, _)| *revision == changed.revision)
-        {
-            if self.seqs.len() == 64 {
-                self.seqs.pop_front();
-            }
-            self.seqs.push_back((changed.revision, seq));
+        if changed.revision > self.revision {
+            self.revision = changed.revision;
+            self.receipts.insert(changed.revision, seq);
         }
         self.latest = changed.clone();
     }
-    fn seq_of(&self, revision: u64) -> Option<u64> {
-        self.seqs
-            .iter()
-            .find(|(r, _)| *r == revision)
-            .map(|(_, seq)| *seq)
+}
+/// Drops a setter's receipt if the setter goes away before reading it.
+struct Receipt<'a> {
+    live: &'a LiveSession,
+    revision: u64,
+}
+impl Receipt<'_> {
+    fn take(self) -> Option<u64> {
+        self.live
+            .announced
+            .lock()
+            .unwrap()
+            .receipts
+            .remove(&self.revision)
+    }
+}
+impl Drop for Receipt<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut announced) = self.live.announced.lock() {
+            announced.receipts.remove(&self.revision);
+        }
     }
 }
 enum Command {
@@ -544,21 +559,7 @@ impl Runtime {
         if full() && (!self.unload_one().await || full()) {
             return Err(BackendError::Busy);
         }
-        let d = &self.defaults;
-        let mut opts = BootstrapOpts {
-            cwd: d.cwd.clone(),
-            provider: d.provider.clone(),
-            model: d.model.clone(),
-            theme: d.theme.clone(),
-            system_prompt: d.system_prompt.clone(),
-            append_system_prompt: d.append_system_prompt.clone(),
-            no_context_files: d.no_context_files,
-            interactive: false,
-            session_id: None,
-            no_web: d.no_web,
-            permission_mode: d.permission_mode.clone(),
-            agent: d.agent.clone(),
-        };
+        let mut opts = self.session_opts();
         if let Some(child) = &child {
             opts.cwd = child.cwd.clone();
         } else if let Some(cwd) = spec.cwd {
@@ -699,6 +700,10 @@ impl Runtime {
                 }
             }
             let initial_config = opened.native.config();
+            // The tree is written before the Event Log; a change whose
+            // announcement was lost is announced before anyone is served.
+            let unannounced =
+                !created && initial_config.revision > self.logged_revision(&reference.key).await?;
             let published = self.log.latest_seq(&reference.key).await.map_err(failed)?;
             let live = Arc::new(LiveSession {
                 lifecycle: AsyncMutex::new(()),
@@ -723,10 +728,28 @@ impl Runtime {
                 turn_epoch: std::sync::atomic::AtomicU64::new(0),
                 announced: Mutex::new(Announced {
                     published,
-                    latest: initial_config,
-                    seqs: VecDeque::new(),
+                    revision: initial_config.revision,
+                    latest: initial_config.clone(),
+                    receipts: HashMap::new(),
                 }),
             });
+            if unannounced {
+                publish(
+                    &live,
+                    UpdateEnvelope::live(
+                        self.instance.clone(),
+                        self.generation,
+                        reference.key.clone(),
+                        None,
+                        0,
+                        SessionUpdate::ConfigChanged(initial_config),
+                    ),
+                    self.log.as_ref(),
+                    self.generation,
+                    &self.updates,
+                )
+                .await?;
+            }
             if depth < self.subagent_depth {
                 if let Some(me) = self.me.get() {
                     subagent::offer(me.clone(), &live).await.map_err(failed)?;
@@ -1453,13 +1476,21 @@ impl Runtime {
         let entries = reader.read_entries(None).await.map_err(failed)?;
         let recorded =
             loop_agent::harness::session::types::config_from_entries(&entries, head.as_deref());
-        let config = SessionConfig {
-            model: recorded.model.map(|(p, m)| format!("{p}/{m}")),
-            effort: recorded
-                .thinking_level
-                .map(|l| loop_agent::effort::thinking_label(l).to_owned()),
-            mode: None,
-        };
+        // Described as loading it would set it up: the same defaults and
+        // the same rule for the Session's own choices.
+        let mut opts = self.session_opts();
+        if let Some(cwd) = &reader.metadata().cwd {
+            opts.cwd = PathBuf::from(cwd);
+        }
+        let workspace = self.factory.workspace(&opts).await.map_err(failed)?;
+        let (default_model, default_effort) = self.factory.session_defaults(&workspace, &opts);
+        let (model, level) = loop_agent::native_backend::restored_choice(
+            &self.factory.globals.models,
+            &recorded,
+            default_model,
+            default_effort,
+        );
+        let config = loop_agent::native_backend::session_config(model.as_ref(), level);
         Ok(ConfigChanged {
             revision: recorded.revision,
             metadata: SessionMetadata {
@@ -1469,6 +1500,39 @@ impl Runtime {
             config,
             ..ConfigChanged::default()
         })
+    }
+    /// Options to open a Session with the Runtime's startup defaults.
+    fn session_opts(&self) -> BootstrapOpts {
+        let d = &self.defaults;
+        BootstrapOpts {
+            cwd: d.cwd.clone(),
+            provider: d.provider.clone(),
+            model: d.model.clone(),
+            theme: d.theme.clone(),
+            system_prompt: d.system_prompt.clone(),
+            append_system_prompt: d.append_system_prompt.clone(),
+            no_context_files: d.no_context_files,
+            interactive: false,
+            session_id: None,
+            no_web: d.no_web,
+            permission_mode: d.permission_mode.clone(),
+            agent: d.agent.clone(),
+        }
+    }
+    /// The newest config revision the Event Log announced for `key`.
+    async fn logged_revision(&self, key: &SessionKey) -> BackendResult<u64> {
+        let records = self.log.read_after(key, 0).await.map_err(failed)?;
+        Ok(records
+            .iter()
+            .rev()
+            .find_map(|record| match &record.event.kind {
+                EventKind::Update(UpdateEnvelope {
+                    update: SessionUpdate::ConfigChanged(changed),
+                    ..
+                }) => Some(changed.revision),
+                _ => None,
+            })
+            .unwrap_or(0))
     }
     /// The loaded Session, loading it again when it was unloaded to make room.
     async fn loaded(&self, session: &SessionRef) -> BackendResult<Arc<LiveSession>> {
@@ -1507,15 +1571,16 @@ impl Runtime {
             }
             set(Arc::clone(&live)).await?
         };
+        let receipt = Receipt {
+            live: &live,
+            revision: result.revision,
+        };
         // Not under the lock: a stalled Event Log must not hold up attach,
         // admission or close. The pump commits in the order changes were
         // made, so the reply still follows the commit.
         barrier(&live).await?;
-        result.seq = live
-            .announced
-            .lock()
-            .unwrap()
-            .seq_of(result.revision)
+        result.seq = receipt
+            .take()
             .ok_or_else(|| failed("the change was not recorded in the Event Log"))?;
         Ok(result)
     }

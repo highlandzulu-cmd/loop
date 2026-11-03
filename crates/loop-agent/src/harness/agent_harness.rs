@@ -119,10 +119,6 @@ pub struct AgentHarness {
     sandbox: RwLock<SandboxMode>,
     phase: Mutex<AgentHarnessPhase>,
     pending_writes: Arc<Mutex<Vec<PendingSessionWrite>>>,
-    /// Model and effort choices made during a turn. Unlike `pending_writes`
-    /// they are kept when the turn is cancelled: they are the Session's
-    /// config, not the turn's output.
-    pending_config: Mutex<Vec<PendingSessionWrite>>,
     steering: Arc<Mutex<VecDeque<AgentMessage>>>,
     follow_up: Arc<Mutex<VecDeque<AgentMessage>>>,
     next_turn: Mutex<VecDeque<AgentMessage>>,
@@ -173,7 +169,6 @@ impl AgentHarness {
             sandbox: RwLock::new(options.sandbox),
             phase: Mutex::new(AgentHarnessPhase::Idle),
             pending_writes: Arc::new(Mutex::new(Vec::new())),
-            pending_config: Mutex::new(Vec::new()),
             steering: Arc::new(Mutex::new(VecDeque::new())),
             follow_up: Arc::new(Mutex::new(VecDeque::new())),
             next_turn: Mutex::new(VecDeque::new()),
@@ -539,20 +534,19 @@ impl AgentHarness {
         &self.models
     }
 
-    /// Record a model or effort choice in the active Session's tree: after
-    /// the running turn, whose end always writes it, or immediately.
+    /// Record a model or effort choice in the active Session's tree before
+    /// returning, also during a turn: a choice that was acknowledged must
+    /// survive a crash. A running turn's own entries are written after it,
+    /// so the choice lands before them on the branch; it is Session config,
+    /// not turn output, and stays when the turn is cancelled.
     pub async fn record_config(&self, write: PendingSessionWrite) -> Result<(), AgentHarnessError> {
         self.assert_not_shut_down()?;
-        if *self.phase.lock() != AgentHarnessPhase::Turn {
-            let session = self.session.lock().await;
-            session
-                .store()
-                .append_entry(&session.metadata().id, write)
-                .await
-                .map_err(AgentHarnessError::Session)?;
-        } else {
-            self.pending_config.lock().push(write);
-        }
+        let session = self.session.lock().await;
+        session
+            .store()
+            .append_entry(&session.metadata().id, write)
+            .await
+            .map_err(AgentHarnessError::Session)?;
         Ok(())
     }
 
@@ -1354,16 +1348,9 @@ impl AgentHarness {
         let result = self.run_turn_inner(input, token.clone()).await;
 
         let writes = std::mem::take(&mut *self.pending_writes.lock());
-        let config = std::mem::take(&mut *self.pending_config.lock());
         // Aborted turns should leave no session footprint so a follow-up prompt
-        // (or UI "stop") behaves as if the turn never ran. Config chosen
-        // meanwhile is kept either way.
-        let writes = if token.is_cancelled() {
-            config
-        } else {
-            writes.into_iter().chain(config).collect()
-        };
-        if !writes.is_empty() {
+        // (or UI "stop") behaves as if the turn never ran.
+        if !token.is_cancelled() {
             let session = self.session.lock().await;
             let store = session.store();
             let sid = session.metadata().id.clone();

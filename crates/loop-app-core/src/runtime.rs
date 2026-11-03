@@ -313,6 +313,7 @@ impl Runtime {
     /// Save `provider/model` as the default for the next start.
     pub fn remember_model(&mut self, provider: &str, model: &str) -> anyhow::Result<()> {
         self.settings.set_selected_model(provider, model);
+        self.sync_native_default_model();
         self.save_settings()
     }
 
@@ -474,9 +475,28 @@ impl Runtime {
                     })
                     .await?;
                 self.session_id = session.native_id;
+                // A new Session starts on the default model.
+                self.selected_model = self.harness.model().await;
                 Ok(())
             }
         }
+    }
+
+    /// Point Loop's own new Sessions at the saved default model. A default
+    /// that is a subscription agent leaves the native default unchanged.
+    fn sync_native_default_model(&self) {
+        let Some((provider, id)) = self.settings.selected_model() else {
+            self.native.set_default_model(None);
+            return;
+        };
+        if self.agents.entry(provider).is_some() {
+            return;
+        }
+        let model = self
+            .models
+            .get_model(provider, id)
+            .filter(|m| !self.credentials.is_logged_out(&m.provider));
+        self.native.set_default_model(model);
     }
 
     /// The active session as the backend interface names it.
@@ -699,6 +719,8 @@ impl Runtime {
                 self.save_settings()?;
             }
         }
+        // The default's metadata may have changed with the provider.
+        self.sync_native_default_model();
         self.needs_provider_setup = false;
         if id == loop_ai::providers::SOKET_PROVIDER_ID {
             // The Soket key also powers the default web search and fetch.
@@ -959,6 +981,7 @@ impl Runtime {
             self.selected_model = None;
             self.harness.clear_model().await;
             self.settings.clear_selected_model();
+            self.sync_native_default_model();
             self.save_settings()?;
         }
         if id == loop_ai::providers::SOKET_PROVIDER_ID {
@@ -992,6 +1015,7 @@ impl Runtime {
         )
         .await?;
         self.settings.set_selected_model(provider, id);
+        self.sync_native_default_model();
         self.selected_model = Some(model.clone());
         self.model_note = None;
         self.save_settings()?;

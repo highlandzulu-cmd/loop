@@ -4,9 +4,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use loop_agent::harness::session::types::{PendingSessionWrite, SessionMetadata, SessionReader};
+use loop_agent::harness::types::SessionError;
 use loop_agent::harness::{
     create_in_memory_session_store, create_session_repository, AgentHarness, AgentHarnessOptions,
-    ExecutionEnv, HostExecutionEnv, SandboxMode, SessionTreeEntry,
+    ExecutionEnv, HostExecutionEnv, SandboxMode, SessionStore, SessionTreeEntry,
 };
 use loop_agent::native_backend::NativeBackend;
 use loop_agent::{AgentThinkingLevel, AgentTool, AgentToolResult};
@@ -29,6 +31,14 @@ fn reasoning(id: &str) -> Model {
 }
 
 async fn harness(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<AgentHarness> {
+    harness_on(create_in_memory_session_store(), responses, tools).await
+}
+
+async fn harness_on(
+    store: Arc<dyn SessionStore>,
+    responses: Vec<FauxResponse>,
+    tools: Vec<AgentTool>,
+) -> Arc<AgentHarness> {
     let script = FauxScript::new();
     script.extend(responses);
     let provider = faux_provider(script);
@@ -36,7 +46,7 @@ async fn harness(responses: Vec<FauxResponse>, tools: Vec<AgentTool>) -> Arc<Age
     let models = Arc::new(Models::new());
     models.set_provider(provider);
     let model = models.get_model("faux", "one").unwrap();
-    let repo = create_session_repository(create_in_memory_session_store(), None);
+    let repo = create_session_repository(store, None);
     let session = repo.create(None, None).await.unwrap();
     let host: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(std::env::temp_dir()));
     let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
@@ -359,4 +369,298 @@ async fn an_effort_change_during_a_turn_applies_after_it() {
     })
     .await
     .expect("test timed out");
+}
+
+/// A store whose message writes wait while `held`, to pause a turn's final
+/// persistence.
+struct GatedStore {
+    inner: Arc<dyn SessionStore>,
+    held: std::sync::atomic::AtomicBool,
+    started: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl SessionStore for GatedStore {
+    async fn create(
+        &self,
+        cwd: Option<String>,
+        name: Option<String>,
+    ) -> Result<Arc<dyn SessionReader>, SessionError> {
+        self.inner.create(cwd, name).await
+    }
+    async fn load(&self, id: &str) -> Result<Arc<dyn SessionReader>, SessionError> {
+        self.inner.load(id).await
+    }
+    async fn list(&self, cwd: Option<&str>) -> Result<Vec<SessionMetadata>, SessionError> {
+        self.inner.list(cwd).await
+    }
+    async fn append_entry(
+        &self,
+        session_id: &str,
+        pending: PendingSessionWrite,
+    ) -> Result<SessionTreeEntry, SessionError> {
+        if matches!(pending, PendingSessionWrite::Message { .. })
+            && self.held.swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.started.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.append_entry(session_id, pending).await
+    }
+    async fn delete(&self, id: &str) -> Result<(), SessionError> {
+        self.inner.delete(id).await
+    }
+    async fn fork(
+        &self,
+        source_id: &str,
+        selection: loop_agent::harness::session::SessionForkSelection,
+        through_entry_id: Option<&str>,
+        name: Option<String>,
+    ) -> Result<Arc<dyn SessionReader>, SessionError> {
+        self.inner
+            .fork(source_id, selection, through_entry_id, name)
+            .await
+    }
+}
+
+/// A change acknowledged while a turn's final writes are paused is in the
+/// tree as soon as they finish; none is lost to the drain.
+#[tokio::test]
+async fn a_setter_racing_the_final_persistence_is_recorded() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let store = Arc::new(GatedStore {
+            inner: create_in_memory_session_store(),
+            held: std::sync::atomic::AtomicBool::new(true),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let harness = harness_on(
+            store.clone(),
+            vec![FauxResponse::Text("done".into())],
+            vec![],
+        )
+        .await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let session = backend.current_session().await;
+        let turn = backend
+            .prompt(&session, vec![ContentBlock::text("go")])
+            .await
+            .unwrap();
+        // The turn's messages are being written; the setter arrives now.
+        store.started.notified().await;
+        let setter = tokio::spawn({
+            let backend = Arc::clone(&backend);
+            let session = session.clone();
+            async move {
+                backend
+                    .model_control()
+                    .unwrap()
+                    .set_effort(&session, "high", None)
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        store.release.notify_one();
+        let result = setter.await.unwrap().unwrap();
+        turn.outcome().await;
+        let entries = harness.read_session_entries().await.unwrap();
+        let recorded = loop_agent::harness::session::types::config_from_entries(
+            &entries,
+            entries.last().map(|e| e.id()),
+        );
+        assert_eq!(recorded.thinking_level, Some(AgentThinkingLevel::High));
+        assert_eq!(recorded.revision, result.revision);
+        assert!(entries
+            .iter()
+            .any(|e| matches!(e, SessionTreeEntry::Message { .. })));
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Changes during a turn are durable when acknowledged, before it ends.
+#[tokio::test]
+async fn an_acknowledged_change_during_a_turn_is_already_recorded() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(
+            vec![
+                FauxResponse::ToolCalls(vec![ToolCall {
+                    id: "w1".into(),
+                    name: "wait".into(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }]),
+                FauxResponse::Text("after".into()),
+            ],
+            vec![wait_tool()],
+        )
+        .await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let session = backend.current_session().await;
+        let mut rx = backend.subscribe();
+        let turn = backend
+            .prompt(&session, vec![ContentBlock::text("wait")])
+            .await
+            .unwrap();
+        tool_running(&mut rx).await;
+        let control = backend.model_control().unwrap();
+        let result = control.set_effort(&session, "high", None).await.unwrap();
+        assert!(result.pending);
+        let entries = harness.read_session_entries().await.unwrap();
+        assert!(entries.iter().any(|e| matches!(
+            e,
+            SessionTreeEntry::ThinkingLevelChange {
+                thinking_level: AgentThinkingLevel::High,
+                ..
+            }
+        )));
+        // The model never changes mid-turn, here as on a Runtime.
+        assert_eq!(
+            control
+                .set_model(&session, "faux/two/with-slash", None)
+                .await
+                .unwrap_err(),
+            BackendError::Busy
+        );
+        backend.cancel(&session);
+        turn.outcome().await;
+        control
+            .set_model(&session, "faux/two/with-slash", None)
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Envelopes from setters and from a running turn reach subscribers in
+/// sequence order.
+#[tokio::test]
+async fn setters_and_turns_never_publish_out_of_order() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let rounds = 20;
+        let harness = harness(
+            (0..rounds)
+                .map(|i| FauxResponse::Text(format!("answer {i}")))
+                .collect(),
+            vec![],
+        )
+        .await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let session = backend.current_session().await;
+        let mut rx = backend.subscribe();
+        for _ in 0..rounds {
+            let turn = backend
+                .prompt(&session, vec![ContentBlock::text("go")])
+                .await
+                .unwrap();
+            let setters: Vec<_> = ["low", "high", "off", "medium"]
+                .into_iter()
+                .map(|level| {
+                    let backend = Arc::clone(&backend);
+                    let session = session.clone();
+                    tokio::spawn(async move {
+                        backend
+                            .model_control()
+                            .unwrap()
+                            .set_effort(&session, level, None)
+                            .await
+                            .unwrap()
+                    })
+                })
+                .collect();
+            for setter in setters {
+                setter.await.unwrap();
+            }
+            turn.outcome().await;
+        }
+        let mut last = 0;
+        let mut seen = 0;
+        while let Ok(envelope) = rx.try_recv() {
+            assert!(envelope.seq > last, "seq {} after {last}", envelope.seq);
+            last = envelope.seq;
+            seen += 1;
+        }
+        assert!(seen > rounds * 4);
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A model chosen in one Session is not carried into a new Session or into
+/// one that never chose a model.
+#[tokio::test]
+async fn a_sessions_model_stays_in_that_session() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let harness = harness(vec![], vec![]).await;
+        let backend = NativeBackend::new(Arc::clone(&harness)).await;
+        let control = backend.model_control().unwrap();
+        let first = backend.current_session().await;
+        control
+            .set_model(&first, "faux/two/with-slash", None)
+            .await
+            .unwrap();
+        let second = backend
+            .new_session(loop_protocol::SessionSpec::default())
+            .await
+            .unwrap();
+        let current = |choices: loop_protocol::ModelChoices| choices.current.unwrap();
+        assert_eq!(current(control.models(&second).await.unwrap()), "faux/one");
+        backend
+            .load_session(&first, loop_protocol::SessionSpec::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            current(control.models(&first).await.unwrap()),
+            "faux/two/with-slash"
+        );
+        backend
+            .load_session(&second, loop_protocol::SessionSpec::default())
+            .await
+            .unwrap();
+        assert_eq!(current(control.models(&second).await.unwrap()), "faux/one");
+        // A changed default reaches Sessions without a choice of their own.
+        backend.set_default_model(harness.models().get_model("faux", "two/with-slash"));
+        backend
+            .load_session(&second, loop_protocol::SessionSpec::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            current(control.models(&second).await.unwrap()),
+            "faux/two/with-slash"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+fn wait_tool() -> AgentTool {
+    AgentTool::simple(
+        "wait",
+        "Wait",
+        "Waits until cancelled.",
+        json!({"type": "object", "properties": {}}),
+        |_id, _args, cancel, _update| async move {
+            if let Some(cancel) = cancel {
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                }
+            }
+            Ok(AgentToolResult::text("waited"))
+        },
+    )
+}
+
+async fn tool_running(rx: &mut broadcast::Receiver<UpdateEnvelope>) {
+    loop {
+        let envelope = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(envelope.update, SessionUpdate::ToolCall(_)) {
+            return;
+        }
+    }
 }

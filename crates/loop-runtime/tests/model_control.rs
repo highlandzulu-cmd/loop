@@ -634,3 +634,265 @@ async fn a_setter_waiting_on_a_stalled_event_log_holds_up_nothing_else() {
     .await
     .unwrap();
 }
+
+/// The config a Session's tree records, read by a separate reader, as after
+/// a crash.
+async fn recorded(
+    dir: &std::path::Path,
+    session: &loop_protocol::SessionRef,
+) -> loop_agent::harness::session::types::SessionConfigEntries {
+    use loop_agent::harness::SessionStore;
+    let db = loop_app_core::config::paths::sessions_db_path(&dir.join("agent"));
+    let store = loop_agent::harness::session::sqlite::SqliteSessionStore::open(db).unwrap();
+    let reader = store.load(&session.native_id).await.unwrap();
+    let head = reader.read_head().await.unwrap();
+    let entries = reader.read_entries(None).await.unwrap();
+    loop_agent::harness::session::types::config_from_entries(&entries, head.as_deref())
+}
+
+#[tokio::test]
+async fn a_change_acknowledged_during_a_turn_survives_a_crash() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        use loop_ai::providers::{FauxResponse, FauxScript};
+        let script = FauxScript::new();
+        script.push(FauxResponse::ToolCalls(vec![loop_ai::ToolCall {
+            id: "call".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "echo waiting"}),
+            thought_signature: None,
+        }]));
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let log = Arc::new(SqliteEventLog::open(&db).await.unwrap());
+        let rt = runtime(dir.path(), log.clone(), script).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        let turn = rt
+            .prompt(&session, vec![ContentBlock::text("run it")])
+            .await
+            .unwrap();
+        loop {
+            let raised = log
+                .read_runtime_after(0)
+                .await
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e.event.kind, EventKind::EscalationRaised(_)));
+            if raised {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let result = rt.set_effort(&session, "high", None).await.unwrap();
+        assert!(result.pending);
+        // Durable as soon as it is acknowledged, while the turn still runs.
+        let now = recorded(dir.path(), &session).await;
+        assert_eq!(
+            now.thinking_level,
+            Some(loop_agent::AgentThinkingLevel::High)
+        );
+        assert_eq!(now.revision, result.revision);
+        // The turn never finishes normally; the Session comes back with it.
+        rt.cancel(&session);
+        turn.outcome().await;
+        rt.shutdown().await;
+        let log = Arc::new(SqliteEventLog::open(&db).await.unwrap());
+        let rt = runtime(dir.path(), log, Default::default()).await;
+        rt.load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        let efforts = rt.efforts(&session).await.unwrap();
+        assert_eq!(efforts.current.as_deref(), Some("high"));
+        assert_eq!(efforts.revision, result.revision);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Refuses to commit `config_changed` updates while `failing`.
+struct FailingLog {
+    inner: Arc<MemoryEventLog>,
+    failing: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl EventLog for FailingLog {
+    async fn append_batch(
+        &self,
+        events: Vec<loop_runtime::log::Event>,
+    ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
+        let config = events.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::Update(UpdateEnvelope {
+                    update: SessionUpdate::ConfigChanged(_),
+                    ..
+                })
+            )
+        });
+        if config && self.failing.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(loop_runtime::log::EventLogError::Invalid(
+                "injected failure".into(),
+            ));
+        }
+        self.inner.append_batch(events).await
+    }
+    async fn read_after(
+        &self,
+        key: &SessionKey,
+        seq: u64,
+    ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
+        self.inner.read_after(key, seq).await
+    }
+    async fn read_runtime_after(
+        &self,
+        seq: u64,
+    ) -> loop_runtime::log::Result<Vec<loop_runtime::log::LoggedEvent>> {
+        self.inner.read_runtime_after(seq).await
+    }
+    async fn latest_seq(&self, key: &SessionKey) -> loop_runtime::log::Result<u64> {
+        self.inner.latest_seq(key).await
+    }
+    async fn allocate_generation(
+        &self,
+        owner: &str,
+        pid: u32,
+        ms: i64,
+    ) -> loop_runtime::log::Result<u64> {
+        self.inner.allocate_generation(owner, pid, ms).await
+    }
+    async fn finish_generation(&self, generation: u64, ms: i64) -> loop_runtime::log::Result<()> {
+        self.inner.finish_generation(generation, ms).await
+    }
+}
+
+/// A change recorded in the tree whose announcement never reached the
+/// Event Log is announced when the Session opens again, before anyone sees it.
+#[tokio::test]
+async fn an_unannounced_change_is_announced_on_reopen() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let inner = Arc::new(MemoryEventLog::new());
+        let log = Arc::new(FailingLog {
+            inner: inner.clone(),
+            failing: std::sync::atomic::AtomicBool::new(false),
+        });
+        let rt = runtime(dir.path(), log.clone(), Default::default()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        log.failing
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(rt.set_effort(&session, "low", None).await.is_err());
+        assert_eq!(recorded(dir.path(), &session).await.revision, 1);
+        rt.shutdown().await;
+
+        log.failing
+            .store(false, std::sync::atomic::Ordering::Release);
+        let rt = runtime(dir.path(), log.clone(), Default::default()).await;
+        let (watcher, _served) = connect(&rt).await;
+        let mut rx = watcher.subscribe();
+        rt.load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        let attached = watcher.attach(&session, 0).await.unwrap();
+        assert_eq!(attached.snapshot.unwrap().revision, 1);
+        let (seq, changed) = config_changed(&mut rx, &session.key).await;
+        assert!(seq <= attached.latest_seq, "announced before serving");
+        assert_eq!(changed.revision, 1);
+        assert_eq!(changed.config.effort.as_deref(), Some("low"));
+        // Announced once: opening again adds nothing.
+        rt.close(&session.key, false).await.unwrap();
+        let before = inner.latest_seq(&session.key).await.unwrap();
+        rt.load_session(&session, SessionSpec::default())
+            .await
+            .unwrap();
+        assert_eq!(inner.latest_seq(&session.key).await.unwrap(), before);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Any number of setters may wait on a stalled Event Log; each still gets
+/// the sequence of its own change.
+#[tokio::test]
+async fn many_setters_waiting_on_a_stalled_log_each_get_their_receipt() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(GatedLog::default());
+        let rt = runtime(dir.path(), log.clone(), Default::default()).await;
+        let session = rt.new_session(SessionSpec::default()).await.unwrap();
+        log.held.store(true, std::sync::atomic::Ordering::Release);
+        let levels = ["off", "low", "medium", "high"];
+        let setters: Vec<_> = (0..100)
+            .map(|i| {
+                let rt = rt.clone();
+                let session = session.clone();
+                tokio::spawn(async move { rt.set_effort(&session, levels[i % 4], None).await })
+            })
+            .collect();
+        // Every change is made and waits for its commit.
+        while rt.efforts(&session).await.unwrap().revision < 100 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        log.held.store(false, std::sync::atomic::Ordering::Release);
+        log.release.notify_one();
+        let mut receipts = Vec::new();
+        for setter in setters {
+            let result = setter.await.unwrap().unwrap();
+            receipts.push((result.revision, result.seq));
+        }
+        receipts.sort();
+        let revisions: Vec<u64> = receipts.iter().map(|(r, _)| *r).collect();
+        assert_eq!(revisions, (1..=100).collect::<Vec<_>>());
+        assert!(receipts.windows(2).all(|w| w[0].1 < w[1].1));
+        // Each receipt names the update that announced that revision.
+        let logged = log.inner.read_after(&session.key, 0).await.unwrap();
+        for (revision, seq) in receipts {
+            assert!(logged.iter().any(|r| matches!(
+                &r.event.kind,
+                EventKind::Update(e) if e.seq == seq
+                    && matches!(&e.update, SessionUpdate::ConfigChanged(c) if c.revision == revision)
+            )));
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A Session not loaded is described exactly as loading it sets it up.
+#[tokio::test]
+async fn cold_and_loaded_snapshots_agree() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("events.db");
+        let (chose_model, chose_nothing) = {
+            let log = Arc::new(SqliteEventLog::open(&db).await.unwrap());
+            let rt = runtime(dir.path(), log, Default::default()).await;
+            let chose_model = rt.new_session(SessionSpec::default()).await.unwrap();
+            rt.set_model(&chose_model, "faux/second", None)
+                .await
+                .unwrap();
+            let chose_nothing = rt.new_session(SessionSpec::default()).await.unwrap();
+            rt.shutdown().await;
+            (chose_model, chose_nothing)
+        };
+        let log = Arc::new(SqliteEventLog::open(&db).await.unwrap());
+        let rt = runtime(dir.path(), log, Default::default()).await;
+        for session in [&chose_model, &chose_nothing] {
+            let (cold, _s1) = connect(&rt).await;
+            let cold = cold.attach(session, 0).await.unwrap().snapshot.unwrap();
+            rt.load_session(session, SessionSpec::default())
+                .await
+                .unwrap();
+            let (loaded, _s2) = connect(&rt).await;
+            let loaded = loaded.attach(session, 0).await.unwrap().snapshot.unwrap();
+            assert_eq!(cold.config, loaded.config, "{}", session.native_id);
+            assert_eq!(cold.effective, loaded.effective);
+            assert_eq!(cold.revision, loaded.revision);
+            assert_eq!(cold.config.effort.as_deref(), Some("medium"));
+        }
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

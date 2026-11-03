@@ -793,3 +793,58 @@ async fn modes_follow_the_capability_and_missing_ones_are_unsupported() {
     .await
     .expect("test timed out");
 }
+
+/// During a turn the model is refused and an effort change waits, the same
+/// in-process and over the wire.
+#[tokio::test]
+async fn busy_model_rules_are_the_same_over_the_wire() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let release = Arc::new(Notify::new());
+        let backend = native(
+            vec![
+                FauxResponse::ToolCalls(vec![ToolCall {
+                    id: "w".into(),
+                    name: "wait".into(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }]),
+                FauxResponse::Text("after".into()),
+            ],
+            vec![gate_tool(Arc::clone(&release), Arc::default())],
+        )
+        .await;
+        let session = backend.current_session().await;
+        let (remote, _server) = over_the_wire(Arc::clone(&backend)).await;
+        let mut updates = remote.subscribe();
+        let turn = remote
+            .prompt(&session, vec![ContentBlock::text("go")])
+            .await
+            .unwrap();
+        loop {
+            let envelope = updates.recv().await.unwrap();
+            if matches!(envelope.update, SessionUpdate::ToolCall(_)) {
+                break;
+            }
+        }
+        let local = backend.model_control().unwrap();
+        let wire = remote.model_control().unwrap();
+        for control in [local, wire] {
+            assert_eq!(
+                control
+                    .set_model(&session, "faux/faux-model", None)
+                    .await
+                    .unwrap_err(),
+                BackendError::Busy
+            );
+            let result = control.set_effort(&session, "off", None).await.unwrap();
+            assert!(result.pending);
+        }
+        release.notify_one();
+        turn.outcome().await;
+        wire.set_model(&session, "faux/faux-model", None)
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
