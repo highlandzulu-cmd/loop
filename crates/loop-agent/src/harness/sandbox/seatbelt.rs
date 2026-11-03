@@ -197,14 +197,15 @@ const TEMP_LOCK: &str = ".loop-lock";
 /// Create and hold the lock of `dir`, a fresh temporary directory.
 #[cfg(unix)]
 fn hold_lock(dir: &Path) -> std::io::Result<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join(TEMP_LOCK))?;
-    rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)?;
-    Ok(file)
+    // Publish only an already-held lock. Otherwise another sandbox's cleanup
+    // can see the new file before flock and remove this live directory.
+    let file = tempfile::NamedTempFile::new_in(dir)?;
+    rustix::fs::flock(
+        file.as_file(),
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )?;
+    file.persist_noclobber(dir.join(TEMP_LOCK))
+        .map_err(|error| error.error)
 }
 
 /// Remove `/tmp/loop-seatbelt-*` and `/tmp/loop-command-*` directories this
@@ -584,6 +585,8 @@ impl SeatbeltPolicy {
 (allow process-exec process-fork)
 (allow signal (target self))
 (allow sysctl-read)
+; xcrun (including /usr/bin/git) asks dirhelper for per-user cache paths.
+(allow mach-lookup (global-name "com.apple.bsd.dirhelper"))
 (allow file-read*)
 (allow mach-lookup (global-name "com.apple.system.logger") (global-name "com.apple.system.notification_center") (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.configd") (global-name "com.apple.cfprefsd.daemon") (global-name "com.apple.cfprefsd.agent"))
 (allow file-write* (literal (param "DEV_NULL")))
@@ -1047,6 +1050,20 @@ impl SandboxFactory for SeatbeltSandboxFactory {
             &runtime,
         )
         .map_err(|e| SandboxError::Policy(e.to_string()))?;
+        if let Some(protected) = policy
+            .denied
+            .iter()
+            .chain(&policy.write_denied)
+            .find(|path| policy.project.starts_with(path))
+        {
+            return Err(SandboxError::Policy(format!(
+                "Cannot start the sandbox: project {} is inside protected folder {}. \
+                 The sandbox blocks this folder to protect credentials and private agent data. \
+                 Move the project outside this folder to use the sandbox",
+                policy.project.display(),
+                protected.display()
+            )));
+        }
         if config
             .options
             .get("denyHomeReads")
