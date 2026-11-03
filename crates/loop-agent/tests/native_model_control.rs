@@ -831,9 +831,7 @@ async fn an_idle_job_releases_an_older_queued_one_of_its_key() {
         let log = Arc::new(StdMutex::new(Vec::<(u32, bool)>::new()));
         let job = |id: u32| -> loop_agent::native_backend::NextTurnJob {
             let log = Arc::clone(&log);
-            Box::new(move |apply| {
-                Box::pin(async move { log.lock().unwrap().push((id, apply)) })
-            })
+            Box::new(move |apply| Box::pin(async move { log.lock().unwrap().push((id, apply)) }))
         };
         let mut rx = backend.subscribe();
         let handle = backend
@@ -930,7 +928,9 @@ async fn cancelling_while_the_next_turn_prepares_stops_the_prompt() {
         assert!(result.is_err(), "the cancelled prompt must not start");
         // Only the first turn's model call (and its tool follow-up) happened.
         let entries = harness.read_session_entries().await.unwrap();
-        assert!(!entries.iter().any(|e| format!("{e:?}").contains("\"again\"")));
+        assert!(!entries
+            .iter()
+            .any(|e| format!("{e:?}").contains("\"again\"")));
         assert!(!backend.is_busy(&session));
     })
     .await

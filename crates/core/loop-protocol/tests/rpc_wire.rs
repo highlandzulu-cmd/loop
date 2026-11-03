@@ -753,6 +753,25 @@ fn ttfb_method_wire() {
     );
 }
 
+/// The Session's chosen sandbox is an optional config field: absent means
+/// the workspace default, and older peers' configs still read.
+#[test]
+fn the_chosen_sandbox_is_an_optional_config_field() {
+    let old: loop_protocol::SessionConfig =
+        serde_json::from_value(json!({"model":"faux/one"})).unwrap();
+    assert_eq!(old.sandbox, None);
+    let config = loop_protocol::SessionConfig {
+        sandbox: Some("local/full/krun".into()),
+        ..Default::default()
+    };
+    let wire = serde_json::to_value(&config).unwrap();
+    assert_eq!(wire, json!({"sandbox":"local/full/krun"}));
+    assert_eq!(
+        serde_json::from_value::<loop_protocol::SessionConfig>(wire).unwrap(),
+        config
+    );
+}
+
 #[test]
 fn workspace_admin_and_host_only_methods_wire() {
     use loop_protocol::admin::*;

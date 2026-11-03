@@ -711,7 +711,9 @@ impl Runtime {
                 let recorded = opened
                     .native
                     .recorded_sandbox()
-                    .and_then(|v| serde_json::from_value::<loop_protocol::admin::SandboxChoice>(v).ok())
+                    .and_then(|v| {
+                        serde_json::from_value::<loop_protocol::admin::SandboxChoice>(v).ok()
+                    })
                     .filter(|choice| *choice != sandbox_choice);
                 if let Some(choice) = recorded {
                     match self.restore_sandbox(&opened, &choice).await {
@@ -722,9 +724,9 @@ impl Runtime {
                                 Self::sandbox_choice(&opened.settings, false)
                             };
                         }
-                        Err(error) => opened.startup_notices.push(format!(
-                            "Could not restore this Session's sandbox: {error}"
-                        )),
+                        Err(error) => opened
+                            .startup_notices
+                            .push(format!("Could not restore this Session's sandbox: {error}")),
                     }
                 }
             }

@@ -818,7 +818,10 @@ mod next_turn {
             let dir = tempfile::tempdir().unwrap();
             let (rt, _log) = runtime_with(dir.path(), "full-access", Default::default()).await;
             let gate = Arc::new(tokio::sync::Semaphore::new(0));
-            let (old, new) = (TaggedSandbox::gated("old", gate.clone()), TaggedSandbox::new("new"));
+            let (old, new) = (
+                TaggedSandbox::gated("old", gate.clone()),
+                TaggedSandbox::new("new"),
+            );
             use_sandboxes(&rt, &[&old, &new]);
             let session = rt.new_session(SessionSpec::default()).await.unwrap();
             let (mut first, mut second) = (rt.subscribe(), rt.subscribe());
@@ -836,12 +839,16 @@ mod next_turn {
 
             gate.add_permits(1);
             turn.outcome().await;
-            let expected = vec![
-                (false, Some("local/old".to_owned()), Some("local/old".to_owned())),
-                (true, Some("local/new".to_owned()), Some("local/old".to_owned())),
-                (false, Some("local/new".to_owned()), Some("local/old".to_owned())),
-                (false, Some("local/new".to_owned()), Some("local/new".to_owned())),
-            ];
+            let waiting = (
+                true,
+                Some("local/new".to_owned()),
+                Some("local/old".to_owned()),
+            );
+            let applied = (
+                false,
+                Some("local/new".to_owned()),
+                Some("local/new".to_owned()),
+            );
             for rx in [&mut first, &mut second] {
                 let seen = sandbox_events(rx, &session.key, "local/new").await;
                 // Both watchers see the pending change, then the effective
@@ -849,8 +856,8 @@ mod next_turn {
                 let pending = seen.iter().position(|e| e.0).expect("a pending event");
                 let effective = seen.len() - 1;
                 assert!(pending < effective, "{seen:?}");
-                assert_eq!(seen[pending], expected[1]);
-                assert_eq!(seen[effective], expected[3]);
+                assert_eq!(seen[pending], waiting);
+                assert_eq!(seen[effective], applied);
             }
             until("the old sandbox released", || old.destroy_count() == 1).await;
 
@@ -946,7 +953,10 @@ mod next_turn {
                 .load_session(&session, SessionSpec::default())
                 .await
                 .unwrap();
-            assert_eq!(sandbox_status(&rt, &reopened).await.config, local("applied"));
+            assert_eq!(
+                sandbox_status(&rt, &reopened).await.config,
+                local("applied")
+            );
             go(&rt, &reopened).await.outcome().await;
             assert_eq!(ran(&applied), 1, "restored, not the workspace default");
 
@@ -997,7 +1007,10 @@ mod next_turn {
             // The second Session's turn waits for the only permit.
             let second = go(&rt, &waiting).await;
             let live = rt.route(&waiting).unwrap();
-            until("the second turn reserved", || live.busy.load(Ordering::Acquire)).await;
+            until("the second turn reserved", || {
+                live.busy.load(Ordering::Acquire)
+            })
+            .await;
 
             for session in [&running, &waiting] {
                 let result = rt.set_model(session, "faux/faux-two", None).await.unwrap();

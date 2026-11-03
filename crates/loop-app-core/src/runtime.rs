@@ -118,6 +118,8 @@ pub struct Runtime {
 pub struct SessionShutdown {
     harness: Arc<AgentHarness>,
     store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    /// Releases work queued for the next turn.
+    native: Option<Arc<loop_agent::native_backend::NativeBackend>>,
     grace: std::time::Duration,
 }
 
@@ -133,8 +135,16 @@ impl SessionShutdown {
         Self {
             harness,
             store,
+            native: None,
             grace: SHUTDOWN_GRACE,
         }
+    }
+
+    /// Also release what `native` holds for the next turn, such as a
+    /// sandbox started ahead of it.
+    pub fn with_native(mut self, native: Arc<loop_agent::native_backend::NativeBackend>) -> Self {
+        self.native = Some(native);
+        self
     }
 
     /// How long to wait for the current turn to stop (default 5 s).
@@ -153,6 +163,9 @@ impl SessionShutdown {
         // `shutdown_requested` hooks, which must not fire again on a repeat.
         if !self.harness.is_shutting_down() {
             self.harness.request_shutdown();
+        }
+        if let Some(native) = &self.native {
+            native.release_next_turn().await;
         }
         if tokio::time::timeout(self.grace, self.harness.wait_for_settled())
             .await
@@ -177,6 +190,7 @@ impl Runtime {
     /// A handle that ends this Surface's Session work and releases its leases.
     pub fn session_shutdown(&self) -> SessionShutdown {
         SessionShutdown::new(Arc::clone(&self.harness), self.session_store.clone())
+            .with_native(Arc::clone(&self.native))
     }
 }
 

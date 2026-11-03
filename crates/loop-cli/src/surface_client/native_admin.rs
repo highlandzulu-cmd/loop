@@ -553,6 +553,11 @@ impl RuntimeAdmin for NativeAdmin<'_> {
     }
 }
 
+/// Starts the sandbox a test asks for.
+#[cfg(test)]
+pub(crate) type SandboxStarter =
+    Arc<dyn Fn(&SandboxChoice) -> BackendResult<loop_agent::harness::SandboxMode> + Send + Sync>;
+
 /// An owned sandbox service lets the terminal keep draining input during startup.
 pub(super) struct NativeSandbox {
     pub native: Arc<loop_agent::native_backend::NativeBackend>,
@@ -563,6 +568,9 @@ pub(super) struct NativeSandbox {
     pub web: loop_app_core::web_tools::WebTools,
     pub search: loop_agent::harness::SearchFilter,
     pub bash: loop_agent::harness::BashLimits,
+    /// Tests start their own sandboxes instead of a platform one.
+    #[cfg(test)]
+    pub starter: Option<SandboxStarter>,
 }
 #[async_trait::async_trait]
 impl RuntimeAdmin for NativeSandbox {
@@ -574,41 +582,33 @@ impl RuntimeAdmin for NativeSandbox {
     }
     async fn sandbox(&self, p: SandboxParams) -> BackendResult<SandboxResult> {
         use loop_agent::harness::SandboxMode;
-        use loop_app_core::sandbox_builder::{SandboxBuilder, SandboxRequest};
         if self.native.current_session().await != p.session {
             return Err(BackendError::SessionNotFound(p.session.key));
         }
         self.native.check_session_revision(p.expected_revision)?;
-        let mut choice = SandboxChoice {
-            mode: self.settings.mode.clone(),
-            isolation: self.settings.isolation.clone(),
-            runtime: self.settings.runtime.clone(),
-        };
+        // The Session's own choice when it made one, else the settings'.
+        let mut choice = self
+            .native
+            .recorded_sandbox()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_else(|| SandboxChoice {
+                mode: self.settings.mode.clone(),
+                isolation: self.settings.isolation.clone(),
+                runtime: self.settings.runtime.clone(),
+            });
         let mut note = String::new();
+        let mut mutation = None;
         if p.action == SandboxAction::Set {
             choice = p
                 .config
                 .ok_or_else(|| failed("missing sandbox configuration"))?;
-            let mode = match choice.mode.as_str() {
-                "off" => SandboxMode::Disabled,
-                "local" => {
-                    let mut settings = self.settings.clone();
-                    settings.mode = choice.mode.clone();
-                    settings.isolation = choice.isolation.clone();
-                    settings.runtime = choice.runtime.clone();
-                    let request = SandboxRequest::from_settings(&settings).map_err(failed)?;
-                    let builder =
-                        SandboxBuilder::for_current_platform().with_agent_dir(&self.agent_dir);
-                    let (sandbox, _) = builder.start(&self.cwd, &request).await.map_err(failed)?;
-                    SandboxMode::Enabled { sandbox }
-                }
-                _ => return Err(failed("unknown sandbox mode")),
-            };
+            let mode = self.start(&choice).await?;
             // A running turn and its tool calls keep the sandbox they
             // started with; the next turn starts in the new one.
             let slot = Arc::new(std::sync::Mutex::new(Some(mode)));
             let deferred = Arc::clone(&slot);
             let harness = Arc::clone(&self.harness);
+            let native = Arc::clone(&self.native);
             let web = self.web.clone();
             let search = self.search.clone();
             let bash = self.bash;
@@ -619,7 +619,12 @@ impl RuntimeAdmin for NativeSandbox {
                         // A failed rebuild is rolled back inside; nobody
                         // is waiting to hear about it.
                         Some(mode) if apply => {
-                            let _ = install_sandbox(&harness, &web, bash, search, mode).await;
+                            if install_sandbox(&harness, &web, bash, search, mode)
+                                .await
+                                .is_ok()
+                            {
+                                native.sandbox_applied();
+                            }
                         }
                         Some(SandboxMode::Enabled { sandbox }) => {
                             let _ = sandbox.destroy().await;
@@ -628,25 +633,112 @@ impl RuntimeAdmin for NativeSandbox {
                     }
                 })
             });
-            if self.native.after_turn(SANDBOX_JOB, job).await.is_some() {
-                let mode = slot.lock().unwrap().take().expect("the job did not run");
-                install_sandbox(
-                    &self.harness,
-                    &self.web,
-                    self.bash,
-                    self.search.clone(),
-                    mode,
-                )
-                .await?;
-            } else {
-                note = "\nThe new sandbox applies from the next turn.".into();
+            let json = serde_json::to_value(&choice).map_err(failed)?;
+            let deferred = self
+                .native
+                .defer_sandbox(&p.session, SANDBOX_JOB, json.clone(), None, job)
+                .await;
+            let deferred = match deferred {
+                Ok(deferred) => deferred,
+                Err(error) => {
+                    // Nothing was queued: release what was started.
+                    let started = slot.lock().unwrap().take();
+                    if let Some(SandboxMode::Enabled { sandbox }) = started {
+                        let _ = sandbox.destroy().await;
+                    }
+                    return Err(error);
+                }
+            };
+            match deferred {
+                Ok(queued) => {
+                    mutation = Some(queued);
+                    note = "\nThe new sandbox applies from the next turn.".into();
+                }
+                Err(_idle_job) => {
+                    let mode = slot.lock().unwrap().take().expect("the job did not run");
+                    install_sandbox(
+                        &self.harness,
+                        &self.web,
+                        self.bash,
+                        self.search.clone(),
+                        mode,
+                    )
+                    .await?;
+                    mutation = Some(
+                        self.native
+                            .record_sandbox(&p.session, json, None, false)
+                            .await?,
+                    );
+                }
             }
         }
         Ok(SandboxResult {
             config: choice,
             info: format!("{}{note}", self.harness.sandbox_info().await.format_box()),
-            ..Default::default()
+            revision: mutation
+                .as_ref()
+                .map_or_else(|| self.native.revision(), |m| m.revision),
+            seq: mutation.map(|m| m.seq),
         })
+    }
+}
+
+impl NativeSandbox {
+    /// Start the sandbox `choice` asks for.
+    async fn start(
+        &self,
+        choice: &SandboxChoice,
+    ) -> BackendResult<loop_agent::harness::SandboxMode> {
+        use loop_agent::harness::SandboxMode;
+        use loop_app_core::sandbox_builder::{SandboxBuilder, SandboxRequest};
+        #[cfg(test)]
+        if let Some(starter) = self.starter.as_ref() {
+            return starter(choice);
+        }
+        match choice.mode.as_str() {
+            "off" => Ok(SandboxMode::Disabled),
+            "local" => {
+                let mut settings = self.settings.clone();
+                settings.mode = choice.mode.clone();
+                settings.isolation = choice.isolation.clone();
+                settings.runtime = choice.runtime.clone();
+                let request = SandboxRequest::from_settings(&settings).map_err(failed)?;
+                let builder =
+                    SandboxBuilder::for_current_platform().with_agent_dir(&self.agent_dir);
+                let (sandbox, _) = builder.start(&self.cwd, &request).await.map_err(failed)?;
+                Ok(SandboxMode::Enabled { sandbox })
+            }
+            _ => Err(failed("unknown sandbox mode")),
+        }
+    }
+
+    /// Put a reopened Session back in the sandbox it last chose, if that is
+    /// not the one it runs in. Nothing has run in it yet.
+    pub(super) async fn restore(&self) -> BackendResult<()> {
+        let Some(choice) = self
+            .native
+            .recorded_sandbox()
+            .and_then(|v| serde_json::from_value::<SandboxChoice>(v).ok())
+        else {
+            return Ok(());
+        };
+        let default = SandboxChoice {
+            mode: self.settings.mode.clone(),
+            isolation: self.settings.isolation.clone(),
+            runtime: self.settings.runtime.clone(),
+        };
+        if choice == default {
+            return Ok(());
+        }
+        let mode = self.start(&choice).await?;
+        install_sandbox(
+            &self.harness,
+            &self.web,
+            self.bash,
+            self.search.clone(),
+            mode,
+        )
+        .await
     }
 }
 

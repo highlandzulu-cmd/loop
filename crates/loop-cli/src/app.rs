@@ -397,6 +397,8 @@ async fn run_loop(
             Vec::new()
         }
     };
+    // A resumed Session goes back to the sandbox it last chose.
+    runtime.restore_sandbox().await;
     for notice in runtime.take_startup_notices() {
         chat.push(sys(notice));
     }

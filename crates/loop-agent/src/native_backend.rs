@@ -130,7 +130,12 @@ fn sandbox_label(choice: &serde_json::Value) -> Option<String> {
     let parts = ["isolation", "runtime"]
         .into_iter()
         .filter_map(|key| choice[key].as_str());
-    Some(std::iter::once(mode).chain(parts).collect::<Vec<_>>().join("/"))
+    Some(
+        std::iter::once(mode)
+            .chain(parts)
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 /// `provider/id` of `model`.
@@ -395,6 +400,16 @@ impl NativeBackend {
         None
     }
 
+    /// Stop a prompt that is still preparing and release everything queued
+    /// for the next turn, for a Session that is going away. Waits for the
+    /// preparation to settle. Safe to repeat.
+    pub async fn release_next_turn(&self) {
+        self.cancel_requested.store(true, Ordering::Release);
+        // A prompt still preparing holds admission.
+        let _admission = self.admission.lock().await;
+        self.discard_next_turn().await;
+    }
+
     /// Release everything queued for the next turn without starting it.
     async fn discard_next_turn(&self) {
         let jobs: Vec<NextTurnJob> = self.next_turn.lock().drain().map(|(_, job)| job).collect();
@@ -422,6 +437,14 @@ impl NativeBackend {
         let _setting = self.setting.lock().await;
         self.current_config(session).await?;
         self.check_revision(expected_revision)?;
+        self.record_sandbox_locked(choice, deferred).await
+    }
+
+    async fn record_sandbox_locked(
+        &self,
+        choice: serde_json::Value,
+        deferred: bool,
+    ) -> BackendResult<MutationResult> {
         self.harness
             .record_config(PendingSessionWrite::Custom {
                 custom_type: SANDBOX_ENTRY.into(),
@@ -436,6 +459,44 @@ impl NativeBackend {
             state.sandbox_deferred = deferred;
         }
         Ok(self.announce_change().await)
+    }
+
+    /// Choose a sandbox while a turn may be running. During a turn the
+    /// choice is recorded, announced as pending and its `job` filed for the
+    /// next turn, replacing an older job of its `key`: `Ok(Ok(result))`.
+    /// With no turn running nothing is recorded; the older job is released
+    /// and `job` is handed back for the caller to run and then record:
+    /// `Ok(Err(job))`.
+    pub async fn defer_sandbox(
+        &self,
+        session: &SessionRef,
+        key: &'static str,
+        choice: serde_json::Value,
+        expected_revision: Option<u64>,
+        job: NextTurnJob,
+    ) -> BackendResult<Result<MutationResult, NextTurnJob>> {
+        // The same order as the model setter: settings, then admission.
+        let _setting = self.setting.lock().await;
+        self.current_config(session).await?;
+        self.check_revision(expected_revision)?;
+        let _admission = self.admission.lock().await;
+        let busy = self.is_busy_now();
+        let recorded = if busy {
+            Some(self.record_sandbox_locked(choice, true).await?)
+        } else {
+            None
+        };
+        let older = self.next_turn.lock().remove(key);
+        if let Some(older) = older {
+            older(false).await;
+        }
+        match recorded {
+            Some(result) => {
+                self.next_turn.lock().insert(key, job);
+                Ok(Ok(result))
+            }
+            None => Ok(Err(job)),
+        }
     }
 
     /// A deferred sandbox is now installed: announce it as effective.
@@ -934,12 +995,8 @@ impl AgentBackend for NativeBackend {
     }
 
     async fn shutdown(&self) {
-        self.cancel_requested.store(true, Ordering::Release);
         self.harness.request_shutdown();
-        // A prompt still preparing holds admission; wait for it to settle,
-        // then release whatever it left queued.
-        let _admission = self.admission.lock().await;
-        self.discard_next_turn().await;
+        self.release_next_turn().await;
     }
 
     fn compaction(&self) -> Option<&dyn Compaction> {
