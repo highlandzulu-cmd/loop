@@ -748,3 +748,93 @@ async fn copied_and_imported_sessions_never_restore_approval_grants() {
     .await
     .unwrap();
 }
+
+/// Page through `session`'s tree one row at a time from `cursor`.
+async fn tree_page(
+    rt: &Runtime,
+    session: &SessionRef,
+    cursor: Option<String>,
+) -> BackendResult<loop_protocol::rpc::TreeResult> {
+    rt.tree(loop_protocol::rpc::TreeParams {
+        session: session.clone(),
+        cursor,
+        limit: Some(1),
+    })
+    .await
+}
+
+#[tokio::test]
+async fn tree_cursors_reject_a_row_set_changed_by_a_turn() {
+    tokio::time::timeout(LIMIT, async {
+        use loop_agent::harness::session::PendingSessionWrite;
+        let dir = tempfile::tempdir().unwrap();
+        let (rt, _) = runtime(dir.path(), 4).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        let store = rt.factory.globals.repository.store();
+        let user = |text: &str| PendingSessionWrite::Message {
+            message: loop_agent::types::AgentMessage::user_text(text),
+        };
+        // Two root branches; the active one parks a turn when prompted.
+        store
+            .append_entry(&source.native_id, user("park a"))
+            .await
+            .unwrap();
+        rt.navigate(loop_protocol::rpc::NavigateParams {
+            session: source.clone(),
+            target_entry_id: None,
+            summarize: false,
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+        store
+            .append_entry(&source.native_id, user("park b"))
+            .await
+            .unwrap();
+        store
+            .append_entry(&source.native_id, user("park b2"))
+            .await
+            .unwrap();
+
+        // Unchanged state: every page follows from the first.
+        let mut ids = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = tree_page(&rt, &source, cursor).await.unwrap();
+            ids.extend(page.entries.into_iter().map(|e| e.entry_id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert!(ids.len() >= 3, "both branches are listed: {ids:?}");
+
+        // An idle cursor does not survive a turn starting.
+        let idle = tree_page(&rt, &source, None)
+            .await
+            .unwrap()
+            .next_cursor
+            .unwrap();
+        let turn = rt
+            .prompt(&source, vec![ContentBlock::text("park c")])
+            .await
+            .unwrap();
+        parked(&rt, &source).await;
+        let error = tree_page(&rt, &source, Some(idle)).await.unwrap_err();
+        assert!(error.to_string().contains("tree changed"), "{error}");
+
+        // A busy cursor does not survive that turn completing.
+        let busy = tree_page(&rt, &source, None)
+            .await
+            .unwrap()
+            .next_cursor
+            .unwrap();
+        rt.cancel(&source);
+        turn.outcome().await;
+        let error = tree_page(&rt, &source, Some(busy)).await.unwrap_err();
+        assert!(error.to_string().contains("tree changed"), "{error}");
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

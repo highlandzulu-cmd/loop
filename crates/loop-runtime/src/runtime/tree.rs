@@ -246,14 +246,26 @@ impl Runtime {
             .control_state(&params.session.native_id)
             .await
             .map_err(failed)?;
+        // A cursor names the exact row set it pages. Turn admission and
+        // completion change rows without a branch revision, so bind to both.
+        let rows_id = {
+            use sha2::{Digest, Sha256};
+            let mut digest = Sha256::new();
+            digest.update(state.branch_revision.to_le_bytes());
+            for row in &rows {
+                digest.update(row.entry_id.as_bytes());
+                digest.update([0, row.on_branch as u8, row.current as u8]);
+            }
+            format!("{:x}", digest.finalize())
+        };
         let cursor = params
             .cursor
             .as_deref()
             .map(|cursor| {
-                let (revision, offset) = cursor
+                let (rows, offset) = cursor
                     .split_once(':')
                     .ok_or_else(|| failed("invalid tree cursor"))?;
-                if revision != state.branch_revision.to_string() {
+                if rows != rows_id {
                     return Err(failed("tree changed; reload the first page"));
                 }
                 Ok(offset)
@@ -314,7 +326,7 @@ impl Runtime {
             fork_points,
             family,
             branch_revision: state.branch_revision,
-            next_cursor: (end < rows.len()).then(|| format!("{}:{end}", state.branch_revision)),
+            next_cursor: (end < rows.len()).then(|| format!("{rows_id}:{end}")),
         })
     }
     async fn check_revision(
