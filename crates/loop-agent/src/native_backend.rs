@@ -353,6 +353,7 @@ impl NativeBackend {
         let mut config = session_config(model.as_ref(), level);
         config.response_timeout_ms = recorded.response_timeout_ms;
         config.sandbox = recorded.sandbox.as_ref().and_then(sandbox_label);
+        config.mode = recorded.permission_mode.clone();
         config.active_skills = self.harness.active_skills().await;
         let timeout = recorded
             .response_timeout_ms
@@ -538,10 +539,12 @@ impl NativeBackend {
         state.level = level;
         let timeout = state.config.response_timeout_ms;
         let sandbox = state.config.sandbox.clone();
+        let mode = state.config.mode.clone();
         let applied_sandbox = state.effective.sandbox.clone();
         state.config = session_config(model.as_ref(), level);
         state.config.response_timeout_ms = timeout;
         state.config.sandbox = sandbox;
+        state.config.mode = mode;
         state.config.active_skills = skills;
         let current_turn = self.stream.lock().mapper.current_turn().cloned();
         match current_turn.filter(|_| running) {
@@ -1212,6 +1215,17 @@ impl NativeBackend {
         let _setting = self.setting.lock().await;
         self.current_config(session).await?;
         self.check_revision(expected_revision)?;
+        self.write_permission_mode(mode).await
+    }
+
+    /// Record a mode the tool gate changed on its own (approving a plan
+    /// returns to the mode it was entered from), so every Surface sees it.
+    pub async fn record_gate_mode(&self, mode: &str) -> BackendResult<MutationResult> {
+        let _setting = self.setting.lock().await;
+        self.write_permission_mode(mode).await
+    }
+
+    async fn write_permission_mode(&self, mode: &str) -> BackendResult<MutationResult> {
         self.harness
             .record_config(PendingSessionWrite::Custom {
                 custom_type: PERMISSION_MODE_ENTRY.into(),
@@ -1219,6 +1233,7 @@ impl NativeBackend {
             })
             .await
             .map_err(harness_error)?;
+        self.config.lock().config.mode = Some(mode.to_owned());
         Ok(self.announce_change().await)
     }
 

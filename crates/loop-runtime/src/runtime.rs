@@ -881,6 +881,11 @@ impl Runtime {
             opened
                 .tool_gate
                 .set_approver(Some(opened.approval_bridge.clone()));
+            opened
+                .tool_gate
+                .set_mode_recorder(Some(loop_app_core::tool_gate::mode_recorder(
+                    &opened.native,
+                )));
             let (depth, workspace, child_state) = match &child {
                 Some(child) => (
                     child.parent.depth + 1,
@@ -2035,7 +2040,8 @@ impl Runtime {
             default_model,
             default_effort,
         );
-        let config = loop_agent::native_backend::session_config(model.as_ref(), level);
+        let mut config = loop_agent::native_backend::session_config(model.as_ref(), level);
+        config.mode = recorded.permission_mode.clone();
         Ok(ConfigChanged {
             revision: recorded.revision,
             metadata: SessionMetadata {

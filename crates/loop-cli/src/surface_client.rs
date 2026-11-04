@@ -764,6 +764,47 @@ mod tests {
     use std::time::Duration;
     use test_support::{fixture, pause_provider};
 
+    /// Connected to a Runtime, the footer shows the Runtime Session's mode,
+    /// not the local gate's.
+    #[tokio::test]
+    async fn the_permission_mode_is_the_runtimes_when_connected() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut client = fixture(dir.path()).await;
+            let local = client.permission_mode();
+            assert_ne!(local.as_str(), "plan");
+            let session = client.session_ref();
+            let snapshot = |mode: Option<&str>| {
+                Some(loop_protocol::rpc::SessionSnapshot {
+                    session: session.clone(),
+                    workspace_id: String::new(),
+                    at_seq: 0,
+                    revision: 0,
+                    branch_revision: 0,
+                    view_id: None,
+                    metadata: Default::default(),
+                    config: loop_protocol::SessionConfig {
+                        mode: mode.map(str::to_owned),
+                        ..Default::default()
+                    },
+                    effective: Default::default(),
+                    pending: false,
+                    capabilities: Default::default(),
+                    turn_state: None,
+                    stats: serde_json::Value::Null,
+                    notices: vec![],
+                    workspace_revision: 0,
+                })
+            };
+            client.remote_snapshot = snapshot(Some("plan"));
+            assert_eq!(client.permission_mode().as_str(), "plan");
+            client.remote_snapshot = snapshot(None);
+            assert_eq!(client.permission_mode(), local, "no Runtime mode yet");
+        })
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn copy_and_export_capture_committed_output_without_switching_or_cancelling_source() {
         tokio::time::timeout(Duration::from_secs(15), async {
@@ -1308,6 +1349,8 @@ impl SurfaceClient {
             })
         }));
         r.tool_gate.set_approver(Some(bridge.clone()));
+        r.tool_gate
+            .set_mode_recorder(Some(loop_app_core::tool_gate::mode_recorder(&r.native)));
         r.tool_approval = Some(bridge.clone());
         Ok(())
     }

@@ -78,6 +78,33 @@ pub struct ToolGate {
     allowed: Mutex<HashMap<String, usize>>,
     /// MCP servers, for the tools they mark read-only.
     mcp: Mutex<Option<Arc<loop_mcp::McpClientManager>>>,
+    /// Told the new mode when approving a plan changes it, so the Session
+    /// can record it for every attached Surface.
+    mode_recorder: Mutex<Option<ModeRecorder>>,
+}
+
+/// See [`ToolGate::set_mode_recorder`].
+pub type ModeRecorder = Arc<
+    dyn Fn(PermissionMode) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A recorder that writes the mode into `native`'s current Session. It holds
+/// the backend weakly, so the gate never keeps it alive.
+pub fn mode_recorder(native: &Arc<loop_agent::native_backend::NativeBackend>) -> ModeRecorder {
+    let native = Arc::downgrade(native);
+    Arc::new(move |mode| {
+        let native = native.clone();
+        Box::pin(async move {
+            let Some(native) = native.upgrade() else {
+                return;
+            };
+            if let Err(error) = native.record_gate_mode(mode.as_str()).await {
+                tracing::warn!(%error, "record permission mode");
+            }
+        })
+    })
 }
 
 impl ToolGate {
@@ -175,6 +202,11 @@ impl ToolGate {
         }
         // A call allowed under the old mode is reviewed under the new one.
         self.allowed.lock().clear();
+    }
+
+    /// Call `recorder` with the new mode when approving a plan changes it.
+    pub fn set_mode_recorder(&self, recorder: Option<ModeRecorder>) {
+        *self.mode_recorder.lock() = recorder;
     }
 
     /// Look up MCP tools' `readOnlyHint` in `mcp`'s servers.
@@ -352,11 +384,16 @@ impl ToolGate {
         let back = *self.plan_return.lock();
         match approver.review_plan(plan, back.as_str(), cancel).await {
             PlanReview::Approved { accept_edits } => {
-                self.set_mode(if accept_edits {
+                let mode = if accept_edits {
                     PermissionMode::AcceptEdits
                 } else {
                     back
-                });
+                };
+                self.set_mode(mode);
+                let recorder = self.mode_recorder.lock().clone();
+                if let Some(recorder) = recorder {
+                    recorder(mode).await;
+                }
                 None
             }
             PlanReview::KeepPlanning(reason) => block(match reason {
@@ -895,6 +932,29 @@ mod tests {
         let blocked = pending.await.unwrap().expect("kept planning");
         assert!(blocked.reason.unwrap().contains("also update the docs"));
         assert_eq!(gate.mode(), PermissionMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn approving_a_plan_tells_the_recorder_the_new_mode() {
+        let (gate, mut prompts) = gate_with_approver(&[]);
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = told.clone();
+        gate.set_mode_recorder(Some(Arc::new(move |mode| {
+            let sink = sink.clone();
+            Box::pin(async move { sink.lock().push(mode) })
+        })));
+        gate.set_mode(PermissionMode::FullAccess);
+        gate.set_mode(PermissionMode::Plan);
+        let before = gate.before_hook();
+        let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+        let prompt = prompts.recv().await.unwrap();
+        assert!(told.lock().is_empty(), "entering plan is not the gate's");
+        prompt
+            .response_tx
+            .send(crate::tool_approval::ApprovalDecision::Accept)
+            .unwrap();
+        assert!(pending.await.unwrap().is_none());
+        assert_eq!(*told.lock(), vec![PermissionMode::FullAccess]);
     }
 
     #[tokio::test]

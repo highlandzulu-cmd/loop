@@ -1389,3 +1389,175 @@ mod next_turn {
         .unwrap();
     }
 }
+
+mod gate_mode {
+    use super::*;
+    use loop_agent::{BeforeToolCallContext, ToolCall as AgentToolCall};
+    use loop_protocol::{ConfigChanged, SessionUpdate};
+    use loop_wire::control::EscalationRecipient;
+    use loop_wire::RuntimeControl;
+    use tokio::sync::{broadcast::Receiver, mpsc, oneshot};
+
+    type Asked = (
+        loop_protocol::rpc::InteractParams,
+        oneshot::Sender<loop_protocol::InteractionOutcome>,
+    );
+    /// A Surface that hands every Escalation to the test.
+    struct Watcher(mpsc::UnboundedSender<Asked>);
+    #[async_trait::async_trait]
+    impl EscalationRecipient for Watcher {
+        fn withdraw(&self, _: loop_protocol::rpc::InteractWithdrawnParams) {}
+        async fn interact(
+            &self,
+            params: loop_protocol::rpc::InteractParams,
+            _withdrawn: oneshot::Receiver<()>,
+        ) -> Result<loop_protocol::InteractionOutcome, ()> {
+            let (tx, rx) = oneshot::channel();
+            self.0.send((params, tx)).map_err(|_| ())?;
+            rx.await.map_err(|_| ())
+        }
+    }
+
+    async fn next_config(rx: &mut Receiver<UpdateEnvelope>, key: &SessionKey) -> ConfigChanged {
+        loop {
+            let envelope = rx.recv().await.unwrap();
+            if let SessionUpdate::ConfigChanged(changed) = envelope.update {
+                if &envelope.session == key {
+                    return changed;
+                }
+            }
+        }
+    }
+
+    async fn set(rt: &Runtime, session: &SessionRef, mode: &str) {
+        rt.permission_mode(PermissionModeParams {
+            session: session.clone(),
+            mode: Some(mode.into()),
+            expected_revision: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    fn exit_plan() -> BeforeToolCallContext {
+        let arguments = json!({"plan": "1. Edit main.rs"});
+        let tool_call = AgentToolCall {
+            id: "plan1".into(),
+            name: "exit_plan".into(),
+            arguments: arguments.clone(),
+            thought_signature: None,
+        };
+        BeforeToolCallContext {
+            assistant_message: loop_ai::AssistantMessage {
+                content: Vec::new(),
+                api: String::new(),
+                provider: String::new(),
+                model: String::new(),
+                response_model: None,
+                response_id: None,
+                usage: Default::default(),
+                stop_reason: loop_ai::StopReason::ToolUse,
+                error_message: None,
+                raw_stop_reason: None,
+                timestamp: 0,
+            },
+            args: arguments,
+            tool_call,
+            context: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_reaches_every_attached_client() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let (rt, _log) = runtime(dir.path()).await;
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            let (mut first, mut second) = (rt.subscribe(), rt.subscribe());
+            set(&rt, &session, "plan").await;
+            for rx in [&mut first, &mut second] {
+                let changed = next_config(rx, &session.key).await;
+                assert_eq!(changed.config.mode.as_deref(), Some("plan"));
+                assert_eq!(changed.effective.mode.as_deref(), Some("plan"));
+            }
+            // Another setting keeps the mode in the announced config.
+            rt.set_model(&session, "faux/faux-two", None).await.unwrap();
+            let changed = next_config(&mut first, &session.key).await;
+            assert_eq!(changed.config.mode.as_deref(), Some("plan"));
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_mode_survives_reopening_the_session() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let (rt, _log) = runtime(dir.path()).await;
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            set(&rt, &session, "plan").await;
+            rt.close(&session.key, false).await.unwrap();
+            // Listing and attaching read the recorded config.
+            let attached = rt.attach_snapshot_watching(90, &session, 0).await.unwrap();
+            let snapshot = attached.snapshot.unwrap();
+            assert_eq!(snapshot.config.mode.as_deref(), Some("plan"));
+            let reopened = rt
+                .load_session(&session, SessionSpec::default())
+                .await
+                .unwrap();
+            let mut rx = rt.subscribe();
+            set(&rt, &reopened, "plan").await;
+            let changed = next_config(&mut rx, &reopened.key).await;
+            assert_eq!(changed.config.mode.as_deref(), Some("plan"));
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn approving_the_plan_announces_the_mode_it_returns_to() {
+        tokio::time::timeout(LIMIT, async {
+            let dir = tempfile::tempdir().unwrap();
+            let (rt, _log) = runtime_with(dir.path(), "full-access", Default::default()).await;
+            let session = rt.new_session(SessionSpec::default()).await.unwrap();
+            let (tx, mut asked) = mpsc::unbounded_channel();
+            RuntimeControl::recipient(rt.as_ref(), &session, 1, Some(Arc::new(Watcher(tx))))
+                .await
+                .unwrap();
+            set(&rt, &session, "plan").await;
+            let (mut first, mut second) = (rt.subscribe(), rt.subscribe());
+
+            let live = rt.route(&session).unwrap();
+            let before = live.opened.tool_gate.before_hook();
+            let review = tokio::spawn(async move { before(exit_plan(), None).await });
+            let (params, answer) = asked.recv().await.unwrap();
+            let loop_protocol::InteractionRequest::Permission { options, .. } = &params.request
+            else {
+                panic!("{params:?}")
+            };
+            let accept = options
+                .iter()
+                .find(|o| o.native_id == loop_app_core::interaction::native_options::ACCEPT)
+                .unwrap_or(&options[0])
+                .native_id
+                .clone();
+            answer
+                .send(loop_protocol::InteractionOutcome::Selected {
+                    native_id: accept,
+                    note: None,
+                })
+                .unwrap();
+            assert!(review.await.unwrap().is_none(), "the plan is approved");
+
+            for rx in [&mut first, &mut second] {
+                let changed = next_config(rx, &session.key).await;
+                assert_eq!(changed.config.mode.as_deref(), Some("full-access"));
+            }
+            rt.shutdown().await;
+        })
+        .await
+        .unwrap();
+    }
+}
