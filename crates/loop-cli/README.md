@@ -72,7 +72,11 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/scoped-models`, `/effort`, `/ttfb`, `/permissions`, `/plan`, `/settings`, `/login`, `/logout`, `/websearch`, `/mcp`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/session`, `/name`, `/copy`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates. Build-dependent: `/usage` (default build), `/tracing` (`telemetry` feature, on by default), `/workflow` (`orchestration` feature).
+
+### MCP server mode
+
+`loop --serve-mcp` starts Loop as an MCP server (streamable HTTP) instead of the chat. `--mcp-host` sets the interface (default `127.0.0.1`), `--mcp-port` the port (default `3100`), and `--mcp-token <token>` requires `Authorization: Bearer <token>` on every request; a non-loopback `--mcp-host` requires a token. Tool calls are judged by the [permission mode](../../docs/permissions.md), and with nobody to ask, calls that need approval are refused unless you pass `--permission-mode full-access`.
 
 `/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
 
@@ -113,7 +117,7 @@ Type `!ls -la` (or any shell command) to run it in the current sandbox/host envi
 |----------|--------|
 | `enter` | Send |
 | `shift+enter` / `ctrl+j` | New line |
-| `escape` | Interrupt |
+| `escape` | Interrupt; twice quickly when idle: open `/tree` (setting `doubleEscapeAction`, see [configuration](../../docs/configuration.md)) |
 | `ctrl+c` | Clear (twice quits) |
 | `ctrl+l` | Model picker |
 | `ctrl+p` | Cycle models |
@@ -186,7 +190,7 @@ In `ask` mode (the default), `write` / `edit` / `bash` pause for approval, per `
 
 - **`read`, `write`, `edit`, `bash`:** files and the shell, under the permission mode.
 - **`grep`, `glob`, `ls`:** search file contents, find files by pattern, and list a directory. They only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; output stops at 500 lines with a truncated note.
-- **`todo`:** the model's checklist for multi-step work. Each update shows in the transcript as a checklist (`☐` pending, `◼` in progress, `✔` done). The checklist is part of the session, so `/resume`, `/fork` and `/clone` keep it.
+- **`todo`:** the model's checklist for multi-step work. The checklist shows live under the transcript and updates in place (`☐` pending, `◼` in progress, `✔` done); when the turn ends it lands in the transcript once, so a five-step task shows one checklist, not five. The checklist is part of the session, so `/resume`, `/fork` and `/clone` keep it.
 
 ## Web tools
 
