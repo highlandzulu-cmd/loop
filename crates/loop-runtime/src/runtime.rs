@@ -2545,6 +2545,10 @@ impl AgentBackend for Runtime {
             }
             let outcome = match result {
                 Ok(outcome) => outcome,
+                // A cancel during the backend's prompt preparation is a cancel.
+                Err(BackendError::Failed(info)) if info.category == ErrorCategory::Cancelled => {
+                    TurnOutcome::Cancelled
+                }
                 Err(BackendError::Failed(info)) => TurnOutcome::Failed(info),
                 Err(error) => TurnOutcome::Failed(loop_protocol::ErrorInfo::new(
                     ErrorCategory::Internal,
