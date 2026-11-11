@@ -1778,7 +1778,7 @@ impl SurfaceClient {
         for (k, v) in &settings.tool_permissions {
             perms.push_str(&format!("\n    {k}: {v}"));
         }
-        Ok(format!("settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  permissionMode: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  ui: {}\n  Theme and UI preferences are Surface-local.", crate::config::paths::settings_path(self.agent_dir()).display(), config.config.model.unwrap_or_else(|| "none".into()), self.theme().name, config.config.effort.unwrap_or(settings.default_thinking_level), settings.sandbox.display(), self.permission_mode().as_str(), settings.diff_editor.as_deref().unwrap_or("(auto)"), settings.response_header_timeout_ms, if settings.response_header_timeout_ms == 0 { " (off)" } else { "" }, self.host.inner.settings.ui_mode))
+        Ok(format!("settings ({})\n  model: {}\n  theme: {}\n  thinking: {}\n  sandbox: {}\n  permissionMode: {}\n  toolPermissions:{perms}\n  diffEditor: {}\n  responseHeaderTimeoutMs: {}{}\n  Theme and UI preferences are Surface-local.", crate::config::paths::settings_path(self.agent_dir()).display(), config.config.model.unwrap_or_else(|| "none".into()), self.theme().name, config.config.effort.unwrap_or(settings.default_thinking_level), settings.sandbox.display(), self.permission_mode().as_str(), settings.diff_editor.as_deref().unwrap_or("(auto)"), settings.response_header_timeout_ms, if settings.response_header_timeout_ms == 0 { " (off)" } else { "" }))
     }
 }
 

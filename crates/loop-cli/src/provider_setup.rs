@@ -370,6 +370,7 @@ impl ProviderSetup {
                                 id,
                                 reasoning: true,
                                 thinking_format: Some(format),
+                                supports_metadata: None,
                             })
                             .collect(),
                     );

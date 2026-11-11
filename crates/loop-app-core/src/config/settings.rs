@@ -190,7 +190,7 @@ pub struct Settings {
     /// Compaction.
     #[serde(default)]
     pub compaction: CompactionSettingsJson,
-    /// Models enabled for Ctrl+P cycling (globs).
+    /// Models enabled for Ctrl+P cycling: exact `id` or `provider/id`, no wildcards.
     #[serde(default)]
     pub enabled_models: Vec<String>,
     /// Extra skill paths / globs.

@@ -86,11 +86,13 @@ async fn connect_reject_restart_and_disconnect() {
                         id: "m-one".into(),
                         reasoning: false,
                         thinking_format: None,
+                        supports_metadata: None,
                     },
                     loop_app_core::config::providers::CustomProviderModel {
                         id: "m-two".into(),
                         reasoning: true,
                         thinking_format: Some(loop_ai::ThinkingFormat::Zai),
+                        supports_metadata: None,
                     },
                 ]),
             })
@@ -347,6 +349,7 @@ async fn corrected_reconnect_restores_thinking(runtime: &mut CliRuntime) {
                 id: "m-two".into(),
                 reasoning: true,
                 thinking_format: Some(format),
+                supports_metadata: None,
             },
         ]),
     };
@@ -419,6 +422,7 @@ async fn removed_pin_clears_selection(runtime: &mut CliRuntime) {
                 id: "removed".into(),
                 reasoning: true,
                 thinking_format: Some(loop_ai::ThinkingFormat::Zai),
+                supports_metadata: None,
             },
         ]),
     };

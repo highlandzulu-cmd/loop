@@ -1153,7 +1153,7 @@ pub fn startup_permission_mode(
     if let Some(value) = flag {
         let mode = PermissionMode::parse(value).ok_or_else(|| {
             anyhow::anyhow!(
-                "unknown --permission-mode `{value}`: use read-only, ask, accept-edits or full-access"
+                "unknown --permission-mode `{value}`: use read-only, ask, accept-edits, full-access or plan"
             )
         })?;
         return Ok((mode, None));
@@ -1391,13 +1391,18 @@ fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
         .with_name(m.get("name").and_then(|v| v.as_str()))
         .with_context_window(field("contextWindow", "context_window"))
         .with_max_tokens(field("maxTokens", "max_tokens"));
-    if let Some(format) = m
+    let thinking_format = m
         .get("thinkingFormat")
         .or_else(|| m.get("thinking_format"))
-        .and_then(|value| serde_json::from_value(value.clone()).ok())
-    {
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    let supports_metadata = m
+        .get("supportsMetadata")
+        .or_else(|| m.get("supports_metadata"))
+        .and_then(|value| value.as_bool());
+    if thinking_format.is_some() || supports_metadata.is_some() {
         spec = spec.with_compat(loop_ai::OpenAICompletionsCompat {
-            thinking_format: Some(format),
+            thinking_format,
+            supports_metadata,
             ..Default::default()
         });
     }
@@ -1722,6 +1727,39 @@ mod tests {
         assert_eq!(
             kept.compat.unwrap().thinking_format,
             Some(loop_ai::ThinkingFormat::Zai)
+        );
+    }
+}
+
+#[cfg(test)]
+mod models_json_metadata_tests {
+    use super::parse_model_spec;
+
+    #[test]
+    fn models_json_reads_supports_metadata_in_both_spellings() {
+        let metadata = |value: serde_json::Value| {
+            let spec = parse_model_spec(&value, "m");
+            loop_ai::resolve_compat("https://gateway.example.com/v1", spec.compat.as_ref())
+                .supports_metadata
+        };
+        assert!(metadata(
+            serde_json::json!({"id": "m", "supportsMetadata": true})
+        ));
+        assert!(metadata(
+            serde_json::json!({"id": "m", "supports_metadata": true})
+        ));
+        assert!(!metadata(
+            serde_json::json!({"id": "m", "supportsMetadata": false})
+        ));
+        assert!(!metadata(serde_json::json!({"id": "m"})));
+        // Soket's detected default can be turned off.
+        let spec = parse_model_spec(
+            &serde_json::json!({"id": "m", "supportsMetadata": false}),
+            "m",
+        );
+        assert!(
+            !loop_ai::resolve_compat("https://api.soket.ai/v1", spec.compat.as_ref())
+                .supports_metadata
         );
     }
 }

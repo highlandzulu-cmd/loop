@@ -547,7 +547,14 @@ async fn run_loop(
     let mut dashboard: Option<dashboard::Screen> = None;
 
     while !should_quit {
-        if let Ok(current_size) = terminal.size() {
+        // While `/usage` is open the dashboard owns the screen: autoresizing the
+        // chat terminal now would draw into its alternate screen. The close path
+        // below re-syncs the size.
+        #[cfg(feature = "usage")]
+        let dashboard_open = dashboard.is_some();
+        #[cfg(not(feature = "usage"))]
+        let dashboard_open = false;
+        if let (false, Ok(current_size)) = (dashboard_open, terminal.size()) {
             if current_size.width != last_size.width || current_size.height != last_size.height {
                 note_terminal_resize(
                     terminal,
@@ -617,7 +624,11 @@ async fn run_loop(
                     let resized = dashboard.take().map(dashboard::Screen::close);
                     if let Some(width) = resized.transpose()?.flatten() {
                         let _ = terminal.autoresize();
-                        last_size.width = width;
+                        if let Ok(size) = terminal.size() {
+                            last_size = size;
+                        } else {
+                            last_size.width = width;
+                        }
                         redraw_request = true;
                     }
                     continue;
@@ -1070,10 +1081,11 @@ async fn run_loop(
                     );
                     for ev in &batch {
                         if let Event::Resize(w, h) = ev {
+                            let (w, h) = current_terminal_size(terminal, *w, *h);
                             note_terminal_resize(
                                 terminal,
-                                *w,
-                                *h,
+                                w,
+                                h,
                                 &mut last_size,
                                 &mut redraw_request,
                             );
@@ -1147,6 +1159,7 @@ async fn run_loop(
                         token_bar.sync_window(runtime);
                     }
                     Event::Resize(w, h) => {
+                        let (w, h) = current_terminal_size(terminal, w, h);
                         note_terminal_resize(terminal, w, h, &mut last_size, &mut redraw_request);
                     }
                     _ => {}
@@ -2329,6 +2342,19 @@ fn unbracketed_paste_keys(events: &[Event]) -> Option<Vec<KeyEvent>> {
         }
     }
     Some(keys)
+}
+
+/// The live terminal size. A drag queues many resize events; the size inside an
+/// old event is stale and would trigger a second redraw on the next loop.
+fn current_terminal_size<B: Backend>(
+    terminal: &Terminal<B>,
+    event_width: u16,
+    event_height: u16,
+) -> (u16, u16) {
+    terminal
+        .size()
+        .map(|size| (size.width, size.height))
+        .unwrap_or((event_width, event_height))
 }
 
 fn note_terminal_resize<B: Backend>(
@@ -6518,6 +6544,13 @@ mod tests {
         assert!(chat
             .iter()
             .any(|item| matches!(item, ChatItem::Assistant { text } if text == "hello")));
+    }
+
+    #[test]
+    fn current_terminal_size_ignores_stale_event_size() {
+        let backend = ratatui::backend::TestBackend::new(90, 40);
+        let terminal = Terminal::new(backend).unwrap();
+        assert_eq!(current_terminal_size(&terminal, 80, 24), (90, 40));
     }
 
     #[test]
