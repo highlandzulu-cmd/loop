@@ -4,11 +4,16 @@ use std::path::PathBuf;
 
 use tracing_subscriber::EnvFilter;
 
-#[tokio::main]
-async fn main() {
-    // `loop-desktop __doc-to-text <format>` is the document reader child of
-    // the read and write tools; otherwise this binary becomes that reader.
+fn main() {
+    // First, before the async runtime: `loop-desktop __doc-to-text <format>`
+    // is the document reader child of the read and write tools; otherwise
+    // this binary becomes that reader.
     loop_agent::harness::run_document_reader_child();
+    async_main();
+}
+
+#[tokio::main]
+async fn async_main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn")),
