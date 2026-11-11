@@ -819,7 +819,8 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
             .expect("loop session attach did not notice the lost Runtime")
             .unwrap();
         assert!(!status.success(), "{}", surface.output());
-        assert!(surface.output().contains("Lost contact with Runtime"));
+        // The reader tasks can still hold the last bytes after the exit.
+        surface.wait_text("Lost contact with Runtime").await;
         drop(serve);
 
         let serve = fx.serve().await;
