@@ -16,10 +16,19 @@
 //! overshoot it briefly. The parent also stops it at a wall-clock timeout,
 //! when its output passes a cap, and when the tool call is cancelled. The
 //! child's stderr (panic messages included) is captured, never printed.
+//! At most [`MAX_CHILDREN`] readers run at once.
+//!
+//! The reader runs on the host, so its executable must be the one this
+//! process started from. On Linux the child is `/proc/self/exe`, the
+//! running image itself. Elsewhere the executable's identity (device,
+//! inode, size, modification time) is recorded at start and checked before
+//! each run, and an executable inside the Session's workspace or the temp
+//! directory, where a Session could replace it, is refused. A swap between
+//! that check and the `exec` is still possible there.
 
 use std::ffi::OsString;
 use std::io::{Read as _, Write as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -37,6 +46,14 @@ pub const CHILD_ARG: &str = "__doc-to-text";
 /// The first bytes of every child reply, so output from a wrong program is
 /// never taken for a document's text.
 const MAGIC: &[u8] = b"LOOPDOC1\n";
+
+/// The reply format; a reader that answers with another is refused.
+const PROTOCOL: u32 = 1;
+
+/// The most reader children at once, across all Sessions.
+const MAX_CHILDREN: usize = 3;
+
+static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_CHILDREN);
 
 /// How documents are parsed.
 #[derive(Debug, Clone)]
@@ -56,6 +73,72 @@ pub enum DocumentReader {
 }
 
 static READER: OnceLock<DocumentReader> = OnceLock::new();
+
+/// The running executable and its identity when this process started.
+static STARTED_FROM: OnceLock<(PathBuf, ExeIdentity)> = OnceLock::new();
+
+/// What identifies an executable file on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExeIdentity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+fn identity_of(path: &Path) -> Option<ExeIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    let m = std::fs::metadata(path).ok()?;
+    Some(ExeIdentity {
+        dev: m.dev(),
+        ino: m.ino(),
+        size: m.size(),
+        mtime: m.mtime(),
+        mtime_nsec: m.mtime_nsec(),
+    })
+}
+
+/// The running image, which a swapped file on disk cannot change.
+const PROC_SELF_EXE: &str = "/proc/self/exe";
+
+/// Whether `program` may run as the reader for a Session in `workspace`.
+fn check_program(
+    program: &Path,
+    started_from: Option<&(PathBuf, ExeIdentity)>,
+    workspace: Option<&Path>,
+) -> Result<(), String> {
+    if program == Path::new(PROC_SELF_EXE) {
+        return Ok(());
+    }
+    if let Some((path, identity)) = started_from {
+        if path == program && identity_of(program).as_ref() != Some(identity) {
+            return Err(format!(
+                "{UNSAFE}: the program file {} changed since Loop started; restart Loop",
+                program.display()
+            ));
+        }
+    }
+    let program = std::fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let roots = workspace
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain([std::env::temp_dir()]);
+    for root in roots {
+        let Ok(root) = std::fs::canonicalize(&root) else {
+            continue;
+        };
+        if program.starts_with(&root) {
+            return Err(format!(
+                "{UNSAFE}: the document reader {} is inside {}, where a Session can replace it; \
+                 run Loop from a copy installed outside the workspace",
+                program.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Set how this process parses documents. Only the first call counts;
 /// returns whether it was that one.
@@ -81,17 +164,29 @@ pub(super) fn current_reader() -> Option<DocumentReader> {
 /// and exit. Otherwise make this executable the document reader of this
 /// process and return.
 pub fn run_document_reader_child() {
-    let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() == Some(std::ffi::OsStr::new(CHILD_ARG)) {
-        let format = args.next().unwrap_or_default();
-        std::process::exit(child_main(&format.to_string_lossy()));
+    let args: Vec<OsString> = std::env::args_os().collect();
+    if args.get(1).map(OsString::as_os_str) == Some(std::ffi::OsStr::new(CHILD_ARG)) {
+        if args.len() != 3 {
+            eprintln!("usage: {CHILD_ARG} <format>");
+            std::process::exit(2);
+        }
+        std::process::exit(child_main(&args[2].to_string_lossy()));
     }
-    if let Ok(program) = std::env::current_exe() {
-        set_document_reader(DocumentReader::Child {
-            program,
-            args: vec![CHILD_ARG.into()],
-        });
-    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let program = if cfg!(target_os = "linux") && Path::new(PROC_SELF_EXE).exists() {
+        PathBuf::from(PROC_SELF_EXE)
+    } else {
+        if let Some(identity) = identity_of(&exe) {
+            let _ = STARTED_FROM.set((exe.clone(), identity));
+        }
+        exe
+    };
+    set_document_reader(DocumentReader::Child {
+        program,
+        args: vec![CHILD_ARG.into()],
+    });
 }
 
 /// What a PDF reader learned besides the text.
@@ -121,6 +216,9 @@ pub(super) enum Reading {
 
 #[derive(Serialize, Deserialize)]
 struct Header {
+    /// [`PROTOCOL`]; absent in a reply from another version.
+    #[serde(default)]
+    v: u32,
     ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -153,8 +251,9 @@ impl Default for Limits {
 /// The prefix of every error about a reader that did not finish.
 pub(super) const UNSAFE: &str = "could not read this document safely";
 
-/// Read `bytes` as `format` with `reader`. `Err` means the reader did not
-/// finish (it crashed, ran out of time or memory, or was cancelled);
+/// Read `bytes` as `format` with `reader`, for a Session whose workspace
+/// is `workspace`. `Err` means the reader did not run or finish (it was
+/// refused, crashed, ran out of time or memory, or was cancelled);
 /// `Ok(Reading::Refused)` means it finished and declined the file.
 pub(super) async fn convert(
     reader: &DocumentReader,
@@ -162,6 +261,7 @@ pub(super) async fn convert(
     format: Format,
     bytes: Vec<u8>,
     cancel: Option<&CancellationToken>,
+    workspace: Option<&Path>,
 ) -> Result<Reading, String> {
     match reader {
         DocumentReader::InProcess => {
@@ -176,6 +276,11 @@ pub(super) async fn convert(
             }
         }
         DocumentReader::Child { program, args } => {
+            check_program(program, STARTED_FROM.get(), workspace)?;
+            let _slot = tokio::select! {
+                slot = SLOTS.acquire() => slot.map_err(|e| e.to_string())?,
+                _ = cancelled(cancel) => return Err(format!("{UNSAFE}: cancelled")),
+            };
             run_child(program, args, limits, format, bytes, cancel).await
         }
     }
@@ -207,6 +312,7 @@ enum Stop {
     Timeout,
     Cancelled,
     Memory,
+    Unwatched,
 }
 
 async fn run_child(
@@ -285,11 +391,25 @@ async fn run_child(
         Ok::<Vec<u8>, ()>(kept)
     };
     let io = async { tokio::try_join!(feed, collect, drain) };
-    let stopped = tokio::select! {
-        r = io => Ok(r),
-        _ = tokio::time::sleep(limits.timeout) => Err(Stop::Timeout),
-        _ = cancelled(cancel) => Err(Stop::Cancelled),
-        _ = watch_memory(pid, limits.memory) => Err(Stop::Memory),
+    tokio::pin!(io);
+    let deadline = tokio::time::sleep(limits.timeout);
+    tokio::pin!(deadline);
+    let mut watching = true;
+    let stopped = loop {
+        tokio::select! {
+            r = &mut io => break Ok(r),
+            _ = &mut deadline => break Err(Stop::Timeout),
+            _ = cancelled(cancel) => break Err(Stop::Cancelled),
+            watch = watch_memory(pid, limits.memory), if watching => match watch {
+                Watch::Over => break Err(Stop::Memory),
+                // The footprint could not be read: fine if the child has
+                // exited, otherwise stop it rather than run it unwatched.
+                Watch::Unknown => match child.try_wait() {
+                    Ok(Some(_)) => watching = false,
+                    _ => break Err(Stop::Unwatched),
+                },
+            },
+        }
     };
     let (out, err) = match stopped {
         Ok(Ok(((), Some(out), err))) => (out, err),
@@ -316,6 +436,7 @@ async fn run_child(
                     "{UNSAFE}: the reader used more than {} MB of memory",
                     limits.memory / (1024 * 1024)
                 ),
+                Stop::Unwatched => format!("{UNSAFE}: could not watch the reader's memory"),
             });
         }
     };
@@ -363,7 +484,7 @@ fn describe_exit(status: std::process::ExitStatus, stderr: &[u8]) -> String {
     format!("{what}: {last}")
 }
 
-/// Lower `resource` to `value`, never above the hard limit already set.
+/// Lower `resource` to `value`, never above the limits already set.
 fn set_limit(resource: LimitResource, value: u64) -> std::io::Result<()> {
     let mut current = libc::rlimit {
         rlim_cur: 0,
@@ -373,7 +494,10 @@ fn set_limit(resource: LimitResource, value: u64) -> std::io::Result<()> {
     if unsafe { libc::getrlimit(resource, &mut current) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
-    let value = (value as libc::rlim_t).min(current.rlim_max);
+    // Never above the limits already set: the soft one is the user's.
+    let value = (value as libc::rlim_t)
+        .min(current.rlim_cur)
+        .min(current.rlim_max);
     let limit = libc::rlimit {
         rlim_cur: value,
         rlim_max: value,
@@ -392,22 +516,35 @@ type LimitResource = libc::__rlimit_resource_t;
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 type LimitResource = libc::c_int;
 
-/// Resolves when the child's physical footprint passes `limit` (macOS,
-/// which does not enforce `RLIMIT_AS`); never elsewhere.
-async fn watch_memory(pid: Option<u32>, limit: u64) {
+enum Watch {
+    /// Over the limit.
+    Over,
+    /// The footprint could not be read.
+    Unknown,
+}
+
+/// Resolves when the child's physical footprint passes `limit`, or cannot
+/// be read (macOS, which does not enforce `RLIMIT_AS`); never elsewhere.
+async fn watch_memory(pid: Option<u32>, limit: u64) -> Watch {
     #[cfg(target_os = "macos")]
-    if let Some(pid) = pid {
+    {
+        let Some(pid) = pid else {
+            return Watch::Unknown;
+        };
         loop {
             tokio::time::sleep(Duration::from_millis(25)).await;
             match footprint(pid) {
-                Some(bytes) if bytes > limit => return,
+                Some(bytes) if bytes > limit => return Watch::Over,
                 Some(_) => {}
-                None => break,
+                None => return Watch::Unknown,
             }
         }
     }
-    let _ = (pid, limit);
-    std::future::pending::<()>().await
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, limit, Watch::Over, Watch::Unknown);
+        std::future::pending().await
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -435,6 +572,12 @@ fn parse_reply(out: &[u8]) -> Result<Reading, String> {
         .ok_or_else(|| format!("{UNSAFE}: the reader gave no valid reply"))?;
     let header: Header = serde_json::from_slice(&rest[..end])
         .map_err(|_| format!("{UNSAFE}: the reader gave no valid reply"))?;
+    if header.v != PROTOCOL {
+        return Err(format!(
+            "{UNSAFE}: the reader speaks reply version {} instead of {PROTOCOL}; restart Loop",
+            header.v
+        ));
+    }
     if !header.ok {
         return Ok(Reading::Refused {
             error: header.error.unwrap_or_else(|| "unknown error".into()),
@@ -454,6 +597,7 @@ fn reply(reading: &Reading) -> Vec<u8> {
     let (header, text) = match reading {
         Reading::Done(c) => (
             Header {
+                v: PROTOCOL,
                 ok: true,
                 error: None,
                 truncated: c.truncated,
@@ -463,6 +607,7 @@ fn reply(reading: &Reading) -> Vec<u8> {
         ),
         Reading::Refused { error, pdf } => (
             Header {
+                v: PROTOCOL,
                 ok: false,
                 error: Some(error.clone()),
                 truncated: false,
@@ -561,9 +706,16 @@ mod tests {
         })))
         .unwrap();
         let script = format!("cat >/dev/null; printf '%s' '{reply}'");
-        let got = convert(&sh(&script), quick(), Format::Docx, b"x".to_vec(), None)
-            .await
-            .unwrap();
+        let got = convert(
+            &sh(&script),
+            quick(),
+            Format::Docx,
+            b"x".to_vec(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let Reading::Done(c) = got else {
             panic!("{got:?}")
         };
@@ -572,9 +724,12 @@ mod tests {
 
     #[tokio::test]
     async fn the_child_gets_no_environment() {
-        std::env::set_var("LOOP_DOC_CHILD_SECRET_PROBE", "s3cret");
-        let script = r#"cat >/dev/null; printf 'LOOPDOC1\n{"ok":true}\n%s' "${LOOP_DOC_CHILD_SECRET_PROBE:-none}""#;
-        let got = convert(&sh(script), quick(), Format::Docx, vec![], None)
+        // HOME is set for the test process; the child does not get it
+        // (`sh` sets a default PATH of its own, so that is no probe).
+        assert!(std::env::var_os("HOME").is_some());
+        let script =
+            r#"cat >/dev/null; printf 'LOOPDOC1\n{"v":1,"ok":true}\n%s' "${HOME:-none}${USER:-}""#;
+        let got = convert(&sh(script), quick(), Format::Docx, vec![], None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -586,6 +741,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reply_of_another_version_is_refused() {
+        let err = parse_reply(b"LOOPDOC1\n{\"ok\":true}\ntext").unwrap_err();
+        assert!(err.contains("reply version 0"), "{err}");
+        let err = parse_reply(b"LOOPDOC1\n{\"v\":2,\"ok\":true}\ntext").unwrap_err();
+        assert!(err.contains("reply version 2"), "{err}");
+    }
+
+    #[test]
+    fn a_reader_program_that_changed_or_sits_in_the_workspace_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        let exe = outside.path().join("loop");
+        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
+        let started = (exe.clone(), identity_of(&exe).unwrap());
+        assert!(check_program(&exe, Some(&started), Some(dir.path())).is_ok());
+        // Replaced after start (another inode and size).
+        std::fs::remove_file(&exe).unwrap();
+        std::fs::write(&exe, b"#!/bin/sh\necho swapped\n").unwrap();
+        let err = check_program(&exe, Some(&started), Some(dir.path())).unwrap_err();
+        assert!(err.contains("changed since Loop started"), "{err}");
+        // Inside the Session's workspace, where it can be replaced.
+        let err = check_program(&exe, None, Some(outside.path())).unwrap_err();
+        assert!(err.contains("where a Session can replace it"), "{err}");
+        // The running image itself is always allowed.
+        assert!(check_program(Path::new(PROC_SELF_EXE), None, Some(Path::new("/"))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn at_most_a_few_readers_run_at_once() {
+        let reply = r#"cat >/dev/null; sleep 0.4; printf 'LOOPDOC1\n{"v":1,"ok":true}\n'"#;
+        let started = std::time::Instant::now();
+        let runs = (0..MAX_CHILDREN * 2).map(|_| async {
+            convert(&sh(reply), quick(), Format::Docx, vec![], None, None).await
+        });
+        for r in futures::future::join_all(runs).await {
+            r.unwrap();
+        }
+        assert!(started.elapsed() >= Duration::from_millis(800));
+    }
+
     #[tokio::test]
     async fn a_crash_is_an_error_not_a_crash_here() {
         let err = convert(
@@ -593,6 +789,7 @@ mod tests {
             quick(),
             Format::Pdf,
             vec![0; 1024 * 1024],
+            None,
             None,
         )
         .await
@@ -609,6 +806,7 @@ mod tests {
             Format::Pdf,
             vec![],
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -622,7 +820,7 @@ mod tests {
             ..Limits::default()
         };
         let started = std::time::Instant::now();
-        let err = convert(&sh("sleep 30"), limits, Format::Pdf, vec![], None)
+        let err = convert(&sh("sleep 30"), limits, Format::Pdf, vec![], None, None)
             .await
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -647,7 +845,7 @@ mod tests {
             ..Limits::default()
         };
         let started = std::time::Instant::now();
-        let err = convert(&reader, limits, Format::Pdf, vec![], None)
+        let err = convert(&reader, limits, Format::Pdf, vec![], None, None)
             .await
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(10), "{err}");
@@ -656,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn endless_output_is_cut_off() {
-        let err = convert(&sh("yes"), quick(), Format::Pdf, vec![], None)
+        let err = convert(&sh("yes"), quick(), Format::Pdf, vec![], None, None)
             .await
             .unwrap_err();
         assert!(err.contains("more than"), "{err}");
@@ -669,6 +867,7 @@ mod tests {
             quick(),
             Format::Pdf,
             vec![],
+            None,
             None,
         )
         .await
@@ -691,6 +890,7 @@ mod tests {
             Format::Pdf,
             vec![],
             Some(&token),
+            None,
         )
         .await
         .unwrap_err();

@@ -162,11 +162,27 @@ async fn read_document(
     }
     let (converted, extracted_by) = match format {
         Format::Pdf => {
-            let reading =
-                child::convert(&reader, Limits::default(), format, bytes.clone(), cancel).await?;
+            let reading = child::convert(
+                &reader,
+                Limits::default(),
+                format,
+                bytes.clone(),
+                cancel,
+                Some(env.cwd()),
+            )
+            .await?;
             pdf::finish(reading, &bytes, ocr::Config::from_env(), cancel).await?
         }
-        _ => match child::convert(&reader, Limits::default(), format, bytes, cancel).await? {
+        _ => match child::convert(
+            &reader,
+            Limits::default(),
+            format,
+            bytes,
+            cancel,
+            Some(env.cwd()),
+        )
+        .await?
+        {
             Reading::Done(converted) => (converted, "reader"),
             Reading::Refused { error, .. } => return Err(error),
         },
@@ -235,6 +251,7 @@ pub(super) async fn text_of(
     path: &Path,
     bytes: &[u8],
     cancel: Option<&CancellationToken>,
+    workspace: &Path,
 ) -> Result<Previous, String> {
     let Some(format) = Format::of(path) else {
         return Ok(Previous::Text(String::from_utf8_lossy(bytes).into_owned()));
@@ -248,7 +265,16 @@ pub(super) async fn text_of(
     let Some(reader) = child::current_reader() else {
         return Ok(Previous::Unreadable(NO_READER.into()));
     };
-    match child::convert(&reader, Limits::default(), format, bytes.to_vec(), cancel).await {
+    match child::convert(
+        &reader,
+        Limits::default(),
+        format,
+        bytes.to_vec(),
+        cancel,
+        Some(workspace),
+    )
+    .await
+    {
         Ok(Reading::Done(c)) if c.truncated || c.text.len() > DEFAULT_MAX_BYTES => {
             Ok(Previous::TooLong)
         }

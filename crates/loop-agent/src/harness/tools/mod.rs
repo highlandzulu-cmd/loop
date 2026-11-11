@@ -162,8 +162,11 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         let previous_text = if created {
                             documents::Previous::Text(String::new())
                         } else {
-                            until_cancelled(cancel, documents::text_of(&abs, &previous, cancel))
-                                .await??
+                            until_cancelled(
+                                cancel,
+                                documents::text_of(&abs, &previous, cancel, env.cwd()),
+                            )
+                            .await??
                         };
                         let rebuilt = !created && documents::is_document(&abs);
                         let previous_text = match previous_text {

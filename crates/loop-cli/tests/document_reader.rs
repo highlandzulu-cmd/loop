@@ -202,3 +202,28 @@ async fn documents_round_trip_through_the_child() {
     let err = read(&env, "junk.pptx").await.unwrap_err();
     assert!(err.contains("zip"), "{err}");
 }
+
+#[test]
+fn the_child_mode_needs_exactly_one_format_and_replies_with_its_version() {
+    let loop_bin = env!("CARGO_BIN_EXE_loop");
+    let status = std::process::Command::new(loop_bin)
+        .arg(DOCUMENT_READER_ARG)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(status.status.code(), Some(2));
+    let extra = std::process::Command::new(loop_bin)
+        .args([DOCUMENT_READER_ARG, "docx", "more"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(extra.status.code(), Some(2));
+    let reply = std::process::Command::new(loop_bin)
+        .args([DOCUMENT_READER_ARG, "docx"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(reply.status.success());
+    let out = String::from_utf8_lossy(&reply.stdout);
+    assert!(out.starts_with("LOOPDOC1\n{\"v\":1,\"ok\":false"), "{out}");
+}
