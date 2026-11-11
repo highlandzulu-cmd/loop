@@ -86,6 +86,8 @@ struct AtTurnEnd {
     db: PathBuf,
     needle: &'static str,
     tree_at_end: Mutex<Option<bool>>,
+    /// Told when a `turn_ended` committed.
+    ended: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 #[async_trait]
 impl EventLog for AtTurnEnd {
@@ -99,6 +101,9 @@ impl EventLog for AtTurnEnd {
                 .lock()
                 .unwrap()
                 .get_or_insert_with(|| tree_has(&self.db, self.needle));
+            if let Some(ended) = self.ended.lock().unwrap().take() {
+                let _ = ended.send(());
+            }
         }
         result
     }
@@ -161,21 +166,24 @@ async fn d1_a_logged_turn_end_implies_the_tree_holds_the_turn() {
         std::fs::create_dir_all(&agent).unwrap();
         let db = agent.join("sessions.db");
         let held: Held = Arc::default();
+        let (ended, ended_rx) = std::sync::mpsc::channel();
         let log = Arc::new(AtTurnEnd {
             inner: SqliteEventLog::open(&agent).await.unwrap(),
             db: db.clone(),
             needle: "reply-d1",
             tree_at_end: Mutex::new(None),
+            ended: Mutex::new(Some(ended)),
         });
-        // The lock is held for 1 s after the model answers: long enough for
-        // a turn end that does not wait for the tree to commit first, short
-        // of the 6 s write deadline, so the tree writes then succeed.
+        // The tree writes wait until the log has committed `turn_ended`. A
+        // turn end that waits for the tree never commits first, so the lock
+        // goes after 3 s, short of the 6 s write deadline, and the writes
+        // then succeed. Either way the order is fixed, not a timing window.
         let releaser = held.clone();
         std::thread::spawn(move || {
             while releaser.lock().unwrap().is_none() {
                 std::thread::sleep(Duration::from_millis(5));
             }
-            std::thread::sleep(Duration::from_secs(1));
+            let _ = ended_rx.recv_timeout(Duration::from_secs(3));
             releaser.lock().unwrap().take();
         });
         let models = locking_model(db.clone(), held, "reply-d1");
@@ -216,7 +224,7 @@ async fn d3_a_completed_turn_is_in_the_tree() {
         let held: Held = Arc::default();
         let log: Arc<dyn EventLog> = Arc::new(SqliteEventLog::open(&agent).await.unwrap());
         let models = locking_model(db.clone(), held.clone(), "reply-d3");
-        let rt = runtime_with(dir.path(), models, log).await;
+        let rt = runtime_with(dir.path(), models, log.clone()).await;
         let session = rt.new_session(SessionSpec::default()).await.unwrap();
         let outcome = rt
             .prompt(&session, vec![ContentBlock::text("go")])
@@ -230,6 +238,35 @@ async fn d3_a_completed_turn_is_in_the_tree() {
         assert!(
             !matches!(outcome, TurnOutcome::Completed(_)) || durable,
             "the prompt was acknowledged {outcome:?}, but sessions.db has no trace of the turn"
+        );
+        // The turn's end reports the failed write; no separate error notice.
+        let updates: Vec<_> = log
+            .read_after(&session.key, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event.kind {
+                EventKind::Update(e) => Some(e.update),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<_> = updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::TurnEnded { stop, error, .. } => Some((*stop, error.is_some())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ends, [(StopReason::Error, true)], "{updates:?}");
+        assert!(
+            !updates.iter().any(|u| matches!(
+                u,
+                SessionUpdate::Notice {
+                    level: loop_protocol::NoticeLevel::Error,
+                    ..
+                }
+            )),
+            "{updates:?}"
         );
     })
     .await
@@ -311,11 +348,137 @@ async fn d2_a_prompt_whose_turn_start_was_not_logged_is_recovered_as_uncertain()
         )
         .unwrap();
         let report = rt.recover(Some(&lock)).await.unwrap();
-        rt.shutdown().await;
         assert_eq!(
             report.turns_ended, 1,
             "the second prompt may have run its tools; it must end uncertain ({report:?})"
         );
+        // The recovered turn is named after the prompt's global sequence (4).
+        let started: Vec<_> = log
+            .read_after(&a, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| match r.event.kind {
+                EventKind::Update(e) => match e.update {
+                    SessionUpdate::TurnStarted { turn_id } => Some(turn_id.0),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, ["turn-1", "recovered-prompt-4"]);
+        // A second pass finds nothing more.
+        let again = rt.recover(Some(&lock)).await.unwrap();
+        rt.shutdown().await;
+        assert_eq!(again.turns_ended, 0, "{again:?}");
+    })
+    .await
+    .expect("test timed out");
+}
+
+async fn runtime_limited(
+    dir: &Path,
+    models: Arc<loop_ai::Models>,
+    log: Arc<dyn EventLog>,
+    limits: RuntimeLimits,
+) -> Runtime {
+    let globals = GlobalResources::with_models(dir.join("agent"), models).unwrap();
+    Runtime::new(globals, opts(dir), log, limits).await.unwrap()
+}
+
+/// The model waits for `gate` before it answers; `entered` is told first.
+fn gated_model(
+    gate: Arc<tokio::sync::Semaphore>,
+    entered: Arc<tokio::sync::Notify>,
+) -> Arc<loop_ai::Models> {
+    let models = Arc::new(loop_ai::Models::create(Default::default()));
+    models.set_provider(faux_provider_fn(Arc::new(move |_: &Context| {
+        let (gate, entered) = (gate.clone(), entered.clone());
+        Box::pin(async move {
+            entered.notify_one();
+            gate.acquire().await.unwrap().forget();
+            FauxResponse::Text("done".into())
+        })
+    })));
+    models
+}
+
+/// Review of the D2 fix. A prompt cancelled while it waited for a turn
+/// permit never started a turn. After a crash it must not be marked
+/// uncertain: the Runtime logs that it settled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prompt_cancelled_in_the_queue_is_not_recovered_as_uncertain() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let log: Arc<dyn EventLog> = Arc::new(SqliteEventLog::open(&agent).await.unwrap());
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let limits = RuntimeLimits {
+            max_active_turns: 1,
+            ..RuntimeLimits::default()
+        };
+        let rt = runtime_limited(
+            dir.path(),
+            gated_model(gate.clone(), entered.clone()),
+            log.clone(),
+            limits,
+        )
+        .await;
+        let a = rt.new_session(SessionSpec::default()).await.unwrap();
+        let b = rt.new_session(SessionSpec::default()).await.unwrap();
+        let first = rt.prompt(&a, vec![ContentBlock::text("a")]).await.unwrap();
+        entered.notified().await;
+        // A holds the only permit: B waits for it, then is cancelled.
+        let queued = rt.prompt(&b, vec![ContentBlock::text("b")]).await.unwrap();
+        rt.cancel(&b);
+        assert!(matches!(queued.outcome().await, TurnOutcome::Cancelled));
+        gate.add_permits(1);
+        assert!(matches!(first.outcome().await, TurnOutcome::Completed(_)));
+        // Crash: no clean stop.
+        drop(rt);
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(loop_ai::providers::faux_provider(Default::default()));
+        let rt = runtime_with(dir.path(), models, log).await;
+        let report = rt.recover(None).await.unwrap();
+        rt.shutdown().await;
+        assert_eq!(report.turns_ended, 0, "{report:?}");
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Review of the D2 fix. A prompt the backend refused (busy, invalid input,
+/// unknown Session) never started a turn; after a crash it must not be
+/// marked uncertain. Invalid input takes the same path as a busy refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prompt_the_backend_refused_is_not_recovered_as_uncertain() {
+    tokio::time::timeout(LIMIT, async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        let log: Arc<dyn EventLog> = Arc::new(SqliteEventLog::open(&agent).await.unwrap());
+        let models = Arc::new(loop_ai::Models::create(Default::default()));
+        models.set_provider(loop_ai::providers::faux_provider(Default::default()));
+        let rt = runtime_with(dir.path(), models.clone(), log.clone()).await;
+        let a = rt.new_session(SessionSpec::default()).await.unwrap();
+        let refused = rt
+            .prompt(
+                &a,
+                vec![ContentBlock::ResourceLink {
+                    uri: "file:///x".into(),
+                    name: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(refused.outcome().await, TurnOutcome::Failed(_)));
+        drop(rt);
+        let rt = runtime_with(dir.path(), models, log).await;
+        let report = rt.recover(None).await.unwrap();
+        rt.shutdown().await;
+        assert_eq!(report.turns_ended, 0, "{report:?}");
     })
     .await
     .expect("test timed out");

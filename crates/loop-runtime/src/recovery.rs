@@ -71,6 +71,10 @@ pub(crate) fn unfinished(
             continue;
         };
         match &event.kind {
+            // The prompt never started a turn.
+            EventKind::PromptSettled(_) => {
+                prompts.remove(session);
+            }
             EventKind::PromptSent(_) => {
                 if event.generation < current {
                     prompts.insert(session.clone(), (record.global_seq, event.generation));
@@ -281,5 +285,12 @@ mod tests {
             },
         });
         assert!(unfinished(&records, 2).0.is_empty());
+    }
+
+    #[test]
+    fn a_settled_prompt_is_not_unfinished() {
+        let mut settled = prompt(2, 1);
+        settled.event.kind = EventKind::PromptSettled(serde_json::json!({}));
+        assert!(unfinished(&[prompt(1, 1), settled], 2).0.is_empty());
     }
 }

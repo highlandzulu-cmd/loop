@@ -2472,6 +2472,9 @@ impl AgentBackend for Runtime {
         let task_live = Arc::clone(&live);
         let task = tokio::spawn(async move {
             let live = task_live;
+            // `prompt_sent` committed, and the backend has not taken the
+            // prompt: an exit now must say the prompt never ran a turn.
+            let mut unsettled = false;
             let result = async {
                 let ts_ms = now();
                 log.append_batch(vec![Event {
@@ -2483,6 +2486,7 @@ impl AgentBackend for Runtime {
                 }])
                 .await
                 .map_err(failed)?;
+                unsettled = true;
                 touch(&live.activity, &live.reference.key, ts_ms);
                 let permit = tokio::select! {
                     p = turns.acquire_owned() => p.map_err(failed)?,
@@ -2496,6 +2500,7 @@ impl AgentBackend for Runtime {
                     return Ok(TurnOutcome::Cancelled);
                 }
                 let turn = live.opened.native.prompt(&live.reference, input).await?;
+                unsettled = false;
                 // A cancel that raced the turn's registration hit an idle backend.
                 if cancelled.has_changed().unwrap_or(true) {
                     live.opened.native.cancel(&live.reference);
@@ -2514,6 +2519,21 @@ impl AgentBackend for Runtime {
                 })
             }
             .await;
+            if unsettled {
+                // Before `busy` clears, so it precedes the next prompt.
+                let settled = log
+                    .append_batch(vec![Event {
+                        generation,
+                        session_key: Some(live.reference.key.clone()),
+                        turn: None,
+                        ts_ms: now(),
+                        kind: EventKind::PromptSettled(json!({})),
+                    }])
+                    .await;
+                if let Err(error) = settled {
+                    eprintln!("Runtime: could not log a prompt that never started: {error}");
+                }
+            }
             live.permit.lock().await.take();
             live.pauses.signal("turn_settling");
             {

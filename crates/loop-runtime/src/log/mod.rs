@@ -26,6 +26,10 @@ pub const WRITER_QUEUE_CAPACITY: usize = 64;
 pub enum EventKind {
     Update(UpdateEnvelope),
     PromptSent(Value),
+    /// A prompt ended without starting a turn (cancelled while queued,
+    /// refused as busy, closing). Log-only: recovery reads it so the prompt
+    /// is not taken for an interrupted turn. Never sent on the wire.
+    PromptSettled(Value),
     Cancelled(Value),
     EscalationRaised(Value),
     EscalationAnswered(Value),
@@ -199,6 +203,7 @@ pub fn is_recovery_record(kind: &EventKind) -> bool {
                 | loop_protocol::SessionUpdate::TurnEnded { .. }
         ),
         EventKind::PromptSent(_)
+        | EventKind::PromptSettled(_)
         | EventKind::RuntimeStopped(_)
         | EventKind::EscalationRaised(_)
         | EventKind::EscalationAnswered(_)

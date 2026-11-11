@@ -129,6 +129,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "002_recovery.sql",
         include_str!("migrations/002_recovery.sql"),
     ),
+    (
+        "003_recovery_kinds.sql",
+        include_str!("migrations/003_recovery_kinds.sql"),
+    ),
 ];
 fn migrate(conn: &mut Connection) -> Result<()> {
     conn.execute_batch(
@@ -368,20 +372,26 @@ fn read(conn: &Connection, session: Option<&SessionKey>, after: u64) -> Result<V
     )
 }
 
-/// Turn boundaries, prompts sent, clean stops and Escalation records,
-/// filtered in SQL so recovery never loads streamed text.
+/// Turn boundaries, prompts sent and settled, clean stops and Escalation
+/// records, filtered in SQL so recovery never loads streamed text. Recovery
+/// needs only that a prompt was sent, so its content is not loaded either.
 fn recovery(conn: &Connection, from_generation: u64) -> Result<Vec<LoggedEvent>> {
     if from_generation > i64::MAX as u64 {
         return Ok(Vec::new());
     }
-    let sql = format!(
-        "SELECT {COLUMNS} FROM events WHERE generation>=?1 AND (\
-         kind IN ('prompt_sent','runtime_stopped',\
+    // Same columns as `COLUMNS`, with a prompt's payload left out.
+    let sql = concat!(
+        "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,\
+         CASE WHEN kind='prompt_sent' \
+         THEN '{\"v\":1,\"event\":{\"kind\":\"prompt_sent\",\"payload\":{}}}' \
+         ELSE payload END \
+         FROM events WHERE generation>=?1 AND (\
+         kind IN ('prompt_sent','prompt_settled','runtime_stopped',\
          'escalation_raised','escalation_answered','escalation_withdrawn') \
          OR (kind='update' AND json_extract(payload,'$.event.payload.update.type') \
              IN ('turn_started','turn_ended'))) ORDER BY global_seq"
     );
-    rows(conn, &sql, params![from_generation as i64])
+    rows(conn, sql, params![from_generation as i64])
 }
 
 fn rows(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<Vec<LoggedEvent>> {
