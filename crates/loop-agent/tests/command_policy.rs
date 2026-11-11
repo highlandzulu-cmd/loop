@@ -15,6 +15,8 @@ fn recursive_commands_on_ordinary_paths_run() {
         "chown -R me:staff ./src",
         "rm -r /home/user/project/target",
         "git commit -m 'rm -rf /'",
+        "sh -c 'rm -rf ./build'",
+        "bash -c \"chmod -R u+w /work/project\"",
     ] {
         assert!(
             check_command_policy(cmd, &[]).is_ok(),
@@ -44,6 +46,12 @@ fn recursive_commands_on_root_or_home_stay_blocked() {
         "rm -rf '/'",
         "r\\m -rf /",
         "RM -RF /",
+        "sh -c 'rm -rf /'",
+        "bash -c \"rm -rf ~\"",
+        "bash -lc 'chmod -R 777 /'",
+        "eval 'rm -rf /'",
+        "sudo sh -c 'cd /tmp && rm -rf /'",
+        "sh -c 'mkfs.ext4 /dev/sda1'",
     ] {
         assert!(
             check_command_policy(cmd, &[]).is_err(),

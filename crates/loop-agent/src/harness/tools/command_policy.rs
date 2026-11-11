@@ -22,6 +22,13 @@ const RECURSIVE_PROGRAMS: &[&str] = &["rm", "chmod", "chown", "chgrp"];
 /// target is the filesystem root or the home directory (`/`, `/*`, `~`,
 /// `$HOME`, …), so `chmod -R u+w ./src` and `rm -rf /tmp/x` run.
 pub fn check_command_policy(command: &str, extra_blocked: &[String]) -> Result<(), String> {
+    check_nested(command, extra_blocked, 0)
+}
+
+/// How deep `sh -c '…'` and `eval '…'` scripts are checked.
+const MAX_NESTING: usize = 4;
+
+fn check_nested(command: &str, extra_blocked: &[String], depth: usize) -> Result<(), String> {
     let lower = command.to_lowercase();
     let trimmed = lower.trim();
     // A command that substitutes commands or has unbalanced quotes does not
@@ -52,6 +59,11 @@ pub fn check_command_policy(command: &str, extra_blocked: &[String]) -> Result<(
     }
 
     for words in &parts {
+        if depth < MAX_NESTING {
+            for script in nested_scripts(words) {
+                check_nested(&script, extra_blocked, depth + 1)?;
+            }
+        }
         if let Some(blocked) = recursive_on_root(words) {
             return Err(format!(
                 "Command blocked by safety policy: recursive `{blocked}` on the root or home directory"
@@ -70,6 +82,28 @@ pub fn check_command_policy(command: &str, extra_blocked: &[String]) -> Result<(
 
     Ok(())
 }
+
+/// Scripts that `words` run through a shell: the argument of `sh -c`
+/// (`bash`, `zsh`, …) and the words after `eval`.
+fn nested_scripts(words: &[String]) -> Vec<String> {
+    let mut scripts = Vec::new();
+    for (i, word) in words.iter().enumerate() {
+        let name = word.rsplit('/').next().unwrap_or(word);
+        if name == "eval" {
+            scripts.push(words[i + 1..].join(" "));
+        } else if SHELLS.contains(&name) {
+            let mut args = words[i + 1..].iter();
+            // `-c`, or combined flags such as `-lc`, then the script.
+            if args.any(|a| a.starts_with('-') && !a.starts_with("--") && a.contains('c')) {
+                scripts.extend(args.find(|a| !a.starts_with('-')).cloned());
+            }
+        }
+    }
+    scripts
+}
+
+/// Shells whose `-c` script is checked like the command itself.
+const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "fish"];
 
 /// The program, when `words` (lowercased) run `rm`, `chmod`, `chown` or
 /// `chgrp` recursively on a root or home target. Any word naming one of them
