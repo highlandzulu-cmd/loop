@@ -41,14 +41,19 @@ pub struct CustomProviderModel {
     /// Request format; omitted uses automatic compatibility detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_format: Option<loop_ai::ThinkingFormat>,
+    /// Whether requests may carry the `metadata` object (session affinity);
+    /// omitted uses the base-URL detection, which is off except for Soket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_metadata: Option<bool>,
 }
 
 impl CustomProviderModel {
     pub(crate) fn spec(&self) -> CustomModelSpec {
         let mut spec = CustomModelSpec::new(&self.id).with_reasoning(self.reasoning);
-        if let Some(format) = self.thinking_format {
+        if self.thinking_format.is_some() || self.supports_metadata.is_some() {
             spec = spec.with_compat(loop_ai::OpenAICompletionsCompat {
-                thinking_format: Some(format),
+                thinking_format: self.thinking_format,
+                supports_metadata: self.supports_metadata,
                 ..Default::default()
             });
         }
@@ -350,6 +355,31 @@ mod tests {
         assert_eq!(
             models[0].compat.as_ref().unwrap().thinking_format,
             Some(loop_ai::ThinkingFormat::Zai)
+        );
+    }
+
+    #[test]
+    fn saved_custom_model_reads_supports_metadata() {
+        let entry: CustomProviderEntry = serde_json::from_value(serde_json::json!({
+            "id": "g", "name": "Gateway", "baseUrl": "https://gateway.example.com/v1",
+            "models": [
+                {"id": "on", "supportsMetadata": true},
+                {"id": "off", "supportsMetadata": false},
+                {"id": "unset"}
+            ]
+        }))
+        .unwrap();
+        let models = entry.provider().get_models();
+        let metadata = |id: &str| {
+            let model = models.iter().find(|m| m.id == id).unwrap();
+            loop_ai::resolve_compat(&model.base_url, model.compat.as_ref()).supports_metadata
+        };
+        assert!(metadata("on"));
+        assert!(!metadata("off"));
+        assert!(!metadata("unset"));
+        assert_eq!(
+            models.iter().find(|m| m.id == "unset").unwrap().compat,
+            None
         );
     }
 
