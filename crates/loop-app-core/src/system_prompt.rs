@@ -102,9 +102,9 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
             .any(|t| opts.selected_tools.contains(t))
         {
             guidelines.push(
-                "Change files in the working directory; never edit a copy elsewhere and report success. \
-                 If a file you own is not writable (permission denied), run `chmod u+w <file>` and retry, \
-                 or say that you could not change it."
+                "Change the files the user means; never edit a copy elsewhere and report success. \
+                 A file can be read-only on purpose (a VCS lock, a generated file): make it writable \
+                 only if it is clearly yours to change, otherwise say you could not change it."
                     .into(),
             );
         }
@@ -319,7 +319,11 @@ mod tests {
             tool_snippets: &default_tool_snippets(),
             context_files: &[],
         });
+        assert!(
+            prompt.contains("Change the files the user means"),
+            "{prompt}"
+        );
         assert!(prompt.contains("never edit a copy elsewhere"), "{prompt}");
-        assert!(prompt.contains("chmod u+w"), "{prompt}");
+        assert!(prompt.contains("read-only on purpose"), "{prompt}");
     }
 }

@@ -60,6 +60,10 @@ async fn permission_denied_errors_hint_at_chmod() {
     let file = dir.path().join("ro.txt");
     std::fs::write(&file, "hello").unwrap();
     std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new().append(true).open(&file).is_ok() {
+        // Root writes read-only files: nothing to test.
+        return;
+    }
     let env =
         Arc::new(HostExecutionEnv::new(dir.path())) as Arc<dyn loop_agent::harness::ExecutionEnv>;
 

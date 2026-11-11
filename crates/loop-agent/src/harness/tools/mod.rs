@@ -31,8 +31,9 @@ use loop_ai::{ImageContent, TextContent, ToolResultContent};
 
 /// Added to permission-denied errors from file writes and shell commands, so
 /// the agent fixes the mode instead of working on a copy elsewhere.
-pub const PERMISSION_DENIED_HINT: &str = "Hint: if this file is in the working directory and \
-yours, make it writable with `chmod u+w <file>` and retry; do not edit a copy elsewhere.";
+pub const PERMISSION_DENIED_HINT: &str = "Hint: the file is not writable. If it is clearly \
+yours to change, run `chmod u+w <file>` and retry; otherwise say you could not change it. \
+Do not edit a copy elsewhere.";
 
 /// A failed file write as tool error text: a permission error on a file
 /// (not a sandbox refusal, which `chmod` cannot fix) carries
@@ -47,6 +48,43 @@ fn write_error(error: crate::harness::types::FileError) -> String {
     } else {
         text
     }
+}
+
+/// Whether failed bash output shows a file write refused by its mode, which
+/// [`PERMISSION_DENIED_HINT`] can fix: a redirect or `cannot create` from
+/// the shell, a refused `cp`/`mv`/`tee`/`touch`/`sed`, or a read-only file
+/// system. Not in a sandbox (where `chmod` does not help), and not for other
+/// refusals such as `Permission denied (publickey)`.
+fn bash_permission_hint(output: &str, exit_code: i32, sandboxed: bool) -> bool {
+    const WRITERS: &[&str] = &[
+        "bash:",
+        "sh:",
+        "zsh:",
+        "/bin/sh:",
+        "/bin/bash:",
+        "dash:",
+        "cp:",
+        "mv:",
+        "tee:",
+        "touch:",
+        "sed:",
+        "install:",
+        "ln:",
+        "mkdir:",
+    ];
+    if exit_code == 0 || sandboxed {
+        return false;
+    }
+    output.lines().any(|line| {
+        let line = line.trim().to_lowercase();
+        line.contains("read-only file system")
+            || (line.contains("permission denied")
+                && !line.contains("publickey")
+                && (line.contains("cannot create")
+                    || WRITERS
+                        .iter()
+                        .any(|w| line.starts_with(w) || line.starts_with(&w.replace(':', "")))))
+    })
 }
 
 pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
@@ -506,6 +544,7 @@ pub fn create_bash_tool_with(
                         });
                     }));
                 }
+                let sandboxed = env.sandboxed();
                 let captured = execute_shell_with_capture(env, &command, options, None)
                     .await
                     .map_err(|e| {
@@ -521,7 +560,7 @@ pub fn create_bash_tool_with(
                         }
                     })?;
                 let mut text = captured.text.clone();
-                if captured.exit_code != 0 && text.to_lowercase().contains("permission denied") {
+                if bash_permission_hint(&text, captured.exit_code, sandboxed) {
                     text.push_str("\n\n");
                     text.push_str(PERMISSION_DENIED_HINT);
                 }
@@ -601,5 +640,33 @@ mod write_error_tests {
         assert_eq!(hinted.matches("chmod u+w").count(), 1, "{hinted}");
         assert!(!write_error(denied("sandbox denies access to /etc/x")).contains("chmod"));
         assert!(!write_error(FileError::new(FileErrorCode::Io, "disk full")).contains("chmod"));
+    }
+}
+
+#[cfg(test)]
+mod bash_hint_tests {
+    use super::*;
+
+    #[test]
+    fn only_write_failures_outside_a_sandbox_get_the_hint() {
+        for text in [
+            "bash: line 1: ro.txt: Permission denied",
+            "zsh:1: permission denied: ro.txt",
+            "sh: 1: cannot create ro.txt: Permission denied",
+            "touch: x: Read-only file system",
+            "sed: couldn't open temporary file ./sedX: Permission denied",
+            "cp: ro.txt: Permission denied",
+        ] {
+            assert!(bash_permission_hint(text, 1, false), "{text}");
+            assert!(!bash_permission_hint(text, 1, true), "sandboxed: {text}");
+            assert!(!bash_permission_hint(text, 0, false), "exit 0: {text}");
+        }
+        for text in [
+            "git@github.com: Permission denied (publickey).",
+            "ls: /root: Permission denied",
+            "error: could not compile",
+        ] {
+            assert!(!bash_permission_hint(text, 1, false), "{text}");
+        }
     }
 }

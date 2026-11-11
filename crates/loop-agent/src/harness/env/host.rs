@@ -10,7 +10,6 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::harness::tools::PERMISSION_DENIED_HINT;
 use crate::harness::types::{
     ExecutionError, ExecutionErrorCode, FileError, FileErrorCode, FileInfo, FileSystem, Shell,
     ShellExecOptions, ShellOutput,
@@ -45,15 +44,6 @@ impl HostExecutionEnv {
             _ => FileErrorCode::Io,
         };
         FileError::new(code, err.to_string())
-    }
-
-    /// [`Self::map_io`] for a write: a permission error says how to fix it.
-    fn map_write_io(err: std::io::Error) -> FileError {
-        let mut error = Self::map_io(err);
-        if error.code == FileErrorCode::PermissionDenied {
-            error.message = format!("{}. {PERMISSION_DENIED_HINT}", error.message);
-        }
-        error
     }
 }
 
@@ -90,11 +80,9 @@ impl FileSystem for HostExecutionEnv {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(Self::map_write_io)?;
+                .map_err(Self::map_io)?;
         }
-        tokio::fs::write(&path, data)
-            .await
-            .map_err(Self::map_write_io)
+        tokio::fs::write(&path, data).await.map_err(Self::map_io)
     }
 
     async fn append_file(&self, path: &Path, data: &[u8]) -> Result<(), FileError> {
@@ -103,15 +91,15 @@ impl FileSystem for HostExecutionEnv {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(Self::map_write_io)?;
+                .map_err(Self::map_io)?;
         }
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
             .await
-            .map_err(Self::map_write_io)?;
-        file.write_all(data).await.map_err(Self::map_write_io)
+            .map_err(Self::map_io)?;
+        file.write_all(data).await.map_err(Self::map_io)
     }
 
     async fn file_info(&self, path: &Path) -> Result<FileInfo, FileError> {
