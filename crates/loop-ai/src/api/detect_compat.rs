@@ -19,8 +19,15 @@ pub fn detect_compat(base_url: &str) -> OpenAICompletionsCompat {
     // Soket's endpoint accepts the `metadata` object (session affinity);
     // everywhere else it is an undocumented field that strict servers
     // (e.g. Z.ai, error 1210) reject outright.
-    let is_soket = url.contains("soket.ai") || url.contains("tensorstudio");
-    let is_zai = url.contains("z.ai") || url.contains("bigmodel");
+    // Matched on the parsed host, not as a substring of the URL: a host such
+    // as `api.xyz.ai` must not be taken for `z.ai`.
+    let host = url_host(base_url);
+    let host = host.as_deref().unwrap_or("");
+    // FIXME(confirm): the `tensorstudio` match predates host matching and is
+    // kept as is; confirm its real domain before it is changed or removed.
+    let is_soket =
+        host_is(host, "soket.ai") || host.split('.').any(|label| label == "tensorstudio");
+    let is_zai = host_is(host, "z.ai") || host_is(host, "bigmodel.cn");
     // `metadata` is only sent where it is known to be accepted.
     let supports_metadata = Some(is_soket);
 
@@ -88,6 +95,24 @@ pub fn detect_compat(base_url: &str) -> OpenAICompletionsCompat {
         thinking_format: Some(thinking_format),
         session_affinity_format: None,
     }
+}
+
+/// Lowercase host of `base_url`; a missing scheme is tolerated.
+fn url_host(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim();
+    let parsed = reqwest::Url::parse(base_url)
+        .ok()
+        .filter(|url| url.host_str().is_some())
+        .or_else(|| reqwest::Url::parse(&format!("https://{base_url}")).ok())?;
+    parsed.host_str().map(|host| host.to_ascii_lowercase())
+}
+
+/// Whether `host` is `domain` or a subdomain of it.
+fn host_is(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// Merge URL-detected defaults with explicit model overrides.
@@ -238,5 +263,64 @@ mod tests {
             detect_compat("https://open.bigmodel.cn/api/paas/v4").thinking_format,
             Some(ThinkingFormat::Zai)
         );
+    }
+
+    #[test]
+    fn provider_hosts_match_on_the_host_not_a_substring() {
+        for url in [
+            "https://z.ai/v1",
+            "https://api.z.ai/api/paas/v4",
+            "https://open.bigmodel.cn/api/paas/v4",
+            "https://bigmodel.cn/v1",
+            "https://API.Z.AI/v1",
+            "https://api.z.ai:8443/v1",
+            "api.z.ai/v1",
+        ] {
+            assert_eq!(
+                detect_compat(url).thinking_format,
+                Some(ThinkingFormat::Zai),
+                "{url} should be Z.ai"
+            );
+        }
+        for url in [
+            "https://api.xyz.ai/v1",
+            "https://notz.ai/v1",
+            "https://z.ai.evil.com/v1",
+            "https://evil.com/z.ai/v1",
+            "https://evil.com/?u=bigmodel.cn",
+            "https://api.z.ai@evil.com/v1",
+            "https://mybigmodel.cn/v1",
+            "https://bigmodel.example.com/v1",
+        ] {
+            assert_eq!(
+                detect_compat(url).thinking_format,
+                Some(ThinkingFormat::Openai),
+                "{url} must not be Z.ai"
+            );
+        }
+        for url in [
+            "https://soket.ai/v1",
+            "https://api.soket.ai/v1",
+            "https://tensorstudio.ai/v1",
+            "https://api.tensorstudio.com/v1",
+        ] {
+            assert_eq!(
+                detect_compat(url).supports_metadata,
+                Some(true),
+                "{url} should accept metadata"
+            );
+        }
+        for url in [
+            "https://notsoket.ai/v1",
+            "https://soket.ai.evil.com/v1",
+            "https://evil.com/soket.ai/v1",
+            "https://nottensorstudio.com/v1",
+        ] {
+            assert_eq!(
+                detect_compat(url).supports_metadata,
+                Some(false),
+                "{url} must not accept metadata"
+            );
+        }
     }
 }
