@@ -172,6 +172,77 @@ pub struct ShellOutput {
     pub stderr: String,
     /// Exit code.
     pub exit_code: i32,
+    /// Output was cut at the environment's cap.
+    pub truncated: bool,
+}
+
+/// Identity of a regular file, used to check that a file is still the one a
+/// tool wrote before removing it. `dev`/`ino`/`mtime_ns` are `None` when the
+/// environment cannot report them; then only `size` is compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    /// Device number.
+    pub dev: Option<u64>,
+    /// Inode number.
+    pub ino: Option<u64>,
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time in nanoseconds since the epoch.
+    pub mtime_ns: Option<i128>,
+}
+
+impl FileIdentity {
+    /// Identity from Unix metadata (lstat or fstat).
+    #[cfg(unix)]
+    pub fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            dev: Some(meta.dev()),
+            ino: Some(meta.ino()),
+            size: meta.len(),
+            mtime_ns: Some(
+                i128::from(meta.mtime()) * 1_000_000_000 + i128::from(meta.mtime_nsec()),
+            ),
+        }
+    }
+
+    /// Identity from Windows or other metadata (size and mtime only).
+    #[cfg(not(unix))]
+    pub fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i128);
+        Self {
+            dev: None,
+            ino: None,
+            size: meta.len(),
+            mtime_ns,
+        }
+    }
+
+    /// Identity with only a size, for environments without stat.
+    pub fn from_info(info: &FileInfo) -> Option<Self> {
+        info.is_file.then_some(Self {
+            dev: None,
+            ino: None,
+            size: info.size,
+            mtime_ns: None,
+        })
+    }
+
+    /// Whether `other` is the same file: dev/ino when both have them, else
+    /// size plus mtime when both have it, else size.
+    pub fn matches(&self, other: &Self) -> bool {
+        if let (Some(a), Some(b), Some(c), Some(d)) = (self.dev, self.ino, other.dev, other.ino) {
+            return a == c && b == d && self.size == other.size;
+        }
+        if let (Some(a), Some(b)) = (self.mtime_ns, other.mtime_ns) {
+            return a == b && self.size == other.size;
+        }
+        self.size == other.size
+    }
 }
 
 /// Filesystem capability (Result-based, never panics).
@@ -205,6 +276,13 @@ pub trait FileSystem: Send + Sync {
     async fn canonical_path(&self, path: &Path) -> Result<PathBuf, FileError>;
     /// Create temp directory under cwd or system temp.
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError>;
+    /// Identity of the regular file at `path`, without following a final
+    /// symlink. `Ok(None)` when `path` is not a regular file (a directory, a
+    /// symlink or another kind). The default can only follow symlinks and
+    /// report a size; environments with stat override it.
+    async fn file_identity(&self, path: &Path) -> Result<Option<FileIdentity>, FileError> {
+        Ok(FileIdentity::from_info(&self.file_info(path).await?))
+    }
 }
 
 /// Shell capability.

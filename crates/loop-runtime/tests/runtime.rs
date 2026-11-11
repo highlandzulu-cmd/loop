@@ -209,6 +209,7 @@ async fn connection_shutdown_keeps_other_sessions_available() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let one = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -221,6 +222,7 @@ async fn connection_shutdown_keeps_other_sessions_available() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let two = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -883,6 +885,101 @@ async fn a_turn_lost_before_its_start_was_logged_never_has_its_id_reused() {
             let turns = turn_starts(&log.read_after(&a.key, 0).await.unwrap());
             assert_eq!(turns, ["turn-1", "turn-3"], "log {n}");
         }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tree_mutation_log_failure_is_reconciled_before_a_new_snapshot() {
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        use loop_protocol::rpc::{NavigateParams, RenameParams};
+        use loop_protocol::{BackendError, SessionUpdate};
+        use loop_wire::RuntimeControl;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(FailingLog::default());
+        let rt = runtime(dir.path(), log.clone(), RuntimeLimits::default()).await;
+        let source = rt.new_session(SessionSpec::default()).await.unwrap();
+        rt.prompt(&source, vec![ContentBlock::text("saved")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        let renamed = rt
+            .rename(RenameParams {
+                session: source.clone(),
+                name: "persistent name".into(),
+                expected_revision: Some(0),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rt.rename(RenameParams {
+                session: source.clone(),
+                name: "stale".into(),
+                expected_revision: Some(0)
+            })
+            .await
+            .unwrap_err(),
+            BackendError::Conflict {
+                revision: renamed.revision
+            }
+        );
+        let before = log.latest_seq(&source.key).await.unwrap();
+        log.fail_updates
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(rt
+            .navigate(NavigateParams {
+                session: source.clone(),
+                target_entry_id: None,
+                summarize: false,
+                expected_revision: Some(renamed.revision)
+            })
+            .await
+            .is_err());
+        assert_eq!(log.latest_seq(&source.key).await.unwrap(), before);
+        assert!(rt
+            .prompt(&source, vec![ContentBlock::text("must not start")])
+            .await
+            .is_err());
+        rt.shutdown().await;
+        log.fail_updates
+            .store(false, std::sync::atomic::Ordering::Release);
+        let rt = runtime(dir.path(), log.clone(), RuntimeLimits::default()).await;
+        let mut first = rt.subscribe();
+        let mut second = rt.subscribe();
+        let attached = rt
+            .attach_snapshot_watching(101, &source, before)
+            .await
+            .unwrap();
+        let snapshot = attached.snapshot.unwrap();
+        assert_eq!(snapshot.metadata.name.as_deref(), Some("persistent name"));
+        assert_eq!(snapshot.branch_revision, 1);
+        assert_eq!(snapshot.at_seq, before + 1);
+        assert_eq!(snapshot.at_seq, attached.latest_seq);
+        for watcher in [&mut first, &mut second] {
+            let reset = watcher.recv().await.unwrap();
+            assert_eq!(reset.seq, snapshot.at_seq);
+            assert!(matches!(
+                reset.update,
+                SessionUpdate::BranchReset {
+                    branch_revision: 1,
+                    ..
+                }
+            ));
+        }
+        assert!(rt
+            .export(&source)
+            .await
+            .unwrap()
+            .markdown
+            .contains("persistent name"));
+        rt.prompt(&source, vec![ContentBlock::text("recovered")])
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        rt.shutdown().await;
     })
     .await
     .unwrap();

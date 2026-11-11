@@ -47,6 +47,7 @@ impl App {
                 View::Tools => self.render_tools(frame, body),
                 View::Agents => self.render_agents(frame, body),
                 View::Sessions => self.render_sessions(frame, body),
+                View::Runtime => self.render_runtime(frame, body),
             }
         }
         self.render_footer(frame, footer);
@@ -72,15 +73,20 @@ impl App {
         let p = self.p();
         let range_w = 26;
         // Narrow terminals: no "usage" title, and numbers only except the selected view.
-        let full_width =
-            16 + View::ALL.iter().map(|v| v.label().len() + 4).sum::<usize>() + range_w;
+        let full_width = 16
+            + self
+                .views()
+                .iter()
+                .map(|v| v.label().len() + 4)
+                .sum::<usize>()
+            + range_w;
         let compact = (area.width as usize) < full_width;
         let mut left = vec![Span::from(" ◆ loop ").fg(p.accent).bold()];
         if !compact {
             left.push(Span::from("usage").fg(p.text).bold());
             left.push(Span::from("   "));
         }
-        for (i, view) in View::ALL.iter().enumerate() {
+        for (i, view) in self.views().iter().enumerate() {
             let label = if compact && *view != self.view {
                 format!(" {} ", i + 1)
             } else {
@@ -320,7 +326,13 @@ impl App {
         }
         lines.push(Line::from(vec![
             Span::from("Session tokens ").fg(p.muted),
-            Span::from(thousands(live.session_tokens)).fg(p.text).bold(),
+            Span::from(
+                live.session_tokens
+                    .map(thousands)
+                    .unwrap_or_else(|| "unknown".into()),
+            )
+            .fg(p.text)
+            .bold(),
         ]));
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -1308,4 +1320,71 @@ impl App {
         let table = self.table(title, &columns, rows, area.width);
         frame.render_stateful_widget(table, area, &mut self.table);
     }
+}
+
+impl App {
+    fn render_runtime(&self, frame: &mut Frame, area: Rect) {
+        let Some(runtime) = &self.runtime else {
+            frame.render_widget(
+                Paragraph::new("Runtime data is available from a connected Session.")
+                    .block(Block::bordered().title(" Runtime ")),
+                area,
+            );
+            return;
+        };
+        let mut lines = vec![
+            Line::from(format!(
+                "{} loaded · {} busy · {} tokens ({} unknown)",
+                runtime.totals.sessions,
+                runtime.totals.busy,
+                thousands(runtime.totals.tokens),
+                runtime.totals.unknown_tokens
+            )),
+            Line::from(""),
+        ];
+        lines.extend(runtime_table(runtime).into_iter().map(Line::from));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::bordered().title(" Runtime "))
+                .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+}
+
+/// Cut `text` to `width` characters, marking the cut with `…`.
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// The Runtime panel's header and rows with aligned columns: ids and models
+/// are cut to fit, token counts are right-aligned with thousands separators.
+pub(super) fn runtime_table(runtime: &loop_protocol::admin::RuntimeSessionsResult) -> Vec<String> {
+    const ID: usize = 36;
+    const MODEL: usize = 30;
+    const TOKENS: usize = 12;
+    let row = |id: &str, state: &str, model: &str, tokens: &str| {
+        format!(
+            "{:<ID$} {:<8} {:<MODEL$} {:>TOKENS$}",
+            fit(id, ID),
+            fit(state, 8),
+            fit(model, MODEL),
+            tokens
+        )
+    };
+    let mut out = vec![row("Session", "State", "Model", "Tokens")];
+    out.extend(runtime.sessions.iter().map(|s| {
+        row(
+            &s.session.native_id,
+            &s.state,
+            s.model.as_deref().unwrap_or("unknown"),
+            &s.tokens.map_or_else(|| "unknown".into(), thousands),
+        )
+    }));
+    out
 }

@@ -8,15 +8,19 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use loop_protocol::admin;
 use loop_protocol::rpc::{
-    methods, AttachParams, AttachResult, ClientCapabilities, CloseParams, InitializeParams,
-    InitializeResult, LoadParams, PeerInfo, PromptParams, PromptResult, RpcErrorBody,
-    RuntimeStatus, SessionInfo, SessionParams,
+    methods, AttachParams, AttachResult, ChoicesResult, ClientCapabilities, CloseParams,
+    InitializeParams, InitializeResult, LoadParams, ModelsResult, PeerInfo, PromptParams,
+    PromptResult, RpcErrorBody, RuntimeStatus, SessionInfo, SessionParams, SetEffortParams,
+    SetModeParams, SetModelParams,
 };
 use loop_protocol::{
-    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
-    ErrorCategory, ErrorInfo, HostServices, InteractionRequest, SessionKey, SessionRef,
-    SessionSpec, SessionUpdate, TurnHandle, TurnOutcome, UpdateEnvelope, PROTOCOL_VERSION,
+    AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, Compaction,
+    CompactionReport, ContentBlock, ErrorCategory, ErrorInfo, HostServices, InteractionRequest,
+    LocalShell, ModelChoices, ModelControl, MutationResult, SessionKey, SessionRef, SessionSpec,
+    SessionStats, SessionUpdate, ShellResult, StatsSummary, TurnHandle, TurnOutcome,
+    UpdateEnvelope, PROTOCOL_VERSION,
 };
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -29,9 +33,21 @@ use crate::transport::Transport;
 /// Updates a client keeps for a slow subscriber before it lags.
 const UPDATE_BUFFER: usize = 4096;
 
+struct Initializing(Option<Arc<Connection>>);
+
+impl Drop for Initializing {
+    fn drop(&mut self) {
+        if let Some(conn) = &self.0 {
+            conn.close();
+        }
+    }
+}
+
 /// A backend served over a connection ([`crate::serve`]).
 pub struct RemoteBackend {
     conn: Arc<Connection>,
+    is_websocket: bool,
+    connection_notices: Mutex<Vec<String>>,
     instance: BackendInstanceId,
     capabilities: Capabilities,
     server: PeerInfo,
@@ -45,6 +61,59 @@ pub struct RemoteBackend {
 }
 
 impl RemoteBackend {
+    /// Connect to the Runtime over an authenticated WebSocket, then initialize.
+    /// The caller supplies the token; it is never included in diagnostics.
+    pub async fn connect_websocket(
+        url: &str,
+        token: &str,
+        client: PeerInfo,
+        host: Arc<dyn HostServices>,
+    ) -> BackendResult<Arc<Self>> {
+        let transport = crate::socket::websocket_connect(url, token)
+            .await
+            .map_err(|error| BackendError::failed(ErrorCategory::Protocol, error.to_string()))?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            Self::connect(transport, client, host),
+        )
+        .await
+        .map_err(|_| {
+            BackendError::failed(ErrorCategory::Protocol, "Runtime initialization timed out")
+        })?
+    }
+
+    /// Current public Session snapshot.
+    pub async fn config(
+        &self,
+        p: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::SessionSnapshot> {
+        if !self.capabilities.session_config {
+            return Err(BackendError::Unsupported(methods::SESSION_CONFIG.into()));
+        }
+        call(&self.conn, methods::SESSION_CONFIG, &p).await
+    }
+
+    /// Activate a Session skill.
+    pub async fn skill(
+        &self,
+        params: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        if !self.capabilities.session_skills {
+            return Err(BackendError::Unsupported(methods::SESSION_SKILL.into()));
+        }
+        call(&self.conn, methods::SESSION_SKILL, &params).await
+    }
+    /// Start a workflow; progress arrives through subscribe.
+    pub async fn workflow(
+        &self,
+        params: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        if !self.capabilities.workflow {
+            return Err(BackendError::Unsupported(methods::SESSION_WORKFLOW.into()));
+        }
+        call(&self.conn, methods::SESSION_WORKFLOW, &params).await
+    }
+
     /// Connect over `transport` and agree on a version. `host` answers the
     /// server's `host/interact` requests.
     pub async fn connect(
@@ -52,7 +121,28 @@ impl RemoteBackend {
         client: PeerInfo,
         host: Arc<dyn HostServices>,
     ) -> BackendResult<Arc<Self>> {
+        Self::connect_with_capabilities(
+            transport,
+            client,
+            host,
+            ClientCapabilities {
+                interact: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Connect with the Surface's actual reset and interaction support.
+    pub async fn connect_with_capabilities(
+        transport: Transport,
+        client: PeerInfo,
+        host: Arc<dyn HostServices>,
+        client_capabilities: ClientCapabilities,
+    ) -> BackendResult<Arc<Self>> {
+        let is_websocket = transport.is_websocket;
         let (conn, incoming) = Connection::new(transport);
+        let mut initializing = Initializing(Some(conn.clone()));
         let (updates, _) = broadcast::channel(UPDATE_BUFFER);
         let busy: Arc<Mutex<HashSet<SessionKey>>> = Arc::default();
         tokio::spawn(read(
@@ -65,7 +155,7 @@ impl RemoteBackend {
         let params = InitializeParams {
             protocol_version: PROTOCOL_VERSION,
             client_info: client,
-            client_capabilities: ClientCapabilities { interact: true },
+            client_capabilities,
         };
         let result: InitializeResult = call(&conn, methods::INITIALIZE, &params).await?;
         if result.protocol_version > PROTOCOL_VERSION || result.protocol_version == 0 {
@@ -78,8 +168,11 @@ impl RemoteBackend {
                 ),
             ));
         }
+        initializing.0 = None;
         Ok(Arc::new(Self {
             conn,
+            is_websocket,
+            connection_notices: Mutex::new(vec![]),
             instance: result.instance,
             capabilities: result.capabilities,
             server: result.server_info,
@@ -87,6 +180,117 @@ impl RemoteBackend {
             busy,
             local: Arc::default(),
         }))
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn tree(
+        &self,
+        params: loop_protocol::rpc::TreeParams,
+    ) -> BackendResult<loop_protocol::rpc::TreeResult> {
+        if !self.capabilities.session_tree {
+            return Err(BackendError::Unsupported(methods::SESSION_TREE.into()));
+        }
+        call(&self.conn, methods::SESSION_TREE, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn view(
+        &self,
+        params: loop_protocol::rpc::ViewParams,
+    ) -> BackendResult<loop_protocol::rpc::ViewResult> {
+        if !self.capabilities.branch_snapshot {
+            return Err(BackendError::Unsupported(methods::SESSION_VIEW.into()));
+        }
+        call(&self.conn, methods::SESSION_VIEW, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn navigate(
+        &self,
+        params: loop_protocol::rpc::NavigateParams,
+    ) -> BackendResult<loop_protocol::rpc::NavigateResult> {
+        if !self.capabilities.session_tree {
+            return Err(BackendError::Unsupported(methods::SESSION_NAVIGATE.into()));
+        }
+        call(&self.conn, methods::SESSION_NAVIGATE, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn rename(
+        &self,
+        params: loop_protocol::rpc::RenameParams,
+    ) -> BackendResult<loop_protocol::rpc::MutationResult> {
+        if !self.capabilities.session_rename {
+            return Err(BackendError::Unsupported(methods::SESSION_RENAME.into()));
+        }
+        call(&self.conn, methods::SESSION_RENAME, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn fork(
+        &self,
+        params: loop_protocol::rpc::ForkParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        if !self.capabilities.session_fork {
+            return Err(BackendError::Unsupported(methods::SESSION_FORK.into()));
+        }
+        call(&self.conn, methods::SESSION_FORK, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn clone_session(
+        &self,
+        params: loop_protocol::rpc::CloneParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        if !self.capabilities.session_fork {
+            return Err(BackendError::Unsupported(methods::SESSION_CLONE.into()));
+        }
+        call(&self.conn, methods::SESSION_CLONE, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn export(
+        &self,
+        params: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::ExportResult> {
+        if !self.capabilities.session_transfer {
+            return Err(BackendError::Unsupported(methods::SESSION_EXPORT.into()));
+        }
+        call(&self.conn, methods::SESSION_EXPORT, &params).await
+    }
+
+    /// Session-tree operation over the wire.
+    pub async fn import(
+        &self,
+        params: loop_protocol::rpc::ImportParams,
+    ) -> BackendResult<loop_protocol::rpc::DestinationResult> {
+        if !self.capabilities.session_transfer {
+            return Err(BackendError::Unsupported(methods::SESSION_IMPORT.into()));
+        }
+        call(&self.conn, methods::SESSION_IMPORT, &params).await
+    }
+
+    /// Whether this client sends data over WebSocket rather than a local socket.
+    pub fn is_websocket(&self) -> bool {
+        self.is_websocket
+    }
+
+    /// Add a Surface startup notice without sending or persisting it on the wire.
+    pub fn add_connection_notice(&self, notice: String) {
+        self.connection_notices.lock().push(notice);
+    }
+    /// Take connection startup notices once.
+    pub fn take_connection_notices(&self) -> Vec<String> {
+        std::mem::take(&mut *self.connection_notices.lock())
+    }
+    /// Wait for the connection to the Runtime to close.
+    pub async fn closed(&self) {
+        self.conn.closed().await;
+    }
+
+    /// Close this Surface connection without stopping the Runtime.
+    pub fn disconnect(&self) {
+        self.conn.close();
     }
 
     /// The server, as it introduced itself.
@@ -135,12 +339,46 @@ impl RemoteBackend {
         call(&self.conn, methods::RUNTIME_STATUS, &serde_json::json!({})).await
     }
 
+    /// Stop an empty owner without racing a new Session admission.
+    pub async fn stop_empty(&self) -> BackendResult<()> {
+        if !self.capabilities.runtime_stop_empty {
+            return Err(BackendError::Unsupported(
+                methods::RUNTIME_STOP_EMPTY.into(),
+            ));
+        }
+        call::<Value>(
+            &self.conn,
+            methods::RUNTIME_STOP_EMPTY,
+            &serde_json::json!({}),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Ask the Runtime to shut down (`runtime/stop`). It answers first, then
     /// closes every connection; send nothing more on this one.
     pub async fn stop(&self) -> BackendResult<()> {
         call::<Value>(&self.conn, methods::RUNTIME_STOP, &serde_json::json!({}))
             .await
             .map(|_| ())
+    }
+
+    /// The models a Session can use, with their backends (`session/models`).
+    /// Needs the `set_model` capability.
+    pub async fn session_models(&self, session: &SessionRef) -> BackendResult<ModelsResult> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call(&self.conn, methods::SESSION_MODELS, &params).await
+    }
+
+    async fn choices(&self, method: &str, session: &SessionRef) -> BackendResult<ModelChoices> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call::<ChoicesResult>(&self.conn, method, &params)
+            .await
+            .map(ModelChoices::from)
     }
 
     /// Close a Session; a busy one needs `force`.
@@ -252,6 +490,164 @@ impl AgentBackend for RemoteBackend {
             .await;
         self.conn.close();
     }
+
+    fn model_control(&self) -> Option<&dyn ModelControl> {
+        let c = self.capabilities;
+        (c.set_model || c.efforts || c.modes || c.session_ttfb).then_some(self as &dyn ModelControl)
+    }
+
+    fn compaction(&self) -> Option<&dyn Compaction> {
+        self.capabilities
+            .compaction
+            .then_some(self as &dyn Compaction)
+    }
+
+    fn session_stats(&self) -> Option<&dyn SessionStats> {
+        self.capabilities
+            .session_stats
+            .then_some(self as &dyn SessionStats)
+    }
+
+    fn local_shell(&self) -> Option<&dyn LocalShell> {
+        self.capabilities
+            .local_shell
+            .then_some(self as &dyn LocalShell)
+    }
+}
+
+#[async_trait]
+impl Compaction for RemoteBackend {
+    async fn compact(
+        &self,
+        session: &SessionRef,
+        instructions: Option<&str>,
+    ) -> BackendResult<CompactionReport> {
+        let params = loop_protocol::rpc::CompactParams {
+            session: session.clone(),
+            instructions: instructions.map(str::to_owned),
+        };
+        call(&self.conn, methods::SESSION_COMPACT, &params).await
+    }
+}
+
+#[async_trait]
+impl SessionStats for RemoteBackend {
+    async fn stats(&self, session: &SessionRef) -> BackendResult<StatsSummary> {
+        let params = SessionParams {
+            session: session.clone(),
+        };
+        call::<loop_protocol::rpc::StatsResult>(&self.conn, methods::SESSION_STATS, &params)
+            .await
+            .map(StatsSummary::from)
+    }
+}
+
+#[async_trait]
+impl LocalShell for RemoteBackend {
+    async fn run(
+        &self,
+        session: &SessionRef,
+        command: &str,
+        timeout_ms: Option<u64>,
+    ) -> BackendResult<ShellResult> {
+        let params = loop_protocol::rpc::ShellParams {
+            session: session.clone(),
+            command: command.to_owned(),
+            timeout_ms,
+        };
+        call(&self.conn, methods::SESSION_SHELL, &params).await
+    }
+}
+
+/// Unsupported unless the server advertised `offered`.
+fn offered(offered: bool, what: &str) -> BackendResult<()> {
+    if offered {
+        Ok(())
+    } else {
+        Err(BackendError::Unsupported(what.into()))
+    }
+}
+
+#[async_trait]
+impl ModelControl for RemoteBackend {
+    async fn ttfb(
+        &self,
+        session: &SessionRef,
+        change: Option<Option<u64>>,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<loop_protocol::rpc::TtfbResult> {
+        offered(
+            self.capabilities.session_ttfb,
+            "changing the response timeout",
+        )?;
+        let params = loop_protocol::rpc::TtfbParams {
+            session: session.clone(),
+            timeout_ms: change.flatten(),
+            clear_override: matches!(change, Some(None)),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_TTFB, &params).await
+    }
+
+    async fn models(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        offered(self.capabilities.set_model, "choosing a model")?;
+        self.session_models(session).await.map(ModelChoices::from)
+    }
+
+    async fn set_model(
+        &self,
+        session: &SessionRef,
+        model: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        offered(self.capabilities.set_model, "choosing a model")?;
+        let params = SetModelParams {
+            session: session.clone(),
+            model: model.into(),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_SET_MODEL, &params).await
+    }
+
+    async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        offered(self.capabilities.efforts, "choosing a reasoning effort")?;
+        self.choices(methods::SESSION_EFFORTS, session).await
+    }
+
+    async fn set_effort(
+        &self,
+        session: &SessionRef,
+        effort: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        offered(self.capabilities.efforts, "choosing a reasoning effort")?;
+        let params = SetEffortParams {
+            session: session.clone(),
+            effort: effort.into(),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_SET_EFFORT, &params).await
+    }
+
+    async fn modes(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
+        offered(self.capabilities.modes, "choosing a mode")?;
+        self.choices(methods::SESSION_MODES, session).await
+    }
+
+    async fn set_mode(
+        &self,
+        session: &SessionRef,
+        mode: &str,
+        expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        offered(self.capabilities.modes, "choosing a mode")?;
+        let params = SetModeParams {
+            session: session.clone(),
+            mode: mode.into(),
+            expected_revision,
+        };
+        call(&self.conn, methods::SESSION_SET_MODE, &params).await
+    }
 }
 
 /// Send a request and parse its result; a remote error becomes the
@@ -286,7 +682,7 @@ async fn call<T: DeserializeOwned>(
 /// Handle everything the server sends, in order.
 async fn read(
     conn: Arc<Connection>,
-    mut incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
+    mut incoming: tokio::sync::mpsc::Receiver<Incoming>,
     updates: broadcast::Sender<UpdateEnvelope>,
     busy: Arc<Mutex<HashSet<SessionKey>>>,
     host: Arc<dyn HostServices>,
@@ -309,6 +705,28 @@ async fn read(
                         let _ = updates.send(envelope);
                     }
                     Err(error) => tracing::debug!(%error, "skipping an unreadable update"),
+                }
+            }
+            // Another Surface answered (or the turn ended): tell subscribers
+            // so a still-open approval can close. Seq 0 is outside the
+            // stream's numbering; consumers act on it before ordering checks.
+            Incoming::Notification { method, params }
+                if method == methods::HOST_INTERACT_WITHDRAWN =>
+            {
+                if let Ok(withdrawn) =
+                    serde_json::from_value::<loop_protocol::rpc::InteractWithdrawnParams>(params)
+                {
+                    let _ = updates.send(UpdateEnvelope::live(
+                        withdrawn.session.instance.clone(),
+                        0,
+                        withdrawn.session.key.clone(),
+                        None,
+                        0,
+                        SessionUpdate::InteractionResolved {
+                            id: withdrawn.id,
+                            outcome: loop_protocol::InteractionOutcome::Cancelled,
+                        },
+                    ));
                 }
             }
             Incoming::Notification { .. } => {}
@@ -336,4 +754,128 @@ async fn read(
         }
     }
     conn.fail_pending().await;
+    conn.close();
+}
+
+/// Workspace admin and host-only methods over the wire. A method the server
+/// did not advertise answers Unsupported without a round trip; a host-only
+/// one on a remote connection comes back Forbidden.
+#[async_trait]
+impl crate::control::RuntimeAdmin for RemoteBackend {
+    async fn providers(
+        &self,
+        p: loop_protocol::host::ProvidersParams,
+    ) -> BackendResult<loop_protocol::host::ProvidersResult> {
+        self.admin_call(|c| c.host_providers, methods::RUNTIME_PROVIDERS, &p)
+            .await
+    }
+    async fn tracing(
+        &self,
+        p: loop_protocol::host::TracingParams,
+    ) -> BackendResult<loop_protocol::host::TracingResult> {
+        self.admin_call(|c| c.host_tracing, methods::RUNTIME_TRACING, &p)
+            .await
+    }
+    async fn mcp_auth(
+        &self,
+        p: loop_protocol::host::McpAuthParams,
+    ) -> BackendResult<loop_protocol::host::McpAuthResult> {
+        self.admin_call(|c| c.host_mcp_auth, methods::RUNTIME_MCP_AUTH, &p)
+            .await
+    }
+
+    async fn settings(&self, p: admin::SettingsParams) -> BackendResult<admin::SettingsResult> {
+        self.admin_call(|c| c.workspace_settings, methods::WORKSPACE_SETTINGS, &p)
+            .await
+    }
+
+    fn offered(&self) -> Capabilities {
+        self.capabilities()
+    }
+    async fn mcp(&self, params: admin::McpParams) -> BackendResult<admin::McpResult> {
+        self.admin_call(|c| c.workspace_mcp, methods::WORKSPACE_MCP, &params)
+            .await
+    }
+    async fn web_search(
+        &self,
+        params: admin::WebSearchParams,
+    ) -> BackendResult<admin::WebSearchResult> {
+        self.admin_call(
+            |c| c.workspace_web_search,
+            methods::WORKSPACE_WEB_SEARCH,
+            &params,
+        )
+        .await
+    }
+    async fn skills(&self, params: admin::SkillsParams) -> BackendResult<admin::SkillsResult> {
+        self.admin_call(|c| c.workspace_skills, methods::WORKSPACE_SKILLS, &params)
+            .await
+    }
+    async fn templates(
+        &self,
+        params: admin::TemplatesParams,
+    ) -> BackendResult<admin::TemplatesResult> {
+        self.admin_call(
+            |c| c.workspace_templates,
+            methods::WORKSPACE_TEMPLATES,
+            &params,
+        )
+        .await
+    }
+    async fn reload(&self, params: admin::ReloadParams) -> BackendResult<admin::ReloadResult> {
+        self.admin_call(|c| c.workspace_reload, methods::WORKSPACE_RELOAD, &params)
+            .await
+    }
+    async fn trust(&self, params: admin::TrustParams) -> BackendResult<admin::TrustResult> {
+        self.admin_call(|c| c.workspace_trust, methods::WORKSPACE_TRUST, &params)
+            .await
+    }
+    async fn sandbox(&self, params: admin::SandboxParams) -> BackendResult<admin::SandboxResult> {
+        self.admin_call(|c| c.session_sandbox, methods::SESSION_SANDBOX, &params)
+            .await
+    }
+    async fn permission_mode(
+        &self,
+        params: admin::PermissionModeParams,
+    ) -> BackendResult<admin::PermissionModeResult> {
+        self.admin_call(
+            |c| c.permission_mode,
+            methods::SESSION_PERMISSION_MODE,
+            &params,
+        )
+        .await
+    }
+    async fn sessions(&self) -> BackendResult<admin::RuntimeSessionsResult> {
+        self.admin_call(
+            |c| c.runtime_sessions,
+            methods::RUNTIME_SESSIONS,
+            &serde_json::json!({}),
+        )
+        .await
+    }
+    async fn usage(&self, params: admin::UsageParams) -> BackendResult<admin::UsageResult> {
+        self.admin_call(|c| c.host_usage, methods::RUNTIME_USAGE, &params)
+            .await
+    }
+    async fn defaults(
+        &self,
+        params: admin::DefaultsParams,
+    ) -> BackendResult<admin::DefaultsResult> {
+        self.admin_call(|c| c.host_defaults, methods::RUNTIME_DEFAULTS, &params)
+            .await
+    }
+}
+
+impl RemoteBackend {
+    async fn admin_call<T: DeserializeOwned>(
+        &self,
+        flag: fn(&Capabilities) -> bool,
+        method: &str,
+        params: &impl serde::Serialize,
+    ) -> BackendResult<T> {
+        if !flag(&self.capabilities()) {
+            return Err(BackendError::Unsupported(method.into()));
+        }
+        call(&self.conn, method, params).await
+    }
 }

@@ -16,8 +16,8 @@ arguments, environment).
   - `cancel` is fire-and-forget. Pending permission requests are answered
     `cancelled`, and a turn that ignores the cancel past the agent's
     `cancel_timeout` gets its process tree killed.
-- `ProcessConnector` starts the agent in its own process group (Unix) or
-  kills its tree with `taskkill /T` (Windows). The agent gets a minimal
+- `ProcessConnector` starts the agent in its own process group and
+  kills the whole group on teardown. The agent gets a minimal
   environment: no provider API keys unless its config sets them.
 - `mapping` translates ACP types to `loop-protocol` and synthesizes the
   message boundaries ACP does not have.

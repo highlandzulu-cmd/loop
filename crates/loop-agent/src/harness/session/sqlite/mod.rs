@@ -11,4 +11,4 @@ pub use leases::{
     LeaseIdentity, PidLiveness, SessionLease, LEASE_RENEW_INTERVAL_MS, LEASE_STALE_AFTER_MS,
 };
 pub use search::create_sqlite_session_search;
-pub use store::{create_sqlite_session_store, SqliteSessionStore};
+pub use store::{create_sqlite_session_store, DestinationCreation, SqliteSessionStore};

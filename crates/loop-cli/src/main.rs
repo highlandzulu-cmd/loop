@@ -1,5 +1,8 @@
 //! Loop — interactive coding agent CLI by Soket AI.
 
+#[cfg(not(unix))]
+compile_error!("Loop supports Linux and macOS only");
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -58,6 +61,14 @@ struct Cli {
     /// Permission mode: read-only, ask (default), accept-edits or full-access.
     #[arg(long, global = true, value_name = "MODE")]
     permission_mode: Option<String>,
+
+    /// Runtime socket path or authenticated ws:// URL.
+    #[arg(long, global = true)]
+    connect: Option<String>,
+
+    /// Private WebSocket token file; otherwise use LOOP_RUNTIME_TOKEN.
+    #[arg(long, global = true, requires = "connect")]
+    token_file: Option<PathBuf>,
 
     /// Print mode: send one prompt and exit (non-interactive).
     #[arg(long, global = true)]
@@ -145,6 +156,11 @@ enum RuntimeCommand {
     /// effect only through that flag, never from settings. The global
     /// `--cwd` sets the folder for Sessions that name none.
     Start {
+        #[arg(long, hide = true)]
+        auto_started: bool,
+        /// Also serve WebSocket clients on a loopback IP address and port.
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
         /// Socket path (default: `run/runtime.sock` in the agent directory).
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -161,6 +177,12 @@ enum RuntimeCommand {
     /// 10 s for it to go. Never signals a process.
     Stop {
         /// Socket path (default: `run/runtime.sock` in the agent directory).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Restart as a detached owner without an idle timeout.
+    Restart {
+        /// Runtime socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -190,6 +212,12 @@ enum SessionCommand {
         /// Runtime socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Runtime WebSocket URL (use an SSH tunnel for another host).
+        #[arg(long, conflicts_with = "socket")]
+        url: Option<String>,
+        /// Private token file; otherwise read LOOP_RUNTIME_TOKEN.
+        #[arg(long, requires = "url")]
+        token_file: Option<PathBuf>,
     },
     /// Create a Session and attach to it. Ctrl+D detaches.
     New {
@@ -208,6 +236,12 @@ enum SessionCommand {
         /// Runtime socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
+        /// Runtime WebSocket URL (use an SSH tunnel for another host).
+        #[arg(long, conflicts_with = "socket")]
+        url: Option<String>,
+        /// Private token file; otherwise read LOOP_RUNTIME_TOKEN.
+        #[arg(long, requires = "url")]
+        token_file: Option<PathBuf>,
     },
     /// Unload a Session from the Runtime. Its history is kept, and
     /// `loop session attach` loads it again.
@@ -326,6 +360,8 @@ async fn real_main() -> anyhow::Result<()> {
                 use loop_cli::runtime_cmd;
                 return match command {
                     RuntimeCommand::Start {
+                        auto_started,
+                        listen,
                         socket,
                         max_sessions,
                         max_active_turns,
@@ -335,6 +371,8 @@ async fn real_main() -> anyhow::Result<()> {
                             None => std::env::current_dir()?,
                         };
                         runtime_cmd::start(runtime_cmd::StartArgs {
+                            auto_started: *auto_started,
+                            listen: *listen,
                             socket: socket.clone(),
                             max_sessions: *max_sessions,
                             max_active_turns: *max_active_turns,
@@ -344,6 +382,10 @@ async fn real_main() -> anyhow::Result<()> {
                         .await
                     }
                     RuntimeCommand::Stop { socket } => runtime_cmd::stop(socket.clone()).await,
+                    RuntimeCommand::Restart { socket } => {
+                        let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
+                        loop_cli::runtime_launch::restart(socket.clone(), &cwd).await
+                    }
                     RuntimeCommand::Status { socket, json } => {
                         if !runtime_cmd::status(socket.clone(), *json).await? {
                             std::process::exit(1);
@@ -355,7 +397,15 @@ async fn real_main() -> anyhow::Result<()> {
             Commands::Session(command) => {
                 use loop_cli::session_cmd::{run, SessionArgs};
                 let args = match command {
-                    SessionCommand::List { all, json, socket } => SessionArgs {
+                    SessionCommand::List {
+                        all,
+                        json,
+                        socket,
+                        url,
+                        token_file,
+                    } => SessionArgs {
+                        url: url.clone(),
+                        token_file: token_file.clone(),
                         cwd: cli.cwd.clone(),
                         socket: socket.clone(),
                         all: *all,
@@ -368,7 +418,14 @@ async fn real_main() -> anyhow::Result<()> {
                         socket: socket.clone(),
                         ..Default::default()
                     },
-                    SessionCommand::Attach { id, socket } => SessionArgs {
+                    SessionCommand::Attach {
+                        id,
+                        socket,
+                        url,
+                        token_file,
+                    } => SessionArgs {
+                        url: url.clone(),
+                        token_file: token_file.clone(),
                         id: Some(id.clone()),
                         socket: socket.clone(),
                         ..Default::default()
@@ -488,6 +545,86 @@ async fn real_main() -> anyhow::Result<()> {
     ) {
         tracing::warn!(%error, "could not register signal handlers");
     }
+    // Subscription admission stays in-process, including a saved default.
+    let saved_subscription_default = (!explicit_model || startup_sessions.is_some())
+        && config::Settings::load_file(&config::paths::settings_path(&agent_dir))
+            .ok()
+            .and_then(|s| s.selected_model().map(|(p, _)| p.to_owned()))
+            .is_some_and(|p| loop_app_core::agents::subscription_ids(&agent_dir).contains(&p));
+    let mut fallback_notice: Option<String> = None;
+    if interactive && pending_agent.is_none() && !saved_subscription_default {
+        let opts = BootstrapOpts {
+            cwd: std::fs::canonicalize(&cwd)?,
+            provider: provider.clone(),
+            model: model.clone(),
+            theme: cli.theme.clone(),
+            system_prompt: cli.system_prompt.clone(),
+            append_system_prompt: cli.append_system_prompt.clone(),
+            no_context_files: cli.no_context_files,
+            no_web: cli.no_web,
+            permission_mode: cli.permission_mode.clone(),
+            interactive: true,
+            session_id: cli.resume.clone(),
+            agent: None,
+        };
+        let connected = async {
+            // Trust must be recorded on the host before the daemon loads any
+            // project settings or hooks for a newly opened local workspace.
+            if cli.connect.is_none() {
+                let mut trust =
+                    config::trust::TrustStore::load(config::paths::trust_path(&agent_dir))?;
+                let settings =
+                    config::Settings::load_file(&config::paths::settings_path(&agent_dir))?;
+                loop_app_core::runtime::resolve_trust(&mut trust, &opts.cwd, &settings, true)?;
+            }
+            let host = std::sync::Arc::new(loop_cli::surface_client::RemoteHost::default());
+            let remote = loop_cli::runtime_launch::launch(
+                cli.connect.as_deref(),
+                cli.token_file.as_deref(),
+                &agent_dir,
+                &opts.cwd,
+                host.clone(),
+            )
+            .await?;
+            let resume = match startup_sessions {
+                Some(loop_cli::StartupSessions::Pick) => Some(""),
+                _ => cli.resume.as_deref(),
+            };
+            loop_cli::runtime_launch::open(remote, host, &opts, resume, cli.continue_last).await
+        }
+        .await;
+        match connected {
+            Ok(mut client) => {
+                client.debug = debug;
+                client.debug_log_path = debug_log_path;
+                let result = loop_cli::app::run(client).await;
+                #[cfg(feature = "telemetry")]
+                print_mode::shutdown_telemetry(&telemetry).await;
+                return result;
+            }
+            // An explicit target is what the user asked for; running somewhere
+            // else would silently use a different provider and machine.
+            Err(error) if cli.connect.is_some() => {
+                eprintln!("loop: {error}");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                let line = format!(
+                    "{error}; using in-process mode for this run (Runtime log: {})",
+                    agent_dir.join("logs/runtime.log").display()
+                );
+                // A terminal UI takes the screen next, so it shows the line
+                // as its first notice; scripts and pipes get it on stderr.
+                if std::io::IsTerminal::is_terminal(&std::io::stderr())
+                    && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                {
+                    fallback_notice = Some(line);
+                } else {
+                    eprintln!("loop: {line}");
+                }
+            }
+        }
+    }
     let mut runtime = bootstrap_cli(BootstrapOpts {
         cwd,
         provider,
@@ -525,6 +662,7 @@ async fn real_main() -> anyhow::Result<()> {
         .flatten();
     runtime.pending_agent = pending_agent.or(saved_subscription);
     runtime.startup_sessions = startup_sessions;
+    runtime.startup_notices.extend(fallback_notice);
     runtime.debug = debug;
     runtime.debug_log_path = debug_log_path;
     #[cfg(feature = "telemetry")]
@@ -564,7 +702,7 @@ async fn real_main() -> anyhow::Result<()> {
             Err(err) => Err(err),
         }
     } else {
-        loop_cli::app::run(runtime).await
+        loop_cli::app::run(runtime.into()).await
     };
     // Idempotent: the TUI and `--print` already released.
     release().await;
@@ -600,12 +738,39 @@ mod tests {
     }
 
     #[test]
+    fn interactive_connection_and_continue_flags_parse() {
+        let cli = parse(&["loop", "-c", "--connect", "/tmp/runtime.sock"]);
+        assert!(!cli.continue_last);
+        assert!(cli.no_context_files);
+        assert_eq!(cli.connect.as_deref(), Some("/tmp/runtime.sock"));
+        assert!(parse(&["loop", "-c", "--resume", "id"]).no_context_files);
+        assert!(parse(&["loop", "--continue"]).continue_last);
+
+        let cli = parse(&[
+            "loop",
+            "--resume",
+            "session",
+            "--connect",
+            "ws://127.0.0.1:9",
+            "--token-file",
+            "/tmp/token",
+        ]);
+        assert_eq!(cli.resume.as_deref(), Some("session"));
+        assert_eq!(cli.token_file, Some("/tmp/token".into()));
+        assert!(matches!(
+            parse(&["loop", "runtime", "restart"]).command,
+            Some(Commands::Runtime(RuntimeCommand::Restart { .. }))
+        ));
+    }
+
+    #[test]
     fn runtime_subcommands_parse() {
         let cli = parse(&["loop", "runtime", "start"]);
         let Some(Commands::Runtime(RuntimeCommand::Start {
             socket,
             max_sessions,
             max_active_turns,
+            ..
         })) = cli.command
         else {
             panic!("not runtime start")
@@ -632,6 +797,7 @@ mod tests {
             socket,
             max_sessions,
             max_active_turns,
+            ..
         })) = cli.command
         else {
             panic!("not runtime start")
@@ -662,7 +828,8 @@ mod tests {
             Some(Commands::Session(SessionCommand::List {
                 all: true,
                 json: true,
-                socket: None
+                socket: None,
+                ..
             }))
         ));
         let cli = parse(&[

@@ -5,8 +5,76 @@ terminal is then only a Surface. You can close it, open another, or watch the
 same Session from two terminals. Work keeps running in the Runtime, which keeps
 an Event Log so any Surface can catch up later.
 
-The Runtime works on **Linux and macOS** only, because it listens on a Unix
-socket. On other platforms `loop runtime` and `loop session` exit with an error.
+Loop supports **Linux and macOS** only (on Windows, use WSL). The Runtime
+listens on a Unix socket.
+
+## Plain `loop` uses the Runtime
+
+Interactive `loop` connects to the Runtime for the current agent directory and
+opens a new Session in the caller's working directory. If none is reachable,
+it starts a detached owner and waits for its socket. A second terminal reuses
+that owner. Discovery currently checks one agent directory; when discovery
+returns several reachable owners, Loop asks you to select one. With piped
+input it chooses the first owner. `--continue` starts a new Session with a
+notice when this folder has no history.
+
+```bash
+loop                                # new Session, auto-start if needed
+loop --continue                     # attach to this folder's latest Session
+loop -c                             # skip AGENTS.md / CLAUDE.md context files
+loop --resume                       # choose an existing Session
+loop --resume SESSION_ID             # attach by id or unique prefix
+loop --connect /path/to/runtime.sock # choose a particular owner
+loop --connect ws://127.0.0.1:8765 --token-file /private/runtime.token
+```
+
+WebSockets require `LOOP_RUNTIME_TOKEN` or a private `--token-file`. For another
+host, tunnel its loopback listener over SSH. WebSocket clients have no host-only
+credential or telemetry access.
+
+Each new Session receives the caller's cwd and environment for tools and
+`!shell`. Provider credentials resolve in the Runtime. A notice warns when an
+exported provider API key differs; it never shows the key. Runtime bearer tokens
+and built-in provider key variables are removed from tool environments.
+
+Resuming keeps the Session's original cwd and tool environment, so attaching a
+second Surface cannot change tools that are already running. The TUI says so on
+resume. Environments are held in memory only; after a Runtime restart, an old
+Session uses the Runtime's environment. Credential-difference notices compare
+the attaching shell with the selected provider's actual Runtime credentials.
+
+Unix sockets can forward the full environment. WebSockets forward only `PATH`,
+`HOME`, `USER`, `SHELL`, `LANG`, `LC_*`, `TERM`, `TMPDIR`, `VIRTUAL_ENV` and
+`CONDA_PREFIX`. Add explicit variable names in the Surface's global settings:
+
+```json
+{ "runtime": { "forwardEnv": ["TASK_VALUE"] } }
+```
+
+Names in `forwardEnv` are an explicit choice to share those values with the
+remote owner. Environment maps are redacted from diagnostics and never saved in
+the Event Log or settings.
+
+Project trust is prompted locally only for the default owner. An explicit
+`--connect` target uses the Runtime host's recorded trust; its startup notice
+reports an untrusted workspace, and `/trust` uses that host's service.
+
+Quitting detaches the TUI. It keeps the Session, running work and parked
+approvals alive. Another Surface can attach and answer a parked request.
+
+An auto-started owner stops after ten idle minutes. Set the global
+`runtime.idleShutdownMinutes` to change this; `0` disables it. Attached Surfaces,
+active turns, parked approvals and running Subagents prevent idle shutdown.
+An owner started explicitly with `loop runtime start` never idles out.
+
+Loop checks the owner's application version before creating or attaching a
+Session. When versions differ, it replaces only an empty local owner known to
+have been auto-started from this agent directory. Explicit owners and owners
+with loaded Sessions stay running; Loop reports both versions, suggests
+`loop runtime restart`, and uses the in-process path for this run. A startup,
+connection or Session-open failure also prints one warning and falls back.
+Subscription/ACP agents and ordinary `--print` runs use the in-process path. If an owner dies while the TUI is open,
+a recovery banner suggests `loop --continue`; quitting still succeeds.
 
 ## Start the Runtime
 
@@ -23,6 +91,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | Flag | Default | Meaning |
 |---|---|---|
 | `--socket PATH` | `~/.loop/agent/run/runtime.sock` | Where Surfaces connect |
+| `--listen IP:PORT` | off | Also serve authenticated WebSockets. Loopback addresses only; other binds are refused until TLS exists |
 | `--max-sessions N` | `runtime.maxSessions`, else 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
 | `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits` or `full-access` |
@@ -55,6 +124,7 @@ Session database is shared.
 loop runtime status          # pid, socket, generation, loaded and busy Sessions
 loop runtime status --json   # the same as one JSON object, for scripts
 loop runtime stop            # ask the Runtime to shut down, then wait for it
+loop runtime restart         # stop, then start a detached explicit owner
 ```
 
 Both talk to the Runtime through its socket, and both take `--socket PATH`.
@@ -67,6 +137,34 @@ its pid may now belong to another program.
   lease released, then the socket is removed. It waits up to 10 seconds for
   the socket to go and fails if it is still there. With no Runtime answering
   it prints `No Runtime running at …` and exits 0.
+
+### Remote use and WebSocket clients
+
+To use a Runtime from another machine, start it with `--listen 127.0.0.1:PORT`,
+open an SSH tunnel to that port, and copy the token file (see below). The TUI
+then connects with `loop --connect ws://127.0.0.1:PORT --token-file FILE`.
+
+```bash
+loop runtime start --listen 127.0.0.1:8080
+loop session list --url ws://127.0.0.1:8080/ --token-file ~/.loop/agent/run/runtime.token
+loop session attach SESSION_ID --url ws://127.0.0.1:8080/ --token-file ~/.loop/agent/run/runtime.token
+```
+
+Each start with `--listen` generates a fresh bearer token in the agent directory's
+`run/runtime.token`. The directory is private (0700) and the file is private
+(0600); symlinks, foreign ownership and shared files are refused. A copied
+`--token-file` also needs a private, user-owned directory. The file is removed on
+clean shutdown. `loop runtime status` shows the WebSocket URL, never the token.
+Clients can use `LOOP_RUNTIME_TOKEN` instead of `--token-file`; an explicit file
+takes precedence. Tokens are required even on loopback.
+
+Only loopback binds are supported until TLS is available. For another host, use
+an SSH tunnel to its loopback listener and keep any copied token in a private
+directory. Authenticated WebSocket clients have remote authority: host-only
+methods, including Runtime stop, provider and MCP credentials, tracing, saved
+defaults and usage history, and workspace trust writes are refused. The host's protected Unix socket still
+serves those operations. A slow WebSocket client is disconnected when its queues
+fill and can attach again to replay missed events.
 
 ### Permissions and trust
 
@@ -255,4 +353,6 @@ when that is set.
 | `sessions.db` | Sessions, with a `runtime.lock` beside it. `LOOP_CODING_AGENT_SESSION_DIR` moves this file, but not `events.db` |
 
 The wire protocol that Surfaces speak is described in
-[`design/protocol-wire.md`](design/protocol-wire.md#11-runtime-methods-s2).
+[`design/protocol-wire.md`](design/protocol-wire.md#11-runtime-methods-s2); the
+methods added for the TUI are in
+[§12](design/protocol-wire.md#12-session-and-workspace-methods-s3).

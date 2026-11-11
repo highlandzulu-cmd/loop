@@ -280,7 +280,26 @@ pub enum PendingSessionWrite {
         /// Name.
         name: String,
     },
+    /// Custom opaque entry.
+    Custom {
+        /// Custom type.
+        custom_type: String,
+        /// Payload.
+        data: Value,
+    },
 }
+
+/// Custom entry type recording a Session's response-timeout override:
+/// `{"timeout_ms": n}`, or `{"timeout_ms": null}` to inherit the default.
+pub const RESPONSE_TIMEOUT_ENTRY: &str = "response_timeout";
+
+/// Custom entry type recording a Session's permission mode:
+/// `{"mode": "ask"}` (`session/permission_mode`).
+pub const PERMISSION_MODE_ENTRY: &str = "permission_mode";
+
+/// Custom entry type recording a Session's chosen sandbox:
+/// `{"choice": {"mode": "local", ...}}` (`session/sandbox`).
+pub const SANDBOX_ENTRY: &str = "sandbox";
 
 /// Reader over a session's entries.
 #[async_trait]
@@ -343,6 +362,23 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<SessionTreeEntry, SessionError>;
     /// Delete session.
     async fn delete(&self, id: &str) -> Result<(), SessionError>;
+    /// Create an independently leased destination from a captured branch for a
+    /// standalone Surface. Uses the same atomic copy and grant filtering as the
+    /// Runtime's destination service. The source is never switched or cancelled.
+    async fn create_surface_destination(
+        &self,
+        _file: super::SessionFile,
+        _cwd: String,
+        _parent: Option<String>,
+        _request_key: String,
+        _fingerprint: String,
+        _receipt: String,
+    ) -> Result<String, SessionError> {
+        Err(SessionError::Invalid(
+            "this store cannot create a Surface destination".into(),
+        ))
+    }
+
     /// Fork session.
     ///
     /// When `selection` is [`SessionForkSelection::ThroughEntry`], pass the
@@ -485,6 +521,111 @@ pub fn default_context_from_entries(entries: &[SessionTreeEntry]) -> SessionCont
         }
     }
     ctx
+}
+
+/// A Session's recorded model, reasoning effort and name, read from its
+/// whole tree rather than only the part since the last compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionConfigEntries {
+    /// Skills explicitly activated on this branch.
+    pub active_skills: Vec<String>,
+    /// Provider and model id last chosen on the active branch.
+    pub model: Option<(String, String)>,
+    /// Effort last chosen on the active branch, including an explicit
+    /// `Off`. `None` means the Session inherits the default.
+    pub thinking_level: Option<AgentThinkingLevel>,
+    /// Name last given to the Session.
+    pub name: Option<String>,
+    /// Response-timeout override last recorded; `None` inherits the
+    /// default, `Some(0)` waits indefinitely.
+    pub response_timeout_ms: Option<u64>,
+    /// Permission mode last recorded with `session/permission_mode`.
+    pub permission_mode: Option<String>,
+    /// Sandbox choice last recorded with `session/sandbox`.
+    pub sandbox: Option<Value>,
+    /// How many model, effort, name, branch, compaction, response-timeout
+    /// and permission-mode changes the Session ever recorded: its one
+    /// Session revision, stable across restarts.
+    pub revision: u64,
+}
+
+/// Read [`SessionConfigEntries`] from all of a Session's `entries`, for the
+/// branch ending at `head`.
+pub fn config_from_entries(
+    entries: &[SessionTreeEntry],
+    head: Option<&str>,
+) -> SessionConfigEntries {
+    let mut config = SessionConfigEntries::default();
+    let mut by_id = std::collections::HashMap::with_capacity(entries.len());
+    for entry in entries {
+        match entry {
+            SessionTreeEntry::ModelChange { .. }
+            | SessionTreeEntry::ThinkingLevelChange { .. }
+            | SessionTreeEntry::Compaction { .. }
+            | SessionTreeEntry::Leaf { .. } => {
+                config.revision += 1;
+            }
+            SessionTreeEntry::SessionInfo { name, .. } => {
+                config.revision += 1;
+                config.name = Some(name.clone());
+            }
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == RESPONSE_TIMEOUT_ENTRY => {
+                config.revision += 1;
+                config.response_timeout_ms = data["timeout_ms"].as_u64();
+            }
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == PERMISSION_MODE_ENTRY => {
+                config.revision += 1;
+                config.permission_mode = data["mode"].as_str().map(str::to_owned);
+            }
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == SANDBOX_ENTRY => {
+                config.revision += 1;
+                config.sandbox = data.get("choice").filter(|c| c.is_object()).cloned();
+            }
+            SessionTreeEntry::Custom { custom_type, .. } if custom_type == "active_skills" => {
+                config.revision += 1;
+            }
+            _ => {}
+        }
+        by_id.insert(entry.id(), entry);
+    }
+    // Nearest first: the first value found on the way to the root wins.
+    let mut skills_read = false;
+    let mut next = head;
+    let mut steps = 0;
+    while let Some(entry) = next.and_then(|id| by_id.get(id)) {
+        match entry {
+            SessionTreeEntry::Custom {
+                custom_type, data, ..
+            } if custom_type == "active_skills" && !skills_read => {
+                config.active_skills =
+                    serde_json::from_value(data["names"].clone()).unwrap_or_default();
+                skills_read = true;
+            }
+            SessionTreeEntry::ModelChange {
+                provider, model_id, ..
+            } if config.model.is_none() => {
+                config.model = Some((provider.clone(), model_id.clone()));
+            }
+            SessionTreeEntry::ThinkingLevelChange { thinking_level, .. }
+                if config.thinking_level.is_none() =>
+            {
+                config.thinking_level = Some(*thinking_level);
+            }
+            _ => {}
+        }
+        steps += 1;
+        if steps > entries.len() || (config.model.is_some() && config.thinking_level.is_some()) {
+            break;
+        }
+        next = entry.parent_id();
+    }
+    config
 }
 
 /// Create a session id.

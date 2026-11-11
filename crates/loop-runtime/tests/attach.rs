@@ -68,6 +68,7 @@ async fn connect(rt: &Arc<Runtime>) -> (Arc<RemoteBackend>, Served) {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let remote = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -260,6 +261,7 @@ async fn a_v1_client_works_and_unknown_methods_stay_unknown_without_control_body
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let old = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -361,6 +363,7 @@ async fn an_observer_is_not_asked_to_answer_body() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let (conn, mut incoming) = Connection::new(client);
@@ -520,6 +523,7 @@ async fn prompt_completes_only_after_its_end_update_body() {
         info(),
         ServeOptions {
             owns_backend: false,
+            authority: loop_wire::Authority::HostLocal,
         },
     );
     let remote = RemoteBackend::connect(client, info(), Arc::new(Reject))
@@ -640,4 +644,357 @@ async fn detaching_mid_turn_clears_observed_busy() {
     )
     .await
     .expect("test timed out");
+}
+
+#[tokio::test]
+async fn tree_wire_reset_detaches_only_legacy_session_and_rename_is_metadata() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::*;
+        use loop_protocol::SessionUpdate;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log.clone()).await;
+        let (legacy, _legacy_server) = connect(&rt).await;
+        let source = legacy.new_session(SessionSpec::default()).await.unwrap();
+        let other = legacy.new_session(SessionSpec::default()).await.unwrap();
+        say(&legacy, &source, "source prompt").await;
+        let (server, client) = memory();
+        let _capable_server = serve_with_control(rt.clone(), rt.clone(), server, info(), ServeOptions { owns_backend: false, authority: loop_wire::Authority::HostLocal });
+        let capable = RemoteBackend::connect_with_capabilities(client,info(),Arc::new(Reject),ClientCapabilities { interact:true,branch_reset:true }).await.unwrap();
+        let mut capable_rx = capable.subscribe();
+        let attached = capable.attach(&source,log.latest_seq(&source.key).await.unwrap()).await.unwrap();
+        let snapshot = attached.snapshot.unwrap();
+        let original_view = snapshot.view_id.clone().unwrap();
+        let mut legacy_rx = legacy.subscribe();
+        let renamed = capable.rename(RenameParams { session:source.clone(),name:"  renamed  ".into(),expected_revision:Some(snapshot.revision) }).await.unwrap();
+        for receiver in [&mut capable_rx,&mut legacy_rx] {
+            let events = collect(receiver,&source.key,renamed.seq).await;
+            assert!(matches!(events.last().unwrap().update,SessionUpdate::ConfigChanged(ref changed) if changed.metadata.name.as_deref() == Some("renamed")));
+            assert!(!events.iter().any(|event| matches!(event.update,SessionUpdate::BranchReset { .. })));
+        }
+        let tree = capable.tree(TreeParams { session:source.clone(),cursor:None,limit:Some(1) }).await.unwrap();
+        let point = tree.fork_points[0].entry_id.as_str();
+        let fork = capable.fork(ForkParams { session:source.clone(),before_entry_id:point.into(),name:None,request_id:"wire-fork".into() }).await.unwrap();
+        assert_ne!(fork.session,source);
+        assert_eq!(fork.draft.as_deref(),Some("source prompt"));
+        assert_eq!(rt.watcher_count(&source.key),2);
+        let reset = capable.navigate(NavigateParams { session:source.clone(),target_entry_id:None,summarize:false,expected_revision:Some(renamed.revision) }).await.unwrap();
+        let events = collect(&mut capable_rx,&source.key,reset.seq).await;
+        let view_id = match &events.last().unwrap().update {
+            SessionUpdate::BranchReset { view_id,.. } => view_id.clone(),
+            other => panic!("expected reset, got {other:?}"),
+        };
+        let events = collect(&mut legacy_rx,&source.key,reset.seq).await;
+        assert!(matches!(&events.last().unwrap().update,SessionUpdate::Notice { text,.. } if text == "this Session changed branch; attach again"));
+        assert!(!events.iter().any(|event| matches!(event.update,SessionUpdate::BranchReset { .. })));
+        while rt.watcher_count(&source.key) != 1 { tokio::task::yield_now().await; }
+        assert_eq!(rt.watcher_count(&other.key),1);
+        let reset_view = capable.view(ViewParams { session:source.clone(),view_id,cursor:None,limit:None }).await.unwrap();
+        assert!(reset_view.updates.is_empty());
+        let old_view = capable.view(ViewParams { session:source.clone(),view_id:original_view,cursor:None,limit:None }).await.unwrap();
+        assert!(!old_view.updates.is_empty(),"old snapshot must stay immutable");
+        legacy.attach(&source,reset.seq).await.unwrap();
+        say(&capable,&source,"after reset").await;
+        let end = log.latest_seq(&source.key).await.unwrap();
+        assert!(!collect(&mut legacy_rx,&source.key,end).await.is_empty());
+        let payload = capable.export(SessionParams { session:source.clone() }).await.unwrap();
+        let imported = capable.import(ImportParams { workspace_id:fork.workspace_id,jsonl:payload.jsonl,request_id:"wire-import".into() }).await.unwrap();
+        assert_ne!(imported.session,source);
+        rt.shutdown().await;
+    }).await.unwrap();
+}
+
+/// Exact-text message chunks among `events`.
+fn texts(events: &[UpdateEnvelope]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match &event.update {
+            loop_protocol::SessionUpdate::MessageChunk { content, .. } => {
+                content.as_text().map(str::to_owned)
+            }
+            _ => None,
+        })
+        .collect()
+}
+fn detach_notices(events: &[UpdateEnvelope]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(&event.update, loop_protocol::SessionUpdate::Notice { text, .. } if text == "this Session changed branch; attach again"))
+        .count()
+}
+
+#[tokio::test]
+async fn a_legacy_reattach_recovers_the_current_branch() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::*;
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log.clone()).await;
+        let (legacy, _legacy_server) = connect(&rt).await;
+        let source = legacy.new_session(SessionSpec::default()).await.unwrap();
+        say(&legacy, &source, "first branch").await;
+        say(&legacy, &source, "second branch").await;
+        let (server, client) = memory();
+        let _capable_server = serve_with_control(
+            rt.clone(),
+            rt.clone(),
+            server,
+            info(),
+            ServeOptions {
+                owns_backend: false,
+                authority: loop_wire::Authority::HostLocal,
+            },
+        );
+        let capable = RemoteBackend::connect_with_capabilities(
+            client,
+            info(),
+            Arc::new(Reject),
+            ClientCapabilities {
+                interact: true,
+                branch_reset: true,
+            },
+        )
+        .await
+        .unwrap();
+        capable
+            .attach(&source, log.latest_seq(&source.key).await.unwrap())
+            .await
+            .unwrap();
+        let tree = capable
+            .tree(TreeParams {
+                session: source.clone(),
+                cursor: None,
+                limit: None,
+            })
+            .await
+            .unwrap();
+        let second = tree
+            .entries
+            .iter()
+            .find(|entry| entry.text.as_deref() == Some("second branch"))
+            .unwrap();
+        let mut legacy_rx = legacy.subscribe();
+        let reset = capable
+            .navigate(NavigateParams {
+                session: source.clone(),
+                target_entry_id: second.parent_id.clone(),
+                summarize: false,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            detach_notices(&collect(&mut legacy_rx, &source.key, reset.seq).await),
+            1
+        );
+
+        // Reattaching at the cursor the detach left starts from the current branch.
+        legacy.attach(&source, reset.seq).await.unwrap();
+        say(&capable, &source, "third branch").await;
+        let events = collect(
+            &mut legacy_rx,
+            &source.key,
+            log.latest_seq(&source.key).await.unwrap(),
+        )
+        .await;
+        let seen = texts(&events);
+        assert_eq!(
+            seen.iter().filter(|text| *text == "first branch").count(),
+            1,
+            "{seen:?}"
+        );
+        assert!(!seen.iter().any(|text| text == "second branch"), "{seen:?}");
+        assert!(seen.iter().any(|text| text == "third branch"), "{seen:?}");
+        assert_eq!(detach_notices(&events), 0);
+
+        // A fresh legacy attach from zero is not detached by the historical reset.
+        let (fresh, _fresh_server) = connect(&rt).await;
+        let mut fresh_rx = fresh.subscribe();
+        fresh.attach(&source, 0).await.unwrap();
+        say(&capable, &source, "fourth branch").await;
+        let events = collect(
+            &mut fresh_rx,
+            &source.key,
+            log.latest_seq(&source.key).await.unwrap(),
+        )
+        .await;
+        let seen = texts(&events);
+        assert_eq!(detach_notices(&events), 0);
+        assert_eq!(
+            seen.iter().filter(|text| *text == "first branch").count(),
+            1,
+            "{seen:?}"
+        );
+        assert!(!seen.iter().any(|text| text == "second branch"), "{seen:?}");
+        assert!(seen.iter().any(|text| text == "fourth branch"), "{seen:?}");
+        assert!(rt.watcher_count(&source.key) >= 3);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Compaction resets the branch: only a reset-capable watcher receives
+/// BranchReset, a legacy one is detached, and the revision it carries is
+/// the one a reopened Session counts from its tree.
+#[tokio::test]
+async fn compaction_resets_capable_watchers_and_detaches_legacy_ones() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        use loop_protocol::rpc::ClientCapabilities;
+        use loop_protocol::{BackendError, ModelControl, SessionUpdate};
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(MemoryEventLog::new());
+        let rt = runtime(dir.path(), log.clone()).await;
+        let (legacy, _legacy_server) = connect(&rt).await;
+        let source = legacy.new_session(SessionSpec::default()).await.unwrap();
+        // Enough earlier context to leave something behind the kept tail.
+        say(&legacy, &source, &"early context ".repeat(8000)).await;
+        say(&legacy, &source, "recent").await;
+        let (server, client) = memory();
+        let _capable_server = serve_with_control(
+            rt.clone(),
+            rt.clone(),
+            server,
+            info(),
+            ServeOptions {
+                owns_backend: false,
+                authority: loop_wire::Authority::HostLocal,
+            },
+        );
+        let capable = RemoteBackend::connect_with_capabilities(
+            client,
+            info(),
+            Arc::new(Reject),
+            ClientCapabilities {
+                interact: true,
+                branch_reset: true,
+            },
+        )
+        .await
+        .unwrap();
+        capable
+            .attach(&source, log.latest_seq(&source.key).await.unwrap())
+            .await
+            .unwrap();
+        let mut legacy_rx = legacy.subscribe();
+        let mut capable_rx = capable.subscribe();
+        let report = capable
+            .compaction()
+            .expect("the Runtime offers compaction")
+            .compact(&source, Some("keep it short"))
+            .await
+            .unwrap();
+        assert!(report.tokens_before.is_some_and(|t| t > 0));
+        assert!(report.branch_revision >= 1);
+        let events = collect(&mut capable_rx, &source.key, report.seq).await;
+        let revision = events
+            .iter()
+            .find_map(|e| match &e.update {
+                SessionUpdate::BranchReset {
+                    revision,
+                    branch_revision,
+                    reason,
+                    ..
+                } if e.seq == report.seq => {
+                    assert_eq!(reason, "compact");
+                    assert_eq!(*branch_revision, report.branch_revision);
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .expect("the capable watcher receives BranchReset");
+        let legacy_events = collect(&mut legacy_rx, &source.key, report.seq).await;
+        assert_eq!(detach_notices(&legacy_events), 1);
+        assert!(!legacy_events
+            .iter()
+            .any(|e| matches!(e.update, SessionUpdate::BranchReset { .. })));
+
+        let stats = capable
+            .session_stats()
+            .unwrap()
+            .stats(&source)
+            .await
+            .unwrap();
+        assert_eq!(stats.turn_state.as_deref(), Some("idle"));
+        assert!(stats.context_window.is_some_and(|w| w > 0));
+
+        // A user command holds the Session busy: compaction and prompts
+        // are refused meanwhile, and a cancel stops the command.
+        let shell = tokio::spawn({
+            let capable = capable.clone();
+            let source = source.clone();
+            async move {
+                capable
+                    .local_shell()
+                    .unwrap()
+                    .run(&source, "sleep 30", None)
+                    .await
+            }
+        });
+        while !rt.is_busy(&source) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            capable
+                .compaction()
+                .unwrap()
+                .compact(&source, None)
+                .await
+                .unwrap_err(),
+            BackendError::Busy
+        );
+        assert!(matches!(
+            rt.prompt(&source, vec![ContentBlock::text("no")]).await,
+            Err(BackendError::Busy)
+        ));
+        capable.cancel(&source);
+        let stopped = shell.await.unwrap().unwrap_err();
+        assert!(stopped.to_string().contains("cancelled"), "{stopped}");
+        assert!(!rt.is_busy(&source));
+        let out = capable
+            .local_shell()
+            .unwrap()
+            .run(&source, "printf ok", None)
+            .await
+            .unwrap();
+        assert_eq!(out.stdout, "ok");
+        // In-process Runtime and Remote answer alike.
+        let command = "printf out; printf err >&2; exit 4";
+        assert_eq!(
+            rt.local_shell()
+                .unwrap()
+                .run(&source, command, None)
+                .await
+                .unwrap(),
+            capable
+                .local_shell()
+                .unwrap()
+                .run(&source, command, None)
+                .await
+                .unwrap()
+        );
+        let here = rt.session_stats().unwrap().stats(&source).await.unwrap();
+        let there = capable
+            .session_stats()
+            .unwrap()
+            .stats(&source)
+            .await
+            .unwrap();
+        assert_eq!(
+            (here.total_tokens, here.context_window, here.turn_state),
+            (there.total_tokens, there.context_window, there.turn_state)
+        );
+
+        // Reopened from its tree, the Session counts the same revision.
+        capable.detach(&source).await.unwrap();
+        legacy.detach(&source).await.unwrap();
+        rt.close(&source.key, false).await.unwrap();
+        rt.load_session(&source, SessionSpec::default())
+            .await
+            .unwrap();
+        assert_eq!(rt.models(&source).await.unwrap().revision, revision);
+        rt.shutdown().await;
+    })
+    .await
+    .unwrap();
 }

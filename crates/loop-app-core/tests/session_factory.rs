@@ -29,6 +29,78 @@ fn factory(agent_dir: &std::path::Path) -> SessionFactory {
 }
 
 #[tokio::test]
+async fn explicit_custom_model_is_resolved_without_a_models_store() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(n, 0);
+                    request.extend_from_slice(&buf[..n]);
+                }
+                assert!(request.starts_with(b"GET /v1/models HTTP/1.1\r\n"));
+                let body = r#"{"data":[{"id":"GLM-5.3"}]}"#;
+                socket.write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        for separate_provider_flag in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let agent_dir = dir.path().join("agent");
+            std::fs::create_dir(&agent_dir).unwrap();
+            let settings = Settings {
+                providers: vec![loop_app_core::config::CustomProviderEntry {
+                    id: "custom-test-soket".into(),
+                    name: "Custom test Soket".into(),
+                    base_url: base_url.clone(),
+                    models: None,
+                }],
+                ..Default::default()
+            };
+            settings.save_file(&settings_path(&agent_dir)).unwrap();
+            let store = loop_app_core::config::paths::models_store_path(&agent_dir);
+            assert!(!store.exists());
+            let mut options = opts(dir.path());
+            options.provider = separate_provider_flag.then(|| "custom-test-soket".into());
+            options.model = Some(if separate_provider_flag { "GLM-5.3" } else { "custom-test-soket/GLM-5.3" }.into());
+            // Disable background discovery so startup must resolve the cold catalog itself.
+            let globals = GlobalResources::load(agent_dir.clone(), &settings.providers, false).await.unwrap();
+            let factory = SessionFactory::new(Arc::new(globals));
+            let workspace = factory.workspace(&options).await.unwrap();
+            let opened = factory.open(workspace, &options).await.unwrap();
+            let model = opened.harness.model().await.unwrap();
+            assert_eq!(model.provider, "custom-test-soket");
+            assert_eq!(model.id, "GLM-5.3");
+            assert_eq!(model.base_url, base_url);
+            assert_eq!(model.context_window, 128_000);
+            assert!(store.exists());
+
+            // The next process can start from the cache without a network request.
+            let globals = GlobalResources::load(agent_dir, &settings.providers, false).await.unwrap();
+            let factory = SessionFactory::new(Arc::new(globals));
+            let workspace = factory.workspace(&options).await.unwrap();
+            let reopened = factory.open(workspace, &options).await.unwrap();
+            assert_eq!(reopened.harness.model().await.unwrap().id, "GLM-5.3");
+            options.provider = None;
+            options.model = Some("unconfigured/GLM-5.3".into());
+            let workspace = factory.workspace(&options).await.unwrap();
+            assert!(factory.open(workspace, &options).await.is_err());
+        }
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn factory_preserves_tools_prompt_permission_and_session() {
     let dir = tempfile::tempdir().unwrap();
     let factory = factory(&dir.path().join("agent"));
@@ -311,4 +383,71 @@ async fn gate_uses_the_session_workspace_for_relative_paths() {
             .await,
         Decision::Ask
     );
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn runtime_refuses_local_sandbox_with_platform_guidance() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        let mut settings = Settings::default();
+        settings.sandbox.mode = "local".into();
+        settings.save_file(&settings_path(&agent)).unwrap();
+        let factory = factory(&agent);
+        let opts = opts(dir.path());
+        let workspace = factory.workspace(&opts).await.unwrap();
+        let error = match factory.open(workspace, &opts).await {
+            Ok(_) => panic!("Runtime admitted a Session without its required sandbox"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.starts_with(
+                "required workspace sandbox failed: local sandbox is unsupported on this platform"
+            ),
+            "{error}"
+        );
+    })
+    .await
+    .expect("sandbox admission timed out");
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn runtime_admits_seatbelt_and_protects_its_actual_agent_directory() {
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir(&agent).unwrap();
+        let mut settings = Settings::default();
+        settings.sandbox.mode = "local".into();
+        settings.save_file(&settings_path(&agent)).unwrap();
+        let factory = factory(&agent);
+        let opts = opts(dir.path());
+        let workspace = factory.workspace(&opts).await.unwrap();
+        let opened = factory.open(workspace, &opts).await.unwrap();
+        let card = opened.harness.sandbox_info().await.format_box();
+        assert!(
+            card.contains("seatbelt") && card.contains("partial"),
+            "{card}"
+        );
+        let read = opened
+            .harness
+            .get_tools()
+            .await
+            .into_iter()
+            .find(|tool| tool.name == "read")
+            .unwrap();
+        assert!((read.execute)(
+            "test".into(),
+            serde_json::json!({"path": agent.join("auth.json")}),
+            None,
+            None
+        )
+        .await
+        .is_err());
+    })
+    .await
+    .expect("sandbox admission timed out");
 }

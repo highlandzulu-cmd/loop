@@ -17,10 +17,12 @@ pub mod connection;
 pub mod control;
 pub mod server;
 pub mod socket;
+#[cfg(unix)]
+pub mod token;
 pub mod transport;
 
 pub use client::RemoteBackend;
 pub use connection::{codes, Connection, Incoming, PeerRequestId, RpcError};
-pub use control::{Attachment, RuntimeControl};
-pub use server::{serve, serve_with_control, Served};
+pub use control::{Attachment, RuntimeAdmin, RuntimeControl};
+pub use server::{serve, serve_with_control, Authority, Served};
 pub use transport::Transport;

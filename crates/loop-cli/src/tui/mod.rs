@@ -287,12 +287,18 @@ pub fn welcome_lines(
                 "opens when the subscription is ready".to_string(),
             ),
         ],
-        (None, Some(model)) => vec![
-            ("Provider", model.provider.clone()),
-            ("Model", model.id.clone()),
-            ("Endpoint", endpoint.to_string()),
-            ("Session", session_id.to_string()),
-        ],
+        (None, Some(model)) => {
+            let mut rows = vec![
+                ("Provider", model.provider.clone()),
+                ("Model", model.id.clone()),
+            ];
+            // An unknown endpoint is left out rather than guessed.
+            if !endpoint.is_empty() {
+                rows.push(("Endpoint", endpoint.to_string()));
+            }
+            rows.push(("Session", session_id.to_string()));
+            rows
+        }
         (None, None) => vec![
             ("Model", "none — run /model".to_string()),
             ("Session", session_id.to_string()),
@@ -2021,13 +2027,21 @@ mod tests {
     }
 
     fn banner_text(model: Option<&loop_ai::Model>, note: Option<&str>) -> String {
+        banner_text_at(model, note, "http://e")
+    }
+
+    fn banner_text_at(
+        model: Option<&loop_ai::Model>,
+        note: Option<&str>,
+        endpoint: &str,
+    ) -> String {
         welcome_lines(
             &Theme::dark(),
             "v",
             model,
             None,
             note,
-            "http://e",
+            endpoint,
             "sess",
             0,
             0,
@@ -2043,6 +2057,24 @@ mod tests {
         })
         .collect::<Vec<_>>()
         .join("\n")
+    }
+
+    #[test]
+    fn banner_omits_an_unknown_endpoint_instead_of_guessing() {
+        let model = loop_ai::Models::new()
+            .get_model("faux", "faux-model")
+            .unwrap_or_else(|| {
+                let models = loop_ai::Models::new();
+                models.set_provider(loop_ai::providers::faux_provider(
+                    loop_ai::providers::FauxScript::new(),
+                ));
+                models.get_model("faux", "faux-model").unwrap()
+            });
+        let known = banner_text_at(Some(&model), None, "http://e");
+        assert!(known.contains("Endpoint"), "{known}");
+        let unknown = banner_text_at(Some(&model), None, "");
+        assert!(!unknown.contains("Endpoint"), "{unknown}");
+        assert!(unknown.contains("Session"), "{unknown}");
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Local, Timelike, Utc};
 use loop_telemetry::obs::keys;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::spans::{log_fingerprint, LogCache, LogFile, SpanRecord};
@@ -30,7 +30,7 @@ pub fn mcp_server(tool: &str) -> Option<&str> {
 }
 
 /// Totals over the selected period.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Totals {
     /// Chat sessions (sub-agent sessions are counted in `sub_agent_runs`).
     pub sessions: u64,
@@ -53,7 +53,7 @@ pub struct Totals {
 }
 
 /// Activity on one local calendar day.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DayRow {
     /// `YYYY-MM-DD`, local time.
     pub date: String,
@@ -66,7 +66,7 @@ pub struct DayRow {
 }
 
 /// Usage of one model.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelRow {
     pub model: String,
     pub provider: String,
@@ -81,7 +81,7 @@ pub struct ModelRow {
 }
 
 /// Usage of one tool.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolRow {
     pub tool: String,
     /// [`BUILT_IN`] or the MCP server name.
@@ -92,7 +92,7 @@ pub struct ToolRow {
 }
 
 /// Usage of one MCP server.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct McpRow {
     pub server: String,
     pub calls: u64,
@@ -102,7 +102,7 @@ pub struct McpRow {
 }
 
 /// Uses of one skill.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SkillRow {
     pub skill: String,
     pub uses: u64,
@@ -111,7 +111,7 @@ pub struct SkillRow {
 }
 
 /// One chat session (or a trace without a session id).
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionRow {
     pub session_id: String,
     pub started: DateTime<Utc>,
@@ -125,7 +125,7 @@ pub struct SessionRow {
 }
 
 /// Everything the dashboard shows.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Summary {
     /// Start of the period (inclusive); `None` for all retained history.
     pub since: Option<DateTime<Utc>>,

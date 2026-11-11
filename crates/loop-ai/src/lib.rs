@@ -43,7 +43,7 @@
 
 pub mod api;
 /// Whether a model's server rejected reasoning parameters in this process.
-pub use api::openai_completions::reasoning_rejected;
+pub use api::openai_completions::{clear_reasoning_rejection, reasoning_rejected};
 pub mod auth;
 pub mod models;
 pub mod models_store;

@@ -65,7 +65,6 @@ impl std::error::Error for RpcError {}
 pub type PeerRequestId = Value;
 
 /// A message from the peer.
-#[derive(Debug)]
 pub enum Incoming {
     /// The result of one of Loop's requests. Pass it to
     /// [`Connection::resolve`] once everything before it is handled.
@@ -95,10 +94,12 @@ pub enum Incoming {
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, RpcError>>>>>;
 
+const QUEUE_MESSAGES: usize = 4096;
+
 /// One JSON-RPC connection.
 pub struct Connection {
     next_id: AtomicI64,
-    outgoing: mpsc::UnboundedSender<Value>,
+    outgoing: mpsc::Sender<Value>,
     pending: Pending,
     closed: CancellationToken,
 }
@@ -106,13 +107,14 @@ pub struct Connection {
 impl Connection {
     /// Start reading and writing `transport`. Returns the connection and
     /// the channel of incoming responses, requests and notifications.
-    pub fn new(transport: Transport) -> (Arc<Self>, mpsc::UnboundedReceiver<Incoming>) {
+    pub fn new(transport: Transport) -> (Arc<Self>, mpsc::Receiver<Incoming>) {
         let Transport {
             incoming: mut from_peer,
             outgoing: to_peer,
+            ..
         } = transport;
-        let (outgoing, mut to_write) = mpsc::unbounded_channel::<Value>();
-        let (incoming_tx, incoming) = mpsc::unbounded_channel();
+        let (outgoing, mut to_write) = mpsc::channel::<Value>(QUEUE_MESSAGES);
+        let (incoming_tx, incoming) = mpsc::channel(QUEUE_MESSAGES);
         let pending: Pending = Arc::default();
         let closed = CancellationToken::new();
 
@@ -131,20 +133,31 @@ impl Connection {
                 }
             }
             // Dropping `to_peer` here closes the transport's output.
+            writer_closed.cancel();
         });
 
+        let reader_closed = closed.clone();
         tokio::spawn(async move {
             // The incoming channel closes when `incoming_tx` drops here; the
             // consumer then calls `fail_pending`.
-            while let Some(text) = from_peer.recv().await {
+            loop {
+                let text = tokio::select! {
+                    _ = reader_closed.cancelled() => break,
+                    text = from_peer.recv() => match text { Some(text) => text, None => break },
+                };
                 match serde_json::from_str(&text) {
-                    Ok(message) => dispatch(message, &incoming_tx),
+                    Ok(message) => {
+                        if dispatch(message, &incoming_tx).is_err() {
+                            tracing::warn!(
+                                "wire input queue full; disconnecting client for replay"
+                            );
+                            reader_closed.cancel();
+                            break;
+                        }
+                    }
                     // Agents sometimes print logs to stdout; skip anything
                     // that is not JSON instead of failing the connection.
-                    Err(_) => tracing::debug!(
-                        line = %truncate(&text, 200),
-                        "skipping a non-JSON message"
-                    ),
+                    Err(_) => tracing::debug!(bytes = text.len(), "skipping a non-JSON message"),
                 }
             }
         });
@@ -160,13 +173,22 @@ impl Connection {
         )
     }
 
+    fn queue(&self, message: Value) -> Result<(), RpcError> {
+        if self.closed.is_cancelled() || self.outgoing.try_send(message).is_err() {
+            tracing::warn!("wire output queue full or closed; disconnecting client for replay");
+            self.closed.cancel();
+            return Err(RpcError::Closed);
+        }
+        Ok(())
+    }
+
     /// Send a request and wait for its result.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
-        if self.outgoing.send(message).is_err() {
+        if self.queue(message).is_err() {
             self.pending.lock().await.remove(&id);
             return Err(RpcError::Closed);
         }
@@ -193,8 +215,7 @@ impl Connection {
         }
         pending.insert(id, tx);
         if self
-            .outgoing
-            .send(json!({"jsonrpc":"2.0", "id":id,
+            .queue(json!({"jsonrpc":"2.0", "id":id,
             "method":loop_protocol::rpc::methods::HOST_INTERACT, "params":params}))
             .is_err()
         {
@@ -229,16 +250,19 @@ impl Connection {
         }
     }
 
-    /// Stop writing and close the peer's input. Reading continues until the
-    /// peer closes its output.
+    /// Wait until the transport closes.
+    pub async fn closed(&self) {
+        self.closed.cancelled().await;
+    }
+
+    /// Stop both transport tasks. Consumers can drain already queued messages.
     pub fn close(&self) {
         self.closed.cancel();
     }
 
     /// Send a notification.
     pub fn notify(&self, method: &str, params: Value) -> Result<(), RpcError> {
-        self.outgoing
-            .send(json!({"jsonrpc": "2.0", "method": method, "params": params}))
+        self.queue(json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .map_err(|_| RpcError::Closed)
     }
 
@@ -254,9 +278,7 @@ impl Connection {
         if let Some(data) = data {
             error["data"] = data;
         }
-        let _ = self
-            .outgoing
-            .send(json!({"jsonrpc": "2.0", "id": id, "error": error}));
+        let _ = self.queue(json!({"jsonrpc": "2.0", "id": id, "error": error}));
     }
 
     /// Answer a request from the peer.
@@ -267,11 +289,11 @@ impl Connection {
                 json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
             }
         };
-        let _ = self.outgoing.send(message);
+        let _ = self.queue(message);
     }
 }
 
-fn dispatch(message: Value, incoming: &mpsc::UnboundedSender<Incoming>) {
+fn dispatch(message: Value, incoming: &mpsc::Sender<Incoming>) -> Result<(), ()> {
     let method = message
         .get("method")
         .and_then(Value::as_str)
@@ -291,7 +313,7 @@ fn dispatch(message: Value, incoming: &mpsc::UnboundedSender<Incoming>) {
         (None, Some(id)) => {
             let Some(id) = id.as_i64() else {
                 tracing::debug!(%id, "response with an id Loop never sent");
-                return;
+                return Ok(());
             };
             let result = if let Some(error) = message.get("error") {
                 Err(RpcError::Remote {
@@ -310,16 +332,59 @@ fn dispatch(message: Value, incoming: &mpsc::UnboundedSender<Incoming>) {
         }
         (None, None) => {
             tracing::debug!("skipping a message with neither method nor id");
-            return;
+            return Ok(());
         }
     };
-    let _ = incoming.send(incoming_message);
+    incoming.try_send(incoming_message).map_err(|_| ())
 }
 
-fn truncate(text: &str, max: usize) -> &str {
-    match text.char_indices().nth(max) {
-        Some((i, _)) => &text[..i],
-        None => text,
+/// Redact environment maps before formatting diagnostic frames. Wire payloads
+/// themselves remain unchanged; an environment is never a log payload.
+fn diagnostic(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if key == "env" {
+                        json!({"key_count": value.as_object().map_or(0, |env| env.len())})
+                    } else {
+                        diagnostic(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(diagnostic).collect()),
+        other => other.clone(),
+    }
+}
+impl fmt::Debug for Incoming {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Request { id, method, params } => f
+                .debug_struct("Request")
+                .field("id", id)
+                .field("method", method)
+                .field("params", &diagnostic(params))
+                .finish(),
+            Self::Notification { method, params } => f
+                .debug_struct("Notification")
+                .field("method", method)
+                .field("params", &diagnostic(params))
+                .finish(),
+            Self::Response { id, result } => match result {
+                Ok(value) => f
+                    .debug_struct("Response")
+                    .field("id", id)
+                    .field("result", &diagnostic(value))
+                    .finish(),
+                Err(error) => f
+                    .debug_struct("Response")
+                    .field("id", id)
+                    .field("error", &error.to_string())
+                    .finish(),
+            },
+        }
     }
 }
 
@@ -389,7 +454,7 @@ mod tests {
     }
 
     /// Resolve responses the way a consumer does: in channel order.
-    fn resolve_responses(conn: &Arc<Connection>, mut incoming: mpsc::UnboundedReceiver<Incoming>) {
+    fn resolve_responses(conn: &Arc<Connection>, mut incoming: mpsc::Receiver<Incoming>) {
         let conn = Arc::clone(conn);
         tokio::spawn(async move {
             while let Some(message) = incoming.recv().await {

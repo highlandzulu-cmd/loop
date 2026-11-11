@@ -97,6 +97,20 @@ impl Scheduler {
 
     /// Run the scheduler loop for a workflow until completion or failure.
     pub async fn run(&self, workflow_id: &str) -> Result<WorkflowResult, SchedulerError> {
+        let mut tasks = tokio::task::JoinSet::new();
+        let result = self.run_inner(workflow_id, &mut tasks).await;
+        if result.is_err() {
+            self.cancel.cancel();
+        }
+        while tasks.join_next().await.is_some() {}
+        result
+    }
+
+    async fn run_inner(
+        &self,
+        workflow_id: &str,
+        tasks: &mut tokio::task::JoinSet<()>,
+    ) -> Result<WorkflowResult, SchedulerError> {
         let progress = self.workflow_engine.progress_notify();
 
         loop {
@@ -159,7 +173,7 @@ impl Scheduler {
                     }
                 };
 
-                tokio::spawn(async move {
+                tasks.spawn(async move {
                     let _permit = permit;
                     Self::execute_task(
                         engine,

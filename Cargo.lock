@@ -4524,6 +4524,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "ignore",
+ "libc",
  "loop-ai",
  "loop-mcp",
  "loop-orchestration",
@@ -4537,6 +4538,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rmcp",
  "rusqlite",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4647,6 +4649,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2 0.10.9",
  "syntect",
  "tempfile",
  "termimad",
@@ -4668,6 +4671,7 @@ version = "0.6.0"
 dependencies = [
  "chrono",
  "crossterm 0.28.1",
+ "loop-protocol",
  "loop-telemetry",
  "ratatui",
  "serde",
@@ -4751,19 +4755,23 @@ dependencies = [
 name = "loop-runtime"
 version = "0.6.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "futures",
  "loop-agent",
  "loop-ai",
  "loop-app-core",
+ "loop-orchestration",
  "loop-protocol",
  "loop-wire",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -4810,7 +4818,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
- "zip",
 ]
 
 [[package]]
@@ -9477,12 +9484,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "typed-path"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
-
-[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11475,22 +11476,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.4",
-]
-
-[[package]]
-name = "zip"
-version = "9.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1156b39d142a34b999c2310a50455e0cb3760bf7efad0122f796d813bee26ccb"
-dependencies = [
- "crc32fast",
- "flate2",
- "getrandom 0.4.3",
- "indexmap 2.14.1",
- "memchr",
- "nix 0.31.3",
- "typed-path",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

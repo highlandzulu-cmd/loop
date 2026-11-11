@@ -56,11 +56,8 @@ fn try_platform_clipboard(text: &str) -> bool {
     if cfg!(target_os = "macos") {
         return pipe_to_command("pbcopy", &[], text);
     }
-    if cfg!(target_os = "windows") {
-        return pipe_to_command("clip", &[], text);
-    }
 
-    // Linux / other Unix
+    // Linux
     if std::env::var_os("TERMUX_VERSION").is_some()
         && pipe_to_command("termux-clipboard-set", &[], text)
     {

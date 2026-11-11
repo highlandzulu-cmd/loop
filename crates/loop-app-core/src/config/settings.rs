@@ -45,6 +45,11 @@ impl Default for CompactionSettingsJson {
 }
 
 /// Sandbox settings.
+///
+/// `isolation` and `runtime` are optional: unset means the platform default
+/// (Linux: `full` and `runc`; macOS: `partial`, no container runtime). Only values
+/// written in `settings.json` count as chosen by the user, so they are never filled
+/// in with defaults before saving.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SandboxSettings {
@@ -52,15 +57,46 @@ pub struct SandboxSettings {
     #[serde(default = "default_sandbox_mode")]
     pub mode: String,
     /// When `mode` is `local`: `full` or `partial`.
-    #[serde(default = "default_sandbox_isolation")]
-    pub isolation: String,
-    /// When `mode` is `local`: `runc` (default), `crun`, `runsc`, or `krun`.
-    #[serde(default = "default_sandbox_runtime")]
-    pub runtime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+    /// When `mode` is `local`: `runc`, `crun`, `runsc`, or `krun` (Linux only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Allow network access from sandboxed commands (default off). Not yet
+    /// enforced by the Linux Podman sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<bool>,
+    /// Extra paths sandboxed commands may write, besides the project. `~` is the
+    /// home directory. Not yet enforced by the Linux Podman sandbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_write: Vec<String>,
+    /// Deny sandboxed commands and file tools reads under the home directory,
+    /// except the project, `allowWrite`, `allowRead` and git/Rust toolchain
+    /// settings (default off; macOS Seatbelt only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny_home_reads: Option<bool>,
+    /// Paths under the home directory that stay readable with
+    /// `denyHomeReads`. `~` is the home directory.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_read: Vec<String>,
 }
 
 fn default_sandbox_mode() -> String {
     "off".into()
+}
+
+impl Default for SandboxSettings {
+    fn default() -> Self {
+        Self {
+            mode: default_sandbox_mode(),
+            isolation: None,
+            runtime: None,
+            network: None,
+            allow_write: Vec::new(),
+            deny_home_reads: None,
+            allow_read: Vec::new(),
+        }
+    }
 }
 
 /// Configuration for an external MCP server (stdio or remote HTTP).
@@ -84,30 +120,53 @@ pub struct McpServerConfig {
     pub headers: BTreeMap<String, String>,
 }
 
-fn default_sandbox_isolation() -> String {
-    "full".into()
-}
-
-fn default_sandbox_runtime() -> String {
-    "runc".into()
-}
-
-impl Default for SandboxSettings {
-    fn default() -> Self {
-        Self {
-            mode: default_sandbox_mode(),
-            isolation: default_sandbox_isolation(),
-            runtime: default_sandbox_runtime(),
-        }
-    }
-}
-
 impl SandboxSettings {
+    /// Whether sandboxed commands may use the network.
+    pub fn network(&self) -> bool {
+        self.network.unwrap_or(false)
+    }
+
+    /// Whether reads under the home directory are denied.
+    pub fn deny_home_reads(&self) -> bool {
+        self.deny_home_reads.unwrap_or(false)
+    }
+
     /// Human-readable short status (settings only; prefer harness `sandbox_info` for live details).
     pub fn display(&self) -> String {
         match self.mode.as_str() {
-            "local" => format!("local --{} --{}", self.isolation, self.runtime),
+            "local" => {
+                let builder = crate::sandbox_builder::SandboxBuilder::for_current_platform();
+                match crate::sandbox_builder::SandboxRequest::from_settings(self)
+                    .and_then(|request| builder.resolve(&request))
+                {
+                    Ok(plan) => format!("local {}", plan.label()),
+                    Err(e) => format!("local (invalid: {e})"),
+                }
+            }
             other => other.to_string(),
+        }
+    }
+
+    /// Overlay project sandbox settings. A project may enable the sandbox, never
+    /// disable it. Isolation and
+    /// runtime only when the project sets them. A project may turn network access off
+    /// but not on, and cannot add writable paths. Likewise it may turn
+    /// `denyHomeReads` on but not off, and cannot add readable paths.
+    fn overlay_project(&mut self, project: SandboxSettings) {
+        if project.deny_home_reads == Some(true) {
+            self.deny_home_reads = Some(true);
+        }
+        if project.mode == "local" {
+            self.mode = project.mode;
+        }
+        if project.isolation.is_some() {
+            self.isolation = project.isolation;
+        }
+        if project.runtime.is_some() {
+            self.runtime = project.runtime;
+        }
+        if project.network == Some(false) {
+            self.network = Some(false);
         }
     }
 }
@@ -240,6 +299,12 @@ pub struct Settings {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettings {
+    /// Additional environment variable names forwarded to WebSocket Sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub forward_env: Vec<String>,
+    /// Idle minutes for auto-started owners; zero disables shutdown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_shutdown_minutes: Option<u64>,
     /// Most Sessions loaded at once (default 16).
     #[serde(
         default,
@@ -263,7 +328,10 @@ fn present<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<serde_json::
 
 impl RuntimeSettings {
     fn is_empty(&self) -> bool {
-        self.max_sessions.is_none() && self.max_active_turns.is_none()
+        self.max_sessions.is_none()
+            && self.max_active_turns.is_none()
+            && self.idle_shutdown_minutes.is_none()
+            && self.forward_env.is_empty()
     }
     /// `runtime.maxSessions`, when set.
     pub fn max_sessions(&self) -> anyhow::Result<Option<usize>> {
@@ -473,7 +541,7 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     base.hide_thinking_block = project.hide_thinking_block;
     base.double_escape_action = project.double_escape_action;
     base.ui_mode = project.ui_mode;
-    base.sandbox = project.sandbox;
+    base.sandbox.overlay_project(project.sandbox);
     if let Some(project_fetch) = project.web_fetch {
         let global = base.web_fetch.unwrap_or_default();
         base.web_fetch = Some(loop_agent::harness::WebFetchConfig {
@@ -589,6 +657,10 @@ pub fn load_settings(
             settings.merge_project(project);
         }
     }
+    // The host's own choices for this workspace win over project files.
+    crate::config::workspace_settings::WorkspaceSettingsStore::load(agent_dir)?
+        .get(cwd)
+        .apply(&mut settings);
     Ok(settings)
 }
 
@@ -606,9 +678,132 @@ pub fn set_skill_disabled(list: &mut Vec<String>, name: &str, enabled: bool) {
     set_disabled_name(list, name, enabled);
 }
 
+impl Settings {
+    /// Public effective values for workspace/settings. Credentials and telemetry destinations are excluded.
+    pub fn public_view(&self) -> serde_json::Value {
+        serde_json::json!({ "defaultThinkingLevel": self.default_thinking_level, "sandbox": self.sandbox, "permissionMode": self.permission_mode, "toolPermissions": self.tool_permissions, "diffEditor": self.diff_editor, "responseHeaderTimeoutMs": self.response_header_timeout_ms })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_settings_old_files_still_parse() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"sandbox":{"mode":"local","isolation":"partial","runtime":"krun"}}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.sandbox.mode, "local");
+        assert_eq!(settings.sandbox.isolation.as_deref(), Some("partial"));
+        assert_eq!(settings.sandbox.runtime.as_deref(), Some("krun"));
+        assert!(!settings.sandbox.network());
+        assert!(settings.sandbox.allow_write.is_empty());
+    }
+
+    #[test]
+    fn sandbox_settings_missing_keys_are_inherited() {
+        let settings: Settings = serde_json::from_str(r#"{"sandbox":{"mode":"local"}}"#).unwrap();
+        assert_eq!(settings.sandbox.isolation, None);
+        assert_eq!(settings.sandbox.runtime, None);
+        assert_eq!(settings.sandbox.network, None);
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.sandbox.mode, "off");
+        assert_eq!(settings.sandbox.isolation, None);
+    }
+
+    #[test]
+    fn sandbox_settings_round_trip_network_and_allow_write() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"sandbox":{"mode":"local","network":true,"allowWrite":["~/.cargo","/opt/cache"]}}"#,
+        )
+        .unwrap();
+        assert!(settings.sandbox.network());
+        assert_eq!(settings.sandbox.allow_write, ["~/.cargo", "/opt/cache"]);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["sandbox"]["network"], true);
+        assert_eq!(
+            json["sandbox"]["allowWrite"],
+            serde_json::json!(["~/.cargo", "/opt/cache"])
+        );
+        let again: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(again.sandbox.allow_write, settings.sandbox.allow_write);
+        assert_eq!(again.sandbox.network, Some(true));
+    }
+
+    #[test]
+    fn saving_default_sandbox_settings_writes_no_inherited_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        Settings::default().save_file(&path).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["sandbox"], serde_json::json!({"mode": "off"}));
+    }
+
+    #[test]
+    fn project_may_tighten_home_reads_but_never_loosen_them() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"sandbox":{"denyHomeReads":true,"allowRead":["~/.npm"]}}"#)
+                .unwrap();
+        global.merge_project(
+            serde_json::from_str(r#"{"sandbox":{"denyHomeReads":false,"allowRead":["~/.ssh"]}}"#)
+                .unwrap(),
+        );
+        assert!(global.sandbox.deny_home_reads());
+        assert_eq!(global.sandbox.allow_read, ["~/.npm"]);
+        let mut global = Settings::default();
+        assert!(!global.sandbox.deny_home_reads());
+        global
+            .merge_project(serde_json::from_str(r#"{"sandbox":{"denyHomeReads":true}}"#).unwrap());
+        assert!(global.sandbox.deny_home_reads());
+    }
+
+    #[test]
+    fn project_cannot_disable_a_required_sandbox() {
+        for project in [
+            r#"{}"#,
+            r#"{"sandbox":{"mode":"off"}}"#,
+            r#"{"sandbox":{"mode":"unknown"}}"#,
+        ] {
+            let mut global: Settings =
+                serde_json::from_str(r#"{"sandbox":{"mode":"local"}}"#).unwrap();
+            global.merge_project(serde_json::from_str(project).unwrap());
+            assert_eq!(global.sandbox.mode, "local");
+        }
+        let mut global = Settings::default();
+        global.merge_project(serde_json::from_str(r#"{"sandbox":{"mode":"local"}}"#).unwrap());
+        assert_eq!(global.sandbox.mode, "local");
+    }
+
+    #[test]
+    fn project_sandbox_settings_overlay_field_by_field() {
+        let mut global: Settings = serde_json::from_str(
+            r#"{"sandbox":{"mode":"local","runtime":"krun","network":true,"allowWrite":["~/.cargo"]}}"#,
+        )
+        .unwrap();
+        let project: Settings = serde_json::from_str(
+            r#"{"sandbox":{"mode":"local","isolation":"partial","allowWrite":["/"]}}"#,
+        )
+        .unwrap();
+        global.merge_project(project);
+        assert_eq!(global.sandbox.isolation.as_deref(), Some("partial"));
+        assert_eq!(global.sandbox.runtime.as_deref(), Some("krun"));
+        assert!(global.sandbox.network());
+        assert_eq!(global.sandbox.allow_write, ["~/.cargo"]);
+
+        let project: Settings =
+            serde_json::from_str(r#"{"sandbox":{"mode":"local","network":false}}"#).unwrap();
+        global.merge_project(project);
+        assert!(!global.sandbox.network());
+
+        let mut global = Settings::default();
+        let project: Settings =
+            serde_json::from_str(r#"{"sandbox":{"mode":"local","network":true}}"#).unwrap();
+        global.merge_project(project);
+        assert!(!global.sandbox.network());
+    }
 
     fn runtime_limits(json: &str) -> anyhow::Result<(Option<usize>, Option<usize>)> {
         let settings: Settings = serde_json::from_str(json)?;

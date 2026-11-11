@@ -69,6 +69,11 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[level]"),
         },
         SlashCommand {
+            name: "default",
+            description: "Save this Session's model and effort for new Sessions",
+            args_hint: None,
+        },
+        SlashCommand {
             name: "scoped-models",
             description: "Manage models for Ctrl+P cycling",
             args_hint: None,
@@ -151,7 +156,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         SlashCommand {
             name: "ttfb",
             description: "Model response-header wait (off for long-running)",
-            args_hint: Some("[off|on|60s|120000]"),
+            args_hint: Some("[off|on|60s|120000|inherit|default <duration>]"),
         },
         SlashCommand {
             name: "compact",
@@ -279,61 +284,7 @@ pub fn parse_command(line: &str) -> Option<ParsedCommand> {
     Some(ParsedCommand { name, args })
 }
 
-/// Parse flags after `/sandbox local` (`--full|--partial`, `--crun|--runc|--runsc|--krun`).
-///
-/// Defaults: `--full` and `--runc`. Positional `full`/`partial`/`runc`/… are accepted too.
-pub fn parse_local_sandbox_flags(
-    args: &[&str],
-) -> Result<
-    (
-        loop_agent::harness::KrunIsolation,
-        loop_agent::harness::LocalSandboxRuntime,
-    ),
-    String,
-> {
-    use loop_agent::harness::{KrunIsolation, LocalSandboxRuntime};
-
-    let mut isolation: Option<KrunIsolation> = None;
-    let mut runtime: Option<LocalSandboxRuntime> = None;
-
-    for tok in args {
-        let raw = tok.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let key = raw.trim_start_matches('-').to_ascii_lowercase();
-        match key.as_str() {
-            "full" => {
-                if isolation.is_some() {
-                    return Err("specify only one of --full / --partial".into());
-                }
-                isolation = Some(KrunIsolation::Full);
-            }
-            "partial" => {
-                if isolation.is_some() {
-                    return Err("specify only one of --full / --partial".into());
-                }
-                isolation = Some(KrunIsolation::Partial);
-            }
-            "crun" | "runc" | "runsc" | "gvisor" | "krun" => {
-                if runtime.is_some() {
-                    return Err("specify only one runtime (--crun|--runc|--runsc|--krun)".into());
-                }
-                runtime = LocalSandboxRuntime::parse(&key);
-            }
-            other => {
-                return Err(format!(
-                    "unknown sandbox option '{other}' (use --full|--partial and --crun|--runc|--runsc|--krun)"
-                ));
-            }
-        }
-    }
-
-    Ok((
-        isolation.unwrap_or(KrunIsolation::Full),
-        runtime.unwrap_or(LocalSandboxRuntime::Runc),
-    ))
-}
+pub use loop_app_core::sandbox_builder::parse_local_sandbox_flags;
 
 /// Shared command side-effect messages for the UI.
 #[derive(Debug, Clone)]
@@ -352,6 +303,8 @@ pub enum CommandEffect {
     Permissions(Option<String>),
     /// Show the reasoning effort levels (None) or set one.
     Effort(Option<String>),
+    /// `/default`: save the Session's model and effort for new Sessions.
+    SaveDefaults,
     /// Sandbox mode change.
     SetSandbox(String),
     /// Langfuse tracing control.
@@ -579,6 +532,7 @@ pub fn dispatch(
         } else {
             Some(cmd.args.trim().to_owned())
         }),
+        "default" => CommandEffect::SaveDefaults,
         "effort" => CommandEffect::Effort(if cmd.args.is_empty() {
             None
         } else {
@@ -686,8 +640,13 @@ pub fn dispatch(
 
 /// Format /help text.
 pub fn help_text(extra: &[(String, String)]) -> String {
+    help_text_for(extra, builtin_commands())
+}
+
+/// Format help for the commands available to the current Surface.
+pub fn help_text_for(extra: &[(String, String)], commands: Vec<SlashCommand>) -> String {
     let mut lines = vec!["Slash commands:".to_string()];
-    for c in builtin_commands() {
+    for c in commands {
         let hint = c.args_hint.unwrap_or("");
         lines.push(format!("  /{} {} — {}", c.name, hint, c.description));
     }

@@ -524,12 +524,7 @@ impl ToolApprovalBridge {
             .get("previousPath")
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
-        let created = ctx
-            .result
-            .details
-            .get("created")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let review = FileReview::from_details(&ctx.result.details);
 
         let _lock = self.gate.lock().await;
         if !self.asks(name, ignore_grants) {
@@ -538,7 +533,7 @@ impl ToolApprovalBridge {
         }
         if cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
             let _ = self
-                .revert_change(&path, previous_path.as_deref(), created)
+                .revert_change(&path, previous_path.as_deref(), &review)
                 .await;
             return Some(reject_file_patch(
                 "File edit review cancelled",
@@ -589,7 +584,7 @@ impl ToolApprovalBridge {
             }
             ApprovalDecision::Reject { reason } => {
                 if let Err(e) = self
-                    .revert_change(&path, previous_path.as_deref(), created)
+                    .revert_change(&path, previous_path.as_deref(), &review)
                     .await
                 {
                     tracing::warn!("revert after reject failed: {e}");
@@ -666,22 +661,42 @@ impl ToolApprovalBridge {
         }
     }
 
-    async fn revert_change(
+    /// Undo a reviewed write. A created file is removed only at the path
+    /// recorded at write time, only while it is still a regular file with
+    /// the identity the write gave it; nothing is resolved now, so a link
+    /// retargeted during review cannot redirect the removal. An existing
+    /// file is restored from its snapshot at the path the write resolved to.
+    pub(crate) async fn revert_change(
         &self,
         path: &Path,
         previous_path: Option<&Path>,
-        created: bool,
+        review: &FileReview,
     ) -> Result<(), String> {
-        if created {
-            let _ = self.env.remove(path).await;
-            return Ok(());
+        if review.created {
+            let (Some(created), Some(identity)) = (&review.created_path, &review.created_identity)
+            else {
+                return Err(format!(
+                    "no identity recorded for {}; left in place",
+                    path.display()
+                ));
+            };
+            return match self.env.file_identity(created).await {
+                Ok(Some(now)) if now.matches(identity) => {
+                    self.env.remove(created).await.map_err(|e| e.to_string())
+                }
+                _ => Err(format!(
+                    "{} changed during review; left in place",
+                    created.display()
+                )),
+            };
         }
         let Some(prev) = previous_path else {
             return Err("missing previous snapshot".into());
         };
         let bytes = tokio::fs::read(prev).await.map_err(|e| e.to_string())?;
+        let target = review.target_path.as_deref().unwrap_or(path);
         self.env
-            .write_file(path, &bytes)
+            .write_file(target, &bytes)
             .await
             .map_err(|e| e.to_string())
     }
@@ -725,6 +740,32 @@ pub fn permissions_from_settings(
         out.insert(k, ToolPermission::parse(&v));
     }
     out
+}
+
+/// What a write or edit result recorded for its review.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FileReview {
+    created: bool,
+    target_path: Option<PathBuf>,
+    created_path: Option<PathBuf>,
+    created_identity: Option<loop_agent::harness::types::FileIdentity>,
+}
+
+impl FileReview {
+    pub(crate) fn from_details(details: &serde_json::Value) -> Self {
+        let path = |key: &str| details.get(key).and_then(|v| v.as_str()).map(PathBuf::from);
+        Self {
+            created: details
+                .get("created")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            target_path: path("targetPath"),
+            created_path: path("createdPath"),
+            created_identity: details
+                .get("createdIdentity")
+                .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        }
+    }
 }
 
 fn reject_file_patch(
@@ -804,6 +845,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn grant_labels_live_in_the_namespace_copies_drop() {
+        assert!(AUTO_APPROVE_LABEL_PREFIX
+            .starts_with(loop_agent::harness::session::TOOL_APPROVAL_LABEL_NAMESPACE));
+    }
+
+    #[test]
     fn policy_and_permissions() {
         assert_eq!(ApprovalPolicy::parse("off"), ApprovalPolicy::Never);
         assert_eq!(ApprovalPolicy::parse("x"), ApprovalPolicy::NewSession);
@@ -822,6 +869,122 @@ mod tests {
         let chosen =
             permissions_from_settings(&BTreeMap::from([("web_fetch".into(), "ask".into())]));
         assert_eq!(chosen.get("web_fetch"), Some(&ToolPermission::Ask));
+    }
+
+    /// Run the write tool in `ws`, then undo it as a rejected review does.
+    #[cfg(unix)]
+    mod revert {
+        use super::*;
+        use loop_agent::harness::tools::create_write_tool;
+        use loop_agent::harness::HostExecutionEnv;
+        use std::os::unix::fs::symlink;
+
+        fn bridge(ws: &Path) -> (ToolApprovalBridge, Arc<dyn ExecutionEnv>) {
+            let env: Arc<dyn ExecutionEnv> = Arc::new(HostExecutionEnv::new(ws.to_path_buf()));
+            let (bridge, _rx) = ToolApprovalBridge::new(Arc::clone(&env), None, HashSet::new());
+            // Never open a GUI diff editor from a test.
+            bridge.set_open_external_diff(false);
+            (bridge, env)
+        }
+
+        async fn write(env: &Arc<dyn ExecutionEnv>, path: &str) -> serde_json::Value {
+            let tool = create_write_tool(Arc::clone(env));
+            let args = json!({"path": path, "content": "agent text"});
+            (tool.execute)("w".into(), args, None, None)
+                .await
+                .expect("write")
+                .details
+        }
+
+        async fn reject(bridge: &ToolApprovalBridge, details: &serde_json::Value) {
+            let path = PathBuf::from(details["path"].as_str().unwrap());
+            let prev = details["previousPath"].as_str().map(PathBuf::from);
+            let _ = bridge
+                .revert_change(&path, prev.as_deref(), &FileReview::from_details(details))
+                .await;
+        }
+
+        #[tokio::test]
+        async fn binary_file_is_restored_not_deleted() {
+            let ws = tempfile::tempdir().unwrap();
+            let file = ws.path().join("data.bin");
+            let bytes = vec![0xff, 0xfe, 0x00, 0x80, 0x81];
+            std::fs::write(&file, &bytes).unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let details = write(&env, "data.bin").await;
+            assert_eq!(details["created"], false);
+            reject(&bridge, &details).await;
+            assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        }
+
+        #[tokio::test]
+        async fn link_to_existing_outside_file_is_restored() {
+            let ws = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("data.bin");
+            std::fs::write(&target, [0xffu8, 0x00, 0x01]).unwrap();
+            symlink(&target, ws.path().join("link")).unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let details = write(&env, "link").await;
+            reject(&bridge, &details).await;
+            assert_eq!(std::fs::read(&target).unwrap(), [0xffu8, 0x00, 0x01]);
+            assert!(ws.path().join("link").is_symlink());
+        }
+
+        #[tokio::test]
+        async fn link_retargeted_during_review_keeps_the_new_target() {
+            let ws = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let link = ws.path().join("link");
+            symlink(outside.path().join("new.txt"), &link).unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let details = write(&env, "link").await;
+            assert_eq!(details["created"], true);
+            // During review the link is pointed at a precious file.
+            let precious = outside.path().join("precious.txt");
+            std::fs::write(&precious, "keep me").unwrap();
+            std::fs::remove_file(&link).unwrap();
+            symlink(&precious, &link).unwrap();
+            reject(&bridge, &details).await;
+            assert_eq!(std::fs::read_to_string(&precious).unwrap(), "keep me");
+        }
+
+        #[tokio::test]
+        async fn dangling_link_create_removes_the_created_file_only() {
+            let ws = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("new.txt");
+            let link = ws.path().join("link");
+            symlink(&target, &link).unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let details = write(&env, "link").await;
+            assert!(target.exists());
+            reject(&bridge, &details).await;
+            assert!(!target.exists());
+            assert!(link.is_symlink());
+        }
+
+        #[tokio::test]
+        async fn created_file_replaced_by_a_directory_is_kept() {
+            let ws = tempfile::tempdir().unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let details = write(&env, "new.txt").await;
+            let file = ws.path().join("new.txt");
+            std::fs::remove_file(&file).unwrap();
+            std::fs::create_dir(&file).unwrap();
+            std::fs::write(file.join("inner"), "keep").unwrap();
+            reject(&bridge, &details).await;
+            assert!(file.join("inner").exists());
+        }
+
+        #[tokio::test]
+        async fn plain_create_is_removed() {
+            let ws = tempfile::tempdir().unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let details = write(&env, "new.txt").await;
+            reject(&bridge, &details).await;
+            assert!(!ws.path().join("new.txt").exists());
+        }
     }
 
     #[test]

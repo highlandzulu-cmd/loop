@@ -61,7 +61,6 @@ impl LeaseEnvironment for SystemLeaseEnvironment {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn pid_liveness(pid: u32) -> PidLiveness {
     // Reject process-group semantics and values that cannot fit pid_t.
     let Ok(pid) = i32::try_from(pid) else {
@@ -83,10 +82,6 @@ fn pid_liveness(pid: u32) -> PidLiveness {
     } else {
         PidLiveness::Unknown
     }
-}
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn pid_liveness(_: u32) -> PidLiveness {
-    PidLiveness::Unknown
 }
 
 fn storage(error: rusqlite::Error) -> SessionError {
@@ -389,33 +384,24 @@ fn same_database(a: &std::path::Path, b: &std::path::Path) -> bool {
 }
 
 /// Open the standalone bootstrap store and claim its resumed Session, if any.
-/// On Unix, stale rows of dead owners are swept first, and ownership is renewed every 5 s and released when the final store
-/// handle drops. Other platforms retain standalone behavior without leases;
-/// the explicit lease API remains available with injectable process liveness.
+/// Stale rows of dead owners are swept first, and ownership is renewed every
+/// 5 s and released when the final store handle drops.
 pub async fn create_sqlite_session_store_for_resume(
     path: impl AsRef<std::path::Path>,
     id: Option<&str>,
 ) -> Result<Arc<dyn crate::harness::session::SessionStore>, SessionError> {
     let store = SqliteSessionStore::open(path)?;
-    #[cfg(unix)]
-    {
-        // Rows of `loop` processes that died without releasing would block
-        // their Sessions until someone takes them over.
-        match store.sweep_stale_leases(None).await {
-            Ok(0) => {}
-            Ok(swept) => tracing::info!(swept, "removed Session leases of exited processes"),
-            Err(error) => tracing::warn!(%error, "could not sweep stale Session leases"),
-        }
-        Ok(Arc::new(match id {
-            Some(id) => store.standalone_resume(id).await?,
-            None => store.standalone_writer(),
-        }))
+    // Rows of `loop` processes that died without releasing would block
+    // their Sessions until someone takes them over.
+    match store.sweep_stale_leases(None).await {
+        Ok(0) => {}
+        Ok(swept) => tracing::info!(swept, "removed Session leases of exited processes"),
+        Err(error) => tracing::warn!(%error, "could not sweep stale Session leases"),
     }
-    #[cfg(not(unix))]
-    {
-        let _ = id;
-        Ok(Arc::new(store))
-    }
+    Ok(Arc::new(match id {
+        Some(id) => store.standalone_resume(id).await?,
+        None => store.standalone_writer(),
+    }))
 }
 
 pub(super) struct ResumeLeaseGuard {

@@ -28,7 +28,7 @@ pub use compaction::{
     default_compaction_settings, find_cut_point, prepare_compaction, should_compact,
     CompactionSettings,
 };
-pub use env::HostExecutionEnv;
+pub use env::{HostExecutionEnv, SessionExecutionEnv};
 pub use hooks::{
     HarnessHookEvent, HookOutcome, HookRegistry, ToolCallInfo, ToolDecision, ToolSource,
 };
@@ -36,7 +36,7 @@ pub use sandbox::{
     check_krun_deps, check_local_sandbox_deps, KrunIsolation, KrunSandbox, KrunSandboxFactory,
     LocalSandboxRuntime, PodmanClient, PodmanExecOpts, PodmanRunOpts, Sandbox, SandboxConfig,
     SandboxError, SandboxFactory, SandboxInfo, SandboxMode, SandboxRegistry, SandboxStatus,
-    KRUN_DEFAULT_IMAGE, KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
+    TaggedSandbox, KRUN_DEFAULT_IMAGE, KRUN_DEFAULT_RUNTIME, LOCAL_DEFAULT_RUNTIME,
 };
 pub use session::{
     compute_session_stats, create_in_memory_session_store, create_jsonl_session_store,

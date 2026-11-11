@@ -195,11 +195,24 @@ async fn run_stream(
     let mut response = send_request(&client, &url, headers.clone(), &payload, &options).await?;
     // Some OpenAI-compatible servers reject reasoning parameters for models
     // they serve. Retry once without them and remember the model.
-    if reasoning.is_some() && matches!(response.status().as_u16(), 400 | 422) {
+    let sent_reasoning = [
+        "reasoning_effort",
+        "reasoning",
+        "thinking",
+        "enable_thinking",
+    ]
+    .iter()
+    .any(|field| payload.get(field).is_some())
+        || payload
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking"))
+            .is_some();
+    let status = response.status().as_u16();
+    if sent_reasoning && matches!(status, 400 | 422) {
         let body = super::sse::error_body(response, &options).await?;
         if !rejects_reasoning(&body) {
             return Err(StreamFail {
-                message: crate::utils::summarize_http_error(400, &body),
+                message: crate::utils::summarize_http_error(status, &body),
                 aborted: false,
             });
         }
@@ -817,6 +830,13 @@ fn apply_reasoning(
     compat: &ResolvedOpenAICompletionsCompat,
     reasoning: Option<ThinkingLevel>,
 ) {
+    if reasoning.is_none()
+        && model.reasoning
+        && compat.thinking_format == ThinkingFormat::Zai
+        && !reasoning_rejected(model)
+    {
+        payload["thinking"] = json!({ "type": "disabled" });
+    }
     let Some(level) = reasoning else { return };
     if !model.reasoning && !compat.supports_reasoning_effort {
         return;
@@ -888,6 +908,15 @@ pub fn reasoning_rejected(model: &Model) -> bool {
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .contains(&model_key(model))
+}
+
+/// Forget a learned rejection after a model's endpoint or thinking format changes.
+pub fn clear_reasoning_rejection(model: &Model) {
+    let key = model_key(model);
+    REASONING_REJECTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|rejected| rejected != &key);
 }
 
 /// Whether an error body says a reasoning parameter is not supported.

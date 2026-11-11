@@ -131,6 +131,20 @@ Ship `dark` and `light`. Custom JSON themes use the same color tokens. Change wi
 
 ## Sandbox
 
+### macOS
+
+`/sandbox local` uses Seatbelt partial isolation, with shell networking off by
+default. Commands may write the project, private sandbox temp directory and configured
+`sandbox.allowWrite` paths. File tools enforce write and secret-path restrictions
+too. Agent credentials, Runtime state/control sockets and common credential
+folders remain denied even under broad grants. Use `sandbox.allowWrite: ["~/.cargo"]`
+for Rust cache writes; add `~/.rustup` if rustup needs installation writes.
+`--full` and Linux runtime flags are unavailable. `/sandbox status` shows the
+runtime, isolation, shell networking and writable paths. Host web/MCP services
+are separate capabilities. See [the boundary](../../docs/design/macos-sandbox.md).
+
+### Linux
+
 `/sandbox` / `/sandbox status` — boxed status (on/off, kind, runtime; not sent to the model)  
 `/sandbox off` — host tools  
 `/sandbox local` — same as `--full --runc` (rootless Podman + runc)  

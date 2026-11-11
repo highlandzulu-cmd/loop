@@ -97,7 +97,7 @@ fn live() -> LiveStatus {
         session_id: "0192aaaa-bbbb".into(),
         context_tokens: Some(54_000),
         context_window: 128_000,
-        session_tokens: 1_200_000,
+        session_tokens: Some(1_200_000),
         main_agent_working: true,
         main_agent_step: "tool · bash".into(),
         external_agent: None,
@@ -455,4 +455,50 @@ fn formatting() {
     assert_eq!(gauge(0.5, 4), "██░░");
     assert_eq!(nice_max(7.3), 10.0);
     assert_eq!(nice_max(0.0), 1.0);
+}
+
+#[test]
+fn served_dashboard_hides_host_history_and_lists_loaded_sessions() {
+    let mut app = app(Summary::default(), Some(live()));
+    app.served = true;
+    app.history_available = false;
+    app.runtime = Some(loop_protocol::admin::RuntimeSessionsResult::default());
+    assert_eq!(app.views(), vec![View::Now, View::Runtime]);
+    app.set_view(View::Runtime);
+    assert_shows(
+        &draw(&mut app, 140, 35),
+        &["Runtime", "loaded", "State", "Tokens"],
+    );
+    assert!(!app.reload());
+}
+
+#[test]
+fn runtime_rows_align_and_group_token_digits() {
+    use loop_protocol::admin::{RuntimeSessionRow, RuntimeSessionsResult};
+    let row = |id: &str, tokens| RuntimeSessionRow {
+        session: loop_protocol::SessionRef {
+            instance: "native".into(),
+            key: id.into(),
+            native_id: id.into(),
+        },
+        workspace_id: "w".into(),
+        state: "idle".into(),
+        model: Some("openrouter/z-ai/glm-5.3".into()),
+        tokens,
+    };
+    let result = RuntimeSessionsResult {
+        sessions: vec![
+            row(
+                "019f2c1e-aaaa-bbbb-cccc-0123456789ab-extra-long",
+                Some(1_234_567),
+            ),
+            row("short", None),
+        ],
+        ..Default::default()
+    };
+    let table = super::views::runtime_table(&result);
+    let widths: Vec<_> = table.iter().map(|l| l.chars().count()).collect();
+    assert!(widths.windows(2).all(|w| w[0] == w[1]), "{table:#?}");
+    assert!(table[1].contains("1,234,567"), "{table:#?}");
+    assert!(table[1].contains('…'), "{table:#?}");
 }

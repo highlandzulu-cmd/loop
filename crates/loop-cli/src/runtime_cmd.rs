@@ -12,6 +12,10 @@ pub const STOP_WAIT: Duration = Duration::from_secs(10);
 /// Options of `loop runtime start`.
 #[derive(Debug, Clone)]
 pub struct StartArgs {
+    /// Started by an interactive client; enables idle shutdown.
+    pub auto_started: bool,
+    /// Optional loopback WebSocket listener, in addition to the Unix socket.
+    pub listen: Option<std::net::SocketAddr>,
     /// Socket path; default is the agent directory's Runtime socket.
     pub socket: Option<PathBuf>,
     /// `--max-sessions`: most Sessions the Runtime holds at once.
@@ -24,30 +28,7 @@ pub struct StartArgs {
     pub cwd: PathBuf,
 }
 
-#[cfg(not(unix))]
-const UNSUPPORTED: &str =
-    "`loop runtime` is not supported on this platform (it needs Unix sockets); Linux and macOS are supported";
-
 /// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
-#[cfg(not(unix))]
-pub async fn start(_args: StartArgs) -> anyhow::Result<()> {
-    anyhow::bail!(UNSUPPORTED)
-}
-
-/// Ask the Runtime on `socket` to stop.
-#[cfg(not(unix))]
-pub async fn stop(_socket: Option<PathBuf>) -> anyhow::Result<()> {
-    anyhow::bail!(UNSUPPORTED)
-}
-
-/// Print the Runtime's status. `Ok(false)` when no Runtime answers.
-#[cfg(not(unix))]
-pub async fn status(_socket: Option<PathBuf>, _json: bool) -> anyhow::Result<bool> {
-    anyhow::bail!(UNSUPPORTED)
-}
-
-/// Run the Runtime until SIGINT, SIGTERM or `loop runtime stop`.
-#[cfg(unix)]
 pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     use anyhow::Context;
     use loop_app_core::{
@@ -59,6 +40,10 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     use loop_protocol::{rpc::PeerInfo, AgentBackend};
     use loop_runtime::{log::SqliteEventLog, Runtime, RuntimeLimits};
     use loop_wire::server::{serve_with_control, ServeOptions};
+
+    if args.listen.is_some_and(|addr| !addr.ip().is_loopback()) {
+        anyhow::bail!("refusing a non-loopback WebSocket bind: TLS is required and is not yet supported; use a loopback address and an SSH tunnel");
+    }
 
     if let Some(mode) = &args.permission_mode {
         if PermissionMode::parse(mode).is_none() {
@@ -158,6 +143,21 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         Some(path) => path.clone(),
         None => paths::runtime_socket_path(&agent_dir)?,
     };
+    let websocket = match args.listen {
+        Some(address) => {
+            let listener = tokio::net::TcpListener::bind(address)
+                .await
+                .context("could not bind the loopback WebSocket listener")?;
+            let (token, path) = loop_wire::token::create(&agent_dir)
+                .context("could not create the private Runtime token file")?;
+            Some((listener, token, TokenFile(path)))
+        }
+        None => None,
+    };
+    let listen_url = websocket
+        .as_ref()
+        .map(|(listener, _, _)| listener.local_addr().map(|addr| format!("ws://{addr}/")))
+        .transpose()?;
     // `unix_listen` probes, and replaces only a socket proven stale.
     let listener = loop_wire::socket::unix_listen(&socket)
         .with_context(|| format!("could not listen on {}", socket.display()))?;
@@ -171,24 +171,47 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
         "Runtime listening"
     );
     eprintln!("loop runtime: listening on {}", socket.display());
+    if let Some(url) = &listen_url {
+        eprintln!(
+            "loop runtime: listening on {url}; token file: {}",
+            agent_dir.join("run/runtime.token").display()
+        );
+    }
     let stop = tokio_util::sync::CancellationToken::new();
     let control: Arc<dyn loop_wire::RuntimeControl> = Arc::new(Control {
         runtime: runtime.clone(),
         socket: std::path::absolute(&socket).unwrap_or_else(|_| socket.clone()),
         stop: stop.clone(),
         limits,
+        #[cfg(feature = "usage")]
+        agent_dir: agent_dir.clone(),
+        listen_url,
+        auto_started: args.auto_started,
     });
 
     let info = PeerInfo {
         name: "loop".into(),
         version: env!("CARGO_PKG_VERSION").into(),
     };
+    let idle_timeout = idle_timeout(args.auto_started, &settings.runtime);
+    let mut idle_since = tokio::time::Instant::now();
+    let mut idle_epoch = runtime.idle_activity();
+    let mut idle_check = tokio::time::interval(Duration::from_secs(1));
     let mut connections = tokio::task::JoinSet::new();
     while !shutdown_ready {
         let Some(pending) = signal.as_mut() else {
             break;
         };
         tokio::select! {
+            _ = idle_check.tick(), if idle_timeout.is_some() => {
+                let activity = runtime.idle_activity();
+                if activity != idle_epoch || !runtime.is_idle().await { idle_since = tokio::time::Instant::now(); }
+                idle_epoch = activity;
+                if idle_since.elapsed() >= idle_timeout.unwrap() && runtime.shutdown_if_idle().await {
+                    tracing::info!("Auto-started Runtime idle timeout reached");
+                    shutdown_ready = true;
+                }
+            }
             result = pending => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "shutdown signal failed");
@@ -208,7 +231,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
                         control,
                         loop_wire::socket::unix(stream),
                         info.clone(),
-                        ServeOptions { owns_backend: false },
+                        ServeOptions { owns_backend: false, authority: loop_wire::Authority::HostLocal, },
                     );
                     connections.spawn(async move {
                         let _ = served.done.await;
@@ -219,11 +242,36 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             },
+            accepted = async {
+                match &websocket {
+                    Some((listener, _, _)) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => match accepted {
+                Ok((stream, _)) => {
+                    let token = websocket.as_ref().expect("WebSocket listener").1.clone();
+                    let backend: Arc<dyn AgentBackend> = runtime.clone();
+                    let control = control.clone();
+                    let info = info.clone();
+                    connections.spawn(async move {
+                        if let Ok(transport) = loop_wire::socket::websocket_accept(stream, &token).await {
+                            let served = serve_with_control(backend, control, transport, info,
+                                ServeOptions { owns_backend: false, authority: loop_wire::Authority::Remote });
+                            let _ = served.done.await;
+                        }
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "WebSocket accept failed");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            },
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
         }
     }
     tracing::info!("Runtime shutting down");
     drop(listener);
+    drop(websocket);
     runtime.shutdown().await;
     connections.abort_all();
     // The Lock is still held, so the socket is ours to remove.
@@ -235,9 +283,25 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     drop(lock);
     Ok(())
 }
+fn idle_timeout(auto_started: bool, settings: &crate::config::RuntimeSettings) -> Option<Duration> {
+    auto_started
+        .then(|| {
+            settings
+                .idle_shutdown_minutes
+                .unwrap_or(10)
+                .saturating_mul(60)
+        })
+        .filter(|seconds| *seconds != 0)
+        .map(Duration::from_secs)
+}
 
-#[cfg(unix)]
 use std::sync::Arc;
+struct TokenFile(PathBuf);
+impl Drop for TokenFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// The Runtime's limits and where each came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,17 +356,223 @@ impl Limits {
 
 /// The Runtime as one socket serves it: `runtime/status` names this socket
 /// and `runtime/stop` ends the accept loop like a signal does.
-#[cfg(unix)]
 struct Control {
+    auto_started: bool,
     runtime: Arc<loop_runtime::Runtime>,
     socket: PathBuf,
     stop: tokio_util::sync::CancellationToken,
     limits: Limits,
+    /// The host's usage log directory.
+    #[cfg(feature = "usage")]
+    agent_dir: PathBuf,
+    listen_url: Option<String>,
 }
 
-#[cfg(unix)]
+/// Workspace admin is the Runtime's; the host-only usage history and
+/// new-Session defaults are the daemon's, served only host-locally (the
+/// wire refuses them on any other connection).
+#[async_trait::async_trait]
+impl loop_wire::RuntimeAdmin for Control {
+    async fn settings(&self, p: admin::SettingsParams) -> BackendResult<admin::SettingsResult> {
+        self.runtime.settings(p).await
+    }
+
+    fn offered(&self) -> loop_protocol::Capabilities {
+        loop_protocol::Capabilities {
+            host_usage: cfg!(feature = "usage"),
+            host_defaults: true,
+            runtime_stop_empty: true,
+            ..self.runtime.offered()
+        }
+    }
+    async fn mcp(&self, p: admin::McpParams) -> BackendResult<admin::McpResult> {
+        self.runtime.mcp(p).await
+    }
+    async fn sessions(&self) -> BackendResult<admin::RuntimeSessionsResult> {
+        loop_wire::RuntimeAdmin::sessions(self.runtime.as_ref()).await
+    }
+    async fn web_search(&self, p: admin::WebSearchParams) -> BackendResult<admin::WebSearchResult> {
+        self.runtime.web_search(p).await
+    }
+    async fn skills(&self, p: admin::SkillsParams) -> BackendResult<admin::SkillsResult> {
+        self.runtime.skills(p).await
+    }
+    async fn templates(&self, p: admin::TemplatesParams) -> BackendResult<admin::TemplatesResult> {
+        self.runtime.templates(p).await
+    }
+    async fn reload(&self, p: admin::ReloadParams) -> BackendResult<admin::ReloadResult> {
+        loop_wire::RuntimeAdmin::reload(self.runtime.as_ref(), p).await
+    }
+    async fn trust(&self, p: admin::TrustParams) -> BackendResult<admin::TrustResult> {
+        self.runtime.trust(p).await
+    }
+    async fn sandbox(&self, p: admin::SandboxParams) -> BackendResult<admin::SandboxResult> {
+        self.runtime.sandbox(p).await
+    }
+    async fn permission_mode(
+        &self,
+        p: admin::PermissionModeParams,
+    ) -> BackendResult<admin::PermissionModeResult> {
+        self.runtime.permission_mode(p).await
+    }
+    #[cfg(feature = "usage")]
+    async fn usage(&self, p: admin::UsageParams) -> BackendResult<admin::UsageResult> {
+        let dir = loop_app_core::config::paths::usage_dir(&self.agent_dir);
+        tokio::task::spawn_blocking(move || usage_page(&dir, &p))
+            .await
+            .map_err(failed)?
+    }
+    async fn defaults(&self, p: admin::DefaultsParams) -> BackendResult<admin::DefaultsResult> {
+        self.runtime.update_defaults(p).await
+    }
+}
+use loop_protocol::{admin, BackendResult};
+
+#[cfg(feature = "usage")]
+fn failed(error: impl std::fmt::Display) -> loop_protocol::BackendError {
+    loop_protocol::BackendError::failed(loop_protocol::ErrorCategory::Internal, error.to_string())
+}
+
+/// One page of the host's usage log, one row per Session, most recently
+/// active first. The cursor is the next row's offset.
+#[cfg(feature = "usage")]
+pub(crate) fn usage_page(
+    dir: &std::path::Path,
+    params: &admin::UsageParams,
+) -> BackendResult<admin::UsageResult> {
+    let bad = || {
+        loop_protocol::BackendError::failed(
+            loop_protocol::ErrorCategory::Protocol,
+            "invalid page cursor or limit (use 1 to 1000)",
+        )
+    };
+    let start: usize = match &params.cursor {
+        Some(cursor) => cursor.parse().map_err(|_| bad())?,
+        None => 0,
+    };
+    let limit = params.limit.unwrap_or(100) as usize;
+    if limit == 0 || limit > 1000 {
+        return Err(bad());
+    }
+    let summary = loop_dashboard::summarize_dir(dir, params.days);
+    let dashboard_summary = serde_json::to_value(&summary).map_err(failed)?;
+    let mut sessions = summary.sessions;
+    sessions.sort_by_key(|row| std::cmp::Reverse(row.last_active));
+    if start > sessions.len() {
+        return Err(bad());
+    }
+    let end = start.saturating_add(limit).min(sessions.len());
+    let rows = sessions[start..end]
+        .iter()
+        .map(|row| serde_json::to_value(row).unwrap_or_default())
+        .collect();
+    let log_status = if summary.files == 0 {
+        "no usage logged yet".to_owned()
+    } else {
+        format!(
+            "read {} log file(s); skipped {} unreadable line(s)",
+            summary.files, summary.skipped_lines
+        )
+    };
+    Ok(admin::UsageResult {
+        summary: Some(dashboard_summary),
+        rows,
+        totals: serde_json::to_value(&summary.totals).unwrap_or_default(),
+        next_cursor: (end < sessions.len()).then(|| end.to_string()),
+        taken_at_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64),
+        log_status,
+    })
+}
 #[async_trait::async_trait]
 impl loop_wire::RuntimeControl for Control {
+    async fn config(
+        &self,
+        p: loop_protocol::rpc::SessionParams,
+    ) -> BackendResult<loop_protocol::rpc::SessionSnapshot> {
+        self.runtime.config(p).await
+    }
+
+    async fn skill(
+        &self,
+        p: loop_protocol::session_services::SkillParams,
+    ) -> BackendResult<loop_protocol::MutationResult> {
+        self.runtime.skill(p).await
+    }
+    async fn workflow(
+        &self,
+        p: loop_protocol::session_services::WorkflowParams,
+    ) -> BackendResult<loop_protocol::session_services::WorkflowResult> {
+        self.runtime.workflow(p).await
+    }
+
+    fn admin(&self) -> Option<&dyn loop_wire::RuntimeAdmin> {
+        Some(self)
+    }
+    async fn attach_snapshot_watching(
+        &self,
+        connection: u64,
+        session: &loop_protocol::SessionRef,
+        after_seq: u64,
+    ) -> loop_protocol::BackendResult<loop_wire::Attachment> {
+        loop_wire::RuntimeControl::attach_snapshot_watching(
+            self.runtime.as_ref(),
+            connection,
+            session,
+            after_seq,
+        )
+        .await
+    }
+    // Session-tree services are forwarded as one additive group.
+    async fn tree(
+        &self,
+        params: loop_protocol::rpc::TreeParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::TreeResult> {
+        loop_wire::RuntimeControl::tree(self.runtime.as_ref(), params).await
+    }
+    async fn view(
+        &self,
+        params: loop_protocol::rpc::ViewParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::ViewResult> {
+        loop_wire::RuntimeControl::view(self.runtime.as_ref(), params).await
+    }
+    async fn navigate(
+        &self,
+        params: loop_protocol::rpc::NavigateParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::NavigateResult> {
+        loop_wire::RuntimeControl::navigate(self.runtime.as_ref(), params).await
+    }
+    async fn rename(
+        &self,
+        params: loop_protocol::rpc::RenameParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::MutationResult> {
+        loop_wire::RuntimeControl::rename(self.runtime.as_ref(), params).await
+    }
+    async fn fork(
+        &self,
+        params: loop_protocol::rpc::ForkParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::DestinationResult> {
+        loop_wire::RuntimeControl::fork(self.runtime.as_ref(), params).await
+    }
+    async fn clone_session(
+        &self,
+        params: loop_protocol::rpc::CloneParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::DestinationResult> {
+        loop_wire::RuntimeControl::clone_session(self.runtime.as_ref(), params).await
+    }
+    async fn export(
+        &self,
+        params: loop_protocol::rpc::SessionParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::ExportResult> {
+        loop_wire::RuntimeControl::export(self.runtime.as_ref(), params).await
+    }
+    async fn import(
+        &self,
+        params: loop_protocol::rpc::ImportParams,
+    ) -> loop_protocol::BackendResult<loop_protocol::rpc::DestinationResult> {
+        loop_wire::RuntimeControl::import(self.runtime.as_ref(), params).await
+    }
     async fn recipient(
         &self,
         session: &loop_protocol::SessionRef,
@@ -364,10 +634,19 @@ impl loop_wire::RuntimeControl for Control {
     }
     async fn status(&self) -> loop_protocol::BackendResult<loop_protocol::rpc::RuntimeStatus> {
         let mut status = self.runtime.status();
+        status.auto_started = self.auto_started;
         status.socket = self.socket.clone();
+        status.listen_url = self.listen_url.clone();
         status.max_sessions_from = Some(self.limits.max_sessions.1.into());
         status.max_active_turns_from = Some(self.limits.max_active_turns.1.into());
         Ok(status)
+    }
+    async fn stop_empty(&self) -> loop_protocol::BackendResult<()> {
+        if !self.runtime.shutdown_if_empty().await {
+            return Err(loop_protocol::BackendError::Busy);
+        }
+        self.stop.cancel();
+        Ok(())
     }
     async fn stop(&self) -> loop_protocol::BackendResult<()> {
         // Only request it: the accept loop tears down after this answer.
@@ -375,8 +654,6 @@ impl loop_wire::RuntimeControl for Control {
         Ok(())
     }
 }
-
-#[cfg(unix)]
 fn socket_or_default(socket: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     match socket {
         Some(socket) => Ok(socket),
@@ -388,7 +665,6 @@ fn socket_or_default(socket: Option<PathBuf>) -> anyhow::Result<PathBuf> {
 
 /// A control connection to the Runtime on `socket`, or `None` when nothing
 /// answers there.
-#[cfg(unix)]
 async fn control_client(
     socket: &std::path::Path,
 ) -> anyhow::Result<Option<Arc<loop_wire::RemoteBackend>>> {
@@ -410,10 +686,7 @@ async fn control_client(
     .map_err(|_| anyhow::anyhow!("the Runtime at {} did not answer", socket.display()))??;
     Ok(Some(backend))
 }
-
-#[cfg(unix)]
 struct NoInteraction;
-#[cfg(unix)]
 #[async_trait::async_trait]
 impl loop_protocol::HostServices for NoInteraction {
     async fn interact(
@@ -428,7 +701,6 @@ impl loop_protocol::HostServices for NoInteraction {
 
 /// Ask the Runtime on `socket` to stop and wait for its socket to go. Never
 /// signals a process: with nothing answering it only says so.
-#[cfg(unix)]
 pub async fn stop(socket: Option<PathBuf>) -> anyhow::Result<()> {
     let socket = socket_or_default(socket)?;
     let Some(backend) = control_client(&socket).await? else {
@@ -467,7 +739,6 @@ pub async fn stop(socket: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 /// Print the Runtime's status. `Ok(false)` when no Runtime answers.
-#[cfg(unix)]
 pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool> {
     let socket = socket_or_default(socket)?;
     let Some(backend) = control_client(&socket).await? else {
@@ -488,6 +759,9 @@ pub async fn status(socket: Option<PathBuf>, json: bool) -> anyhow::Result<bool>
             status.pid, status.generation
         );
         println!("socket:  {}", status.socket.display());
+        if let Some(url) = &status.listen_url {
+            println!("listen:  {url}");
+        }
         let from = |source: &Option<String>| {
             source
                 .as_deref()
@@ -535,9 +809,27 @@ where
     })
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_auto_started_owners_have_an_idle_deadline() {
+        let mut settings = crate::config::RuntimeSettings::default();
+        assert_eq!(
+            idle_timeout(true, &settings),
+            Some(Duration::from_secs(600))
+        );
+        assert_eq!(idle_timeout(false, &settings), None);
+        settings.idle_shutdown_minutes = Some(0);
+        assert_eq!(idle_timeout(true, &settings), None);
+        settings.idle_shutdown_minutes = Some(2);
+        assert_eq!(
+            idle_timeout(true, &settings),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(idle_timeout(false, &settings), None);
+    }
 
     #[tokio::test]
     async fn a_shutdown_ready_during_registration_is_kept() {

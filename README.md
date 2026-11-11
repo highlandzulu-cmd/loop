@@ -47,13 +47,6 @@ curl -fsSL https://loop.soket.ai/install | bash -s -- --no-modify-path
 
 From a clone of this repo you can also run `./install.sh`. Assets come from [soketlabs/loop releases](https://github.com/soketlabs/loop/releases).
 
-On native Windows, run the PowerShell installer from a clone:
-
-```powershell
-.\install.ps1
-.\install.ps1 -Version 0.3.4 -NoModifyPath
-```
-
 For installer-owned binaries, opening the terminal chat checks GitHub in the background. If a newer
 release is available, it shows a notice with the `loop update` command. It does
 not install updates at startup. Offline checks do not block the chat.
@@ -84,23 +77,60 @@ First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, Anthr
 | macOS (Intel) | x86_64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux (glibc) | x86_64, arm64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux via WSL | x86_64, arm64 | Supported (uses the Linux build) | `curl -fsSL https://loop.soket.ai/install \| bash` inside WSL |
-| Windows (native) | x86_64 | Installer and lifecycle tests in CI | `./install.ps1` in PowerShell |
 | Linux (musl, e.g. Alpine) | any | Not supported | [Build from source](#build--test) |
+
+Loop supports Linux and macOS only. Native Windows is not supported; use WSL.
 
 ### Feature support
 
-| Feature | Linux | macOS | Windows |
-|---------|-------|-------|---------|
-| Sandboxing | Supported | Planned | Planned |
-| Compaction (manual) | Supported | Supported | In testing |
-| mcp-serve | Supported | Supported | In testing |
+| Feature | Linux | macOS |
+|---------|-------|-------|
+| Sandboxing | Podman | Seatbelt (partial) |
+| Compaction (manual) | Supported | Supported |
+| mcp-serve | Supported | Supported |
 
 The installer detects your OS and CPU, downloads the latest matching release from GitHub, verifies its SHA-256 checksum, installs to `~/.loop/bin`, and adds that directory to your `PATH`. Re-running it is safe: it skips the download if you already have the latest version (use `--force` to reinstall).
 
+### Sandboxing
+
+#### Linux
+
+`/sandbox local` uses Podman with full isolation and runc by default. Use
+`--partial` or an installed runtime flag (`--crun`, `--runsc`, `--krun`) to choose
+another supported mode.
+
+#### macOS
+
+`/sandbox local` uses Seatbelt with partial isolation. Shell writes are limited
+to the project, private sandbox temp directory and `sandbox.allowWrite`; built-in file
+tools also enforce write and secret-path restrictions. Shell network access is
+off unless `sandbox.network` is enabled. Runtime Unix sockets and agent
+credentials remain denied even when networking or broad write grants are enabled.
+For Rust development, add `~/.cargo` to `sandbox.allowWrite` (and `~/.rustup` if
+rustup needs to update installation metadata). `--full` is not available yet.
+
+`/sandbox status` shows the runtime, isolation, shell network policy and writable
+paths. Host web/MCP capabilities are separate from the shell sandbox. See
+[configuration](docs/configuration.md) and the
+[macOS boundary](docs/design/macos-sandbox.md).
+
 ### Shared Runtime (Linux and macOS)
 
-Run one long-lived Runtime and attach to its Sessions from any terminal. Work
-keeps running when you detach, and approvals wait until a Surface answers.
+Plain `loop` is a Runtime client. It reuses the Runtime for your agent
+directory, or starts one, and opens a new Session in the current folder. Work
+keeps running when you quit, and approvals wait until a Surface answers.
+`loop --continue` and `loop --resume` attach to an existing Session, and
+`loop --connect <socket|ws://…>` picks a particular Runtime. `--print`, ACP
+agents and a Runtime that won't start use the in-process path instead.
+
+```bash
+loop                       # new Session; starts the Runtime if needed
+loop --continue            # attach to this folder's latest Session
+loop --resume              # choose a Session
+loop --connect ws://127.0.0.1:8765 --token-file ~/runtime.token
+```
+
+You can also manage the Runtime yourself:
 
 ```bash
 loop runtime start         # start the Runtime (foreground; Ctrl+C stops it)
@@ -113,7 +143,8 @@ loop runtime stop          # stop the Runtime from another terminal
 ```
 
 After a crash, restarting `loop runtime start` marks interrupted turns as uncertain
-instead of retrying them. See [The Runtime](docs/runtime.md).
+instead of retrying them. See [The Runtime](docs/runtime.md) for remote use,
+environment rules and idle shutdown.
 
 ## Supported models
 

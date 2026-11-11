@@ -7,9 +7,11 @@
 //!   own "reject once" option and an allow its "allow once" option (never an
 //!   "always" one). The call is judged by kind against the same Capability
 //!   table as Loop's own tools: a Policy layer that turns its Capability off
-//!   rejects it, and a layer's "ask" always reaches the user. Then the
-//!   permission mode: `full-access` allows once, `read-only` rejects edits
-//!   and commands; otherwise the user is asked.
+//!   rejects it, a `toolPermissions` deny rule for a Loop tool of the same
+//!   kind rejects it, and so does a mode that turns it off (`read-only`
+//!   rejects edits and commands), all before hooks run. A layer's "ask"
+//!   always reaches the user. Then `full-access` allows once; otherwise the
+//!   user is asked.
 //! - **tool-call updates**, which [`AgentToolObserver`] turns into
 //!   `tool_result` events once a call finishes. These are observe-only: the
 //!   agent already ran the tool.
@@ -119,6 +121,18 @@ impl HostServices for GatedHost {
                     Capability::of(&judged).label()
                 ));
             }
+            // Deny rules and the mode's "off" come before hooks: a hook's
+            // allow can't lift either (docs/hooks.md).
+            if let Some(reason) = self.gate.agent_call_denied(judged.kind, &judged.args) {
+                return reject(reason);
+            }
+            let mode = self.gate.mode();
+            if mode.setting(&Capability::of(&judged)).state_for(&judged) == State::Off {
+                return reject(format!(
+                    "Loop is in {} mode; the user can switch with /permissions",
+                    mode.as_str()
+                ));
+            }
             // A Policy layer's "ask" goes to the user, whatever the mode or
             // a hook says.
             let must_ask = ceiling.is_some_and(|c| c.state == State::Ask);
@@ -130,13 +144,6 @@ impl HostServices for GatedHost {
                     }
                 }
                 _ => {}
-            }
-            let mode = self.gate.mode();
-            if mode.setting(&Capability::of(&judged)).state_for(&judged) == State::Off {
-                return reject(format!(
-                    "Loop is in {} mode; the user can switch with /permissions",
-                    mode.as_str()
-                ));
             }
             if mode == PermissionMode::FullAccess && !must_ask {
                 if let Some(outcome) = allow_once() {

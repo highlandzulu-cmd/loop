@@ -253,7 +253,7 @@ async fn services_are_available() {
     let shell = backend
         .local_shell()
         .unwrap()
-        .run(&session, "echo native-shell")
+        .run(&session, "echo native-shell", None)
         .await
         .unwrap();
     assert_eq!(shell.exit_code, 0);
@@ -427,4 +427,78 @@ async fn switching_back_to_a_session_continues_its_turn_numbering() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn a_user_command_defaults_to_the_bash_maximum() {
+    let harness = harness(Vec::new(), Vec::new()).await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    // Unconfigured: 600 s, the bash.maxTimeoutMs default.
+    assert_eq!(backend.shell_timeout(None).unwrap(), 600_000);
+    harness.set_bash_limits(loop_agent::harness::tools::BashLimits {
+        default_timeout_ms: 1_000,
+        max_timeout_ms: 30_000,
+    });
+    // Not the bash tool's per-call default: the configured maximum.
+    assert_eq!(backend.shell_timeout(None).unwrap(), 30_000);
+    assert_eq!(backend.shell_timeout(Some(30_000)).unwrap(), 30_000);
+    assert!(backend.shell_timeout(Some(30_001)).is_err());
+    assert!(backend.shell_timeout(Some(0)).is_err());
+    let session = backend.current_session().await;
+    let refused = backend
+        .local_shell()
+        .unwrap()
+        .run(&session, "true", Some(30_001))
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("30000"), "{refused}");
+}
+
+/// A cancel after the turn's end, while its tree writes are pending, still
+/// releases the held end; the next prompt's updates flow.
+#[tokio::test]
+async fn a_cancel_while_the_turn_end_is_held_does_not_block_the_stream() {
+    let harness = harness(
+        vec![
+            FauxResponse::Text("first".into()),
+            FauxResponse::Text("second".into()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    let cancel = std::sync::Mutex::new(Some((Arc::clone(&backend), session.clone())));
+    harness.subscribe(move |event: loop_agent::AgentEvent| {
+        if matches!(event, loop_agent::AgentEvent::AgentEnd { .. }) {
+            if let Some((backend, session)) = cancel.lock().unwrap().take() {
+                backend.cancel(&session);
+            }
+        }
+        async {}
+    });
+    let first = backend.prompt(&session, text("one")).await.unwrap();
+    let _ = first.outcome().await;
+    assert!(collect_turn(&mut rx)
+        .await
+        .iter()
+        .any(|e| matches!(e.update, SessionUpdate::TurnEnded { .. })));
+    let second = backend.prompt(&session, text("two")).await.unwrap();
+    assert!(matches!(second.outcome().await, TurnOutcome::Completed(_)));
+    let updates: Vec<_> = collect_turn(&mut rx)
+        .await
+        .into_iter()
+        .map(|e| e.update)
+        .collect();
+    assert!(
+        matches!(
+            updates.last(),
+            Some(SessionUpdate::TurnEnded {
+                stop: StopReason::EndTurn,
+                ..
+            })
+        ),
+        "{updates:?}"
+    );
 }

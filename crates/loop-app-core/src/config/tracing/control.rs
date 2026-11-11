@@ -8,7 +8,7 @@ use loop_telemetry::{
 use super::*;
 
 /// What `/tracing setup` collected.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TracingSetupRequest {
     /// Langfuse project.
     Langfuse {

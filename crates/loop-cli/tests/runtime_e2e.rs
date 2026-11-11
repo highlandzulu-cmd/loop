@@ -1,4 +1,3 @@
-#![cfg(unix)]
 //! Runtime end to end: the real `loop runtime start` and `loop session` binaries against
 //! a fake OpenAI-compatible model, with isolated agent and Session directories.
 
@@ -23,6 +22,7 @@ use tokio::{
 const TEST_LIMIT: Duration = Duration::from_secs(120);
 const WAIT: Duration = Duration::from_secs(30);
 const PROVIDER_ENV: &[&str] = &[
+    "LOOP_RUNTIME_TOKEN",
     "SOKET_API_KEY",
     "TENSORSTUDIO_API_KEY",
     "LOOP_API_KEY",
@@ -73,6 +73,116 @@ async fn bounded<F: std::future::Future>(test: F) -> F::Output {
     tokio::time::timeout(TEST_LIMIT, test)
         .await
         .expect("test timed out")
+}
+
+#[tokio::test]
+async fn websocket_clients_list_attach_and_cannot_call_host_methods() {
+    bounded(async {
+        use loop_protocol::rpc::methods;
+        use loop_wire::{Connection, Incoming, RpcError};
+        let fx = Fixture::new();
+        let serve = fx.serve_with(&["--listen", "127.0.0.1:0"]).await;
+        let local = fx.client().await;
+        let status = serde_json::to_value(local.status().await.unwrap()).unwrap();
+        let url = status["listen_url"].as_str().expect("WebSocket listen URL");
+        let token_file = fx.agent.join("run/runtime.token");
+        let token = std::fs::read_to_string(&token_file).unwrap();
+        let address = url.strip_prefix("ws://").unwrap().trim_end_matches('/');
+        for auth in [String::new(), "Authorization: Bearer wrong\r\n".to_owned()] {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(format!("GET / HTTP/1.1\r\nHost: {address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n{auth}\r\n").as_bytes()).await.unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).await.unwrap();
+            assert!(response.starts_with("HTTP/1.1 401"), "{response}");
+        }
+        let remote = loop_wire::RemoteBackend::connect_websocket(url, token.trim(),
+            loop_protocol::rpc::PeerInfo { name: "ws-library".into(), version: "0".into() }, Arc::new(Refuse)).await.unwrap();
+        assert!(!remote.capabilities().host_defaults && !remote.capabilities().host_usage);
+        let session = local.new_session(SessionSpec { cwd: Some(fx.work.clone()), ..Default::default() }).await.unwrap();
+        let id = session.key.to_string();
+        assert_eq!(remote.list().await.unwrap()[0].r#ref.key, session.key);
+        remote.shutdown().await;
+        let listing = fx.session(&["list", "--json", "--url", url, "--token-file", token_file.to_str().unwrap()]).finish().await;
+        assert_eq!(sessions(&listing)[0].r#ref.key, session.key);
+        let mut cmd = fx.command(&["session", "attach", &id, "--url", url]);
+        cmd.env("LOOP_RUNTIME_TOKEN", token.trim());
+        let mut surface = Proc::spawn(cmd);
+        surface.wait_text("Attached").await;
+        surface.line("hellows").await;
+        surface.wait_text("reply hellows").await;
+        let output = surface.finish().await;
+        assert!(!output.contains(token.trim()));
+        let replay = fx.session(&["attach", &id, "--url", url, "--token-file", token_file.to_str().unwrap()]).finish().await;
+        assert!(replay.contains("reply hellows"), "{replay}");
+
+        // Bypass client capability checks to prove enforcement at dispatch.
+        let transport = loop_wire::socket::websocket_connect(url, token.trim()).await.unwrap();
+        let (conn, mut incoming) = Connection::new(transport);
+        let resolver = conn.clone();
+        tokio::spawn(async move {
+            while let Some(message) = incoming.recv().await {
+                if let Incoming::Response { id, result } = message {
+                    resolver.resolve(id, result).await;
+                }
+            }
+            resolver.fail_pending().await;
+        });
+        conn.request(methods::INITIALIZE, json!({"protocol_version":1,"client_info":{"name":"ws-test","version":"0"}})).await.unwrap();
+        for method in methods::HOST_ONLY {
+            assert!(matches!(conn.request(method, json!({})).await,
+                Err(RpcError::Remote { code, .. }) if code == loop_protocol::rpc::error_codes::FORBIDDEN), "{method}");
+        }
+        for trusted in [true, false] {
+            assert!(matches!(conn.request(methods::WORKSPACE_TRUST, json!({"workspace_id":"unknown","trusted":trusted})).await,
+                Err(RpcError::Remote { code, .. }) if code == loop_protocol::rpc::error_codes::FORBIDDEN));
+        }
+        assert!(local.status().await.is_ok(), "remote stop must not shut down the Runtime");
+        conn.close();
+        serve.stop().await;
+    }).await;
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn seatbelt_cannot_read_the_running_websocket_listeners_token() {
+    bounded(async {
+        use loop_agent::harness::sandbox::seatbelt::SeatbeltSandboxFactory;
+        use loop_agent::harness::types::ShellExecOptions;
+        use loop_agent::harness::{SandboxConfig, SandboxFactory};
+        let fx = Fixture::new();
+        let serve = fx.serve_with(&["--listen", "127.0.0.1:0"]).await;
+        let token_file = fx.agent.join("run/runtime.token");
+        let token = std::fs::read_to_string(&token_file).unwrap();
+        let sandbox = SeatbeltSandboxFactory
+            .create(SandboxConfig {
+                workdir: fx.work.clone(),
+                options: json!({"homeDir":fx.home,"agentDir":fx.agent,"allowWrite":[fx.agent]}),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        sandbox.start().await.unwrap();
+        let command = format!(
+            "cat '{}'",
+            token_file.display().to_string().replace('\'', "'\\''")
+        );
+        let result = sandbox
+            .env()
+            .exec(
+                &command,
+                ShellExecOptions {
+                    timeout_ms: Some(10_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(result.exit_code, 0, "Seatbelt allowed reading the token");
+        assert!(!result.stdout.contains(token.trim()));
+        sandbox.stop().await.unwrap();
+        serve.stop().await;
+    })
+    .await;
 }
 
 // ---- fake model -------------------------------------------------------------
@@ -1118,6 +1228,75 @@ async fn closing_a_parent_with_a_running_subagent_needs_force_and_cascades() {
         assert_eq!(client.status().await.unwrap().loaded, 0);
         drop(client);
         parent.finish().await;
+        serve.stop().await;
+    })
+    .await
+}
+
+#[tokio::test]
+async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket() {
+    bounded(async {
+        use loop_protocol::admin::*;
+        use loop_wire::RuntimeAdmin;
+        let fx = Fixture::new();
+        let serve = fx.serve().await;
+        let client = fx.client().await;
+        let offered = client.capabilities();
+        assert!(offered.workspace_reload && offered.workspace_skills && offered.workspace_trust);
+        assert!(offered.permission_mode && offered.session_sandbox);
+        // The 0600 Unix socket is host-local: host-only methods are offered.
+        assert!(offered.host_defaults);
+        // The usage history is the `usage` feature's: without it the daemon does
+        // not offer it, even host-locally.
+        assert_eq!(offered.host_usage, cfg!(feature = "usage"));
+
+        let session = client
+            .new_session(loop_protocol::SessionSpec {
+                cwd: Some(fx.work.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let workspace_id = client
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.r#ref.key == session.key)
+            .and_then(|s| s.summary.workspace_id)
+            .expect("the listing names the workspace");
+        let reloaded = client
+            .reload(ReloadParams {
+                workspace_id: workspace_id.clone(),
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(reloaded.revision, 1);
+        assert_eq!(reloaded.pending_sessions, 0);
+        assert!(offered.runtime_sessions);
+        let panel = client.sessions().await.unwrap();
+        assert_eq!(panel.totals.sessions, 1);
+        assert_eq!(panel.sessions[0].workspace_id, workspace_id);
+
+        let saved = client
+            .defaults(DefaultsParams {
+                patch: Some(DefaultsPatch {
+                    response_header_timeout_ms: Some(45_000),
+                    ..DefaultsPatch::default()
+                }),
+                ..DefaultsParams::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.response_header_timeout_ms, Some(45_000));
+        let settings = std::fs::read_to_string(fx.agent.join("settings.json")).unwrap();
+        assert!(settings.contains("45000"), "{settings}");
+        #[cfg(feature = "usage")]
+        {
+            let usage = client.usage(UsageParams::default()).await.unwrap();
+            assert!(usage.next_cursor.is_none());
+        }
         serve.stop().await;
     })
     .await

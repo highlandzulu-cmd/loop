@@ -21,9 +21,9 @@ use async_trait::async_trait;
 use loop_protocol::{
     AgentBackend, BackendError, BackendInstanceId, BackendResult, Capabilities, ContentBlock,
     ErrorCategory, ErrorInfo, HostServices, InteractionId, InteractionOutcome, InteractionRequest,
-    ModelChoice, ModelChoices, ModelControl, Origin, SessionKey, SessionRef, SessionSpec,
-    SessionUpdate, StopReason, TerminalRequest, TurnHandle, TurnId, TurnOutcome, UpdateEnvelope,
-    DECLINE_CHOICE, PROTOCOL_VERSION,
+    ModelChoice, ModelChoices, ModelControl, MutationResult, Origin, SessionKey, SessionRef,
+    SessionSpec, SessionUpdate, StopReason, TerminalRequest, TurnHandle, TurnId, TurnOutcome,
+    UpdateEnvelope, DECLINE_CHOICE, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -420,6 +420,7 @@ impl AcpBackend {
         let spec = SessionSpec {
             cwd: Some(cwd),
             name: None,
+            ..Default::default()
         };
         self.load(&conn, session, &spec, false).await?;
         Ok(conn)
@@ -613,7 +614,7 @@ async fn dispatch(
     backend: Weak<AcpBackend>,
     generation: u64,
     conn: Arc<Connection>,
-    mut incoming: mpsc::UnboundedReceiver<Incoming>,
+    mut incoming: mpsc::Receiver<Incoming>,
 ) {
     while let Some(message) = incoming.recv().await {
         if let Incoming::Response { id, result } = message {
@@ -1203,6 +1204,7 @@ fn model_choices(select: &acp::SessionConfigSelect) -> ModelChoices {
     ModelChoices {
         current: Some(select.current_value.0.to_string()),
         models,
+        revision: 0,
     }
 }
 
@@ -1268,23 +1270,44 @@ impl ModelControl for AcpBackend {
         self.choices(session, Setting::Model)
     }
 
-    async fn set_model(&self, session: &SessionRef, model: &str) -> BackendResult<()> {
-        self.choose(session, Setting::Model, model).await
+    async fn set_model(
+        &self,
+        session: &SessionRef,
+        model: &str,
+        _expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        // The agent keeps this config; Loop tracks no revision for it yet.
+        self.choose(session, Setting::Model, model).await?;
+        Ok(MutationResult::default())
     }
 
     async fn efforts(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
         self.choices(session, Setting::Effort)
     }
 
-    async fn set_effort(&self, session: &SessionRef, effort: &str) -> BackendResult<()> {
-        self.choose(session, Setting::Effort, effort).await
+    async fn set_effort(
+        &self,
+        session: &SessionRef,
+        effort: &str,
+        _expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        // The agent keeps this config; Loop tracks no revision for it yet.
+        self.choose(session, Setting::Effort, effort).await?;
+        Ok(MutationResult::default())
     }
 
     async fn modes(&self, session: &SessionRef) -> BackendResult<ModelChoices> {
         self.choices(session, Setting::Mode)
     }
 
-    async fn set_mode(&self, session: &SessionRef, mode: &str) -> BackendResult<()> {
-        self.choose(session, Setting::Mode, mode).await
+    async fn set_mode(
+        &self,
+        session: &SessionRef,
+        mode: &str,
+        _expected_revision: Option<u64>,
+    ) -> BackendResult<MutationResult> {
+        // The agent keeps this config; Loop tracks no revision for it yet.
+        self.choose(session, Setting::Mode, mode).await?;
+        Ok(MutationResult::default())
     }
 }

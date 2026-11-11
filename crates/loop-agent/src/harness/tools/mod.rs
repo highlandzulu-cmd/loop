@@ -21,7 +21,7 @@ pub use search::{
 pub use todo::{create_todo_tool, todos_from_details};
 
 use crate::harness::tools::file_mutation_queue::with_file_mutation_queue;
-use crate::harness::types::{ExecutionEnv, ShellExecOptions};
+use crate::harness::types::{ExecutionEnv, FileErrorCode, FileIdentity, ShellExecOptions};
 use crate::harness::utils::{execute_shell_with_capture, truncate_head, DEFAULT_MAX_BYTES};
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{ImageContent, TextContent, ToolResultContent};
@@ -124,16 +124,30 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     let env = Arc::clone(&env);
                     let content = content.clone();
                     async move {
-                        let (created, previous) = match env.read_text_file(&abs).await {
-                            Ok(text) => (false, text),
-                            Err(_) => (true, String::new()),
+                        // Only a missing file counts as created. Any other
+                        // error (a directory, no permission) fails the write
+                        // before it happens, and an existing file that is
+                        // not text gets a byte snapshot, so a rejected
+                        // review restores it instead of deleting it.
+                        let previous = match env.file_info(&abs).await {
+                            Ok(_) => Some(env.read_binary_file(&abs).await.map_err(|e| {
+                                format!("cannot snapshot {} for review: {e}", abs.display())
+                            })?),
+                            Err(e) if e.code == FileErrorCode::NotFound => None,
+                            Err(e) => return Err(e.to_string()),
                         };
-                        let previous_path =
-                            write_review_snapshot(&abs, &previous).map_err(|e| e.to_string())?;
-                        let diff = unified_diff(&previous, &content, &abs);
+                        let created = previous.is_none();
+                        let previous = previous.unwrap_or_default();
+                        let previous_path = write_review_snapshot(env.as_ref(), &abs, &previous)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let diff =
+                            unified_diff(&String::from_utf8_lossy(&previous), &content, &abs);
                         env.write_file(&abs, content.as_bytes())
                             .await
                             .map_err(|e| e.to_string())?;
+                        let (target_path, created_identity) =
+                            written_target(env.as_ref(), &abs, created).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
@@ -144,6 +158,9 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "bytes": content.len(),
                                 "created": created,
                                 "previousPath": previous_path,
+                                "targetPath": target_path,
+                                "createdPath": created_identity.map(|_| &target_path),
+                                "createdIdentity": created_identity,
                                 "diff": diff,
                             }),
                             usage: None,
@@ -199,11 +216,14 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             fuzzy_replace(&original, &old_text, &new_text)?
                         };
                         let previous_path =
-                            write_review_snapshot(&abs, &original).map_err(|e| e.to_string())?;
+                            write_review_snapshot(env.as_ref(), &abs, original.as_bytes())
+                                .await
+                                .map_err(|e| e.to_string())?;
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
                             .map_err(|e| e.to_string())?;
+                        let (target_path, _) = written_target(env.as_ref(), &abs, false).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Edited {}", abs.display()),
@@ -214,6 +234,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "diff": diff,
                                 "created": false,
                                 "previousPath": previous_path,
+                                "targetPath": target_path,
                             }),
                             usage: None,
                             added_tool_names: None,
@@ -228,14 +249,37 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
 }
 
 /// Persist pre-edit contents so the CLI can open a diff and revert on reject.
-fn write_review_snapshot(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("loop-file-review");
-    std::fs::create_dir_all(&dir)?;
+async fn write_review_snapshot(
+    env: &dyn ExecutionEnv,
+    path: &Path,
+    contents: &[u8],
+) -> Result<PathBuf, crate::harness::types::FileError> {
+    let dir = env.create_temp_dir(".loop-file-review").await?;
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-    let id = loop_ai::new_id();
-    let out = dir.join(format!("{id}-{stem}.before"));
-    std::fs::write(&out, contents)?;
+    let out = dir.join(format!("{stem}.before"));
+    env.write_file(&out, contents).await?;
     Ok(out)
+}
+
+/// The file a write to `abs` landed in, resolved once right after the
+/// write (a symlink is followed here, never at review time), and, when the
+/// write created it, its identity. A review that rejects the write removes
+/// only that path, and only while its identity still matches.
+async fn written_target(
+    env: &dyn ExecutionEnv,
+    abs: &Path,
+    created: bool,
+) -> (PathBuf, Option<FileIdentity>) {
+    let target = env
+        .canonical_path(abs)
+        .await
+        .unwrap_or_else(|_| abs.to_path_buf());
+    let identity = if created {
+        env.file_identity(&target).await.ok().flatten()
+    } else {
+        None
+    };
+    (target, identity)
 }
 
 fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<String, String> {

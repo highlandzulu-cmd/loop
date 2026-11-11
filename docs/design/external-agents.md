@@ -167,7 +167,7 @@ pub struct SessionRef { backend: BackendId, native_id: String, cwd: PathBuf, met
   - Its approval hooks call `HostServices::interact`. Loop's own tools and external agents then share one policy path, which is also the roadmap's P0 permission enforcement.
 - **`AcpBackend`** (`crates/loop-acp`, new) is generic over any ACP agent and built on the `agent-client-protocol` crate. It maps ACP types to canonical ones almost one to one and routes ACP client requests to `HostServices`.
 - **`BackendSupervisor`**, inside `loop-acp`, owns the connection → session → turn → pending-request state machine. It handles:
-  - **Spawning** in its own process group (Unix) or Job Object (Windows), so killing it also kills descendants; `kill_on_drop` alone doesn't. It also sets an env allowlist (no `*_API_KEY` leakage, per CONTRIBUTING invariant 5) and an absolute cwd.
+  - **Spawning** in its own process group, so killing it also kills descendants; `kill_on_drop` alone doesn't. It also sets an env allowlist (no `*_API_KEY` leakage, per CONTRIBUTING invariant 5) and an absolute cwd.
   - **Draining** stderr to the log, and using bounded queues.
   - **Owning every in-flight `session/prompt` future**, so each turn produces exactly one `TurnOutcome`.
   - **Crash restart.** It bumps `generation` and marks **every** session with a live turn as `Uncertain`, because one process may host several sessions. Answers and updates from an older generation are discarded.
@@ -213,7 +213,6 @@ To the user, an external agent is a **subscription provider**. It is not a separ
 | Sandbox and cwd | Always send an absolute cwd. With `fs`/`terminal` capabilities, Loop's `ExecutionEnv` and sandbox apply. Otherwise the agent's own sandbox applies, and the status bar says "execution managed by agent". |
 | Several agents on one tree | `write_text_file` checks a per-file version hash from this session's last read ("file changed since you read it"). Reject-revert only if the file still matches what this session wrote; otherwise report a conflict. These checks don't cover shell commands, so a tree with more than one writing agent is either serialized or split into worktrees. |
 | Large output and stray stdout | Drain continuously into bounded queues, stash large content to disk, strip terminal escape codes. Non-JSON lines on stdout are logged and skipped. |
-| Windows | Resolve `npx.cmd` and `.exe`, use process-group kill, normalize paths. Native Windows and WSL are tested as separate environments. |
 | Model reroutes and compaction | Shown as `Notice`. Compaction is the agent's own, so Loop's `/compact` reports "unsupported" for external backends. |
 | Secrets | Child process env is built from an allowlist and the preset env. No API keys from Loop's credential store unless the preset asks for them. |
 

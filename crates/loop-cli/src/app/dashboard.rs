@@ -2,7 +2,6 @@
 //! the chat loop keeps draining agent events and hands it a fresh live status, so turns
 //! and sub-agents carry on and the **Now** view stays current. Nothing runs while closed.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -12,7 +11,7 @@ use loop_dashboard::{
     Dashboard, LiveStatus, McpServerStatus, Options, Palette, SubAgent, SubAgentState,
 };
 
-use super::{CardStatus, ChatItem, CliRuntime, Theme, TokenBarState};
+use super::{CardStatus, ChatItem, SurfaceClient, Theme};
 
 /// How often the Now view is rebuilt from the chat's in-memory state.
 const LIVE_EVERY: Duration = Duration::from_millis(500);
@@ -49,7 +48,7 @@ pub(super) struct ChatState<'a> {
     pub items: &'a [ChatItem],
     pub working: bool,
     pub turn_step: &'a str,
-    pub token_bar: &'a TokenBarState,
+    pub token_bar: &'a super::TokenBarState,
 }
 
 /// The open dashboard.
@@ -59,29 +58,29 @@ pub(super) struct Screen {
     slow: Slow,
     live_at: Instant,
     slow_at: Instant,
+    period: Option<u32>,
 }
 
 impl Screen {
-    pub async fn open(runtime: &CliRuntime, chat: ChatState<'_>) -> io::Result<Self> {
+    pub async fn open(runtime: &mut SurfaceClient, chat: ChatState<'_>) -> io::Result<Self> {
         let slow = Slow::query(runtime).await;
-        let usage_log = runtime.usage_log();
-        let dir = usage_log
-            .as_ref()
-            .and_then(|log| log.path.parent().map(PathBuf::from))
-            .unwrap_or_else(|| loop_app_core::config::paths::usage_dir(&runtime.agent_dir));
-        let notice = usage_log
-            .and_then(|log| log.last_error)
-            .map(|err| format!("The usage log could not be written: {err}"));
-        let mut options = options(&runtime.theme, dir, notice);
+        let summary = runtime
+            .usage_history(Some(30))
+            .await
+            .ok()
+            .and_then(|r| r.summary)
+            .and_then(|s| serde_json::from_value(s).ok());
+        let rows = runtime.loaded_sessions().await.unwrap_or_default();
+        let mut options = options(runtime.theme(), PathBuf::new(), None);
         options.live = Some(live_status(runtime, &chat, &slow));
-        // Include this session's latest spans; they show up on the next reload.
-        runtime.flush_usage_log();
+        let board = Dashboard::open_served(options, summary, rows)?;
         Ok(Self {
-            board: Dashboard::open(options)?,
+            board,
             size: crossterm::terminal::size().ok(),
             slow,
             live_at: Instant::now(),
             slow_at: Instant::now(),
+            period: Some(30),
         })
     }
 
@@ -98,13 +97,27 @@ impl Screen {
     }
 
     /// Refresh the live status when due and redraw.
-    pub async fn refresh(&mut self, runtime: &CliRuntime, chat: ChatState<'_>) -> io::Result<()> {
-        if self.slow_at.elapsed() >= SLOW_EVERY {
+    pub async fn refresh(
+        &mut self,
+        runtime: &mut SurfaceClient,
+        chat: ChatState<'_>,
+    ) -> io::Result<()> {
+        let period = self.board.period_days();
+        if self.slow_at.elapsed() >= SLOW_EVERY || self.period != period {
             self.slow = Slow::query(runtime).await;
-            runtime.flush_usage_log();
+            let summary = runtime
+                .usage_history(period)
+                .await
+                .ok()
+                .and_then(|r| r.summary)
+                .and_then(|s| serde_json::from_value(s).ok());
+            let rows = runtime.loaded_sessions().await.unwrap_or_default();
+            self.board.set_host_data(summary, rows);
+            self.period = period;
             self.slow_at = Instant::now();
         }
         if self.live_at.elapsed() >= LIVE_EVERY {
+            self.slow.stats = runtime.stats().await.ok();
             self.board.set_live(live_status(runtime, &chat, &self.slow));
             self.live_at = Instant::now();
         }
@@ -125,67 +138,67 @@ impl Screen {
 struct Slow {
     sandbox: String,
     mcp_servers: Vec<McpServerStatus>,
+    stats: Option<loop_protocol::StatsSummary>,
+}
+/// One line for the dashboard row; `SandboxResult::info` is the multi-line
+/// `/sandbox status` card.
+fn sandbox_summary(config: loop_protocol::admin::SandboxChoice) -> String {
+    [Some(config.mode), config.isolation, config.runtime]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 impl Slow {
-    async fn query(runtime: &CliRuntime) -> Self {
-        let sandbox = runtime.harness.sandbox_info().await;
-        let sandbox = sandbox
-            .fields
-            .iter()
-            .map(|(_, value)| value.as_str())
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" · ");
-        let connected: HashMap<String, usize> = runtime
-            .mcp_client
-            .list_connections()
-            .await
-            .into_iter()
-            .collect();
-        let mut mcp_servers: Vec<McpServerStatus> = runtime
-            .settings
-            .mcp_servers
-            .keys()
-            .filter(|name| !runtime.settings.disabled_mcp_servers.contains(name))
-            .map(|name| McpServerStatus {
-                name: name.clone(),
-                tools: connected.get(name).copied().unwrap_or(0),
-                connected: connected.contains_key(name),
+    async fn query(runtime: &mut SurfaceClient) -> Self {
+        let sandbox = runtime
+            .sandbox_service()
+            .sandbox(loop_protocol::admin::SandboxParams {
+                session: runtime.session_ref(),
+                action: loop_protocol::admin::SandboxAction::Status,
+                config: None,
+                expected_revision: None,
             })
-            .collect();
-        for (name, tools) in &connected {
-            if !mcp_servers.iter().any(|s| &s.name == name) {
-                mcp_servers.push(McpServerStatus {
-                    name: name.clone(),
-                    tools: *tools,
-                    connected: true,
-                });
-            }
-        }
+            .await
+            .map(|s| sandbox_summary(s.config))
+            .unwrap_or_default();
+        let mcp_servers = runtime
+            .mcp(loop_protocol::admin::AdminAction::List, None)
+            .await
+            .map(|r| {
+                r.servers
+                    .into_iter()
+                    .filter(|s| s.enabled)
+                    .map(|s| McpServerStatus {
+                        name: s.name,
+                        tools: s.tools as usize,
+                        connected: s.connected,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         Self {
             sandbox,
             mcp_servers,
+            stats: runtime.stats().await.ok(),
         }
     }
 }
 
 /// The Now view's status, from in-memory state only.
-fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveStatus {
+fn live_status(runtime: &SurfaceClient, chat: &ChatState<'_>, slow: &Slow) -> LiveStatus {
     let subscription = runtime
-        .active_agent
+        .active_agent()
         .as_deref()
-        .map(|id| match runtime.agents.entry(id) {
-            Some(entry) => entry.display_name().to_string(),
-            None => id.to_string(),
-        });
+        .map(|id| runtime.agent_label(id).unwrap_or_else(|| id.to_string()));
     let (model, effort) = match &subscription {
         Some(agent) => (
             runtime
-                .agent_model
+                .agent_model()
                 .as_ref()
                 .map_or(agent.clone(), |m| format!("{agent}/{m}")),
-            runtime.agent_effort.clone(),
+            runtime.agent_effort().clone(),
         ),
         None => (
             runtime
@@ -221,12 +234,24 @@ fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveS
         effort,
         permission_mode: runtime.permission_mode().label().to_string(),
         sandbox: slow.sandbox.clone(),
-        web: runtime.web_tools().status(),
-        cwd: runtime.cwd.display().to_string(),
-        session_id: runtime.session_id.clone(),
-        context_tokens: chat.token_bar.context_tokens,
-        context_window: chat.token_bar.context_window,
-        session_tokens: chat.token_bar.total_tokens,
+        web: runtime.web_label(),
+        cwd: runtime.cwd().display().to_string(),
+        session_id: runtime.session_id().clone(),
+        context_tokens: slow
+            .stats
+            .as_ref()
+            .and_then(|s| s.context_tokens)
+            .or(chat.token_bar.context_tokens),
+        context_window: slow
+            .stats
+            .as_ref()
+            .and_then(|s| s.context_window)
+            .unwrap_or(chat.token_bar.context_window),
+        session_tokens: slow.stats.as_ref().map(|s| s.total_tokens).or_else(|| {
+            chat.token_bar
+                .total_known
+                .then_some(chat.token_bar.total_tokens)
+        }),
         main_agent_working: chat.working,
         main_agent_step: if chat.working {
             chat.turn_step.to_string()
@@ -236,19 +261,23 @@ fn live_status(runtime: &CliRuntime, chat: &ChatState<'_>, slow: &Slow) -> LiveS
         external_agent: subscription.map(|agent| format!("{agent} · subscription agent")),
         sub_agents,
         skills_loaded: runtime
-            .resources
+            .resource_view()
+            .skills
+            .into_iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.name)
+            .collect(),
+        skills_active: runtime.resource_view().active_skills,
+        skills_disabled: runtime
+            .resource_view()
             .skills
             .iter()
-            .map(|s| s.name.clone())
-            .collect(),
-        skills_active: runtime.active_skills.clone(),
-        skills_disabled: runtime.resources.disabled_skills.len(),
+            .filter(|s| !s.enabled)
+            .count(),
         mcp_servers: slow.mcp_servers.clone(),
-        extensions: runtime.resources.extension_paths.len(),
-        hooks: runtime.resources.hook_paths.len(),
-        usage_log: runtime
-            .usage_log()
-            .map(|log| log.path.display().to_string()),
+        extensions: runtime.resource_view().extensions,
+        hooks: runtime.resource_view().hooks,
+        usage_log: runtime.usage_log_status().map(|s| s.0),
     }
 }
 
@@ -288,5 +317,166 @@ mod tests {
             .map(|agent| agent.id)
             .collect();
         assert_eq!(ids, ["100", "3", "4", "5", "6", "7"]);
+    }
+}
+
+#[cfg(test)]
+mod session_stats_tests {
+    use super::*;
+    #[tokio::test]
+    async fn dashboard_uses_attached_session_stats_and_lists_only_loaded_sessions() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runtime = crate::surface_client::test_support::fixture(dir.path()).await;
+            runtime.new_session().await.unwrap();
+            let slow = Slow {
+                sandbox: "off".into(),
+                mcp_servers: vec![],
+                stats: Some(loop_protocol::StatsSummary {
+                    total_tokens: 321,
+                    context_tokens: Some(123),
+                    context_window: Some(4096),
+                    ..Default::default()
+                }),
+            };
+            let state = live_status(
+                &runtime,
+                &ChatState {
+                    items: &[],
+                    working: false,
+                    turn_step: "",
+                    token_bar: &super::super::TokenBarState::from_model(&runtime),
+                },
+                &slow,
+            );
+            assert_eq!(
+                (
+                    state.session_tokens,
+                    state.context_tokens,
+                    state.context_window
+                ),
+                (Some(321), Some(123), 4096)
+            );
+            let loaded = runtime.loaded_sessions().await.unwrap();
+            assert_eq!(loaded.totals.sessions, 1);
+            assert_eq!(loaded.sessions[0].session, runtime.session_ref());
+            let history = runtime.usage_history(None).await.unwrap();
+            assert!(history.summary.is_some());
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod subscription_usage_tests {
+    use super::*;
+    use crate::surface_client::test_support;
+    use loop_protocol::AgentBackend;
+
+    #[tokio::test]
+    async fn dashboard_retains_subscription_usage_without_a_stats_service() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runtime = test_support::fixture(dir.path()).await;
+            let backend = test_support::SubscriptionBackend::new();
+            runtime.adopt_agent(
+                "subscription",
+                backend.clone(),
+                backend.session(),
+                Some("agent-model".into()),
+            );
+            assert!(runtime.backend().session_stats().is_none());
+            let mut updates = backend.subscribe();
+            let mut bar = super::super::TokenBarState::load(&runtime).await;
+            backend.usage(loop_protocol::Usage {
+                total_tokens: 1234,
+                context_window: Some(8192),
+                ..Default::default()
+            });
+            let event = updates.recv().await.unwrap();
+            let mut chat = vec![];
+            super::super::handle_update(
+                event.update,
+                event.origin,
+                &mut chat,
+                &mut String::new(),
+                &mut String::new(),
+                &mut None,
+                &mut None,
+                &mut false,
+                &mut bar,
+                &mut false,
+                None,
+                &mut None,
+            );
+            let slow = Slow::query(&mut runtime).await;
+            let state = live_status(
+                &runtime,
+                &ChatState {
+                    items: &chat,
+                    working: false,
+                    turn_step: "",
+                    token_bar: &bar,
+                },
+                &slow,
+            );
+            assert_eq!(state.context_tokens, Some(1234));
+            assert_eq!(state.context_window, 8192);
+            assert_eq!(state.session_tokens, None);
+            bar.sync_window(&runtime);
+            assert_eq!(bar.context_window, 8192);
+            // An incomplete stats response must not erase known context fields.
+            let partial = Slow {
+                stats: Some(loop_protocol::StatsSummary {
+                    total_tokens: 99,
+                    ..Default::default()
+                }),
+                ..slow
+            };
+            let state = live_status(
+                &runtime,
+                &ChatState {
+                    items: &chat,
+                    working: false,
+                    turn_step: "",
+                    token_bar: &bar,
+                },
+                &partial,
+            );
+            assert_eq!(
+                (
+                    state.session_tokens,
+                    state.context_tokens,
+                    state.context_window
+                ),
+                (Some(99), Some(1234), 8192)
+            );
+            runtime.shutdown().run().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod sandbox_summary_tests {
+    use super::sandbox_summary;
+    use loop_protocol::admin::SandboxChoice;
+
+    #[test]
+    fn the_sandbox_row_is_one_line() {
+        let off = SandboxChoice {
+            mode: "off".into(),
+            isolation: None,
+            runtime: None,
+        };
+        assert_eq!(sandbox_summary(off), "off");
+        let local = SandboxChoice {
+            mode: "local".into(),
+            isolation: Some("partial".into()),
+            runtime: Some("seatbelt".into()),
+        };
+        assert_eq!(sandbox_summary(local), "local · partial · seatbelt");
     }
 }

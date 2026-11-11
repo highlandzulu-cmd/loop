@@ -164,8 +164,17 @@ pub fn inside_workspace(path: &str, workspace: &Path) -> bool {
 }
 
 /// Canonicalise the longest existing ancestor of `path` and append the
-/// rest, rejecting `..` in the part that does not exist yet.
-fn resolve(path: &Path) -> Option<PathBuf> {
+/// rest, rejecting `..` in the part that does not exist yet. A dangling
+/// symlink is followed to its target, so a write through it lands where
+/// the result says.
+pub(crate) fn resolve(path: &Path) -> Option<PathBuf> {
+    resolve_at(path, 0)
+}
+
+/// Symlinks followed before giving up (the kernel's own limit is 40).
+const MAX_LINKS: usize = 40;
+
+fn resolve_at(path: &Path, links: usize) -> Option<PathBuf> {
     let mut existing = path.to_path_buf();
     let mut rest = Vec::new();
     loop {
@@ -175,6 +184,17 @@ fn resolve(path: &Path) -> Option<PathBuf> {
                 out.push(part);
             }
             return Some(out);
+        }
+        // A symlink whose target does not exist: resolve the target.
+        if let Ok(target) = std::fs::read_link(&existing) {
+            if links >= MAX_LINKS {
+                return None;
+            }
+            let mut next = existing.parent()?.join(target);
+            for part in rest.iter().rev() {
+                next.push(part);
+            }
+            return resolve_at(&next, links + 1);
         }
         let name = existing.file_name()?.to_owned();
         if name == ".." {

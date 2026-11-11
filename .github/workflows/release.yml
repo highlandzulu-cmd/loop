@@ -38,16 +38,34 @@ on:
         type: string
         required: false
 
+# Least privilege: the build jobs only read the repo. Only the `release` job
+# can write (it creates the GitHub Release).
 permissions:
-  contents: write
+  contents: read
+
+# Two runs for one ref must not race (for example a tag push and a manual
+# run). Never cancel a release that has started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+
+# Action versions are pinned to commit SHAs (the comment gives the tag).
+# dependabot.yml opens PRs to move them.
+#
+# Cache note: a tag run cannot restore the cache of an older tag run (caches
+# are per ref, plus the default branch), so saving from tags only filled the
+# 10 GB repo limit and added about 45 s per macOS job. The build jobs save a
+# cache only on main. To get a warm release build, run this workflow by hand
+# on main first (a dry run: leave "create_release" unchecked).
 
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -55,34 +73,31 @@ jobs:
           # Ubuntu 22.04 (glibc 2.35) so GNU binaries run on 22.04+ (not only 24.04).
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            archive: tar.gz
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            archive: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            archive: tar.gz
             sign: true
           - os: macos-14
             target: x86_64-apple-darwin
-            archive: tar.gz
             sign: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: ${{ matrix.target }}-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         run: cargo build -p loop-cli --release --locked --target ${{ matrix.target }}
@@ -189,7 +204,6 @@ jobs:
       # ── end macOS signing ──────────────────────────────────────────
 
       - name: Package (Unix)
-        if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           set -euo pipefail
@@ -203,31 +217,20 @@ jobs:
           echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
           echo "CHECKSUM=${staging}.tar.gz.sha256" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $staging = "loop-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/loop.exe" "$staging/loop.exe"
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "$staging.zip.sha256" -Value "$hash  $staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CHECKSUM=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: loop-${{ matrix.target }}
           path: |
             ${{ env.ASSET }}
             ${{ env.CHECKSUM }}
           if-no-files-found: error
+          compression-level: 0
 
   build-desktop:
     name: Build Desktop (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -235,28 +238,24 @@ jobs:
           # Ubuntu 22.04 (glibc 2.35) so GNU binaries run on 22.04+ (not only 24.04).
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            archive: tar.gz
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            archive: tar.gz
           - os: macos-14
             target: aarch64-apple-darwin
-            archive: tar.gz
             sign: true
           - os: macos-14
             target: x86_64-apple-darwin
-            archive: tar.gz
             sign: true
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            archive: zip
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust (nightly for GPUI)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: nightly
           targets: ${{ matrix.target }}
 
       - name: Install Linux dependencies
@@ -268,9 +267,10 @@ jobs:
             libwayland-dev libvulkan-dev
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           key: desktop-${{ matrix.target }}-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release
         env:
@@ -355,7 +355,6 @@ jobs:
         run: security delete-keychain "$KEYCHAIN" 2>/dev/null || true
 
       - name: Package (Unix)
-        if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           set -euo pipefail
@@ -369,47 +368,42 @@ jobs:
           echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
           echo "CHECKSUM=${staging}.tar.gz.sha256" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
-        run: |
-          $staging = "loop-desktop-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/loop-desktop.exe" "$staging/loop-desktop.exe"
-          Compress-Archive -Path $staging -DestinationPath "$staging.zip"
-          $hash = (Get-FileHash "$staging.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content -Path "$staging.zip.sha256" -Value "$hash  $staging.zip"
-          "ASSET=$staging.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          "CHECKSUM=$staging.zip.sha256" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
       - name: Upload build artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: loop-desktop-${{ matrix.target }}
           path: |
             ${{ env.ASSET }}
             ${{ env.CHECKSUM }}
           if-no-files-found: error
+          compression-level: 0
 
   release:
     name: Publish GitHub Release
     needs: [build, build-desktop]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
     if: >
       startsWith(github.ref, 'refs/tags/v') ||
       (github.event_name == 'workflow_dispatch' && inputs.create_release)
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Resolve tag
         id: tag
         shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag_name }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
             tag="${GITHUB_REF#refs/tags/}"
           else
-            tag="${{ inputs.tag_name }}"
+            tag="$INPUT_TAG"
             if [[ -z "$tag" ]]; then
               echo "tag_name is required when create_release is true" >&2
               exit 1
@@ -424,10 +418,12 @@ jobs:
 
       - name: Check workspace version matches tag
         shell: bash
+        env:
+          TAG_VERSION: ${{ steps.tag.outputs.version }}
         run: |
           set -euo pipefail
           cargo_version="$(grep -E '^version\s*=' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
-          tag_version="${{ steps.tag.outputs.version }}"
+          tag_version="$TAG_VERSION"
           if [[ "$cargo_version" != "$tag_version" ]]; then
             echo "Cargo.toml version ($cargo_version) does not match tag version ($tag_version)." >&2
             echo "Bump [workspace.package] version in Cargo.toml before tagging." >&2
@@ -435,7 +431,7 @@ jobs:
           fi
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
@@ -444,7 +440,7 @@ jobs:
         run: ls -la dist/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Loop ${{ steps.tag.outputs.tag }}
@@ -453,6 +449,5 @@ jobs:
           files: |
             dist/*
             install.sh
-            install.ps1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
