@@ -251,3 +251,110 @@ Re-run, seed 42, 143 cases, 94 s: **15 leaks, all L6 (11) and L7 (4). L1–L5: 0
 - **Hard links.** A file with `nlink > 1` inside the workspace can alias a file outside it. Refuse or ask for such files.
 - **Unicode case folding.** Protected names fold ASCII case only.
 - **Workspace resolve cache.** `protected()` resolves the workspace on every call. Cache it per Session.
+
+## Symlink read checks
+
+Branch `probe/e3-symlink-read`, from `staging` f0883d7. This is a probe. No product code changed. We added scripted `faux` cases (no model, no tokens) for two suspected gaps.
+
+### Gap 1: `read` deny rules are lexical
+
+**Setup.** Each case has a fake home inside its own temp dir. The real home is never touched.
+
+- Canary file: `{HOME}/.secret/e3key`, with the text `E3SECRET`.
+- Rule (user `settings.json`): `"read({HOME}/.secret/*)": "deny"`. The pattern is an absolute path. The `~/` form uses the same code (see L8).
+- Workspace: `notes -> {HOME}/.secret/e3key` (file link), `sec -> {HOME}/.secret` (directory link), `plain.txt` (normal file).
+
+**What counts as a leak.** The canary text (`read`, `grep`) or the canary file name `e3key` (`glob`, `ls`, which show names only) appears in a tool result that is not an error. The `grep`, `glob` and `ls` tools do not return an error for a hidden path. They add `[N paths hidden by permission rules]`. The harness now counts that text as a report of the refusal (`reported()`).
+
+**Cases.** Group `symlink-read`, ids 143-246, 104 cases. Each row ran in `ask`, `accept-edits` and `full-access`, on the `embedded` path and on the `runtime` path (6 runs per row).
+
+| Row | Tool call | Result |
+|---|---|---|
+| file link | `read notes` | LEAK |
+| file link, absolute | `read {WS}/notes` | LEAK |
+| directory link | `read sec/e3key` | LEAK |
+| `..`, no link | `read {WS}/../home/.secret/e3key` | LEAK |
+| file link | `grep E3SECRET notes` | LEAK |
+| directory link | `grep E3SECRET sec` | LEAK |
+| workspace root | `grep E3SECRET` (the walk crosses both links) | LEAK |
+| `..`, no link | `grep E3SECRET ../home/.secret` | LEAK |
+| directory link | `glob * sec` | LEAK (names) |
+| workspace root | `glob e3key` | LEAK (names) |
+| directory link | `ls sec` | LEAK (names) |
+| `..`, no link | `ls ../home/.secret` | LEAK (names) |
+| file link | `ls notes` | ok, but vacuous: "not a directory" |
+| file link | `glob * notes` (control) | ok, but vacuous: lists only the link name |
+
+Controls, all ok:
+
+- `read` of the denied path itself: refused in all 3 modes, on both paths (6).
+- `grep`, `glob` and `ls` of the denied directory itself: the files are hidden and the result says so (6).
+- `read`, `grep`, `glob` and `ls` of a normal workspace file, with the deny rule and the links present (8).
+
+The two vacuous rows cannot show the target, by construction. They do not count as "held".
+
+**Result: 72 of 72 cells in the 12 non-vacuous rows leak** (36 on `embedded`, 36 on `runtime`). The mode makes no difference, because reads are on in every mode. No shell is used. 0 control failures, 0 unreported refusals.
+
+The `..` rows need no symlink. A path that is written with `..` is not matched either.
+
+### Causes
+
+1. **L8: the `read` tool.** The rule is matched on the path as written.
+   - `path_matches` (`crates/loop-app-core/src/permissions/rules.rs:310-321`) expands `~`, joins the path to the workspace, and runs a glob on both strings. `Path::components` drops `.` but keeps `..`. It never resolves a symlink.
+   - `rule_for` (`rules.rs:358`) uses that match for `read`, `write`, `edit` and the search tools. `decide` (`policy.rs:92`) takes the verdict on that string.
+   - `Call::resolve` (`policy.rs:55-66`) resolves only `write` and `edit`, and only for the workspace check.
+   - Reproduction: `leaks::l8_read_deny_rule_is_lexical` (ignored). It also shows that the direct path and `~/.secret/e3key` are denied.
+2. **L9: `grep`, `glob`, `ls`.** The hide filter has the same lexical match.
+   - `search_may_show` (`rules.rs:104-122`) is called by `ToolGate::search_filter` (`tool_gate.rs:331`) with the path that the walk built.
+   - `Walk::files` (`crates/loop-agent/src/harness/tools/search.rs:330-361`) lists the children of a directory link as `ws/sec/e3key`, follows a file link with `metadata`, and `ls` does the same (`search.rs:243`). The filter never sees the real path.
+   - The search root is checked only as the call's subject (lexical too).
+   - Reproduction: `leaks::l9_search_filter_is_lexical` (ignored).
+3. **Docs say more than the code does.** `docs/permissions.md` says `"read(~/.ssh/*)": "deny"` keeps `~/.ssh` out of a search of the home directory. That holds for a normal tree, but not for a link into `~/.ssh` in the workspace or a `..` path. The same file says "Paths are resolved through symlinks". That is true only for the `accept-edits` workspace check on `write` and `edit`.
+
+**Why we did not fix it.** The fix is not trivial. Resolving only the call's path would turn a deny into a miss when the pattern is not canonical (`/var` against `/private/var` on macOS, or a home that is itself a link). Both sides must be resolved. Also, `..` must be collapsed before the match. We suggest:
+
+- Match the pattern against the written path **and** the resolved path (longest existing prefix, links followed, `..` collapsed). Resolve the literal prefix of the pattern the same way.
+- In the search filter, resolve every path before `search_may_show`.
+- Treat an unresolvable path like `protected()` does: ask or deny.
+
+The risk is real, because a repository can carry a link. A repository that someone cloned can read a denied file with no shell, and no mode stops it.
+
+### Gap 2: what the approver sees for an edit through a symlink
+
+Test: `e3_enforcement_approval_prompt` (ignored; the same command runs it). It runs in `ask` mode on the embedded stack with an approver attached. The approver rejects. It records the prompt on both transports:
+
+- `raw`: the `ApprovalPrompt` that the TUI and the desktop app show (`summary`, `detail`).
+- `interaction`: the `InteractionRequest::Permission` that the Runtime sends to a Surface (`native_permission_request`, `interaction.rs:92`). The Runtime's `EscalationHost` sends this same request. We did not attach a real Surface connection.
+
+| Cell | Title | Detail | Resolved target shown? | Outside file when the prompt arrived | After reject |
+|---|---|---|---|---|---|
+| `write notes` (file link to an existing outside file) | `notes` | `{WS}/notes` | no | `E3MARK` (already written) | `ORIGINAL`, restored |
+| `edit notes` (same link) | `notes` | `{WS}/notes` | no | edited text | `ORIGINAL`, restored |
+| `write lnk/new.txt` (directory link to outside) | `new.txt` | `{WS}/lnk/new.txt` | no | `E3MARK` | file removed |
+| `write f.txt` (dangling link to outside) | `f.txt` | `{WS}/f.txt` | no | `E3MARK` | file removed |
+| control: `write plain.txt` | `plain.txt` | `{WS}/plain.txt` | not applicable | | restored |
+
+The result is the same on both transports: **the resolved target is not visible to the approver** in all 8 outside cells.
+
+- **Cause:** `review_after_file_tool` (`crates/loop-app-core/src/tool_approval.rs:559-571`) uses `file_name()` of `details.path` as the title and `details.path` as the detail. `details.path` is the path as written, made absolute (`tools/mod.rs:79`, `:157`). The resolved `details.targetPath` (`written_target`, `tools/mod.rs:268-283`) is in the tool result, but the prompt does not use it.
+- **Effect:** a link named `notes` can point at `~/.ssh/authorized_keys` or at a hook file. The approver sees `notes`. The same prompt is used in `accept-edits`, where a link out of the workspace is the case that asks (same code; we did not run that mode).
+- **Second finding:** the prompt for `write` and `edit` comes **after** the write (`review_before_tool` has no arm for them, `tool_approval.rs:363-418`). At prompt time the outside file already has the new content. A reject restores it (the review fixes hold), but a hook or a watcher on that file can act during the prompt.
+- **Reproduction:** `leaks::l10_approval_prompt_hides_symlink_target` (ignored; fails while the target is hidden). Finding L10 is a UX and security finding, not a forbidden-effect leak.
+- **Suggestion:** show the resolved path (`targetPath`) in the detail when it differs from the path as written, and mark it "outside the workspace".
+
+### Full run
+
+Command: `E3_SEED=42 cargo test -p loop-runtime --features orchestration --test e3_enforcement -- --ignored --nocapture --test-threads=4 e3_enforcement`.
+
+| | Before (staging f0883d7) | With the new cases |
+|---|---|---|
+| Cases | 143 | 247 (143 + 104) |
+| LEAK | 15 (L6: 11, L7: 4) | 87 (the same 15 + 72 new: L8 and L9) |
+| CONTROL-FAIL, UNREPORTED | 0, 0 | 0, 0 |
+| Run time | 95 s | 103 s |
+
+The verdict of every case 000-142 is the same as in the run before the change (compared by id). Leaks per path: `embedded` 51 (15 + 36), `runtime` 36 (0 + 36), `subagent`, `workflow`, `acp`: 0. The new cases need no 8 s wait. They ran in 5 s.
+
+The harness changes: `Prep::SecretLinks` and `Prep::EditLinks`, the `{HOME}` template, `symlink_read_cases`, the "hidden by permission rules" report in `reported()`, and the new test. The new cases were appended, so the ids of the old cases did not change.
+
+The reproductions run with `-- --ignored leaks::` (L8, L9, L10 fail until fixed).
