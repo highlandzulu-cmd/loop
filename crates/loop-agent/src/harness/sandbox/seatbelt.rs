@@ -1019,6 +1019,10 @@ impl FileSystem for JailedHostFs {
 #[cfg(unix)]
 #[async_trait]
 impl Shell for JailedHostFs {
+    fn sandboxed(&self) -> bool {
+        true
+    }
+
     async fn exec(
         &self,
         command: &str,
@@ -1401,6 +1405,10 @@ impl FileSystem for SeatbeltEnv {
 #[cfg(unix)]
 #[async_trait]
 impl Shell for SeatbeltEnv {
+    fn sandboxed(&self) -> bool {
+        true
+    }
+
     async fn exec(&self, c: &str, mut o: ShellExecOptions) -> Result<ShellOutput, ExecutionError> {
         {
             let mut active = self.active.lock();

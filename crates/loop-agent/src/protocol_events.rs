@@ -162,6 +162,12 @@ impl NativeEventMapper {
             None => (StopReason::EndTurn, None),
         };
         self.last_assistant = None;
+        if stop == StopReason::MaxTokens {
+            updates.push(SessionUpdate::Notice {
+                level: NoticeLevel::Warning,
+                text: "The model stopped at its output limit; the answer may be incomplete.".into(),
+            });
+        }
         updates.push(SessionUpdate::TurnEnded {
             turn_id,
             stop,

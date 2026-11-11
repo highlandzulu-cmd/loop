@@ -8,6 +8,8 @@ use serde_json::Value;
 
 use super::Call;
 use crate::hooks_load::glob_match;
+pub use loop_agent::harness::tools::shell::split_command;
+use loop_agent::harness::tools::shell::split_words;
 
 /// Per-tool default from `~/.loop/agent/settings.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,50 +123,6 @@ pub fn search_may_show(
     })
 }
 
-/// The parts of a shell command, split at `;`, `&&`, `||`, `|`, `&` and
-/// newlines outside quotes. `None` when it substitutes commands (`$(…)`,
-/// backticks, `<(…)`) or has unbalanced quotes.
-pub fn split_command(command: &str) -> Option<Vec<String>> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let (mut single, mut double) = (false, false);
-    let mut chars = command.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            // An escaped character never opens a quote or ends a part, as
-            // in the shell (and in `words`).
-            '\\' if !single => {
-                current.push(c);
-                current.extend(chars.next());
-                continue;
-            }
-            '\'' if !double => single = !single,
-            '"' if !single => double = !double,
-            '`' if !single => return None,
-            '$' | '<' | '>' if !single && chars.peek() == Some(&'(') => return None,
-            ';' | '\n' | '&' | '|' if !single && !double => {
-                if matches!(chars.peek(), Some('&' | '|')) {
-                    chars.next();
-                }
-                parts.push(std::mem::take(&mut current));
-                continue;
-            }
-            _ => {}
-        }
-        current.push(c);
-    }
-    if single || double {
-        return None;
-    }
-    parts.push(current);
-    let parts: Vec<String> = parts
-        .into_iter()
-        .map(|p| p.trim().to_owned())
-        .filter(|p| !p.is_empty())
-        .collect();
-    (!parts.is_empty()).then_some(parts)
-}
-
 /// Commands `read-only` runs: they print what they read and change nothing
 /// (with the options [`read_only_part`] refuses).
 const READ_ONLY_COMMANDS: &[&str] = &[
@@ -206,39 +164,6 @@ fn words(part: &str) -> Option<Vec<String>> {
 /// `rm`. Deny and ask patterns match this as well as the part as written.
 fn normalise(part: &str) -> String {
     split_words(part, true).unwrap_or_default().join(" ")
-}
-
-/// [`words`], keeping `>` as a character when `redirects` is true.
-fn split_words(part: &str, redirects: bool) -> Option<Vec<String>> {
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let (mut single, mut double, mut started) = (false, false, false);
-    let mut chars = part.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if !double => {
-                single = !single;
-                started = true;
-            }
-            '"' if !single => {
-                double = !double;
-                started = true;
-            }
-            '\\' if !single => current.extend(chars.next()),
-            '>' if !single && !double && !redirects => return None,
-            c if c.is_whitespace() && !single && !double => {
-                if started || !current.is_empty() {
-                    words.push(std::mem::take(&mut current));
-                }
-                started = false;
-            }
-            c => current.push(c),
-        }
-    }
-    if started || !current.is_empty() {
-        words.push(current);
-    }
-    Some(words)
 }
 
 fn read_only_part(words: &[String]) -> bool {

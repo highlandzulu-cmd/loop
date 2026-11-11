@@ -1,8 +1,10 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
+mod command_policy;
 mod file_mutation_queue;
 mod plan;
 mod search;
+pub mod shell;
 mod todo;
 #[cfg(feature = "web")]
 pub mod web;
@@ -13,6 +15,7 @@ use std::sync::Arc;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
+pub use command_policy::check_command_policy;
 pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
 pub use search::{
     create_glob_tool, create_grep_tool, create_ls_tool, search_tools_with_filter, SearchFilter,
@@ -25,6 +28,64 @@ use crate::harness::types::{ExecutionEnv, FileErrorCode, FileIdentity, ShellExec
 use crate::harness::utils::{execute_shell_with_capture, truncate_head, DEFAULT_MAX_BYTES};
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{ImageContent, TextContent, ToolResultContent};
+
+/// Added to permission-denied errors from file writes and shell commands, so
+/// the agent fixes the mode instead of working on a copy elsewhere.
+pub const PERMISSION_DENIED_HINT: &str = "Hint: the file is not writable. If it is clearly \
+yours to change, run `chmod u+w <file>` and retry; otherwise say you could not change it. \
+Do not edit a copy elsewhere.";
+
+/// A failed file write as tool error text: a permission error on a file
+/// (not a sandbox refusal, which `chmod` cannot fix) carries
+/// [`PERMISSION_DENIED_HINT`], whichever environment raised it.
+fn write_error(error: crate::harness::types::FileError) -> String {
+    let text = error.to_string();
+    if error.code == FileErrorCode::PermissionDenied
+        && !text.contains(PERMISSION_DENIED_HINT)
+        && !text.contains("sandbox")
+    {
+        format!("{text}. {PERMISSION_DENIED_HINT}")
+    } else {
+        text
+    }
+}
+
+/// Whether failed bash output shows a file write refused by its mode, which
+/// [`PERMISSION_DENIED_HINT`] can fix: a redirect or `cannot create` from
+/// the shell, a refused `cp`/`mv`/`tee`/`touch`/`sed`, or a read-only file
+/// system. Not in a sandbox (where `chmod` does not help), and not for other
+/// refusals such as `Permission denied (publickey)`.
+fn bash_permission_hint(output: &str, exit_code: i32, sandboxed: bool) -> bool {
+    const WRITERS: &[&str] = &[
+        "bash:",
+        "sh:",
+        "zsh:",
+        "/bin/sh:",
+        "/bin/bash:",
+        "dash:",
+        "cp:",
+        "mv:",
+        "tee:",
+        "touch:",
+        "sed:",
+        "install:",
+        "ln:",
+        "mkdir:",
+    ];
+    if exit_code == 0 || sandboxed {
+        return false;
+    }
+    output.lines().any(|line| {
+        let line = line.trim().to_lowercase();
+        line.contains("read-only file system")
+            || (line.contains("permission denied")
+                && !line.contains("publickey")
+                && (line.contains("cannot create")
+                    || WRITERS
+                        .iter()
+                        .any(|w| line.starts_with(w) || line.starts_with(&w.replace(':', "")))))
+    })
+}
 
 pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
@@ -145,7 +206,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             unified_diff(&String::from_utf8_lossy(&previous), &content, &abs);
                         env.write_file(&abs, content.as_bytes())
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(write_error)?;
                         let (target_path, created_identity) =
                             written_target(env.as_ref(), &abs, created).await;
                         Ok(AgentToolResult {
@@ -222,7 +283,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(write_error)?;
                         let (target_path, _) = written_target(env.as_ref(), &abs, false).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
@@ -360,46 +421,6 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
     out
 }
 
-/// Default patterns that are always blocked regardless of user configuration.
-const DEFAULT_BLOCKED_PATTERNS: &[&str] = &[
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "mkfs.",
-    ":(){ :|:& };:",
-    "> /dev/sda",
-    "dd if=/dev/zero of=/dev/",
-    "chmod -r 777 /",
-    "chown -r",
-    "format c:",
-];
-
-/// Check a command against the blocklist. Returns `Err` with a rejection message
-/// if the command matches a blocked pattern.
-pub fn check_command_policy(command: &str, extra_blocked: &[String]) -> Result<(), String> {
-    let lower = command.to_lowercase();
-    let trimmed = lower.trim();
-
-    for pattern in DEFAULT_BLOCKED_PATTERNS {
-        if trimmed.contains(pattern) {
-            return Err(format!(
-                "Command blocked by safety policy: matches blocked pattern `{pattern}`"
-            ));
-        }
-    }
-
-    for pattern in extra_blocked {
-        let pat_lower = pattern.to_lowercase();
-        if trimmed.contains(&pat_lower) {
-            return Err(format!(
-                "Command blocked by safety policy: matches custom blocked pattern `{pattern}`"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
 /// Create a bash tool bound to `env`.
 pub fn create_bash_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     create_bash_tool_with_prepare(env, None)
@@ -523,6 +544,7 @@ pub fn create_bash_tool_with(
                         });
                     }));
                 }
+                let sandboxed = env.sandboxed();
                 let captured = execute_shell_with_capture(env, &command, options, None)
                     .await
                     .map_err(|e| {
@@ -537,9 +559,14 @@ pub fn create_bash_tool_with(
                             e
                         }
                     })?;
+                let mut text = captured.text.clone();
+                if bash_permission_hint(&text, captured.exit_code, sandboxed) {
+                    text.push_str("\n\n");
+                    text.push_str(PERMISSION_DENIED_HINT);
+                }
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
-                        text: captured.text.clone(),
+                        text,
                         text_signature: None,
                     })],
                     details: json!({
@@ -597,5 +624,49 @@ mod bash_limit_tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
         assert!(err.contains("pass timeoutMs (at most 120000)"), "{err}");
         assert!(tool.parameters["properties"]["timeoutMs"].is_object());
+    }
+}
+
+#[cfg(test)]
+mod write_error_tests {
+    use super::*;
+    use crate::harness::types::FileError;
+
+    #[test]
+    fn permission_errors_get_the_hint_once_and_sandbox_refusals_none() {
+        let denied = |m: &str| FileError::new(FileErrorCode::PermissionDenied, m);
+        assert!(write_error(denied("Permission denied (os error 13)")).contains("chmod u+w"));
+        let hinted = write_error(denied(&format!("denied. {PERMISSION_DENIED_HINT}")));
+        assert_eq!(hinted.matches("chmod u+w").count(), 1, "{hinted}");
+        assert!(!write_error(denied("sandbox denies access to /etc/x")).contains("chmod"));
+        assert!(!write_error(FileError::new(FileErrorCode::Io, "disk full")).contains("chmod"));
+    }
+}
+
+#[cfg(test)]
+mod bash_hint_tests {
+    use super::*;
+
+    #[test]
+    fn only_write_failures_outside_a_sandbox_get_the_hint() {
+        for text in [
+            "bash: line 1: ro.txt: Permission denied",
+            "zsh:1: permission denied: ro.txt",
+            "sh: 1: cannot create ro.txt: Permission denied",
+            "touch: x: Read-only file system",
+            "sed: couldn't open temporary file ./sedX: Permission denied",
+            "cp: ro.txt: Permission denied",
+        ] {
+            assert!(bash_permission_hint(text, 1, false), "{text}");
+            assert!(!bash_permission_hint(text, 1, true), "sandboxed: {text}");
+            assert!(!bash_permission_hint(text, 0, false), "exit 0: {text}");
+        }
+        for text in [
+            "git@github.com: Permission denied (publickey).",
+            "ls: /root: Permission denied",
+            "error: could not compile",
+        ] {
+            assert!(!bash_permission_hint(text, 1, false), "{text}");
+        }
     }
 }

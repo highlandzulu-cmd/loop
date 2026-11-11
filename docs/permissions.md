@@ -115,6 +115,12 @@ Codex runs some commands without asking: read-only commands in `read-only` mode,
 - **ChatGPT (Codex) in `ask` mode** runs in Codex's `read-only` mode, so it asks before each edit. Before, it ran in Codex's own default, which edits without asking.
 - **A project's `.loop/settings.json`** can no longer loosen `toolPermissions` or `fileEditReview`.
 
+## `bash` block list
+
+Some `bash` commands are refused in every mode, `full-access` included: recursive `rm`, `chmod`, `chown` and `chgrp` on `/`, your home directory (`~`, `$HOME` or its path) or a top-level system directory (`/usr`, `/etc`, `/Users`, …), and `mkfs`, a fork bomb, `dd` onto a disk device, `> /dev/sda` and `format c:`. Loop also checks scripts given to `sh -c`, `su -c`, `eval`, `ssh`, a here-string or a shell's stdin. `rm -rf /tmp/x`, `rm -rf ./build` and `chmod -R u+w ./src` run.
+
+The block list is a best-effort guard against accidents, **not a security boundary**. It reads the command as text, so it misses what programs, variables and scripts do: `find / -delete`, `xargs rm -rf`, `rm -rf "$DIR"` and `cd / && rm -rf *` all pass. The boundary is the sandbox and the permission rules above: deny rules, modes and hooks.
+
 ## `bash` time limits
 
 A `bash` call may pass `timeoutMs` to get more time than the default. A command that times out tells the model how to ask for more.

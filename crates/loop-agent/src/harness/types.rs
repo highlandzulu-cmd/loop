@@ -288,6 +288,12 @@ pub trait FileSystem: Send + Sync {
 /// Shell capability.
 #[async_trait]
 pub trait Shell: Send + Sync {
+    /// Whether commands run in a sandbox, where a permission error is the
+    /// sandbox's refusal rather than a file mode.
+    fn sandboxed(&self) -> bool {
+        false
+    }
+
     /// Execute a command string via the system shell.
     async fn exec(
         &self,
