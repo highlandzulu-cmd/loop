@@ -94,7 +94,10 @@ impl Scope {
     pub fn contains(&self, call: &Call) -> bool {
         match self {
             Self::Workspace => {
-                call.inside_workspace && call.path().is_some_and(|path| !protected(path))
+                call.inside_workspace
+                    && call
+                        .path()
+                        .is_some_and(|path| !protected(path, &call.workspace))
             }
             Self::ReadOnlyCommands => {
                 call.tool == "bash"
@@ -122,16 +125,33 @@ impl Scope {
 }
 
 /// Paths `accept-edits` still asks about: version control, Loop's own
-/// settings and environment files.
-fn protected(path: &str) -> bool {
+/// settings and environment files. Both the path as written and the path
+/// it resolves to (symlinks followed) are checked, ignoring case, since
+/// macOS and Windows disks ignore case (`.GIT` is `.git`).
+fn protected(path: &str, workspace: &std::path::Path) -> bool {
     use std::path::{Component, Path};
-    let path = Path::new(path);
-    path.components()
-        .any(|c| matches!(c, Component::Normal(name) if name == ".git" || name == ".loop"))
-        || path
+    let check = |path: &Path| {
+        path.components().any(|c| {
+            matches!(c, Component::Normal(name)
+                if name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".loop"))
+        }) || path
             .file_name()
             .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with(".env"))
+            .is_some_and(|n| n.to_ascii_lowercase().starts_with(".env"))
+    };
+    let written = Path::new(path);
+    if check(written) {
+        return true;
+    }
+    match super::policy::resolve(&workspace.join(written)) {
+        // Only the part below the workspace counts: a workspace that
+        // itself sits under a `.git` directory is not protected.
+        Some(real) => {
+            let root = super::policy::resolve(workspace).unwrap_or_default();
+            check(real.strip_prefix(&root).unwrap_or(&real))
+        }
+        None => true,
+    }
 }
 
 /// The state of one Capability: `state`, or `within`'s state for calls in
