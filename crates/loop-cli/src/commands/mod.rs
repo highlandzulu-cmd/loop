@@ -284,6 +284,18 @@ pub fn parse_command(line: &str) -> Option<ParsedCommand> {
     Some(ParsedCommand { name, args })
 }
 
+/// True when `cmd` represents a command (built-in, explicit skill invocation, or
+/// registered skill / prompt template), or is command-shaped (contains no `/`).
+///
+/// If a line starts with `/` and its command token contains a `/` without matching
+/// a registered command, it is treated as a file path rather than a slash command.
+pub fn is_command(cmd: &ParsedCommand, skill_names: &[String], template_names: &[String]) -> bool {
+    !cmd.name.contains('/')
+        || cmd.name.starts_with("skill:")
+        || skill_names.iter().any(|s| s == &cmd.name)
+        || template_names.iter().any(|t| t == &cmd.name)
+}
+
 pub use loop_app_core::sandbox_builder::parse_local_sandbox_flags;
 
 /// Shared command side-effect messages for the UI.

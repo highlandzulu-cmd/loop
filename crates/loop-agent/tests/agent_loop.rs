@@ -226,3 +226,207 @@ async fn run_budget_ends_a_stalled_generation_without_user_abort() {
     assert!(events.iter().any(|event| matches!(event, AgentEvent::MessageEnd { message } if message.as_assistant().is_some_and(|m| m.stop_reason == loop_ai::StopReason::Error && m.error_message.as_deref().is_some_and(|e| e.contains("run_budget"))))));
     assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
 }
+
+/// A text response that stops on the output limit (`max_tokens`).
+fn length_stop(model: &loop_ai::Model, text: &str) -> FauxResponse {
+    length_stop_with(model, text, 100, None)
+}
+
+/// [`length_stop`] with `output` tokens and a provider stop reason.
+fn length_stop_with(
+    model: &loop_ai::Model,
+    text: &str,
+    output: u64,
+    raw_stop_reason: Option<&str>,
+) -> FauxResponse {
+    use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
+    let mut message = AssistantMessage::pending(model);
+    message.usage.output = output;
+    message.usage.total_tokens = output;
+    message.raw_stop_reason = raw_stop_reason.map(str::to_owned);
+    message
+        .content
+        .push(AssistantContent::Text(loop_ai::TextContent {
+            text: text.into(),
+            text_signature: None,
+        }));
+    message.stop_reason = StopReason::Length;
+    FauxResponse::Events(vec![
+        AssistantMessageEvent::Start {
+            partial: AssistantMessage::pending(model),
+        },
+        AssistantMessageEvent::Done {
+            reason: StopReason::Length,
+            message,
+        },
+    ])
+}
+
+async fn run_script(build: impl FnOnce(&loop_ai::Model) -> Vec<FauxResponse>) -> Vec<AgentMessage> {
+    let script = FauxScript::new();
+    let (models, model) = setup_faux(script.clone());
+    script.extend(build(&model));
+    let stream_fn = stream_fn_from_models(Arc::new(models));
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: None,
+    };
+    let emit = Arc::new(|_ev: AgentEvent| {
+        Box::pin(async {}) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    });
+    run_agent_loop(
+        vec![AgentMessage::user_text("write it all")],
+        context,
+        AgentLoopConfig::new(model),
+        emit,
+        None,
+        Some(stream_fn),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_length_stop_without_tool_calls_asks_the_model_to_continue() {
+    let msgs = run_script(|m| {
+        vec![
+            length_stop(m, "part one"),
+            FauxResponse::Text("part two".into()),
+        ]
+    })
+    .await;
+    let assistants: Vec<_> = msgs.iter().filter_map(AgentMessage::as_assistant).collect();
+    assert_eq!(assistants.len(), 2, "{msgs:?}");
+    assert_eq!(assistants[1].stop_reason, loop_ai::StopReason::Stop);
+    // One continuation prompt between the two answers.
+    let users = msgs.iter().filter(|m| m.role() == "user").count();
+    assert_eq!(users, 2, "the prompt and one continuation: {msgs:?}");
+}
+
+#[tokio::test]
+async fn length_continuations_stop_after_three() {
+    let msgs = run_script(|m| {
+        (0..6)
+            .map(|i| length_stop(m, &format!("part {i}")))
+            .collect()
+    })
+    .await;
+    let assistants: Vec<_> = msgs.iter().filter_map(AgentMessage::as_assistant).collect();
+    assert_eq!(
+        assistants.len(),
+        4,
+        "the first answer and three continuations"
+    );
+    assert_eq!(
+        assistants.last().unwrap().stop_reason,
+        loop_ai::StopReason::Length
+    );
+}
+
+/// Every progress update of a tool reaches listeners before its end, so a
+/// surface never shows a finished call as running again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_updates_arrive_before_the_tool_end() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::ToolCalls(vec![ToolCall {
+        id: "c1".into(),
+        name: "chatty".into(),
+        arguments: json!({}),
+        thought_signature: None,
+    }]));
+    script.push(FauxResponse::Text("done".into()));
+    let (models, model) = setup_faux(script);
+    let stream_fn = stream_fn_from_models(Arc::new(models));
+    let tool = AgentTool::simple(
+        "chatty",
+        "Chatty",
+        "chatty",
+        json!({"type":"object","properties":{}}),
+        |_id, _args, _c, on_update| async move {
+            if let Some(on_update) = on_update {
+                for i in 0..200 {
+                    on_update(AgentToolResult::text(format!("line {i}")));
+                }
+            }
+            Ok(AgentToolResult::text("finished"))
+        },
+    );
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: Some(vec![tool]),
+    };
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let emit = Arc::new(move |ev: AgentEvent| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move {
+            // A listener that takes a moment per update (a broadcast, a
+            // session write) must still see them all before the end.
+            if ev.type_name() == "tool_execution_update" {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            sink.lock().push(ev.type_name().to_string());
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    });
+    run_agent_loop(
+        vec![AgentMessage::user_text("go")],
+        context,
+        AgentLoopConfig::new(model),
+        emit,
+        None,
+        Some(stream_fn),
+    )
+    .await
+    .unwrap();
+    let types = events.lock().clone();
+    let end = types
+        .iter()
+        .position(|t| t == "tool_execution_end")
+        .expect("tool end");
+    assert!(
+        !types[end..].iter().any(|t| t == "tool_execution_update"),
+        "an update came after the tool end: {types:?}"
+    );
+    // Only the latest waiting update is kept: a slow listener does not build
+    // a queue of all 200.
+    let updates = types
+        .iter()
+        .filter(|t| *t == "tool_execution_update")
+        .count();
+    assert!(
+        updates < 200,
+        "{updates} updates queued behind a slow listener"
+    );
+}
+
+#[tokio::test]
+async fn a_context_overflow_is_not_continued() {
+    // No output at all: the prompt filled the context window.
+    let msgs = run_script(|m| {
+        vec![
+            length_stop_with(m, "", 0, None),
+            FauxResponse::Text("no".into()),
+        ]
+    })
+    .await;
+    assert_eq!(
+        msgs.iter().filter_map(AgentMessage::as_assistant).count(),
+        1,
+        "{msgs:?}"
+    );
+    // The provider says the context window is full.
+    let msgs = run_script(|m| {
+        vec![
+            length_stop_with(m, "part", 100, Some("model_context_window_exceeded")),
+            FauxResponse::Text("no".into()),
+        ]
+    })
+    .await;
+    assert_eq!(
+        msgs.iter().filter_map(AgentMessage::as_assistant).count(),
+        1,
+        "{msgs:?}"
+    );
+}

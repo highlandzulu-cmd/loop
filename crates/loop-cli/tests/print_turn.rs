@@ -306,3 +306,113 @@ async fn the_turn_is_saved_before_print_returns() {
         .collect();
     assert_eq!(roles, ["user", "assistant"]);
 }
+
+/// A text response that stops on the output limit (`max_tokens`).
+fn length_stop(text: &str) -> FauxResponse {
+    use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
+    let model = Models::new();
+    model.set_provider(faux_provider(FauxScript::new()));
+    let model = model.get_model("faux", "faux-model").unwrap();
+    let mut message = AssistantMessage::pending(&model);
+    if !text.is_empty() {
+        message
+            .content
+            .push(AssistantContent::Text(loop_ai::TextContent {
+                text: text.into(),
+                text_signature: None,
+            }));
+    }
+    message.stop_reason = StopReason::Length;
+    message.usage.output = 100;
+    message.usage.total_tokens = 100;
+    FauxResponse::Events(vec![
+        AssistantMessageEvent::Start {
+            partial: AssistantMessage::pending(&model),
+        },
+        AssistantMessageEvent::Done {
+            reason: StopReason::Length,
+            message,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_on_the_output_limit_fails() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(
+        (0..4).map(|i| length_stop(&format!("part {i}"))).collect(),
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |_| {}).await;
+    assert_ne!(report.exit_code(), 0, "{report:?}");
+    let error = report.end.error().unwrap();
+    assert!(error.contains("output limit"), "{error}");
+}
+
+#[tokio::test]
+async fn a_turn_with_no_final_text_fails() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(vec![FauxResponse::Text(String::new())], true).await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |_| {}).await;
+    assert_ne!(report.exit_code(), 0, "{report:?}");
+    assert!(
+        report.end.error().unwrap().contains("no text"),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_continued_answer_prints_in_full() {
+    let backend = backend(
+        vec![
+            length_stop("part one "),
+            FauxResponse::Text("part two".into()),
+        ],
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let text = print_turn(backend.as_ref(), &session, "hi".into())
+        .await
+        .unwrap();
+    assert_eq!(text, "part one part two");
+}
+
+#[tokio::test]
+async fn a_tool_turn_with_an_empty_last_message_completes() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(
+        vec![
+            FauxResponse::ToolCalls(vec![ToolCall {
+                id: "c1".into(),
+                name: "missing_tool".into(),
+                arguments: json!({}),
+                thought_signature: None,
+            }]),
+            FauxResponse::Text(String::new()),
+        ],
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "go".into(), |_| {}).await;
+    assert_eq!(report.exit_code(), 0, "{report:?}");
+}
+
+#[tokio::test]
+async fn a_cut_answer_keeps_its_partial_text() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(
+        (0..4).map(|i| length_stop(&format!("part {i} "))).collect(),
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |_| {}).await;
+    assert_eq!(report.exit_code(), 1);
+    assert_eq!(report.text, "part 0 part 1 part 2 part 3 ");
+    assert_eq!(report.partial_text(), Some("part 0 part 1 part 2 part 3 "));
+}

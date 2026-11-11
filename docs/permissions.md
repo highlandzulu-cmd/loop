@@ -1,11 +1,11 @@
 # Permissions
 
-Every tool call Loop makes passes one check, whether it comes from the chat, `--print`, `mcp serve`, a `/workflow` task, or a subscription agent's permission request. The check runs in this order:
+Every tool call Loop makes passes one check, whether it comes from the chat, `--print`, `--serve-mcp`, a `/workflow` task, or a subscription agent's permission request. The check runs in this order:
 
 1. **Deny rules** (`toolPermissions` entries set to `deny`) and the `read-only` mode refuse the call.
 2. **Hooks** (`tool_call`) may block the call or allow it without asking. See [hooks](hooks.md).
 3. **The permission mode** allows the call or asks.
-4. **Asking**: the TUI and desktop app show a prompt. With nobody to ask (`--print`, `mcp serve`), the call is refused, and the model is told which flag or rule would allow it.
+4. **Asking**: the TUI and desktop app show a prompt. With nobody to ask (`--print`, `--serve-mcp`), the call is refused, and the model is told which flag or rule would allow it.
 
 ## Modes
 
@@ -21,7 +21,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **Protected names in `accept-edits`:** `.git`, `.loop` and `.env*` match without case (`.GIT` too), on the path as written and after symlinks are resolved. Only the part below the workspace counts. A path Loop cannot resolve asks.
 - **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
-- **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop mcp serve`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
+- **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop --serve-mcp`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
 - **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), `$(…)`, backticks, variable assignments, and options that write or run programs (`find -exec`/`-delete`, `sort -o`, `rg --pre`, `git --output`) are refused.
 - **MCP tools in `read-only`** run when their server marks them read-only (`readOnlyHint`). The server sets that hint, so deny a tool in `toolPermissions` if you don't trust it.
 - **Session approvals:** "Accept all … for this session" in a prompt stops further prompts for that group (file edits, bash or web) in this session, including after `--resume`.
@@ -51,8 +51,8 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **Switching:** `/permissions full-access` asks you to repeat the command before it switches.
 - **While on:** the footer shows a red `⚠ full access · tools run without approval` banner.
 - **Startup:** starting in this mode prints a warning.
-- **Unattended runs** (`--print`, `mcp serve`) need the flag `--permission-mode full-access`. The setting alone falls back to `ask` there, with a notice.
-- **`mcp serve` without `--token`:** it warns, because any local process could then run tools without approval.
+- **Unattended runs** (`--print`, `--serve-mcp`) need the flag `--permission-mode full-access`. The setting alone falls back to `ask` there, with a notice.
+- **`--serve-mcp` in this mode without `--mcp-token`:** it warns, because any local process could then run tools without approval.
 
 ## Rules
 
@@ -107,13 +107,19 @@ Codex runs some commands without asking: read-only commands in `read-only` mode,
 
 ## Upgrading from 0.4
 
-- **`--print` and `mcp serve` refuse tools that need approval.** In `ask` mode that is `write`, `edit` and `bash`. The model is told why. For unattended edits use `--permission-mode accept-edits`. Bash still needs `full-access` or an allow rule such as `"bash(cargo test*)": "allow"`.
+- **`--print` and `--serve-mcp` refuse tools that need approval.** In `ask` mode that is `write`, `edit` and `bash`. The model is told why. For unattended edits use `--permission-mode accept-edits`. Bash still needs `full-access` or an allow rule such as `"bash(cargo test*)": "allow"`.
 - **Resumed sessions ask too.** Before, `fileEditReview: newSession` (the default) turned prompts off after `--resume`. Now the mode decides; approvals you accepted for the session still apply.
 - **`fileEditReview: never`** turned off every prompt. With no `permissionMode` set, it now starts Loop in `accept-edits`, with a notice at each start; setting `permissionMode` removes the notice. `newSession` and `always` no longer change anything, and `/review` only shows the session's approvals.
 - **`web_fetch` and `web_search` are allowed by default.** A settings file that already says `ask` for them keeps asking. To be asked before each request, set `"web_fetch": "ask"` and `"web_search": "ask"` in `toolPermissions`.
 - **A hook file with a `tool_call` block and no `match`** now blocks every tool call. Loop warns about such files at startup.
 - **ChatGPT (Codex) in `ask` mode** runs in Codex's `read-only` mode, so it asks before each edit. Before, it ran in Codex's own default, which edits without asking.
 - **A project's `.loop/settings.json`** can no longer loosen `toolPermissions` or `fileEditReview`.
+
+## `bash` block list
+
+Some `bash` commands are refused in every mode, `full-access` included: recursive `rm`, `chmod`, `chown` and `chgrp` on `/`, your home directory (`~`, `$HOME` or its path) or a top-level system directory (`/usr`, `/etc`, `/Users`, …), and `mkfs`, a fork bomb, `dd` onto a disk device, `> /dev/sda` and `format c:`. Loop also checks scripts given to `sh -c`, `su -c`, `eval`, `ssh`, a here-string or a shell's stdin. `rm -rf /tmp/x`, `rm -rf ./build` and `chmod -R u+w ./src` run.
+
+The block list is a best-effort guard against accidents, **not a security boundary**. It reads the command as text, so it misses what programs, variables and scripts do: `find / -delete`, `xargs rm -rf`, `rm -rf "$DIR"` and `cd / && rm -rf *` all pass. The boundary is the sandbox and the permission rules above: deny rules, modes and hooks.
 
 ## `bash` time limits
 
