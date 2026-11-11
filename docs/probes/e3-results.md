@@ -302,11 +302,11 @@ The `..` rows need no symlink. A path that is written with `..` is not matched e
 1. **L8: the `read` tool.** The rule is matched on the path as written.
    - `path_matches` (`crates/loop-app-core/src/permissions/rules.rs:310-321`) expands `~`, joins the path to the workspace, and runs a glob on both strings. `Path::components` drops `.` but keeps `..`. It never resolves a symlink.
    - `rule_for` (`rules.rs:358`) uses that match for `read`, `write`, `edit` and the search tools. `decide` (`policy.rs:92`) takes the verdict on that string.
-   - `Call::resolve` (`policy.rs:55-66`) resolves only `write` and `edit`, and only for the workspace check.
+   - `Call::resolve` (`policy.rs:60-72`) resolves only `write` and `edit`, and only for the workspace check.
    - Reproduction: `leaks::l8_read_deny_rule_is_lexical` (ignored). It also shows that the direct path and `~/.secret/e3key` are denied.
 2. **L9: `grep`, `glob`, `ls`.** The hide filter has the same lexical match.
    - `search_may_show` (`rules.rs:104-122`) is called by `ToolGate::search_filter` (`tool_gate.rs:331`) with the path that the walk built.
-   - `Walk::files` (`crates/loop-agent/src/harness/tools/search.rs:330-361`) lists the children of a directory link as `ws/sec/e3key`, follows a file link with `metadata`, and `ls` does the same (`search.rs:243`). The filter never sees the real path.
+   - `Walk::files` (`crates/loop-agent/src/harness/tools/search.rs:330-361`) lists the children of a directory link as `ws/sec/e3key`, follows a file link with `metadata`, and `ls` does the same (`search.rs:239`). The filter never sees the real path.
    - The search root is checked only as the call's subject (lexical too).
    - Reproduction: `leaks::l9_search_filter_is_lexical` (ignored).
 3. **Docs say more than the code does.** `docs/permissions.md` says `"read(~/.ssh/*)": "deny"` keeps `~/.ssh` out of a search of the home directory. That holds for a normal tree, but not for a link into `~/.ssh` in the workspace or a `..` path. The same file says "Paths are resolved through symlinks". That is true only for the `accept-edits` workspace check on `write` and `edit`.
@@ -336,9 +336,9 @@ Test: `e3_enforcement_approval_prompt` (ignored; the same command runs it). It r
 
 The result is the same on both transports: **the resolved target is not visible to the approver** in all 8 outside cells.
 
-- **Cause:** `review_after_file_tool` (`crates/loop-app-core/src/tool_approval.rs:559-571`) uses `file_name()` of `details.path` as the title and `details.path` as the detail. `details.path` is the path as written, made absolute (`tools/mod.rs:79`, `:157`). The resolved `details.targetPath` (`written_target`, `tools/mod.rs:268-283`) is in the tool result, but the prompt does not use it.
+- **Cause:** `review_after_file_tool` (`crates/loop-app-core/src/tool_approval.rs:559-571`) uses `file_name()` of `details.path` as the title and `details.path` as the detail. `details.path` is the path as written, made absolute (`tools/mod.rs:157`, `:233`). The resolved `details.targetPath` (`written_target`, `tools/mod.rs:268-283`) is in the tool result, but the prompt does not use it.
 - **Effect:** a link named `notes` can point at `~/.ssh/authorized_keys` or at a hook file. The approver sees `notes`. The same prompt is used in `accept-edits`, where a link out of the workspace is the case that asks (same code; we did not run that mode).
-- **Second finding:** the prompt for `write` and `edit` comes **after** the write (`review_before_tool` has no arm for them, `tool_approval.rs:363-418`). At prompt time the outside file already has the new content. A reject restores it (the review fixes hold), but a hook or a watcher on that file can act during the prompt.
+- **Second finding:** the prompt for `write` and `edit` comes **after** the write (`review_before_tool` has no arm for them, `tool_approval.rs:363-420`). At prompt time the outside file already has the new content. A reject restores it (the review fixes hold), but a hook or a watcher on that file can act during the prompt.
 - **Reproduction:** `leaks::l10_approval_prompt_hides_symlink_target` (ignored; fails while the target is hidden). Finding L10 is a UX and security finding, not a forbidden-effect leak.
 - **Suggestion:** show the resolved path (`targetPath`) in the detail when it differs from the path as written, and mark it "outside the workspace".
 
