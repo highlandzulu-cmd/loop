@@ -310,3 +310,77 @@ async fn length_continuations_stop_after_three() {
         loop_ai::StopReason::Length
     );
 }
+
+/// Every progress update of a tool reaches listeners before its end, so a
+/// surface never shows a finished call as running again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tool_updates_arrive_before_the_tool_end() {
+    let script = FauxScript::new();
+    script.push(FauxResponse::ToolCalls(vec![ToolCall {
+        id: "c1".into(),
+        name: "chatty".into(),
+        arguments: json!({}),
+        thought_signature: None,
+    }]));
+    script.push(FauxResponse::Text("done".into()));
+    let (models, model) = setup_faux(script);
+    let stream_fn = stream_fn_from_models(Arc::new(models));
+    let tool = AgentTool::simple(
+        "chatty",
+        "Chatty",
+        "chatty",
+        json!({"type":"object","properties":{}}),
+        |_id, _args, _c, on_update| async move {
+            if let Some(on_update) = on_update {
+                for i in 0..200 {
+                    on_update(AgentToolResult::text(format!("line {i}")));
+                }
+            }
+            Ok(AgentToolResult::text("finished"))
+        },
+    );
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: Some(vec![tool]),
+    };
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let emit = Arc::new(move |ev: AgentEvent| {
+        let sink = Arc::clone(&sink);
+        Box::pin(async move {
+            // A listener that takes a moment per update (a broadcast, a
+            // session write) must still see them all before the end.
+            if ev.type_name() == "tool_execution_update" {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            sink.lock().push(ev.type_name().to_string());
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    });
+    run_agent_loop(
+        vec![AgentMessage::user_text("go")],
+        context,
+        AgentLoopConfig::new(model),
+        emit,
+        None,
+        Some(stream_fn),
+    )
+    .await
+    .unwrap();
+    let types = events.lock().clone();
+    let end = types
+        .iter()
+        .position(|t| t == "tool_execution_end")
+        .expect("tool end");
+    assert!(
+        !types[end..].iter().any(|t| t == "tool_execution_update"),
+        "an update came after the tool end: {types:?}"
+    );
+    assert_eq!(
+        types
+            .iter()
+            .filter(|t| *t == "tool_execution_update")
+            .count(),
+        200
+    );
+}

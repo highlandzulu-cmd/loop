@@ -1047,30 +1047,35 @@ async fn execute_prepared_tool_call(
     emit: &AgentEventSink,
     config: &AgentLoopConfig,
 ) -> ExecutedOutcome {
+    // Progress updates go through one ordered queue, drained before the
+    // tool's end is emitted: a task per update could land after the end and
+    // show a finished call as running again.
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let accepting_cb = Arc::clone(&accepting);
-    let emit_cb = Arc::clone(emit);
-    let tool_call_id = tool_call.id.clone();
-    let tool_name = tool_call.name.clone();
-    let args_for_cb = tool_call.arguments.clone();
-
-    let on_update: AgentToolUpdateCallback = Arc::new(move |partial| {
-        if !accepting_cb.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        let emit = Arc::clone(&emit_cb);
-        let tool_call_id = tool_call_id.clone();
-        let tool_name = tool_name.clone();
-        let args = args_for_cb.clone();
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<Option<_>>();
+    let forward = {
+        let emit = Arc::clone(emit);
+        let tool_call_id = tool_call.id.clone();
+        let tool_name = tool_call.name.clone();
+        let args = tool_call.arguments.clone();
         tokio::spawn(async move {
-            emit(AgentEvent::ToolExecutionUpdate {
-                tool_call_id,
-                tool_name,
-                args,
-                partial_result: partial,
-            })
-            .await;
-        });
+            // `None` marks the end: a tool may keep its callback alive.
+            while let Some(Some(partial)) = update_rx.recv().await {
+                emit(AgentEvent::ToolExecutionUpdate {
+                    tool_call_id: tool_call_id.clone(),
+                    tool_name: tool_name.clone(),
+                    args: args.clone(),
+                    partial_result: partial,
+                })
+                .await;
+            }
+        })
+    };
+    let accepting_cb = Arc::clone(&accepting);
+    let update_cb = update_tx.clone();
+    let on_update: AgentToolUpdateCallback = Arc::new(move |partial| {
+        if accepting_cb.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = update_cb.send(Some(partial));
+        }
     });
 
     let span = tool_span(
@@ -1084,6 +1089,8 @@ async fn execute_prepared_tool_call(
         .await;
 
     accepting.store(false, std::sync::atomic::Ordering::SeqCst);
+    let _ = update_tx.send(None);
+    let _ = forward.await;
 
     let outcome = match result {
         Ok(result) => ExecutedOutcome {
