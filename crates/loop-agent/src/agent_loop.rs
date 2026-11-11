@@ -280,7 +280,7 @@ async fn run_loop_observed(
 const MAX_LENGTH_CONTINUATIONS: u32 = 3;
 
 /// The user turn sent after a response stopped on the output limit.
-const LENGTH_CONTINUE_PROMPT: &str = "Your last response stopped at the output token limit. \
+pub const LENGTH_CONTINUE_PROMPT: &str = "Your last response stopped at the output token limit. \
 Continue from where you stopped. Do not repeat what you already wrote.";
 
 async fn run_loop(

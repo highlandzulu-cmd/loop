@@ -361,3 +361,20 @@ async fn a_turn_with_no_final_text_fails() {
         "{report:?}"
     );
 }
+
+#[tokio::test]
+async fn a_continued_answer_prints_in_full() {
+    let backend = backend(
+        vec![
+            length_stop("part one "),
+            FauxResponse::Text("part two".into()),
+        ],
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let text = print_turn(backend.as_ref(), &session, "hi".into())
+        .await
+        .unwrap();
+    assert_eq!(text, "part one part two");
+}

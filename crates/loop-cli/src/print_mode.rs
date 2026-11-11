@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 
+use loop_agent::agent_loop::LENGTH_CONTINUE_PROMPT;
 use loop_agent::AgentMessage;
 use loop_ai::{AssistantContent, Message};
 use loop_protocol::{
@@ -468,6 +469,7 @@ pub async fn run_turn(
     };
     // Subscribe before prompting so no update of this turn is missed.
     let mut updates = backend.subscribe();
+    let mut continued = false;
     let turn = match backend
         .prompt(session, vec![ContentBlock::text(prompt)])
         .await
@@ -495,9 +497,16 @@ pub async fn run_turn(
             report.text.push_str(text);
         }
         match envelope.update {
+            // The answer after a continuation prompt goes on the one cut at
+            // the output limit.
+            SessionUpdate::MessageChunk {
+                role: Role::User,
+                ref content,
+                ..
+            } => continued = content.as_text() == Some(LENGTH_CONTINUE_PROMPT),
             SessionUpdate::MessageStarted {
                 role: Role::Agent, ..
-            } => report.text.clear(),
+            } if !std::mem::take(&mut continued) => report.text.clear(),
             SessionUpdate::Usage(usage) => report.usage = Some(usage),
             SessionUpdate::TurnEnded { stop, error, .. } => {
                 report.stop = Some(stop);
