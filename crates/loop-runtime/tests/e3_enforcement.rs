@@ -2023,7 +2023,8 @@ async fn e3_enforcement() {
 // ---------------------------------------------------------------- leaks
 //
 // Minimal reproductions of the leaks the probe found. Each asserts the
-// safe behaviour, so it fails while the leak is open. Ignored by default.
+// safe behaviour, so it failed while the leak was open. An open leak is
+// marked `#[ignore]`.
 
 mod leaks {
     use super::*;
@@ -2185,9 +2186,9 @@ mod leaks {
     /// symlink to its directory, and through `..`. `path_matches`
     /// (rules.rs:310-321) never resolves symlinks or `..`; `decide`
     /// (policy.rs:92) takes the rule's verdict on that string. Direct
-    /// path: refused (control).
+    /// path: refused (control). Fixed: path rules also match the file the
+    /// path names (`PathForms` in rules.rs).
     #[test]
-    #[ignore = "L8: open leak; fails until read deny rules resolve the path"]
     fn l8_read_deny_rule_is_lexical() {
         let (_d, ws, home, rules) = secret_fixture();
         let decision = |path: &str| {
@@ -2202,10 +2203,16 @@ mod leaks {
             Decision::Deny(_)
         ));
         assert!(matches!(decision("~/.secret/e3key"), Decision::Deny(_)));
-        let leaks: Vec<&str> = ["notes", "sec/e3key", "../out/home/.secret/e3key"]
-            .into_iter()
-            .filter(|p| !matches!(decision(p), Decision::Deny(_)))
-            .collect();
+        let leaks: Vec<&str> = [
+            "notes",
+            "sec/e3key",
+            "../out/home/.secret/e3key",
+            // `..` after a link: the kernel goes up from the link's target.
+            "sec/../.secret/e3key",
+        ]
+        .into_iter()
+        .filter(|p| !matches!(decision(p), Decision::Deny(_)))
+        .collect();
         assert!(leaks.is_empty(), "read allowed through {leaks:?}");
     }
 
@@ -2215,8 +2222,8 @@ mod leaks {
     /// `search_may_show` (rules.rs:104-122) has the same lexical match as
     /// L8; `Walk::files` (search.rs:330-361) lists children of a directory
     /// link by their link path and follows file links with `metadata`.
+    /// Fixed: `search_may_show` resolves each path like L8.
     #[test]
-    #[ignore = "L9: open leak; fails until the search filter resolves the path"]
     fn l9_search_filter_is_lexical() {
         let (_d, ws, home, rules) = secret_fixture();
         let may = |path: PathBuf| search_may_show(&rules, "grep", &path, &ws, Some(&home));

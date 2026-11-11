@@ -1,5 +1,7 @@
-//! The decision for one call: a pure function of the mode, the rules and a
-//! [`Call`] the gate resolved first.
+//! The decision for one call: a function of the mode, the rules and a
+//! [`Call`] the gate resolved first. Path patterns in the rules also look
+//! at the filesystem, to match the file a path names through symlinks
+//! ([`super::rules::rule_for`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -23,8 +25,8 @@ pub enum Decision {
     Deny(String),
 }
 
-/// One tool call, with everything [`decide`] needs that would otherwise
-/// touch the filesystem already worked out ([`Call::resolve`]).
+/// One tool call, with the workspace check [`decide`] needs already worked
+/// out ([`Call::resolve`]). Path patterns resolve the path themselves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Call {
     /// The tool's name, e.g. `bash` or `mcp__github__create_issue`.
