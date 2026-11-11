@@ -440,24 +440,34 @@ impl Runtime {
         let records = self.log.recovery_records(from).await.map_err(failed)?;
         let (turns, escalations) = unfinished(&records, self.generation);
         let ts_ms = now();
-        let mut events = Vec::with_capacity(turns.len() + escalations.len());
-        for (session, turn_id) in &turns {
-            events.push(Event::update(
-                self.generation,
-                ts_ms,
-                UpdateEnvelope::live(
-                    self.instance.clone(),
+        let mut events = Vec::with_capacity(2 * turns.len() + escalations.len());
+        for turn in &turns {
+            let update = |update| {
+                Event::update(
                     self.generation,
-                    session.clone(),
-                    Some(turn_id.clone()),
-                    0,
-                    SessionUpdate::TurnEnded {
-                        turn_id: turn_id.clone(),
-                        stop: loop_protocol::StopReason::RuntimeRestarted,
-                        error: None,
-                    },
-                ),
-            ));
+                    ts_ms,
+                    UpdateEnvelope::live(
+                        self.instance.clone(),
+                        self.generation,
+                        turn.session.clone(),
+                        Some(turn.turn_id.clone()),
+                        0,
+                        update,
+                    ),
+                )
+            };
+            // A prompt whose turn start never committed may still have run
+            // tools: give it a turn, so it can end uncertain.
+            if turn.unstarted {
+                events.push(update(SessionUpdate::TurnStarted {
+                    turn_id: turn.turn_id.clone(),
+                }));
+            }
+            events.push(update(SessionUpdate::TurnEnded {
+                turn_id: turn.turn_id.clone(),
+                stop: loop_protocol::StopReason::RuntimeRestarted,
+                error: None,
+            }));
         }
         for open in &escalations {
             events.push(Event {
@@ -2462,6 +2472,9 @@ impl AgentBackend for Runtime {
         let task_live = Arc::clone(&live);
         let task = tokio::spawn(async move {
             let live = task_live;
+            // `prompt_sent` committed, and the backend has not taken the
+            // prompt: an exit now must say the prompt never ran a turn.
+            let mut unsettled = false;
             let result = async {
                 let ts_ms = now();
                 log.append_batch(vec![Event {
@@ -2473,6 +2486,7 @@ impl AgentBackend for Runtime {
                 }])
                 .await
                 .map_err(failed)?;
+                unsettled = true;
                 touch(&live.activity, &live.reference.key, ts_ms);
                 let permit = tokio::select! {
                     p = turns.acquire_owned() => p.map_err(failed)?,
@@ -2486,6 +2500,7 @@ impl AgentBackend for Runtime {
                     return Ok(TurnOutcome::Cancelled);
                 }
                 let turn = live.opened.native.prompt(&live.reference, input).await?;
+                unsettled = false;
                 // A cancel that raced the turn's registration hit an idle backend.
                 if cancelled.has_changed().unwrap_or(true) {
                     live.opened.native.cancel(&live.reference);
@@ -2504,6 +2519,21 @@ impl AgentBackend for Runtime {
                 })
             }
             .await;
+            if unsettled {
+                // Before `busy` clears, so it precedes the next prompt.
+                let settled = log
+                    .append_batch(vec![Event {
+                        generation,
+                        session_key: Some(live.reference.key.clone()),
+                        turn: None,
+                        ts_ms: now(),
+                        kind: EventKind::PromptSettled(json!({})),
+                    }])
+                    .await;
+                if let Err(error) = settled {
+                    eprintln!("Runtime: could not log a prompt that never started: {error}");
+                }
+            }
             live.permit.lock().await.take();
             live.pauses.signal("turn_settling");
             {

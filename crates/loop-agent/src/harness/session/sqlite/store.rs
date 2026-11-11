@@ -256,8 +256,18 @@ fn migration_applied(conn: &Connection, id: &str) -> Result<bool, SessionError> 
 }
 
 fn apply_migrations(conn: &mut Connection) -> Result<(), SessionError> {
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
-        .map_err(|e| SessionError::Storage(e.to_string()))?;
+    // Switching a fresh file to WAL reports BUSY at once, without the busy
+    // timeout, while another process opens it too. Try again for a while.
+    let deadline = std::time::Instant::now() + BUSY_TIMEOUT;
+    loop {
+        match conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;") {
+            Ok(()) => break,
+            Err(e) if is_busy(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => return Err(SessionError::Storage(e.to_string())),
+        }
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS migrations (id TEXT PRIMARY KEY, applied_at INTEGER NOT NULL);",
     )
@@ -269,6 +279,10 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), SessionError> {
         conn.execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| SessionError::Storage(e.to_string()))?;
         let result = (|| {
+            // Another process may have applied it since the check above.
+            if migration_applied(conn, migration.id)? {
+                return Ok(());
+            }
             conn.execute_batch(migration.sql)
                 .map_err(|e| SessionError::Storage(e.to_string()))?;
             conn.execute(

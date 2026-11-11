@@ -422,3 +422,53 @@ async fn prompts_sent(log: &dyn EventLog) {
     .unwrap();
 }
 shared_suite!(memory_prompts_sent, sqlite_prompts_sent, prompts_sent);
+
+/// Recovery needs only that a prompt was sent, not its content: the SQLite
+/// log does not load `prompt_sent` payloads for it, and finds recovery
+/// records by an index on (generation, kind).
+#[tokio::test]
+async fn sqlite_recovery_does_not_load_prompt_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = loop_runtime::log::SqliteEventLog::open(dir.path())
+        .await
+        .unwrap();
+    let g = log.allocate_generation("runtime", 1, 0).await.unwrap();
+    let prompt = |kind: EventKind| Event {
+        generation: g,
+        session_key: Some(SessionKey("s".into())),
+        turn: None,
+        ts_ms: 1,
+        kind,
+    };
+    log.append_batch(vec![
+        prompt(EventKind::PromptSent(
+            json!({"content": "x".repeat(10_000)}),
+        )),
+        prompt(EventKind::PromptSettled(json!({}))),
+    ])
+    .await
+    .unwrap();
+    let kinds: Vec<_> = log
+        .recovery_records(1)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.event.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            EventKind::PromptSent(json!({})),
+            EventKind::PromptSettled(json!({}))
+        ]
+    );
+    let conn = rusqlite::Connection::open(dir.path().join("events.db")).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_info('events_generation_kind')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(columns, ["generation", "kind"]);
+}
