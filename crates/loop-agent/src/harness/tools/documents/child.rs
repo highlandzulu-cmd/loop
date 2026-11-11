@@ -363,12 +363,22 @@ fn describe_exit(status: std::process::ExitStatus, stderr: &[u8]) -> String {
     format!("{what}: {last}")
 }
 
+/// Lower `resource` to `value`, never above the hard limit already set.
 fn set_limit(resource: LimitResource, value: u64) -> std::io::Result<()> {
-    let limit = libc::rlimit {
-        rlim_cur: value as libc::rlim_t,
-        rlim_max: value as libc::rlim_t,
+    let mut current = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
     };
-    // SAFETY: plain syscall on a stack value.
+    // SAFETY: plain syscalls on stack values.
+    if unsafe { libc::getrlimit(resource, &mut current) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let value = (value as libc::rlim_t).min(current.rlim_max);
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    // SAFETY: as above.
     if unsafe { libc::setrlimit(resource, &limit) } == -1 {
         return Err(std::io::Error::last_os_error());
     }
