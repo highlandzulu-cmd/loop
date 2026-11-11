@@ -62,7 +62,8 @@ const HOOK_OUTPUT_CAP: usize = 64 * 1024;
 /// Deny rules, hooks and an optional interactive approver.
 #[derive(Default)]
 pub struct ToolGate {
-    permissions: Mutex<BTreeMap<String, ToolPermission>>,
+    /// Shared, so the search filter takes the rules without copying them.
+    permissions: Mutex<Arc<BTreeMap<String, ToolPermission>>>,
     approver: Mutex<Option<Arc<ToolApprovalBridge>>>,
     hooks: Mutex<Option<HookRegistry>>,
     harness: Mutex<Weak<AgentHarness>>,
@@ -72,6 +73,11 @@ pub struct ToolGate {
     plan_return: Mutex<PermissionMode>,
     policy: Mutex<Policy>,
     workspace: Mutex<Option<PathBuf>>,
+    /// The directory the tools resolve relative paths against (the
+    /// harness's cwd); it can be below the workspace.
+    cwd: Mutex<Option<PathBuf>>,
+    /// More bases for relative deny and ask patterns ([`Call::rule_bases`]).
+    rule_bases: Mutex<Vec<PathBuf>>,
     /// Calls allowed without asking, counted by [`call_key`]; their
     /// after-call review is skipped. Keyed by more than the id, which a
     /// server may leave empty or reuse across parallel workflow tasks.
@@ -111,7 +117,7 @@ impl ToolGate {
     /// A gate enforcing `permissions` (from `settings.toolPermissions`).
     pub fn new(permissions: BTreeMap<String, ToolPermission>) -> Arc<Self> {
         Arc::new(Self {
-            permissions: Mutex::new(permissions),
+            permissions: Mutex::new(Arc::new(permissions)),
             ..Default::default()
         })
     }
@@ -124,6 +130,7 @@ impl ToolGate {
     ) -> Arc<Self> {
         let gate = Self::new(permissions);
         gate.set_workspace(crate::permissions::workspace_root(cwd));
+        *gate.cwd.lock() = Some(cwd.to_path_buf());
         gate
     }
 
@@ -132,6 +139,7 @@ impl ToolGate {
         self.workspace
             .lock()
             .get_or_insert_with(|| crate::permissions::workspace_root(&harness.cwd()));
+        self.cwd.lock().get_or_insert_with(|| harness.cwd());
         *self.hooks.lock() = Some(harness.hooks());
         *self.harness.lock() = Arc::downgrade(harness);
         harness.set_before_tool_call(Some(self.before_hook()));
@@ -228,6 +236,12 @@ impl ToolGate {
         }
     }
 
+    /// More directories relative `deny` and `ask` patterns match against:
+    /// a subagent bound to its own cwd keeps its parent's git root and cwd.
+    pub fn set_rule_bases(&self, bases: Vec<PathBuf>) {
+        *self.rule_bases.lock() = bases;
+    }
+
     /// The directory `accept-edits` may edit (default: the git root of the
     /// harness's cwd).
     pub fn set_workspace(&self, workspace: PathBuf) {
@@ -246,13 +260,26 @@ impl ToolGate {
     /// approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
         let call = self.call(tool, args).await;
-        self.policy
-            .lock()
-            .decide(self.mode(), &self.permissions.lock(), &call)
+        self.policy.lock().decide(self.mode(), &self.rules(), &call)
     }
 
     async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
-        Call::resolve(tool, self.kind(tool).await, args, &self.workspace())
+        let workspace = self.workspace();
+        let cwd = self.cwd(&workspace);
+        let kind = self.kind(tool).await;
+        Call {
+            rule_bases: self.rule_bases.lock().clone(),
+            ..Call::resolve_in(tool, kind, args, &workspace, &cwd)
+        }
+    }
+
+    /// The directory the tools open relative paths against: the harness's
+    /// cwd, or the workspace when none is known.
+    fn cwd(&self, workspace: &std::path::Path) -> PathBuf {
+        self.cwd
+            .lock()
+            .clone()
+            .unwrap_or_else(|| workspace.to_path_buf())
     }
 
     /// Run `hooks` without a harness (tests, hosts that only gate agents).
@@ -263,8 +290,14 @@ impl ToolGate {
     /// The `toolPermissions` deny rule that refuses an external agent's
     /// call, if any. Deny rules name Loop's own tools, so the call is
     /// checked as each Loop tool of its kind (`bash` for a command, `write`
-    /// and `edit` for an edit, and so on) with the agent's raw input.
-    pub fn agent_call_denied(&self, kind: ToolKind, args: &serde_json::Value) -> Option<String> {
+    /// and `edit` for an edit, and so on) with the agent's raw input. A
+    /// relative path in that input is joined to the agent's `cwd`.
+    pub fn agent_call_denied(
+        &self,
+        kind: ToolKind,
+        args: &serde_json::Value,
+        cwd: &std::path::Path,
+    ) -> Option<String> {
         let tools: &[&str] = match kind {
             ToolKind::Execute => &["bash"],
             ToolKind::Edit | ToolKind::Delete | ToolKind::Move => &["write", "edit"],
@@ -273,10 +306,13 @@ impl ToolGate {
             ToolKind::Fetch => &["web_fetch", "web_search"],
             ToolKind::Think | ToolKind::Other => &[],
         };
-        let rules = self.permissions.lock();
+        let rules = self.rules();
         let workspace = self.workspace();
         tools.iter().find_map(|tool| {
-            let call = Call::resolve(tool, kind, args, &workspace);
+            let call = Call {
+                rule_bases: self.rule_bases.lock().clone(),
+                ..Call::resolve_in(tool, kind, args, &workspace, cwd)
+            };
             let rule = crate::permissions::rule_for(&rules, &call);
             (rule.permission == ToolPermission::Deny)
                 .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
@@ -336,19 +372,35 @@ impl ToolGate {
                 return true;
             };
             let workspace = gate.workspace();
-            let rules = gate.permissions.lock();
-            crate::permissions::search_may_show(&rules, tool, path, &workspace, home.as_deref())
+            let cwd = gate.cwd(&workspace);
+            let bases = gate.rule_bases.lock().clone();
+            // Not under the lock: matching reads the filesystem.
+            let rules = gate.rules();
+            crate::permissions::search_may_show_in(
+                &rules,
+                tool,
+                path,
+                &workspace,
+                &cwd,
+                &bases,
+                home.as_deref(),
+            )
         })
     }
 
     /// The `toolPermissions` rules in force.
     pub fn permissions(&self) -> BTreeMap<String, ToolPermission> {
-        self.permissions.lock().clone()
+        (*self.rules()).clone()
+    }
+
+    /// The rules in force, shared.
+    fn rules(&self) -> Arc<BTreeMap<String, ToolPermission>> {
+        Arc::clone(&self.permissions.lock())
     }
 
     /// Replace the per-tool permissions (settings changed).
     pub fn set_permissions(&self, permissions: BTreeMap<String, ToolPermission>) {
-        *self.permissions.lock() = permissions;
+        *self.permissions.lock() = Arc::new(permissions);
         self.allowed.lock().clear();
     }
 
@@ -1022,6 +1074,115 @@ mod tests {
             filter("grep", &dir.path().join("secret/key")),
             "the filter reads the rules at each call"
         );
+    }
+
+    /// The cwd can be below the workspace (the git root); a relative path
+    /// is checked where the tools open it, against the cwd.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_paths_are_checked_against_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        let sub = repo.join("sub");
+        let secret = root.join("secret");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("key"), "k").unwrap();
+        std::os::unix::fs::symlink(secret.join("key"), sub.join("notes")).unwrap();
+        let gate = ToolGate::new_for_workspace(
+            crate::tool_approval::permissions_from_settings(&BTreeMap::from([(
+                format!("read({}/*)", secret.display()),
+                "deny".into(),
+            )])),
+            &sub,
+        );
+        gate.set_mode(PermissionMode::FullAccess);
+        let read = |path: &str| serde_json::json!({ "path": path });
+        assert!(matches!(
+            gate.decide("read", &read("notes")).await,
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            gate.decide("read", &read("other.txt")).await,
+            Decision::Allow
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_search_filter_matches_relative_rules_against_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        let svc = repo.join("svc");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(svc.join("secrets")).unwrap();
+        let gate = ToolGate::new_for_workspace(
+            crate::tool_approval::permissions_from_settings(&BTreeMap::from([(
+                "read(secrets/*)".into(),
+                "deny".into(),
+            )])),
+            &svc,
+        );
+        let filter = gate.search_filter();
+        assert!(!filter("grep", &svc.join("secrets/key")));
+        assert!(filter("grep", &svc.join("main.rs")));
+    }
+
+    /// An ACP agent's relative path is checked against its cwd.
+    #[cfg(unix)]
+    #[test]
+    fn agent_calls_are_checked_against_the_agent_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        let svc = repo.join("svc");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(svc.join("secrets")).unwrap();
+        let gate = ToolGate::new_for_workspace(
+            crate::tool_approval::permissions_from_settings(&BTreeMap::from([(
+                format!("read({}/*)", svc.join("secrets").display()),
+                "deny".into(),
+            )])),
+            &repo,
+        );
+        let args = serde_json::json!({ "path": "secrets/key" });
+        assert!(gate
+            .agent_call_denied(ToolKind::Read, &args, &svc)
+            .is_some());
+        assert!(gate
+            .agent_call_denied(ToolKind::Read, &args, &repo)
+            .is_none());
+    }
+
+    /// The parent's git root stays a base for relative deny rules in a
+    /// subagent gate bound to its own cwd.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rule_bases_reach_the_gate_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        let svc = repo.join("svc");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("secrets")).unwrap();
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::write(repo.join("secrets/key"), "k").unwrap();
+        let gate = ToolGate::new_for_workspace(
+            crate::tool_approval::permissions_from_settings(&BTreeMap::from([(
+                "read(secrets/*)".into(),
+                "deny".into(),
+            )])),
+            &svc,
+        );
+        gate.set_workspace(svc.clone());
+        gate.set_mode(PermissionMode::FullAccess);
+        let read = serde_json::json!({ "path": "../secrets/key" });
+        assert_eq!(gate.decide("read", &read).await, Decision::Allow);
+        gate.set_rule_bases(vec![repo.clone()]);
+        assert!(matches!(
+            gate.decide("read", &read).await,
+            Decision::Deny(_)
+        ));
     }
 
     #[tokio::test]

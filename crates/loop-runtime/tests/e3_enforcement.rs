@@ -980,8 +980,10 @@ fn symlink_read_cases(v: &mut Vec<Case>) {
                         .note(note),
                 );
             }
-            // glob of a file link: lists the link's own name only. A
-            // control, and vacuous for the same reason.
+            // glob of a file link. The probe ran it as a control that
+            // listed the link's own name. Since the L9 fix the filter
+            // resolves the link to the denied file, so the name is hidden
+            // and the result reports it.
             v.push(
                 Case::new(
                     "symlink-read",
@@ -992,8 +994,7 @@ fn symlink_read_cases(v: &mut Vec<Case>) {
                 .user(rule.clone())
                 .prep(Prep::SecretLinks)
                 .check(Check::Result("notes".into()))
-                .allowed()
-                .note("glob a file link lists the link name only (vacuous control)"),
+                .note("glob a file link hides the link to the denied file"),
             );
             // The rule refuses the denied path itself.
             v.push(
@@ -1075,6 +1076,21 @@ fn symlink_read_cases(v: &mut Vec<Case>) {
             );
         }
     }
+    // Positive control for the L9 fix: a file link to a file the rule does
+    // not deny is still listed by its link name.
+    v.push(
+        Case::new(
+            "symlink-read",
+            Embedded,
+            "ask",
+            calls("glob", json!({"pattern": "*", "path": "pub"})),
+        )
+        .user(rule.clone())
+        .prep(Prep::SecretLinks)
+        .check(Check::Result("pub".into()))
+        .allowed()
+        .note("control: glob a file link to a file that is not denied"),
+    );
 }
 
 // ---------------------------------------------------------------- fixture
@@ -1142,6 +1158,8 @@ impl Dirs {
                 std::fs::write(dirs.ws.join("plain.txt"), "E3PLAIN\n").unwrap();
                 symlink(secret.join("e3key"), dirs.ws.join("notes")).unwrap();
                 symlink(&secret, dirs.ws.join("sec")).unwrap();
+                std::fs::write(dirs.home.join("public.txt"), "E3PUBLIC\n").unwrap();
+                symlink(dirs.home.join("public.txt"), dirs.ws.join("pub")).unwrap();
             }
             Prep::EditLinks => {
                 use std::os::unix::fs::symlink;
@@ -2023,7 +2041,8 @@ async fn e3_enforcement() {
 // ---------------------------------------------------------------- leaks
 //
 // Minimal reproductions of the leaks the probe found. Each asserts the
-// safe behaviour, so it fails while the leak is open. Ignored by default.
+// safe behaviour, so it failed while the leak was open. An open leak is
+// marked `#[ignore]`.
 
 mod leaks {
     use super::*;
@@ -2185,9 +2204,9 @@ mod leaks {
     /// symlink to its directory, and through `..`. `path_matches`
     /// (rules.rs:310-321) never resolves symlinks or `..`; `decide`
     /// (policy.rs:92) takes the rule's verdict on that string. Direct
-    /// path: refused (control).
+    /// path: refused (control). Fixed: path rules also match the file the
+    /// path names (`PathForms` in rules.rs).
     #[test]
-    #[ignore = "L8: open leak; fails until read deny rules resolve the path"]
     fn l8_read_deny_rule_is_lexical() {
         let (_d, ws, home, rules) = secret_fixture();
         let decision = |path: &str| {
@@ -2202,10 +2221,16 @@ mod leaks {
             Decision::Deny(_)
         ));
         assert!(matches!(decision("~/.secret/e3key"), Decision::Deny(_)));
-        let leaks: Vec<&str> = ["notes", "sec/e3key", "../out/home/.secret/e3key"]
-            .into_iter()
-            .filter(|p| !matches!(decision(p), Decision::Deny(_)))
-            .collect();
+        let leaks: Vec<&str> = [
+            "notes",
+            "sec/e3key",
+            "../out/home/.secret/e3key",
+            // `..` after a link: the kernel goes up from the link's target.
+            "sec/../.secret/e3key",
+        ]
+        .into_iter()
+        .filter(|p| !matches!(decision(p), Decision::Deny(_)))
+        .collect();
         assert!(leaks.is_empty(), "read allowed through {leaks:?}");
     }
 
@@ -2215,8 +2240,8 @@ mod leaks {
     /// `search_may_show` (rules.rs:104-122) has the same lexical match as
     /// L8; `Walk::files` (search.rs:330-361) lists children of a directory
     /// link by their link path and follows file links with `metadata`.
+    /// Fixed: `search_may_show` resolves each path like L8.
     #[test]
-    #[ignore = "L9: open leak; fails until the search filter resolves the path"]
     fn l9_search_filter_is_lexical() {
         let (_d, ws, home, rules) = secret_fixture();
         let may = |path: PathBuf| search_may_show(&rules, "grep", &path, &ws, Some(&home));
@@ -2230,9 +2255,9 @@ mod leaks {
     /// (tool_approval.rs:559-571) shows `path.file_name()` and the path as
     /// written (`details.path`, the join of cwd and the argument); the
     /// resolved `details.targetPath` is not used. The prompt also comes
-    /// after the write.
+    /// after the write. Fixed: when `details.viaLink` is set, the title and
+    /// the detail show `link → target`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "L10: open finding; fails until the prompt names the resolved target"]
     async fn l10_approval_prompt_hides_symlink_target() {
         for host_sink in [false, true] {
             let p = capture_approval(

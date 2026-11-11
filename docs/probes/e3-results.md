@@ -358,3 +358,45 @@ The verdict of every case 000-142 is the same as in the run before the change (c
 The harness changes: `Prep::SecretLinks` and `Prep::EditLinks`, the `{HOME}` template, `symlink_read_cases`, the "hidden by permission rules" report in `reported()`, and the new test. The new cases were appended, so the ids of the old cases did not change.
 
 The reproductions run with `-- --ignored leaks::` (L8, L9, L10 fail until fixed).
+
+## Re-run after L8–L10 fixes
+
+Branch `fix/e3-l8-l10`, from `staging` 2f2933c. Same command, `E3_SEED=42`.
+
+### Fixes
+
+- **L8 (`read`, `write`, `edit` path rules).** `rule_for` (`crates/loop-app-core/src/permissions/rules.rs`) matches a path pattern against `PathForms`: the path as written (`~` expanded, absolute), the path with `.` and `..` removed, and the path resolved through symlinks (`policy::resolve`), both as the kernel opens it and after `..` is removed. Each form is tried as an absolute path and relative to the cwd; `deny` and `ask` also try it relative to the workspace (the git root).
+  - `deny` and `ask` apply when any form matches. A path that cannot be resolved (a link loop) matches them. The fixed directory part of an absolute or `~/` pattern is resolved too, so `/var/...` and `/private/var/...` match each other. `~/x` is also tried as `<cwd>/~/x`, the file the tools open (they do not expand `~`).
+  - `allow` applies only when the written path and every resolved form match. In an `allow` pattern a leading workspace, cwd or home directory is replaced by its resolved path, and an absolute pattern follows links only through directories that root owns and nobody else can write (`/tmp` to `/private/tmp`); no other link in the pattern is followed. A link inside an allowed directory does not allow its target, and a link or `..` out of an allowed directory is not allowed by that pattern.
+- **L9 (`grep`, `glob`, `ls`).** `search_may_show` uses the same match, with one resolution per path for the `read` rule and the tool's rule. `Walk::files` and `ls` call it for every entry, so the children of a directory link and a file link are checked by the file they name. A directory link to a denied directory is listed, but each file in it is hidden and counted. The filesystem is read only when a path pattern applies to the tool. Pattern prefixes and the workspace are resolved once per 2 s per thread. A path with no `..` costs one `canonicalize` per entry. The gate shares its rules in an `Arc`: the filter takes the `Arc` and does not hold the lock while it resolves paths.
+- **L10 (approval prompt).** `write` and `edit` report `viaLink` when the target is not where the path says (only the working directory is resolved for the comparison, so a workspace below `/var` is not marked). The file-edit prompt then shows the target first: the title is `writes to "<target>" via link "<name>"` (the TUI shows only the title, on one line), and the detail is `writes to "<target>"` and `through link "<path>"` on two lines. Names are quoted with control, bidi, zero-width and separator characters escaped, and a long link name is shortened in the middle. The same text goes to the `ApprovalPrompt` (TUI, desktop) and to the Runtime's `InteractionRequest::Permission`. The prompt still comes after the write (out of scope).
+- **Relative paths below the workspace.** The workspace is the git root, but the tools open a relative path against the cwd, which can be a subdirectory. `Call` now carries the cwd (`Call::resolve_in`), and the rules, the workspace check and the protected-name check join a relative path to it. Before, `read notes` in `repo/sub` was checked as `repo/notes`. Relative patterns match relative to the cwd (as project rules in `<cwd>/.loop/settings.json` are written) and, for `deny` and `ask`, also relative to the git root. E3 cannot show this, because its cwd is the git root. Tests: `tool_gate::tests::relative_paths_are_checked_against_the_cwd`, `rules::tests::relative_deny_and_ask_patterns_match_below_the_git_root`. Calls from ACP agents join a relative path to the agent's cwd. A subagent bound to its own cwd keeps the parent's git root and cwd as bases for relative `deny` and `ask` patterns (`Call::rule_bases`).
+- `docs/permissions.md` now describes path patterns exactly, and says that `read` rules do not cover the shell.
+
+### Tests
+
+- `leaks::l8_read_deny_rule_is_lexical`, `leaks::l9_search_filter_is_lexical` and `leaks::l10_approval_prompt_hides_symlink_target` are no longer ignored. They failed before the fix and pass after it. L8 also checks `sec/../.secret/e3key` (`..` after a link, which the kernel resolves from the link's target).
+- New unit tests in `rules.rs`: `path_rules_see_through_links_and_dot_dot`, `allow_patterns_need_the_written_and_the_resolved_path`, `relative_deny_and_ask_patterns_match_below_the_git_root`, `an_allow_pattern_never_follows_a_link_in_its_own_prefix`, `deny_also_matches_the_literal_tilde_path_the_tools_open`, `normalising_paths`. In `tool_approval.rs`: `file_edit_prompt::*` (a 200-character link name, a path with ` → /tmp/notes.txt` in it, a newline and an escape character). In `tools/mod.rs`: `via_link_tests::only_a_link_below_the_cwd_marks_a_write` (a cwd reached through a link: a plain write and a plain `..` are not marked; a write through a link is).
+- One harness change: the probe's control "glob a file link lists the link name only" now expects the link to be hidden (the filter resolves `notes` to the denied file). It is an ordinary check, with the same ids. A new positive control (case 247, `embedded`, `ask`) runs `glob * pub`, where `pub` links to a file the rule does not deny; the link name must be listed.
+
+### Full run
+
+| | Before (probe) | After the fixes |
+|---|---|---|
+| Cases | 247 | 248 (with the positive control) |
+| LEAK | 87 (L6: 11, L7: 4, L8/L9: 72) | 15 (L6: 11, L7: 4) |
+| CONTROL-FAIL, UNREPORTED | 0, 0 | 0, 0 |
+| Run time | 103 s | 99 s |
+
+Leaks per path: `embedded` 15, `runtime`, `subagent`, `workflow`, `acp`: 0. The 15 leaks are the same ids as before (074-079, 084-087, 089, 122-125). All 105 `symlink-read` cases are ok.
+
+`E3|PROMPT`: in all 8 outside cells (4 cells × 2 transports) the title and the detail show the resolved target first, for example `title="writes to \"{OUT}/target.txt\" via link \"notes\""` and the detail `writes to "{OUT}/target.txt"` / `through link "{WS}/notes"`. In the title, a long target is shortened in the middle. The control `write plain.txt` shows `plain.txt` and `{WS}/plain.txt`, with no arrow.
+
+### Remaining risks
+
+- **Check and use are not atomic.** The rule is checked on the resolved path, and then the tool opens the path. A link that changes between the two can still reach a denied file.
+- **The shell is not covered.** `read` rules do not stop `cat` in `bash`. Use `bash` rules or the sandbox.
+- **Windows.** `canonicalize` gives `\\?\` paths. Deny rules still match the written form; an `allow` rule on an absolute path may stop matching and fall back to the plain rule.
+- **Bases resolved during the Session.** The workspace, cwd and rule bases are resolved when a call is checked (cached for 2 s). A base that becomes a link during the Session changes what relative patterns match.
+- **Cache.** Pattern prefixes and the workspace are resolved at most every 2 s per thread. A link that changes inside that time is seen late.
+- **Directory names.** A search shows the name of a directory link to a denied directory (not its files), as for a normal denied directory.

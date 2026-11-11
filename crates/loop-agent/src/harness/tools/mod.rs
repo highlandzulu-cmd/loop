@@ -264,6 +264,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         env.write_file(&abs, &bytes).await.map_err(write_error)?;
                         let (target_path, created_identity) =
                             written_target(env.as_ref(), &abs, created).await;
+                        let via_link = through_link(env.as_ref(), &abs, &target_path).await;
                         let mut text = format!("Wrote {} bytes to {}", bytes.len(), abs.display());
                         if rebuilt {
                             text = format!("{text}. {}", documents::REBUILT_NOTE);
@@ -279,6 +280,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "created": created,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
+                                "viaLink": via_link,
                                 "createdPath": created_identity.map(|_| &target_path),
                                 "createdIdentity": created_identity,
                                 "diff": diff,
@@ -360,6 +362,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             .await
                             .map_err(write_error)?;
                         let (target_path, _) = written_target(env.as_ref(), &abs, false).await;
+                        let via_link = through_link(env.as_ref(), &abs, &target_path).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Edited {}", abs.display()),
@@ -371,6 +374,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "created": false,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
+                                "viaLink": via_link,
                             }),
                             usage: None,
                             added_tool_names: None,
@@ -416,6 +420,29 @@ async fn written_target(
         None
     };
     (target, identity)
+}
+
+/// Whether a write to `abs` landed somewhere its path does not show: a
+/// symlink on the way took it to `target`. Only the working directory is
+/// resolved for the comparison, so a workspace below a link (such as `/var`
+/// on macOS) does not count, and a plain `..` does not either.
+async fn through_link(env: &dyn ExecutionEnv, abs: &Path, target: &Path) -> bool {
+    let cwd = env.cwd();
+    let expected = match (abs.strip_prefix(cwd), env.canonical_path(cwd).await) {
+        (Ok(rest), Ok(root)) => root.join(rest),
+        _ => abs.to_path_buf(),
+    };
+    let mut normal = PathBuf::new();
+    for part in expected.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            part => normal.push(part),
+        }
+    }
+    normal != target
 }
 
 fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<String, String> {
@@ -743,5 +770,45 @@ mod bash_hint_tests {
         ] {
             assert!(!bash_permission_hint(text, 1, false), "{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod via_link_tests {
+    use super::*;
+
+    /// The working directory is reached through a link (as `/var` is on
+    /// macOS): a plain write is not marked, a write through a link is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_link_below_the_cwd_marks_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(real.join("ws")).unwrap();
+        std::fs::create_dir_all(real.join("out")).unwrap();
+        std::fs::write(real.join("out/target.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(real.join("ws"), real.join("ws-link")).unwrap();
+        std::os::unix::fs::symlink(real.join("out/target.txt"), real.join("ws/notes")).unwrap();
+        let env: Arc<dyn ExecutionEnv> =
+            Arc::new(crate::harness::HostExecutionEnv::new(real.join("ws-link")));
+        let tool = create_write_tool(env);
+        let write = |path: &str| {
+            (tool.execute)(
+                "w".into(),
+                json!({"path": path, "content": "y"}),
+                None,
+                None,
+            )
+        };
+        let plain = write("plain.txt").await.unwrap();
+        assert_eq!(plain.details["viaLink"], json!(false));
+        let dotdot = write("../ws/other.txt").await.unwrap();
+        assert_eq!(dotdot.details["viaLink"], json!(false), "a plain `..`");
+        let linked = write("notes").await.unwrap();
+        assert_eq!(linked.details["viaLink"], json!(true));
+        assert_eq!(
+            linked.details["targetPath"],
+            json!(real.join("out/target.txt"))
+        );
     }
 }
