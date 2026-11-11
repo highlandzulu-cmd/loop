@@ -742,7 +742,7 @@ pub fn permissions_from_settings(
 /// a symlink names its real `target` first, because the TUI shows only the
 /// title, on one line: `writes to "/real/key" via link "notes"`. The
 /// detail gives the target and the link on two lines. Names a model or a
-/// repository chose are quoted with control characters escaped, so a
+/// repository chose are quoted with control and bidi characters escaped, so a
 /// newline, an escape sequence or a fake ` → ` in a name cannot hide the
 /// target; a long name is shortened in the middle in the title.
 pub(crate) fn file_edit_prompt(path: &Path, target: Option<&Path>) -> (String, String) {
@@ -756,24 +756,61 @@ pub(crate) fn file_edit_prompt(path: &Path, target: Option<&Path>) -> (String, S
             let target = target.display().to_string();
             (
                 format!(
-                    "writes to {:?} via link {:?}",
-                    shorten(&target, 80),
-                    shorten(&name, 40)
+                    "writes to {} via link {}",
+                    quoted(&shorten(&target, 80)),
+                    quoted(&shorten(&name, 40))
                 ),
-                format!("writes to {target:?}\nthrough link {full:?}"),
+                format!(
+                    "writes to {}\nthrough link {}",
+                    quoted(&target),
+                    quoted(&full)
+                ),
             )
         }
         None => (escaped(&name), escaped(&full)),
     }
 }
 
-/// `s` as is, or quoted with escapes when it has a control character.
+/// `s` as is, or [`quoted`] when it has a character a terminal would not
+/// show as itself.
 fn escaped(s: &str) -> String {
-    if s.chars().any(char::is_control) {
-        format!("{s:?}")
+    if s.chars().any(hidden) {
+        quoted(s)
     } else {
         s.to_owned()
     }
+}
+
+/// `s` in double quotes, with Rust's escapes (`\n`, `\u{1b}`) and every
+/// other [`hidden`] character as `\u{…}`.
+fn quoted(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        if hidden(c) && !c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.extend(c.escape_debug());
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Control characters, and the format characters that reorder or hide
+/// text: bidi controls, zero-width characters, line and paragraph
+/// separators, the byte order mark.
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+        )
 }
 
 /// `s` cut to about `max` characters, keeping its start and its end.
@@ -948,6 +985,21 @@ mod tests {
             );
             let (summary, _) = linked("notes → x");
             assert!(summary.ends_with("via link \"notes → x\""), "{summary}");
+        }
+
+        #[test]
+        fn bidi_and_zero_width_characters_are_escaped() {
+            for name in ["a\u{202e}txt.exe", "pla\u{200b}in.txt", "a\u{2028}b"] {
+                let path = Path::new("/ws").join(name);
+                let (plain, detail) = file_edit_prompt(&path, None);
+                assert!(plain.starts_with('"') && plain.is_ascii(), "{plain}");
+                assert!(detail.is_ascii(), "{detail}");
+                let (summary, detail) = linked(name);
+                assert!(
+                    summary.is_ascii() && detail.is_ascii(),
+                    "{summary} {detail}"
+                );
+            }
         }
 
         #[test]
