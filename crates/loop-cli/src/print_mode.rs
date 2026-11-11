@@ -196,7 +196,13 @@ pub async fn run_print(
     match format {
         OutputFormat::Text => match report.end.error() {
             None => println!("{}", report.text),
-            Some(error) => eprintln!("loop: {error}"),
+            Some(error) => {
+                // A cut answer still prints what the model wrote.
+                if let Some(text) = report.partial_text() {
+                    println!("{text}");
+                }
+                eprintln!("loop: {error}");
+            }
         },
         OutputFormat::Json | OutputFormat::StreamJson => {
             print_json_line(&report.result_json(&session))
@@ -293,6 +299,12 @@ impl TurnReport {
     /// The process exit code ([`TurnEnd::exit_code`]).
     pub fn exit_code(&self) -> i32 {
         self.end.exit_code()
+    }
+
+    /// The text of an answer cut at the output limit, when there is some.
+    pub fn partial_text(&self) -> Option<&str> {
+        (self.stop == Some(StopReason::MaxTokens) && !self.text.trim().is_empty())
+            .then_some(self.text.as_str())
     }
 
     /// The `result` object for `--output-format json` and `stream-json`.
@@ -470,6 +482,7 @@ pub async fn run_turn(
     // Subscribe before prompting so no update of this turn is missed.
     let mut updates = backend.subscribe();
     let mut continued = false;
+    let mut ran_tool = false;
     let turn = match backend
         .prompt(session, vec![ContentBlock::text(prompt)])
         .await
@@ -508,12 +521,13 @@ pub async fn run_turn(
                 role: Role::Agent, ..
             } if !std::mem::take(&mut continued) => report.text.clear(),
             SessionUpdate::Usage(usage) => report.usage = Some(usage),
+            SessionUpdate::ToolCall(_) => ran_tool = true,
             SessionUpdate::TurnEnded { stop, error, .. } => {
                 report.stop = Some(stop);
                 report.end = match (error, stop) {
                     (Some(error), _) => TurnEnd::Failed(error.message),
                     (None, StopReason::Cancelled) => TurnEnd::Cancelled,
-                    (None, stop) => completed(stop, &report.text),
+                    (None, stop) => completed(stop, &report.text, ran_tool),
                 };
                 // The backend saves the turn after it ends on the stream;
                 // `--print` exits right after this, so wait for that (with
@@ -528,7 +542,7 @@ pub async fn run_turn(
     report.end = match turn.outcome().await {
         TurnOutcome::Completed(stop) => {
             report.stop = Some(stop);
-            completed(stop, &report.text)
+            completed(stop, &report.text, ran_tool)
         }
         TurnOutcome::Cancelled => TurnEnd::Cancelled,
         TurnOutcome::Failed(error) => TurnEnd::Failed(error.message),
@@ -538,13 +552,14 @@ pub async fn run_turn(
 }
 
 /// How a turn that ended without an error went: a turn cut at the output
-/// limit, or one with no final text, has no answer to print, so it fails.
-fn completed(stop: StopReason, text: &str) -> TurnEnd {
+/// limit, or one with no final text and no tool call, has no full answer to
+/// print, so it fails. A turn that ran tools may end with an empty message.
+fn completed(stop: StopReason, text: &str, ran_tool: bool) -> TurnEnd {
     if stop == StopReason::MaxTokens {
         TurnEnd::Failed(
             "the model stopped at its output limit (max_tokens); the answer is incomplete".into(),
         )
-    } else if text.trim().is_empty() {
+    } else if text.trim().is_empty() && !ran_tool {
         TurnEnd::Failed("the agent ended the turn with no text".into())
     } else {
         TurnEnd::Completed

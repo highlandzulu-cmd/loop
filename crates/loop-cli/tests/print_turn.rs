@@ -378,3 +378,39 @@ async fn a_continued_answer_prints_in_full() {
         .unwrap();
     assert_eq!(text, "part one part two");
 }
+
+#[tokio::test]
+async fn a_tool_turn_with_an_empty_last_message_completes() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(
+        vec![
+            FauxResponse::ToolCalls(vec![ToolCall {
+                id: "c1".into(),
+                name: "missing_tool".into(),
+                arguments: json!({}),
+                thought_signature: None,
+            }]),
+            FauxResponse::Text(String::new()),
+        ],
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "go".into(), |_| {}).await;
+    assert_eq!(report.exit_code(), 0, "{report:?}");
+}
+
+#[tokio::test]
+async fn a_cut_answer_keeps_its_partial_text() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(
+        (0..4).map(|i| length_stop(&format!("part {i} "))).collect(),
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |_| {}).await;
+    assert_eq!(report.exit_code(), 1);
+    assert_eq!(report.text, "part 0 part 1 part 2 part 3 ");
+    assert_eq!(report.partial_text(), Some("part 0 part 1 part 2 part 3 "));
+}
