@@ -37,6 +37,9 @@ pub struct Call {
     pub args: Value,
     /// The directory `accept-edits` may edit.
     pub workspace: PathBuf,
+    /// The directory the tools open a relative path against; it can be
+    /// below `workspace` (the git root). [`Call::new`] sets the workspace.
+    pub cwd: PathBuf,
     /// The home directory, for `~/` in path patterns.
     pub home: Option<PathBuf>,
     /// Whether the call's `path` resolves inside `workspace`, following
@@ -47,11 +50,13 @@ pub struct Call {
 impl Call {
     /// A call with the tool's default kind, nothing resolved and no home.
     pub fn new(tool: &str, args: Value, workspace: impl Into<PathBuf>) -> Self {
+        let workspace = workspace.into();
         Self {
             tool: tool.to_owned(),
             kind: loop_agent::protocol_events::tool_kind(tool),
             args,
-            workspace: workspace.into(),
+            cwd: workspace.clone(),
+            workspace,
             home: None,
             inside_workspace: false,
         }
@@ -60,15 +65,28 @@ impl Call {
     /// A call of `kind`, with the home directory and the workspace check
     /// read from the filesystem.
     pub fn resolve(tool: &str, kind: ToolKind, args: &Value, workspace: &Path) -> Self {
+        Self::resolve_in(tool, kind, args, workspace, workspace)
+    }
+
+    /// [`Call::resolve`] for a cwd below the workspace: a relative `path`
+    /// is where the tools open it, under `cwd`.
+    pub fn resolve_in(
+        tool: &str,
+        kind: ToolKind,
+        args: &Value,
+        workspace: &Path,
+        cwd: &Path,
+    ) -> Self {
         let inside_workspace = is_file_write(tool)
             && args
                 .get("path")
                 .and_then(Value::as_str)
-                .is_some_and(|path| inside_workspace(path, workspace));
+                .is_some_and(|path| inside_workspace(&cwd.join(path).to_string_lossy(), workspace));
         Self {
             kind,
             home: dirs::home_dir(),
             inside_workspace,
+            cwd: cwd.to_path_buf(),
             ..Self::new(tool, args.clone(), workspace)
         }
     }

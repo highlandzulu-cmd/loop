@@ -258,40 +258,17 @@ impl ToolGate {
 
     async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
         let workspace = self.workspace();
-        let args = self.anchored(tool, args, &workspace);
-        Call::resolve(tool, self.kind(tool).await, &args, &workspace)
+        let cwd = self.cwd(&workspace);
+        Call::resolve_in(tool, self.kind(tool).await, args, &workspace, &cwd)
     }
 
-    /// `args` with a relative `path` made absolute against the cwd, as the
-    /// tools open it, when the cwd is not the workspace: rules and the
-    /// workspace check join relative paths to the workspace.
-    fn anchored(
-        &self,
-        tool: &str,
-        args: &serde_json::Value,
-        workspace: &std::path::Path,
-    ) -> serde_json::Value {
-        let search = matches!(tool, "grep" | "glob" | "ls");
-        if !(search || matches!(tool, "read" | "write" | "edit")) {
-            return args.clone();
-        }
-        let Some(cwd) = self.cwd.lock().clone().filter(|cwd| cwd != workspace) else {
-            return args.clone();
-        };
-        let path = match args.get("path").and_then(serde_json::Value::as_str) {
-            Some(path) => path,
-            None if search => ".",
-            None => return args.clone(),
-        };
-        if path.starts_with('~') || std::path::Path::new(path).is_absolute() {
-            return args.clone();
-        }
-        let mut args = args.clone();
-        if let Some(map) = args.as_object_mut() {
-            let joined = cwd.join(path);
-            map.insert("path".into(), joined.to_string_lossy().into_owned().into());
-        }
-        args
+    /// The directory the tools open relative paths against: the harness's
+    /// cwd, or the workspace when none is known.
+    fn cwd(&self, workspace: &std::path::Path) -> PathBuf {
+        self.cwd
+            .lock()
+            .clone()
+            .unwrap_or_else(|| workspace.to_path_buf())
     }
 
     /// Run `hooks` without a harness (tests, hosts that only gate agents).
@@ -302,7 +279,9 @@ impl ToolGate {
     /// The `toolPermissions` deny rule that refuses an external agent's
     /// call, if any. Deny rules name Loop's own tools, so the call is
     /// checked as each Loop tool of its kind (`bash` for a command, `write`
-    /// and `edit` for an edit, and so on) with the agent's raw input.
+    /// and `edit` for an edit, and so on) with the agent's raw input. A
+    /// relative path in that input is joined to the workspace, not to the
+    /// agent's cwd.
     pub fn agent_call_denied(&self, kind: ToolKind, args: &serde_json::Value) -> Option<String> {
         let tools: &[&str] = match kind {
             ToolKind::Execute => &["bash"],
@@ -375,8 +354,17 @@ impl ToolGate {
                 return true;
             };
             let workspace = gate.workspace();
-            let rules = gate.permissions.lock();
-            crate::permissions::search_may_show(&rules, tool, path, &workspace, home.as_deref())
+            let cwd = gate.cwd(&workspace);
+            // Not under the lock: matching reads the filesystem.
+            let rules = gate.permissions.lock().clone();
+            crate::permissions::search_may_show_in(
+                &rules,
+                tool,
+                path,
+                &workspace,
+                &cwd,
+                home.as_deref(),
+            )
         })
     }
 

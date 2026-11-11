@@ -103,10 +103,7 @@ fn is_search(tool: &str) -> bool {
 }
 
 /// Whether a search tool (`grep`, `glob`, `ls`) may show or read the file
-/// at `path`: not when a `read` rule, or the tool's own rule, denies that
-/// path. The rules see the path as the walk built it and the file it names
-/// ([`PathForms`]), so a symlink or `..` into a denied tree is hidden too.
-/// The search root is checked separately, as the call's subject.
+/// at `path`, when the cwd is the workspace. See [`search_may_show_in`].
 pub fn search_may_show(
     rules: &BTreeMap<String, ToolPermission>,
     tool: &str,
@@ -114,15 +111,30 @@ pub fn search_may_show(
     workspace: &Path,
     home: Option<&Path>,
 ) -> bool {
-    // Inside the workspace, relative patterns such as `secret/*` match the
-    // relative path; `PathForms` also tries it joined to the workspace.
-    let subject = path.strip_prefix(workspace).unwrap_or(path);
-    let args = serde_json::json!({ "path": subject.to_string_lossy() });
+    search_may_show_in(rules, tool, path, workspace, workspace, home)
+}
+
+/// Whether a search tool (`grep`, `glob`, `ls`) may show or read the file
+/// at `path`: not when a `read` rule, or the tool's own rule, denies that
+/// path. The rules see the path as the walk built it and the file it names
+/// ([`PathForms`]), so a symlink or `..` into a denied tree is hidden too.
+/// Relative patterns match against `cwd` and `workspace`. The search root
+/// is checked separately, as the call's subject.
+pub fn search_may_show_in(
+    rules: &BTreeMap<String, ToolPermission>,
+    tool: &str,
+    path: &Path,
+    workspace: &Path,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> bool {
+    let args = serde_json::json!({ "path": path.to_string_lossy() });
     // Both tools share one resolution of the path.
     let forms = OnceCell::new();
     ["read", tool].iter().all(|tool| {
         let call = Call {
             home: home.map(Path::to_path_buf),
+            cwd: cwd.to_path_buf(),
             ..Call::new(tool, args.clone(), workspace)
         };
         rule_with(rules, &call, &forms).permission != ToolPermission::Deny
@@ -275,41 +287,69 @@ fn normalise_path(path: &Path) -> PathBuf {
 /// resolved name.
 #[derive(Debug)]
 pub(crate) struct PathForms {
-    /// The path as written (`~` expanded), its absolute form and, inside
-    /// the workspace, its relative form.
-    written: Vec<String>,
-    /// Each other name of the file: the absolute form and, inside the
-    /// workspace, the relative one. `None` when the path cannot be resolved
+    /// The path as written (`~` expanded) and its absolute form.
+    written: Names,
+    /// Each other name of the file. `None` when the path cannot be resolved
     /// (a symlink loop): deny and ask then apply, allow does not.
-    resolved: Option<Vec<Vec<String>>>,
+    resolved: Option<Vec<Names>>,
+    /// Names only `deny` and `ask` see: the tools do not expand `~`, so
+    /// `~/x` also names `cwd/~/x`.
+    literal: Vec<Names>,
+}
+
+/// One name of a path, absolute and relative.
+#[derive(Debug, Default)]
+struct Names {
+    /// The absolute form and the forms relative to the cwd (as written and
+    /// resolved). Every rule sees these.
+    strict: Vec<String>,
+    /// `strict` and the forms relative to the workspace (the git root),
+    /// which only `deny` and `ask` see: a relative `allow` pattern is
+    /// relative to the cwd alone.
+    all: Vec<String>,
+}
+
+impl Names {
+    fn push(&mut self, name: String) {
+        self.strict.push(name.clone());
+        self.all.push(name);
+    }
 }
 
 impl PathForms {
-    pub(crate) fn new(path: &str, workspace: &Path, home: Option<&Path>) -> Self {
-        let path = expand_home(path, home);
-        let joined = workspace.join(&path);
-        // Components drop `.` parts, so `.` is the workspace itself.
+    pub(crate) fn new(path: &str, workspace: &Path, cwd: &Path, home: Option<&Path>) -> Self {
+        let expanded = expand_home(path, home);
+        let joined = cwd.join(&expanded);
+        // Components drop `.` parts, so `.` is the cwd itself.
         let absolute: PathBuf = joined.components().collect();
-        let root = resolve_cached(workspace);
+        let real_cwd = resolve_cached(cwd);
+        let real_workspace = resolve_cached(workspace);
+        let relative = |p: &Path, base: &Path| {
+            p.strip_prefix(base)
+                .ok()
+                .filter(|rel| !rel.as_os_str().is_empty())
+                .map(|rel| rel.to_string_lossy().into_owned())
+        };
         let names = |p: &Path| {
-            let mut names = vec![p.to_string_lossy().into_owned()];
-            for base in std::iter::once(workspace).chain(root.as_deref()) {
-                if let Ok(rel) = p.strip_prefix(base) {
-                    if !rel.as_os_str().is_empty() {
-                        names.push(rel.to_string_lossy().into_owned());
-                    }
-                }
+            let mut names = Names::default();
+            names.push(p.to_string_lossy().into_owned());
+            for base in std::iter::once(cwd).chain(real_cwd.as_deref()) {
+                names.strict.extend(relative(p, base));
+            }
+            names.all = names.strict.clone();
+            for base in std::iter::once(workspace).chain(real_workspace.as_deref()) {
+                names.all.extend(relative(p, base));
             }
             names
         };
         let mut written = names(&absolute);
-        written.push(path);
+        written.push(expanded);
         let lexical = normalise_path(&joined);
         let resolved = resolve(&lexical).map(|real| {
             let mut groups = vec![names(&lexical), names(&real)];
             // `resolve` refuses `..` below a missing part; the kernel would
-            // not open such a path either.
-            // With no `..` in the path, this is the same file as `real`.
+            // not open such a path either. With no `..` in the path, this
+            // is the same file as `real`.
             if lexical != absolute {
                 if let Some(kernel) = resolve(&joined) {
                     if kernel != real {
@@ -319,31 +359,49 @@ impl PathForms {
             }
             groups
         });
-        Self { written, resolved }
+        let mut literal = Vec::new();
+        if path.starts_with('~') && home.is_some() {
+            let opened = normalise_path(&cwd.join(path));
+            literal.extend(resolve(&opened).map(|real| names(&real)));
+            literal.push(names(&opened));
+        }
+        Self {
+            written,
+            resolved,
+            literal,
+        }
     }
 
-    /// Whether `patterns` (one rule's forms) apply to this path for a rule
-    /// of `permission`.
-    fn hit(&self, patterns: &[String], permission: ToolPermission) -> bool {
-        let any = |names: &[String]| {
+    /// Whether a rule of `permission` applies to this path. `patterns` are
+    /// its forms for `deny` and `ask` ([`pattern_forms`]), `allow` its
+    /// forms for `allow` ([`allow_pattern_forms`]).
+    fn hit(&self, patterns: &[String], allow: &[String], permission: ToolPermission) -> bool {
+        let any = |patterns: &[String], names: &[String]| {
             names
                 .iter()
                 .any(|name| patterns.iter().any(|p| glob_match(p, name)))
         };
-        let written = any(&self.written);
-        match (permission, &self.resolved) {
-            (ToolPermission::Allow, Some(groups)) => written && groups.iter().all(|g| any(g)),
-            (ToolPermission::Allow, None) => false,
-            (_, Some(groups)) => written || groups.iter().any(|g| any(g)),
-            (_, None) => true,
+        if permission == ToolPermission::Allow {
+            return any(allow, &self.written.strict)
+                && self
+                    .resolved
+                    .as_ref()
+                    .is_some_and(|groups| groups.iter().all(|g| any(allow, &g.strict)));
         }
+        let Some(groups) = &self.resolved else {
+            return true;
+        };
+        std::iter::once(&self.written)
+            .chain(groups)
+            .chain(&self.literal)
+            .any(|g| any(patterns, &g.all))
     }
 }
 
-/// A path pattern as written (`~` expanded) and, when its fixed directory
-/// part is absolute, with that part resolved through symlinks, so that
-/// `/var/x/*` also names `/private/var/x/*` and a home behind a link still
-/// matches.
+/// A `deny` or `ask` path pattern as written (`~` expanded) and, when its
+/// fixed directory part is absolute, with that part resolved through
+/// symlinks, so that `/var/x/*` also names `/private/var/x/*` and a home
+/// behind a link still matches. Resolving can only widen a deny.
 fn pattern_forms(pattern: &str, home: Option<&Path>) -> Vec<String> {
     let pattern = expand_home(pattern, home);
     let mut forms = vec![pattern.clone()];
@@ -361,6 +419,40 @@ fn pattern_forms(pattern: &str, home: Option<&Path>) -> Vec<String> {
         let real = format!("{}{rest}", real.display());
         if real != pattern {
             forms.push(real);
+        }
+    }
+    forms
+}
+
+/// An `allow` path pattern as written (`~` expanded) and, when it starts
+/// with the workspace, the cwd or the home directory, with that directory
+/// replaced by its resolved path (`/var/...` by `/private/var/...` on
+/// macOS). No other link in the pattern is followed: a link inside an
+/// allowed directory must not allow what it points to.
+fn allow_pattern_forms(pattern: &str, call: &Call) -> Vec<String> {
+    let home = call.home.as_deref();
+    let pattern = expand_home(pattern, home);
+    let mut forms = vec![pattern.clone()];
+    let bases = [
+        Some(call.workspace.as_path()),
+        Some(call.cwd.as_path()),
+        home,
+    ];
+    for base in bases.into_iter().flatten() {
+        let Ok(rest) = Path::new(&pattern).strip_prefix(base) else {
+            continue;
+        };
+        let Some(real) = resolve_cached(base).filter(|real| real != base) else {
+            continue;
+        };
+        let rest = rest.to_string_lossy();
+        let form = if rest.is_empty() {
+            real.to_string_lossy().into_owned()
+        } else {
+            real.join(&*rest).to_string_lossy().into_owned()
+        };
+        if !forms.contains(&form) {
+            forms.push(form);
         }
     }
     forms
@@ -442,8 +534,13 @@ fn rule_with(
             }
         } else if matches!(tool, "read" | "write" | "edit") || is_search(tool) {
             let home = call.home.as_deref();
-            let forms = forms.get_or_init(|| PathForms::new(subject, &call.workspace, home));
-            forms.hit(&pattern_forms(pattern, home), *permission)
+            let forms =
+                forms.get_or_init(|| PathForms::new(subject, &call.workspace, &call.cwd, home));
+            if *permission == ToolPermission::Allow {
+                forms.hit(&[], &allow_pattern_forms(pattern, call), *permission)
+            } else {
+                forms.hit(&pattern_forms(pattern, home), &[], *permission)
+            }
         } else {
             glob_match(pattern, subject)
         };
@@ -821,6 +918,124 @@ mod tests {
             .permission,
             ToolPermission::Allow
         );
+    }
+
+    /// A git root with the cwd one level below it: project rules are
+    /// written relative to the cwd (`cwd/.loop/settings.json`).
+    #[cfg(unix)]
+    fn repo_with_service() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        let svc = repo.join("svc");
+        for d in ["svc/secrets", "svc/migrations", "shared", ".git"] {
+            std::fs::create_dir_all(repo.join(d)).unwrap();
+        }
+        std::fs::write(svc.join("secrets/key"), "k").unwrap();
+        std::fs::write(svc.join(".env"), "e").unwrap();
+        std::fs::write(repo.join("shared/x"), "x").unwrap();
+        (dir, repo, svc)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_deny_and_ask_patterns_match_below_the_git_root() {
+        let (_d, repo, svc) = repo_with_service();
+        let r = rules(&[
+            ("read(secrets/*)", "deny"),
+            ("read(.env)", "deny"),
+            ("read(../shared/*)", "deny"),
+            ("write(migrations/*)", "ask"),
+            ("write", "allow"),
+        ]);
+        let rule = |tool: &str, path: &str| {
+            let call = Call {
+                cwd: svc.clone(),
+                ..Call::new(tool, json!({ "path": path }), &repo)
+            };
+            rule_for(&r, &call)
+        };
+        for path in ["secrets/key", ".env", "../shared/x"] {
+            assert_eq!(
+                rule("read", path).permission,
+                ToolPermission::Deny,
+                "{path}"
+            );
+        }
+        let absolute = svc.join("secrets/key");
+        assert_eq!(
+            rule("read", absolute.to_str().unwrap()).permission,
+            ToolPermission::Deny
+        );
+        let ask = rule("write", "migrations/001.sql");
+        assert_eq!((ask.permission, ask.specific), (ToolPermission::Ask, true));
+        assert_eq!(
+            rule("read", "src/main.rs").permission,
+            ToolPermission::Allow
+        );
+        // The search filter sees the walk's absolute paths.
+        assert!(!search_may_show_in(
+            &r,
+            "grep",
+            &svc.join("secrets/key"),
+            &repo,
+            &svc,
+            None
+        ));
+        assert!(search_may_show_in(
+            &r,
+            "grep",
+            &svc.join("main.rs"),
+            &repo,
+            &svc,
+            None
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_allow_pattern_never_follows_a_link_in_its_own_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ssh = root.join("home/.ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+        std::fs::write(ssh.join("authorized_keys"), "").unwrap();
+        std::os::unix::fs::symlink(&ssh, root.join("repo/out")).unwrap();
+        let r = rules(&[
+            (
+                &format!("write({}/out/*)", root.join("repo").display()),
+                "allow",
+            ),
+            ("write", "ask"),
+        ]);
+        let keys = ssh.join("authorized_keys");
+        let call = Call::new(
+            "write",
+            json!({ "path": keys.to_str().unwrap() }),
+            root.join("repo"),
+        );
+        assert_eq!(rule_for(&r, &call).permission, ToolPermission::Ask);
+        let call = Call::new(
+            "write",
+            json!({ "path": "out/authorized_keys" }),
+            root.join("repo"),
+        );
+        assert_eq!(rule_for(&r, &call).permission, ToolPermission::Ask);
+    }
+
+    /// The tools do not expand `~`: `read ~/key` opens `cwd/~/key`.
+    #[cfg(unix)]
+    #[test]
+    fn deny_also_matches_the_literal_tilde_path_the_tools_open() {
+        let (_d, repo, svc) = repo_with_service();
+        std::os::unix::fs::symlink(svc.join("secrets"), svc.join("~")).unwrap();
+        let r = rules(&[(&format!("read({}/secrets/*)", svc.display()), "deny")]);
+        let call = Call {
+            cwd: svc.clone(),
+            home: Some(repo.join("elsewhere")),
+            ..Call::new("read", json!({ "path": "~/key" }), &repo)
+        };
+        assert_eq!(rule_for(&r, &call).permission, ToolPermission::Deny);
     }
 
     #[test]

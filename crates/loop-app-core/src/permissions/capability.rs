@@ -95,9 +95,9 @@ impl Scope {
         match self {
             Self::Workspace => {
                 call.inside_workspace
-                    && call
-                        .path()
-                        .is_some_and(|path| !protected(path, &call.workspace))
+                    && call.path().is_some_and(|path| {
+                        !protected(&call.cwd.join(path).to_string_lossy(), &call.workspace)
+                    })
             }
             Self::ReadOnlyCommands => {
                 call.tool == "bash"
