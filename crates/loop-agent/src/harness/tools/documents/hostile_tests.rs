@@ -370,3 +370,20 @@ async fn ocr_is_off_or_refused_without_any_request() {
         .unwrap_err();
     assert!(err.contains("encrypted"), "{err}");
 }
+
+#[tokio::test]
+async fn a_damaged_encrypted_pdf_is_not_sent_to_ocr() {
+    // It fails to load, so the reader cannot say it is encrypted.
+    let bytes = b"%PDF-1.4\ngarbage\ntrailer\n<< /Root 1 0 R /Encrypt 9 0 R >>\n%%EOF\n";
+    let reading = child::reading(Format::Pdf, bytes);
+    assert!(matches!(reading, Reading::Refused { .. }), "{reading:?}");
+    let config = ocr::Config {
+        key: "k".into(),
+        url: "https://192.0.2.1/ocr".into(),
+        model: "m".into(),
+    };
+    let err = pdf::finish(reading, bytes, Some(config), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("encrypted, so it is not sent"), "{err}");
+}

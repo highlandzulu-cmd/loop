@@ -385,9 +385,11 @@ fn set_limit(resource: LimitResource, value: u64) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+// glibc types the resource as `__rlimit_resource_t`; musl and the BSDs
+// (macOS) as `c_int`.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
 type LimitResource = libc::__rlimit_resource_t;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 type LimitResource = libc::c_int;
 
 /// Resolves when the child's physical footprint passes `limit` (macOS,

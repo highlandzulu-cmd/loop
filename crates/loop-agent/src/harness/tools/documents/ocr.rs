@@ -65,13 +65,10 @@ impl Config {
 }
 
 /// Whether the PDF in `bytes`, about which the reader said `info`, may be
-/// sent to OCR. `info` is `None` when the reader could not tell, and the
-/// bytes are then searched for an encryption dictionary.
+/// sent to OCR. The bytes are also searched for an encryption dictionary,
+/// since a reader that failed to load the file cannot tell.
 pub(super) fn permitted(info: Option<PdfInfo>, bytes: &[u8]) -> Result<(), String> {
-    let encrypted = match info {
-        Some(info) => info.encrypted,
-        None => bytes.windows(8).any(|w| w == b"/Encrypt"),
-    };
+    let encrypted = info.is_some_and(|i| i.encrypted) || bytes.windows(8).any(|w| w == b"/Encrypt");
     if encrypted {
         return Err("the PDF is encrypted, so it is not sent to OCR".into());
     }
