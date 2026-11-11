@@ -1388,7 +1388,7 @@ impl AgentHarness {
 
         // Always release phase on exit so early failures (sandbox/session/hooks)
         // cannot leave the harness stuck in `Turn` with the CLI showing Working…
-        let result = self.run_turn_inner(input, token.clone()).await;
+        let mut result = self.run_turn_inner(input, token.clone()).await;
 
         let writes = std::mem::take(&mut *self.pending_writes.lock());
         // Aborted turns should leave no session footprint so a follow-up prompt
@@ -1400,6 +1400,12 @@ impl AgentHarness {
             for w in writes {
                 if let Err(e) = store.append_entry(&sid, w).await {
                     tracing::error!(session_id = %sid, "session write failed: {e}");
+                    // A turn the Session does not hold is not complete. Later
+                    // entries would hang off the wrong parent, so stop here.
+                    if result.is_ok() {
+                        result = Err(AgentHarnessError::Session(e));
+                    }
+                    break;
                 }
             }
         }

@@ -196,14 +196,13 @@ async fn d1_a_logged_turn_end_implies_the_tree_holds_the_turn() {
     .expect("test timed out");
 }
 
-/// D3. A turn whose tree writes fail is still acknowledged as completed.
-/// `AgentHarness::run_turn` logs the failed `append_entry` and returns the
-/// reply, so the prompt resolves `Completed` while the tree has no trace of
-/// the turn. Here the writes fail because another process holds
+/// D3 (fixed). A turn whose tree writes fail must not be acknowledged as
+/// completed. `AgentHarness::run_turn` used to log the failed `append_entry`
+/// and return the reply, so the prompt resolved `Completed` while the tree had
+/// no trace of the turn. Here the writes fail because another process holds
 /// the database's write lock past the 6 s write deadline; a full disk or a
 /// lost lease does the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "E1 defect D3: a failed tree write is acknowledged as Completed"]
 async fn d3_a_completed_turn_is_in_the_tree() {
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
