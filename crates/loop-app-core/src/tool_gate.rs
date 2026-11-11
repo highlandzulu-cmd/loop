@@ -72,6 +72,9 @@ pub struct ToolGate {
     plan_return: Mutex<PermissionMode>,
     policy: Mutex<Policy>,
     workspace: Mutex<Option<PathBuf>>,
+    /// The directory the tools resolve relative paths against (the
+    /// harness's cwd); it can be below the workspace.
+    cwd: Mutex<Option<PathBuf>>,
     /// Calls allowed without asking, counted by [`call_key`]; their
     /// after-call review is skipped. Keyed by more than the id, which a
     /// server may leave empty or reuse across parallel workflow tasks.
@@ -124,6 +127,7 @@ impl ToolGate {
     ) -> Arc<Self> {
         let gate = Self::new(permissions);
         gate.set_workspace(crate::permissions::workspace_root(cwd));
+        *gate.cwd.lock() = Some(cwd.to_path_buf());
         gate
     }
 
@@ -132,6 +136,7 @@ impl ToolGate {
         self.workspace
             .lock()
             .get_or_insert_with(|| crate::permissions::workspace_root(&harness.cwd()));
+        self.cwd.lock().get_or_insert_with(|| harness.cwd());
         *self.hooks.lock() = Some(harness.hooks());
         *self.harness.lock() = Arc::downgrade(harness);
         harness.set_before_tool_call(Some(self.before_hook()));
@@ -252,7 +257,41 @@ impl ToolGate {
     }
 
     async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
-        Call::resolve(tool, self.kind(tool).await, args, &self.workspace())
+        let workspace = self.workspace();
+        let args = self.anchored(tool, args, &workspace);
+        Call::resolve(tool, self.kind(tool).await, &args, &workspace)
+    }
+
+    /// `args` with a relative `path` made absolute against the cwd, as the
+    /// tools open it, when the cwd is not the workspace: rules and the
+    /// workspace check join relative paths to the workspace.
+    fn anchored(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        workspace: &std::path::Path,
+    ) -> serde_json::Value {
+        let search = matches!(tool, "grep" | "glob" | "ls");
+        if !(search || matches!(tool, "read" | "write" | "edit")) {
+            return args.clone();
+        }
+        let Some(cwd) = self.cwd.lock().clone().filter(|cwd| cwd != workspace) else {
+            return args.clone();
+        };
+        let path = match args.get("path").and_then(serde_json::Value::as_str) {
+            Some(path) => path,
+            None if search => ".",
+            None => return args.clone(),
+        };
+        if path.starts_with('~') || std::path::Path::new(path).is_absolute() {
+            return args.clone();
+        }
+        let mut args = args.clone();
+        if let Some(map) = args.as_object_mut() {
+            let joined = cwd.join(path);
+            map.insert("path".into(), joined.to_string_lossy().into_owned().into());
+        }
+        args
     }
 
     /// Run `hooks` without a harness (tests, hosts that only gate agents).
@@ -1021,6 +1060,40 @@ mod tests {
         assert!(
             filter("grep", &dir.path().join("secret/key")),
             "the filter reads the rules at each call"
+        );
+    }
+
+    /// The cwd can be below the workspace (the git root); a relative path
+    /// is checked where the tools open it, against the cwd.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn relative_paths_are_checked_against_the_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        let sub = repo.join("sub");
+        let secret = root.join("secret");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("key"), "k").unwrap();
+        std::os::unix::fs::symlink(secret.join("key"), sub.join("notes")).unwrap();
+        let gate = ToolGate::new_for_workspace(
+            crate::tool_approval::permissions_from_settings(&BTreeMap::from([(
+                format!("read({}/*)", secret.display()),
+                "deny".into(),
+            )])),
+            &sub,
+        );
+        gate.set_mode(PermissionMode::FullAccess);
+        let read = |path: &str| serde_json::json!({ "path": path });
+        assert!(matches!(
+            gate.decide("read", &read("notes")).await,
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            gate.decide("read", &read("other.txt")).await,
+            Decision::Allow
         );
     }
 

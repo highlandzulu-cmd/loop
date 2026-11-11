@@ -290,7 +290,7 @@ impl PathForms {
         let joined = workspace.join(&path);
         // Components drop `.` parts, so `.` is the workspace itself.
         let absolute: PathBuf = joined.components().collect();
-        let root = resolve(workspace);
+        let root = resolve_cached(workspace);
         let names = |p: &Path| {
             let mut names = vec![p.to_string_lossy().into_owned()];
             for base in std::iter::once(workspace).chain(root.as_deref()) {
@@ -309,9 +309,12 @@ impl PathForms {
             let mut groups = vec![names(&lexical), names(&real)];
             // `resolve` refuses `..` below a missing part; the kernel would
             // not open such a path either.
-            if let Some(kernel) = resolve(&joined) {
-                if kernel != real {
-                    groups.push(names(&kernel));
+            // With no `..` in the path, this is the same file as `real`.
+            if lexical != absolute {
+                if let Some(kernel) = resolve(&joined) {
+                    if kernel != real {
+                        groups.push(names(&kernel));
+                    }
                 }
             }
             groups
@@ -363,8 +366,9 @@ fn pattern_forms(pattern: &str, home: Option<&Path>) -> Vec<String> {
     forms
 }
 
-/// [`resolve`] for pattern prefixes, remembered for a moment: a search
-/// checks every file it walks against the same few patterns.
+/// [`resolve`] for pattern prefixes and the workspace, remembered for a
+/// moment: a search checks every file it walks against the same few
+/// patterns.
 fn resolve_cached(path: &Path) -> Option<PathBuf> {
     use std::collections::HashMap;
     use std::time::{Duration, Instant};

@@ -697,3 +697,43 @@ mod bash_hint_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod via_link_tests {
+    use super::*;
+
+    /// The working directory is reached through a link (as `/var` is on
+    /// macOS): a plain write is not marked, a write through a link is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_link_below_the_cwd_marks_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(real.join("ws")).unwrap();
+        std::fs::create_dir_all(real.join("out")).unwrap();
+        std::fs::write(real.join("out/target.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(real.join("ws"), real.join("ws-link")).unwrap();
+        std::os::unix::fs::symlink(real.join("out/target.txt"), real.join("ws/notes")).unwrap();
+        let env: Arc<dyn ExecutionEnv> =
+            Arc::new(crate::harness::HostExecutionEnv::new(real.join("ws-link")));
+        let tool = create_write_tool(env);
+        let write = |path: &str| {
+            (tool.execute)(
+                "w".into(),
+                json!({"path": path, "content": "y"}),
+                None,
+                None,
+            )
+        };
+        let plain = write("plain.txt").await.unwrap();
+        assert_eq!(plain.details["viaLink"], json!(false));
+        let dotdot = write("../ws/other.txt").await.unwrap();
+        assert_eq!(dotdot.details["viaLink"], json!(false), "a plain `..`");
+        let linked = write("notes").await.unwrap();
+        assert_eq!(linked.details["viaLink"], json!(true));
+        assert_eq!(
+            linked.details["targetPath"],
+            json!(real.join("out/target.txt"))
+        );
+    }
+}
