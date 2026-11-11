@@ -4629,7 +4629,7 @@ dependencies = [
  "parking_lot",
  "pdf-extract",
  "pulldown-cmark",
- "quick-xml 0.41.0",
+ "quick-xml 0.42.0",
  "regex",
  "reqwest 0.12.28",
  "rmcp",
@@ -4719,6 +4719,7 @@ dependencies = [
  "clap",
  "crossterm 0.28.1",
  "dirs",
+ "flate2",
  "futures",
  "ignore",
  "libc",
@@ -4761,6 +4762,7 @@ dependencies = [
  "unicode-width 0.2.2",
  "uuid",
  "walkdir",
+ "zip",
 ]
 
 [[package]]

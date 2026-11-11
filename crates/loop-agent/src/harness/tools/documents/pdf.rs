@@ -4,64 +4,116 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
-
 use pdf_extract::{MediaBox, OutputDev, OutputError, Transform};
+use tokio_util::sync::CancellationToken;
 
+use super::child::{Converted, PdfInfo, Reading};
 use super::markdown::{Block, Markdown, Marker, Span};
 use super::ocr;
+use crate::harness::utils::{truncate_head, DEFAULT_MAX_BYTES};
+use super::pdf_guard as guard;
 
 /// Average non-space characters per page below which the text layer is
 /// treated as missing (a scan, or text drawn as shapes).
 const MIN_CHARS_PER_PAGE: usize = 20;
 
-/// The PDF's text and what produced it (`reader` or `ocr`).
-pub(super) async fn read(bytes: Vec<u8>) -> Result<(String, &'static str), String> {
-    let bytes = Arc::new(bytes);
-    let shared = Arc::clone(&bytes);
-    let extracted = super::blocking(move || extract(&shared)).await;
-    if let Ok(text) = &extracted {
-        if text.readable {
-            return Ok((text.markdown.clone(), "reader"));
+/// The text of a PDF from the reader's answer, with OCR when the text
+/// layer is missing and OCR is configured and allowed, and what produced
+/// it (`reader` or `ocr`). Runs in the parent: OCR is a network call.
+pub(super) async fn finish(
+    reading: Reading,
+    bytes: &[u8],
+    ocr: Option<ocr::Config>,
+    cancel: Option<&CancellationToken>,
+) -> Result<(Converted, &'static str), String> {
+    let (converted, info, error) = match reading {
+        Reading::Done(c) => {
+            let info = c.pdf.unwrap_or_default();
+            (Some(c), Some(info), None)
+        }
+        Reading::Refused { error, pdf } => (None, pdf, Some(error)),
+    };
+    if let Some(c) = &converted {
+        if info.is_some_and(|i| i.readable) {
+            return Ok((c.clone(), "reader"));
         }
     }
-    let partial = extracted
-        .as_ref()
-        .ok()
-        .map(|t| t.markdown.clone())
-        .filter(|t| !t.trim().is_empty());
-    if ocr::enabled() {
-        return match (ocr::run(&bytes).await, partial) {
-            (Ok(text), _) => Ok((text, "ocr")),
-            (Err(e), Some(text)) => Ok((format!("{text}\n\n[OCR failed ({e}); this is the little text the PDF itself contains.]"), "reader")),
-            (Err(e), None) => Err(e),
-        };
+    let partial = converted.filter(|c| !c.text.trim().is_empty());
+    if let Some(config) = ocr {
+        match ocr::permitted(info, bytes) {
+            Ok(()) => {
+                let run = ocr::run(&config, bytes);
+                let result = tokio::select! {
+                    r = run => r,
+                    _ = async {
+                        match cancel {
+                            Some(c) => c.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => return Err("cancelled".into()),
+                };
+                return match (result, partial) {
+                    (Ok(text), _) => {
+                        let (text, truncated) = truncate_head(&text, DEFAULT_MAX_BYTES);
+                        Ok((
+                            Converted {
+                                text,
+                                truncated,
+                                pdf: info,
+                            },
+                            "ocr",
+                        ))
+                    }
+                    (Err(e), Some(mut c)) => {
+                        c.text = format!("{}\n\n[OCR failed ({e}); this is the little text the PDF itself contains.]", c.text);
+                        Ok((c, "reader"))
+                    }
+                    (Err(e), None) => Err(e),
+                };
+            }
+            Err(why) => {
+                return match partial {
+                    Some(mut c) => {
+                        c.text = format!("{}\n\n[Little text could be extracted, and OCR was not used: {why}.]", c.text);
+                        Ok((c, "reader"))
+                    }
+                    None => Err(match error {
+                        Some(e) => format!("could not read the PDF ({e}); OCR was not used: {why}"),
+                        None => format!("this PDF has no text layer, and OCR was not used: {why}"),
+                    }),
+                };
+            }
+        }
     }
-    match (extracted, partial) {
-        (_, Some(text)) => Ok((
-            format!("{text}\n\n[Little text could be extracted; the PDF may be scanned. OCR is off: set {} to enable it.]", ocr::KEY_ENV),
-            "reader",
-        )),
-        (Ok(_), None) => Err(format!(
+    match (error, partial) {
+        (_, Some(mut c)) => {
+            c.text = format!("{}\n\n[Little text could be extracted; the PDF may be scanned. OCR is off: set {} to enable it.]", c.text, ocr::KEY_ENV);
+            Ok((c, "reader"))
+        }
+        (None, None) => Err(format!(
             "this PDF has no text layer (it may be scanned); set {} to read it with OCR",
             ocr::KEY_ENV
         )),
-        (Err(e), None) => Err(format!("could not read the PDF ({e}); set {} to read it with OCR", ocr::KEY_ENV)),
+        (Some(e), None) => Err(format!("could not read the PDF ({e}); set {} to read it with OCR", ocr::KEY_ENV)),
     }
 }
 
-pub(super) struct Extracted {
-    pub markdown: String,
-    readable: bool,
+/// The text layer of `bytes` as markdown, and what the reader learned
+/// (also when it failed).
+pub(super) fn extract(bytes: &[u8]) -> (Result<String, String>, PdfInfo) {
+    let mut info = PdfInfo::default();
+    let text = extract_into(bytes, &mut info);
+    (text, info)
 }
 
-/// The text layer of `bytes` as markdown.
-pub(super) fn extract(bytes: &[u8]) -> Result<Extracted, String> {
+fn extract_into(bytes: &[u8], info: &mut PdfInfo) -> Result<String, String> {
     let mut doc = pdf_extract::Document::load_mem(bytes).map_err(|e| e.to_string())?;
     if doc.is_encrypted() {
+        info.encrypted = true;
         doc.decrypt("")
             .map_err(|_| "the PDF is password-protected".to_owned())?;
     }
+    guard::check(&doc)?;
     let mut collector = Collector::default();
     pdf_extract::output_doc(&doc, &mut collector).map_err(|e| e.to_string())?;
     let pages: Vec<Vec<Line>> = collector.pages.into_iter().map(lines).collect();
@@ -75,8 +127,8 @@ pub(super) fn extract(bytes: &[u8]) -> Result<Extracted, String> {
                 || c.is_control() && !c.is_whitespace()
         })
         .count();
-    let readable = chars >= MIN_CHARS_PER_PAGE * pages.len().max(1) && garbled * 5 < chars;
-    Ok(Extracted { markdown, readable })
+    info.readable = chars >= MIN_CHARS_PER_PAGE * pages.len().max(1) && garbled * 5 < chars;
+    Ok(markdown)
 }
 
 struct Glyph {
@@ -856,10 +908,12 @@ mod tests {
     fn written_pdfs_read_back_with_structure() {
         let source = "# Quarterly Report\n\nRevenue grew in every region this quarter, led by strong demand.\n\n## Highlights\n\n- New customers signed\n- Costs held flat\n\nClosing paragraph with caf\u{e9} text.";
         let bytes = write(&markdown::parse(source));
-        let text = extract(&bytes).unwrap();
-        assert!(text.readable, "{}", text.markdown);
+        let (text, info) = extract(&bytes);
+        let text = text.unwrap();
+        assert!(info.readable, "{text}");
+        assert!(!info.encrypted);
         assert_eq!(
-            text.markdown,
+            text,
             "# Quarterly Report\n\nRevenue grew in every region this quarter, led by strong demand.\n\n## Highlights\n\n- New customers signed\n- Costs held flat\n\nClosing paragraph with caf\u{e9} text."
         );
     }
@@ -872,7 +926,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         let bytes = write(&markdown::parse(&source));
-        let text = extract(&bytes).unwrap();
-        assert!(text.markdown.contains("<!-- page 2 -->"));
+        let text = extract(&bytes).0.unwrap();
+        assert!(text.contains("<!-- page 2 -->"));
     }
 }

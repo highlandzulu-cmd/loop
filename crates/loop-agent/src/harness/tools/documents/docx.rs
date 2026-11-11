@@ -24,7 +24,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         ordered,
         ..Default::default()
     };
-    for node in xml::nodes(&document)? {
+    for node in xml::nodes(&document) {
+        let node = node?;
         reader.node(node);
     }
     Ok(reader.md.finish())
@@ -35,7 +36,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
 fn heading_styles(styles: &str) -> Result<HashMap<String, u8>, String> {
     let mut out = HashMap::new();
     let mut id: Option<String> = None;
-    for node in xml::nodes(styles)? {
+    for node in xml::nodes(styles) {
+        let node = node?;
         let Node::Open { name, attrs } = node else {
             continue;
         };
@@ -70,7 +72,8 @@ fn ordered_levels(numbering: &str) -> Result<HashMap<(String, u8), bool>, String
     let mut abstracts: HashMap<String, HashMap<u8, bool>> = HashMap::new();
     let mut nums: Vec<(String, String)> = Vec::new();
     let (mut abstract_id, mut level, mut num_id) = (None::<String>, 0u8, None::<String>);
-    for node in xml::nodes(numbering)? {
+    for node in xml::nodes(numbering) {
+        let node = node?;
         let Node::Open { name, attrs } = node else {
             continue;
         };

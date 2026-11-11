@@ -103,7 +103,7 @@ opentelemetry_sdk = { version = "0.33", default-features = false, features = ["t
 opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 tracing-opentelemetry = { version = "0.34", default-features = false }
 pulldown-cmark = "0.12"
-quick-xml = "0.41"
+quick-xml = "0.42"
 calamine = { version = "0.38", features = ["dates"] }
 rust_xlsxwriter = "0.102"
 pdf-extract = "0.12"

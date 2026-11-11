@@ -9,16 +9,34 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 /// The most one part of a package may inflate to, against zip bombs.
 const MAX_PART_BYTES: u64 = 64 * 1024 * 1024;
 
-/// A zip package being read.
+/// The most all the parts one read inflates may add up to.
+pub(super) const INFLATE_BUDGET: u64 = 256 * 1024 * 1024;
+
+/// The most entries a package may list.
+const MAX_ENTRIES: usize = 20_000;
+
+/// A zip package being read, with one inflate budget for all its parts.
 pub(super) struct Package<'a> {
     zip: ZipArchive<Cursor<&'a [u8]>>,
+    /// Bytes still allowed to inflate.
+    budget: u64,
 }
 
 impl<'a> Package<'a> {
     pub(super) fn open(bytes: &'a [u8]) -> Result<Self, String> {
+        Self::with_budget(bytes, INFLATE_BUDGET)
+    }
+
+    pub(super) fn with_budget(bytes: &'a [u8], budget: u64) -> Result<Self, String> {
         let zip = ZipArchive::new(Cursor::new(bytes))
             .map_err(|e| format!("not a valid Office file (zip): {e}"))?;
-        Ok(Self { zip })
+        if zip.len() > MAX_ENTRIES {
+            return Err(format!(
+                "the file has too many parts ({}; the limit is {MAX_ENTRIES})",
+                zip.len()
+            ));
+        }
+        Ok(Self { zip, budget })
     }
 
     /// The UTF-8 text of part `name`, or `None` when the package has no such part.
@@ -28,15 +46,48 @@ impl<'a> Package<'a> {
             Err(zip::result::ZipError::FileNotFound) => return Ok(None),
             Err(e) => return Err(format!("{name}: {e}")),
         };
+        let limit = MAX_PART_BYTES.min(self.budget);
         let mut text = String::new();
-        file.take(MAX_PART_BYTES + 1)
+        file.take(limit + 1)
             .read_to_string(&mut text)
             .map_err(|e| format!("{name}: {e}"))?;
-        if text.len() as u64 > MAX_PART_BYTES {
+        let used = text.len() as u64;
+        if used > MAX_PART_BYTES {
             return Err(format!("{name} is too large"));
         }
+        if used > self.budget {
+            return Err(too_much());
+        }
+        self.budget -= used;
         Ok(Some(text))
     }
+
+    /// Inflate every part, discarding the bytes, to prove the whole
+    /// package stays within the budget before a reader that has no limit
+    /// of its own (calamine) inflates it again. Declared sizes are not
+    /// trusted: the bytes are counted.
+    pub(super) fn check_all(&mut self) -> Result<(), String> {
+        for i in 0..self.zip.len() {
+            let file = self
+                .zip
+                .by_index(i)
+                .map_err(|e| format!("not a valid Office file (zip): {e}"))?;
+            let used = std::io::copy(&mut file.take(self.budget + 1), &mut std::io::sink())
+                .map_err(|e| format!("not a valid Office file (zip): {e}"))?;
+            if used > self.budget {
+                return Err(too_much());
+            }
+            self.budget -= used;
+        }
+        Ok(())
+    }
+}
+
+fn too_much() -> String {
+    format!(
+        "the file unpacks to more than {} MB, which looks like a zip bomb",
+        INFLATE_BUDGET / (1024 * 1024)
+    )
 }
 
 /// A zip package of `parts`; a `mimetype` part is stored uncompressed, as
@@ -73,62 +124,80 @@ pub(super) enum Node {
     Text(String),
 }
 
-/// The events of `xml`, with entities and character references resolved.
-pub(super) fn nodes(xml: &str) -> Result<Vec<Node>, String> {
-    let mut reader = quick_xml::Reader::from_str(xml);
-    let mut out = Vec::new();
-    loop {
-        let event = reader
-            .read_event()
-            .map_err(|e| format!("malformed XML: {e}"))?;
-        match event {
-            Event::Start(e) => out.push(open(&e)?),
-            Event::Empty(e) => {
-                let node = open(&e)?;
-                let name = match &node {
-                    Node::Open { name, .. } => name.clone(),
-                    _ => unreachable!(),
-                };
-                out.push(node);
-                out.push(Node::Close(name));
-            }
-            Event::End(e) => out.push(Node::Close(local(e.local_name().as_ref()))),
-            Event::Text(e) => {
-                let text = e.xml10_content().map_err(|e| e.to_string())?;
-                out.push(Node::Text(text.into_owned()));
-            }
-            Event::CData(e) => {
-                let text = e.decode().map_err(|e| e.to_string())?;
-                out.push(Node::Text(text.into_owned()));
-            }
-            Event::GeneralRef(e) => {
-                let ch = match e.resolve_char_ref() {
-                    Ok(Some(ch)) => Some(ch),
-                    _ => match e.decode().map_err(|e| e.to_string())?.as_ref() {
-                        "amp" => Some('&'),
-                        "lt" => Some('<'),
-                        "gt" => Some('>'),
-                        "quot" => Some('"'),
-                        "apos" => Some('\''),
-                        _ => None,
-                    },
-                };
-                if let Some(ch) = ch {
-                    out.push(Node::Text(ch.to_string()));
-                }
-            }
-            Event::Eof => break,
-            _ => {}
-        }
+/// The events of `xml`, one at a time, with entities and character
+/// references resolved.
+pub(super) fn nodes(xml: &str) -> Nodes<'_> {
+    Nodes {
+        reader: quick_xml::Reader::from_str(xml),
+        pending: None,
+        done: false,
     }
-    Ok(out)
+}
+
+/// See [`nodes`]. Stops after the first error.
+pub(super) struct Nodes<'a> {
+    reader: quick_xml::Reader<&'a [u8]>,
+    /// The `Close` of an empty element just returned as `Open`.
+    pending: Option<String>,
+    done: bool,
+}
+
+impl Iterator for Nodes<'_> {
+    type Item = Result<Node, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(name) = self.pending.take() {
+            return Some(Ok(Node::Close(name)));
+        }
+        while !self.done {
+            let node = match self.reader.read_event() {
+                Err(e) => Err(format!("malformed XML: {e}")),
+                Ok(Event::Eof) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(Event::Start(e)) => open(&e),
+                Ok(Event::Empty(e)) => open(&e).inspect(|node| {
+                    if let Node::Open { name, .. } = node {
+                        self.pending = Some(name.clone());
+                    }
+                }),
+                Ok(Event::End(e)) => Ok(Node::Close(local(e.local_name().as_ref()))),
+                Ok(Event::Text(e)) => Ok(Node::Text(e.xml10_content().into_owned())),
+                Ok(Event::CData(e)) => Ok(Node::Text(e.xml10_content().into_owned())),
+                Ok(Event::GeneralRef(e)) => {
+                    let ch = match e.resolve_char_ref() {
+                        Ok(Some(ch)) => Some(ch),
+                        _ => match e.xml10_content().as_ref() {
+                            "amp" => Some('&'),
+                            "lt" => Some('<'),
+                            "gt" => Some('>'),
+                            "quot" => Some('"'),
+                            "apos" => Some('\''),
+                            _ => None,
+                        },
+                    };
+                    match ch {
+                        Some(ch) => Ok(Node::Text(ch.to_string())),
+                        None => continue,
+                    }
+                }
+                Ok(_) => continue,
+            };
+            if node.is_err() {
+                self.done = true;
+            }
+            return Some(node);
+        }
+        None
+    }
 }
 
 fn open(e: &BytesStart) -> Result<Node, String> {
     let mut attrs = Vec::new();
     for attr in e.attributes().with_checks(false) {
         let attr = attr.map_err(|e| e.to_string())?;
-        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+        let key = attr.key.as_ref().to_owned();
         let value = attr
             .normalized_value(quick_xml::XmlVersion::Implicit1_0)
             .map_err(|e| e.to_string())?;
@@ -140,8 +209,8 @@ fn open(e: &BytesStart) -> Result<Node, String> {
     })
 }
 
-fn local(name: &[u8]) -> String {
-    String::from_utf8_lossy(name).into_owned()
+fn local(name: &str) -> String {
+    name.to_owned()
 }
 
 /// Attribute `name` exactly (`r:id`), else by local name (`val` finds `w:val`).
@@ -200,8 +269,8 @@ pub(super) fn relationships(
     xml: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
     let mut out = std::collections::HashMap::new();
-    for node in nodes(xml)? {
-        if let Node::Open { name, attrs } = node {
+    for node in nodes(xml) {
+        if let Node::Open { name, attrs } = node? {
             if name == "Relationship" {
                 if let (Some(id), Some(target)) = (attr(&attrs, "Id"), attr(&attrs, "Target")) {
                     out.insert(id.to_owned(), target.to_owned());
@@ -218,7 +287,9 @@ mod tests {
 
     #[test]
     fn nodes_resolve_entities_and_split_empty_elements() {
-        let got = nodes(r#"<w:p><w:t>a &amp; b&#33;</w:t><w:br/></w:p>"#).unwrap();
+        let got: Vec<Node> = nodes(r#"<w:p><w:t>a &amp; b&#33;</w:t><w:br/></w:p>"#)
+            .collect::<Result<_, _>>()
+            .unwrap();
         let text: String = got
             .iter()
             .filter_map(|n| match n {

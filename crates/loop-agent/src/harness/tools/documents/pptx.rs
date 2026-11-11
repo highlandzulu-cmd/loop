@@ -17,7 +17,8 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
     };
     let mut md = Markdown::default();
     let mut number = 0;
-    for node in xml::nodes(&presentation)? {
+    for node in xml::nodes(&presentation) {
+        let node = node?;
         let Node::Open { name, attrs } = node else {
             continue;
         };
@@ -66,7 +67,8 @@ fn read_slide(md: &mut Markdown, number: usize, slide: &str) -> Result<(), Strin
     let (mut bold, mut italic, mut in_text) = (false, false, false);
     let mut table: Option<Vec<Vec<String>>> = None;
     let (mut row, mut cell) = (Vec::new(), Vec::new());
-    for node in xml::nodes(slide)? {
+    for node in xml::nodes(slide) {
+        let node = node?;
         match node {
             Node::Open { name, attrs } => match name.as_str() {
                 "sp" => shape = Some(Shape::default()),
