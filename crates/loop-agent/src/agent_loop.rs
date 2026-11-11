@@ -1047,7 +1047,7 @@ async fn prepare_tool_call_inner(
 /// The latest progress update of a running tool, waiting to be emitted.
 enum UpdateSlot {
     Empty,
-    Update(AgentToolResult),
+    Update(Box<AgentToolResult>),
     Done,
 }
 
@@ -1097,7 +1097,7 @@ async fn execute_prepared_tool_call(
                             tool_call_id: tool_call_id.clone(),
                             tool_name: tool_name.clone(),
                             args: args.clone(),
-                            partial_result: partial,
+                            partial_result: *partial,
                         })
                         .await;
                     }
@@ -1111,7 +1111,7 @@ async fn execute_prepared_tool_call(
         if accepting_cb.load(std::sync::atomic::Ordering::SeqCst) {
             let mut guard = slot_cb.0.lock();
             if !matches!(*guard, UpdateSlot::Done) {
-                *guard = UpdateSlot::Update(partial);
+                *guard = UpdateSlot::Update(Box::new(partial));
                 drop(guard);
                 slot_cb.1.notify_one();
             }
