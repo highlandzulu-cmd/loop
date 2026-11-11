@@ -1044,6 +1044,13 @@ async fn prepare_tool_call_inner(
     }
 }
 
+/// The latest progress update of a running tool, waiting to be emitted.
+enum UpdateSlot {
+    Empty,
+    Update(AgentToolResult),
+    Done,
+}
+
 struct ExecutedOutcome {
     result: AgentToolResult,
     is_error: bool,
@@ -1057,34 +1064,57 @@ async fn execute_prepared_tool_call(
     emit: &AgentEventSink,
     config: &AgentLoopConfig,
 ) -> ExecutedOutcome {
-    // Progress updates go through one ordered queue, drained before the
-    // tool's end is emitted: a task per update could land after the end and
-    // show a finished call as running again.
+    // Progress updates go through one slot that holds only the latest (bash
+    // sends its whole output each time), emitted in order before the tool's
+    // end: a task per update could land after the end and show a finished
+    // call as running again, and a queue could grow behind a slow listener.
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let (update_tx, mut update_rx) = tokio::sync::mpsc::unbounded_channel::<Option<_>>();
+    let slot = Arc::new((
+        parking_lot::Mutex::new(UpdateSlot::Empty),
+        tokio::sync::Notify::new(),
+    ));
     let forward = {
         let emit = Arc::clone(emit);
+        let slot = Arc::clone(&slot);
         let tool_call_id = tool_call.id.clone();
         let tool_name = tool_call.name.clone();
         let args = tool_call.arguments.clone();
         tokio::spawn(async move {
-            // `None` marks the end: a tool may keep its callback alive.
-            while let Some(Some(partial)) = update_rx.recv().await {
-                emit(AgentEvent::ToolExecutionUpdate {
-                    tool_call_id: tool_call_id.clone(),
-                    tool_name: tool_name.clone(),
-                    args: args.clone(),
-                    partial_result: partial,
-                })
-                .await;
+            loop {
+                let next = {
+                    let mut guard = slot.0.lock();
+                    match &*guard {
+                        UpdateSlot::Done => UpdateSlot::Done,
+                        _ => std::mem::replace(&mut *guard, UpdateSlot::Empty),
+                    }
+                };
+                match next {
+                    UpdateSlot::Empty => slot.1.notified().await,
+                    // A tool may keep its callback alive: `Done` ends the wait.
+                    UpdateSlot::Done => break,
+                    UpdateSlot::Update(partial) => {
+                        emit(AgentEvent::ToolExecutionUpdate {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                            partial_result: partial,
+                        })
+                        .await;
+                    }
+                }
             }
         })
     };
     let accepting_cb = Arc::clone(&accepting);
-    let update_cb = update_tx.clone();
+    let slot_cb = Arc::clone(&slot);
     let on_update: AgentToolUpdateCallback = Arc::new(move |partial| {
         if accepting_cb.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = update_cb.send(Some(partial));
+            let mut guard = slot_cb.0.lock();
+            if !matches!(*guard, UpdateSlot::Done) {
+                *guard = UpdateSlot::Update(partial);
+                drop(guard);
+                slot_cb.1.notify_one();
+            }
         }
     });
 
@@ -1099,7 +1129,9 @@ async fn execute_prepared_tool_call(
         .await;
 
     accepting.store(false, std::sync::atomic::Ordering::SeqCst);
-    let _ = update_tx.send(None);
+    // The end carries the full result, so an update still waiting is dropped.
+    *slot.0.lock() = UpdateSlot::Done;
+    slot.1.notify_one();
     let _ = forward.await;
 
     let outcome = match result {

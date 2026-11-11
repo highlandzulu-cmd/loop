@@ -4531,19 +4531,22 @@ fn apply_tool_update(
         _ => None,
     };
     let Some(is_error) = finished else {
+        // Progress never reopens a finished call: late output of a command
+        // must not show it running again, in its card or in the status line.
+        let idx = find_tool_index(chat, &id);
+        if idx.is_some_and(|idx| {
+            matches!(chat.get(idx), Some(ChatItem::Tool { status, .. }) if *status != CardStatus::Pending)
+        }) {
+            return;
+        }
         // Still running: show partial output until the result arrives.
         if live {
             if let Some(name) = &update.name {
                 *turn_step = format!("tool · {name}");
             }
         }
-        if let Some(idx) = find_tool_index(chat, &id) {
-            if let Some(ChatItem::Tool { detail, status, .. }) = chat.get_mut(idx) {
-                // Progress never reopens a finished call: late output of a
-                // command must not show it running again.
-                if *status != CardStatus::Pending {
-                    return;
-                }
+        if let Some(idx) = idx {
+            if let Some(ChatItem::Tool { detail, .. }) = chat.get_mut(idx) {
                 if detail.is_empty() && !output.is_empty() {
                     *detail = format!("(partial) {output}");
                 }
@@ -6719,6 +6722,14 @@ mod plan_tests {
             ),
             "{chat:?}"
         );
+
+        // Live, the status line does not go back to the tool either.
+        let mut chat = chat;
+        let mut step = String::new();
+        let mut late = ToolCallUpdate::new(ToolCallId("b1".into()));
+        late.name = Some("bash".into());
+        apply_tool_update(late, true, &mut chat, &mut step);
+        assert_eq!(step, "", "{chat:?}");
     }
 
     #[test]

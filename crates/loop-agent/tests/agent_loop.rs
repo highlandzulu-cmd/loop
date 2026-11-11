@@ -389,12 +389,15 @@ async fn tool_updates_arrive_before_the_tool_end() {
         !types[end..].iter().any(|t| t == "tool_execution_update"),
         "an update came after the tool end: {types:?}"
     );
-    assert_eq!(
-        types
-            .iter()
-            .filter(|t| *t == "tool_execution_update")
-            .count(),
-        200
+    // Only the latest waiting update is kept: a slow listener does not build
+    // a queue of all 200.
+    let updates = types
+        .iter()
+        .filter(|t| *t == "tool_execution_update")
+        .count();
+    assert!(
+        updates < 200,
+        "{updates} updates queued behind a slow listener"
     );
 }
 
