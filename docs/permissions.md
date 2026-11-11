@@ -52,7 +52,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **While on:** the footer shows a red `⚠ full access · tools run without approval` banner.
 - **Startup:** starting in this mode prints a warning.
 - **Unattended runs** (`--print`, `--serve-mcp`) need the flag `--permission-mode full-access`. The setting alone falls back to `ask` there, with a notice.
-- **`--serve-mcp` without `--mcp-token`:** it warns, because any local process could then run tools without approval.
+- **`--serve-mcp` in this mode without `--mcp-token`:** it warns, because any local process could then run tools without approval.
 
 ## Rules
 

@@ -34,4 +34,4 @@ Crates are grouped by the dependency rules above:
 - `crates/core/`: `loop-protocol` (the versioned event model and backend interface) and `loop-wire` (JSON-RPC and the transports that carry it).
 - `crates/extend/`: optional surfaces and integrations, `loop-acp` and `loop-dashboard`.
 - `crates/ops/`: distribution operations, `loop-update`.
-- `crates/`: the remaining crates keep their original paths: `loop-agent`, `loop-ai`, `loop-app-core`, `loop-cli`, `loop-desktop`, `loop-mcp`, `loop-orchestration`, `loop-runtime` (the shared Runtime and its durable Session Event Log) and `loop-telemetry`.
+- `crates/`: the remaining crates keep their original paths: `loop-agent`, `loop-ai`, `loop-app-core`, `loop-cli`, `loop-desktop`, `loop-mcp`, `loop-orchestration`, `loop-runtime` (the shared Runtime and its durable Session Event Log), `loop-telemetry` and `loop-test-support` (test helpers).

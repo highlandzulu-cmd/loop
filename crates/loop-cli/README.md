@@ -72,13 +72,13 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/scoped-models`, `/effort`, `/ttfb`, `/permissions`, `/plan`, `/settings`, `/login`, `/logout`, `/websearch`, `/mcp`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/session`, `/name`, `/copy`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates. Build-dependent: `/usage` (default build), `/tracing` (`telemetry` feature, on by default), `/workflow` (`orchestration` feature).
+`/theme`, `/sandbox`, `/model`, `/scoped-models`, `/effort`, `/default`, `/ttfb`, `/permissions`, `/plan`, `/settings`, `/login`, `/logout`, `/websearch`, `/mcp`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/session`, `/name`, `/copy`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates. Build-dependent: `/usage` (default build), `/tracing` (`telemetry` feature, on by default), `/workflow` (`orchestration` feature).
+
+`/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
 
 ### MCP server mode
 
 `loop --serve-mcp` starts Loop as an MCP server (streamable HTTP) instead of the chat. `--mcp-host` sets the interface (default `127.0.0.1`), `--mcp-port` the port (default `3100`), and `--mcp-token <token>` requires `Authorization: Bearer <token>` on every request; a non-loopback `--mcp-host` requires a token. Tool calls are judged by the [permission mode](../../docs/permissions.md), and with nobody to ask, calls that need approval are refused unless you pass `--permission-mode full-access`.
-
-`/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
 
 ## Sessions
 
@@ -284,13 +284,15 @@ loop config
 | `-c`, `--no-context-files` | Don't load `AGENTS.md` / `CLAUDE.md` context files |
 | `--resume [<id>]`, `--continue` | Resume a session by id (no id opens the picker), or the most recent one in this folder |
 | `--no-web` | Run without the `web_search` and `web_fetch` tools |
+| `--cwd <dir>` | Working directory |
+| `--connect <socket\|ws://…>`, `--token-file <file>` | Connect to a particular Runtime by socket path or authenticated WebSocket URL; `--token-file` (or `LOOP_RUNTIME_TOKEN`) supplies the WebSocket token. See [the Runtime](../../docs/runtime.md) |
 | `--permission-mode <mode>` | `read-only`, `ask` (default), `accept-edits` or `full-access`; see [permissions](../../docs/permissions.md) |
 | `--print "<prompt>"`, `--output-format text\|json\|stream-json` | One prompt, then exit; see [print mode](../../docs/print-mode.md) |
 | `--trace-name`, `--trace-tag`, `--trace-metadata`, `--trace-session`, `--trace-env`, `--trace-parent` | Langfuse trace labels for `--print` runs (`telemetry` feature) |
 | `--serve-mcp`, `--mcp-host`, `--mcp-port`, `--mcp-token` | Run as an MCP server; see [MCP server mode](#mcp-server-mode) |
 | `--debug` | Write verbose session logs (same as `LOOP_DEBUG=1`) |
 
-Subcommands: `loop config` (config directory paths), `loop version`, `loop update [--check] [--version <v>] [--force]`, `loop rollback`, `loop uninstall`, `loop usage`, `loop runtime ...` and `loop session ...` (see [the Runtime](../../docs/runtime.md)).
+Subcommands: `loop config` (config directory paths), `loop version`, `loop update [--check] [--version <v>] [--force]`, `loop rollback`, `loop uninstall`, `loop usage` (default build), `loop runtime start|stop|restart|status` and `loop session list|new|attach|close` (see [the Runtime](../../docs/runtime.md)).
 
 ## Tests
 

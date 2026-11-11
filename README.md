@@ -209,7 +209,7 @@ Maintainers: see [docs/releasing.md](docs/releasing.md) to cut a release.
 
 ## Contributing
 
-Contributions are welcome. Read [CONTRIBUTING.md](.github/CONTRIBUTING.md) before you open a pull request.
+Contributions are welcome. Read [CONTRIBUTING.md](.github/CONTRIBUTING.md) before you open a pull request. Maintainers: [docs/ci.md](docs/ci.md) describes the CI jobs.
 
 ## Community
 
