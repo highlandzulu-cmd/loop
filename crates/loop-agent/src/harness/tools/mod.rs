@@ -15,7 +15,8 @@ use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
 pub use documents::{
-    run_document_reader_child, set_document_reader, DocumentReader, CHILD_ARG as DOCUMENT_READER_ARG,
+    run_document_reader_child, set_document_reader, DocumentReader,
+    CHILD_ARG as DOCUMENT_READER_ARG,
 };
 pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
 pub use search::{

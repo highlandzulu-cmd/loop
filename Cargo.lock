@@ -4615,6 +4615,7 @@ dependencies = [
  "chrono",
  "encoding_rs",
  "eventsource-stream",
+ "flate2",
  "futures",
  "ignore",
  "libc",

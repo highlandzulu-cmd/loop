@@ -2,16 +2,16 @@
 //! the text layer, OCR for scanned files when configured, and markdown laid
 //! out into a new PDF.
 
+use pdf_extract::{MediaBox, OutputDev, OutputError, Transform};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use pdf_extract::{MediaBox, OutputDev, OutputError, Transform};
 use tokio_util::sync::CancellationToken;
 
 use super::child::{Converted, PdfInfo, Reading};
 use super::markdown::{Block, Markdown, Marker, Span};
 use super::ocr;
-use crate::harness::utils::{truncate_head, DEFAULT_MAX_BYTES};
 use super::pdf_guard as guard;
+use crate::harness::utils::{truncate_head, DEFAULT_MAX_BYTES};
 
 /// Average non-space characters per page below which the text layer is
 /// treated as missing (a scan, or text drawn as shapes).
@@ -74,7 +74,10 @@ pub(super) async fn finish(
             Err(why) => {
                 return match partial {
                     Some(mut c) => {
-                        c.text = format!("{}\n\n[Little text could be extracted, and OCR was not used: {why}.]", c.text);
+                        c.text = format!(
+                            "{}\n\n[Little text could be extracted, and OCR was not used: {why}.]",
+                            c.text
+                        );
                         Ok((c, "reader"))
                     }
                     None => Err(match error {
@@ -94,7 +97,10 @@ pub(super) async fn finish(
             "this PDF has no text layer (it may be scanned); set {} to read it with OCR",
             ocr::KEY_ENV
         )),
-        (Some(e), None) => Err(format!("could not read the PDF ({e}); set {} to read it with OCR", ocr::KEY_ENV)),
+        (Some(e), None) => Err(format!(
+            "could not read the PDF ({e}); set {} to read it with OCR",
+            ocr::KEY_ENV
+        )),
     }
 }
 

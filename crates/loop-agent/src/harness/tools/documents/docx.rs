@@ -25,8 +25,10 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         ..Default::default()
     };
     for node in xml::nodes(&document) {
-        let node = node?;
-        reader.node(node);
+        reader.node(node?);
+        if reader.md.full() {
+            break;
+        }
     }
     Ok(reader.md.finish())
 }

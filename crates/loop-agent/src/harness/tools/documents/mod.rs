@@ -44,7 +44,8 @@ pub(super) const OUTPUT_BUDGET: usize = 2 * DEFAULT_MAX_BYTES;
 const NO_READER: &str = "this program cannot read documents: no document reader is set up";
 
 /// Added to the tool result and the diff when a write replaces a document.
-pub(super) const REBUILT_NOTE: &str = "The document was rebuilt from this text: formatting, images, comments, \
+pub(super) const REBUILT_NOTE: &str =
+    "The document was rebuilt from this text: formatting, images, comments, \
 and any other content the text does not show were not kept.";
 
 /// The "before" text of a review when the previous document could not be read.
@@ -316,3 +317,6 @@ async fn blocking<T: Send + 'static>(
         }
     })?
 }
+
+#[cfg(test)]
+mod hostile_tests;

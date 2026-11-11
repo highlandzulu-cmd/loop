@@ -1,6 +1,9 @@
 //! PowerPoint decks (.pptx): one `# Title` section per slide, both ways.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// The most slides a deck may list.
+const MAX_SLIDES: usize = 5_000;
 use std::fmt::Write as _;
 
 use super::markdown::{self, Block, Markdown, Marker, Run, Span};
@@ -15,11 +18,11 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         Some(rels) => xml::relationships(&rels)?,
         None => HashMap::new(),
     };
-    let mut md = Markdown::default();
-    let mut number = 0;
+    // Each slide part is read once, however often the list names it.
+    let mut parts = Vec::new();
+    let mut seen = HashSet::new();
     for node in xml::nodes(&presentation) {
-        let node = node?;
-        let Node::Open { name, attrs } = node else {
+        let Node::Open { name, attrs } = node? else {
             continue;
         };
         if name != "sldId" {
@@ -28,11 +31,27 @@ pub(super) fn read(bytes: &[u8]) -> Result<String, String> {
         let Some(target) = attr(&attrs, "r:id").and_then(|id| rels.get(id)) else {
             continue;
         };
-        let Some(slide) = package.text(&xml::resolve("ppt/", target))? else {
+        let part = xml::resolve("ppt/", target);
+        if seen.insert(part.clone()) {
+            parts.push(part);
+        }
+        if parts.len() > MAX_SLIDES {
+            return Err(format!(
+                "the deck lists more than {MAX_SLIDES} slides, too many to read"
+            ));
+        }
+    }
+    let mut md = Markdown::default();
+    let mut number = 0;
+    for part in parts {
+        let Some(slide) = package.text(&part)? else {
             continue;
         };
         number += 1;
         read_slide(&mut md, number, &slide)?;
+        if md.full() {
+            break;
+        }
     }
     Ok(md.finish())
 }

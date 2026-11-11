@@ -355,8 +355,14 @@ pub(super) struct Markdown {
 }
 
 impl Markdown {
+    /// Past the output budget: further blocks are dropped, and the reader
+    /// can stop.
+    pub(super) fn full(&self) -> bool {
+        self.out.len() > super::OUTPUT_BUDGET
+    }
+
     pub(super) fn block(&mut self, text: &str) {
-        if text.trim().is_empty() {
+        if text.trim().is_empty() || self.full() {
             return;
         }
         self.separate(false);
@@ -374,7 +380,7 @@ impl Markdown {
     }
 
     pub(super) fn item(&mut self, depth: usize, ordered: bool, text: &str) {
-        if text.trim().is_empty() {
+        if text.trim().is_empty() || self.full() {
             return;
         }
         // A list can only nest one level deeper than its previous item, and

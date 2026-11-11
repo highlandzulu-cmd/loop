@@ -133,8 +133,8 @@ pub(super) async fn run(config: &Config, pdf: &[u8]) -> Result<String, String> {
         let detail: String = String::from_utf8_lossy(&raw).chars().take(300).collect();
         return Err(format!("OCR service returned {status}: {detail}"));
     }
-    let value: serde_json::Value = serde_json::from_slice(&raw)
-        .map_err(|e| format!("OCR response was not JSON: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&raw).map_err(|e| format!("OCR response was not JSON: {e}"))?;
     text_of(&value)
 }
 
@@ -228,7 +228,10 @@ mod tests {
     #[test]
     fn responses_become_page_sections() {
         let v = serde_json::json!({"pages": [{"markdown": "a"}, {"markdown": "b"}]});
-        assert_eq!(text_of(&v).unwrap(), "<!-- page 1 -->\n\na\n\n<!-- page 2 -->\n\nb");
+        assert_eq!(
+            text_of(&v).unwrap(),
+            "<!-- page 1 -->\n\na\n\n<!-- page 2 -->\n\nb"
+        );
         assert!(text_of(&serde_json::json!({})).is_err());
     }
 }

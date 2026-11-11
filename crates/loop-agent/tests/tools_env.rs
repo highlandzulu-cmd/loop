@@ -57,8 +57,15 @@ fn text(result: &loop_agent::AgentToolResult) -> &str {
     }
 }
 
+/// This test binary parses documents in process; the `loop` binary uses a
+/// child (see loop-cli's `document_reader` test).
+fn in_process_reader() {
+    loop_agent::harness::set_document_reader(loop_agent::harness::DocumentReader::InProcess);
+}
+
 #[tokio::test]
 async fn documents_are_written_from_text_and_read_back_as_text() {
+    in_process_reader();
     let dir = tempfile::tempdir().unwrap();
     let env =
         Arc::new(HostExecutionEnv::new(dir.path())) as Arc<dyn loop_agent::harness::ExecutionEnv>;
@@ -134,4 +141,91 @@ async fn documents_are_written_from_text_and_read_back_as_text() {
         .unwrap();
     assert_eq!(text(&r), "# Hi\n\n- a\n- b");
     assert_eq!(r.details["format"], "Word");
+}
+
+#[tokio::test]
+async fn overwriting_a_document_warns_that_it_is_rebuilt_from_text() {
+    in_process_reader();
+    let dir = tempfile::tempdir().unwrap();
+    let env =
+        Arc::new(HostExecutionEnv::new(dir.path())) as Arc<dyn loop_agent::harness::ExecutionEnv>;
+    let write = create_write_tool(Arc::clone(&env));
+    let first = (write.execute)(
+        "1".into(),
+        json!({"path": "a.docx", "content": "# One"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !text(&first).contains("rebuilt"),
+        "a new file loses nothing"
+    );
+    let second = (write.execute)(
+        "2".into(),
+        json!({"path": "a.docx", "content": "# Two"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        text(&second).contains("formatting, images, comments"),
+        "{}",
+        text(&second)
+    );
+    let diff = second.details["diff"].as_str().unwrap();
+    assert!(
+        diff.starts_with("# The document was rebuilt from this text"),
+        "{diff}"
+    );
+    assert!(diff.contains("-# One") && diff.contains("+# Two"), "{diff}");
+
+    // A previous file the reader cannot read shows as such, not as empty.
+    std::fs::write(dir.path().join("broken.docx"), b"not a zip").unwrap();
+    let r = (write.execute)(
+        "3".into(),
+        json!({"path": "broken.docx", "content": "# New"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let diff = r.details["diff"].as_str().unwrap();
+    assert!(
+        diff.contains("-(could not read the previous document)"),
+        "{diff}"
+    );
+
+    // A document with more text than read shows is not overwritten.
+    let long = (0..3000)
+        .map(|i| format!("Paragraph {i} with some words in it."))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (write.execute)(
+        "4".into(),
+        json!({"path": "long.docx", "content": long}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let read = create_read_tool(Arc::clone(&env));
+    let shown = (read.execute)("5".into(), json!({"path": "long.docx"}), None, None)
+        .await
+        .unwrap();
+    assert_eq!(shown.details["truncated"], true);
+    assert!(text(&shown).contains("Do not overwrite it"));
+    let before = std::fs::read(dir.path().join("long.docx")).unwrap();
+    let err = (write.execute)(
+        "6".into(),
+        json!({"path": "long.docx", "content": "# Short"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("more text than read can show"), "{err}");
+    assert_eq!(std::fs::read(dir.path().join("long.docx")).unwrap(), before);
 }

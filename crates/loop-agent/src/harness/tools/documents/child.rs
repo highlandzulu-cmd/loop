@@ -116,10 +116,7 @@ pub(super) struct Converted {
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Reading {
     Done(Converted),
-    Refused {
-        error: String,
-        pdf: Option<PdfInfo>,
-    },
+    Refused { error: String, pdf: Option<PdfInfo> },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -498,7 +495,10 @@ fn child_main(format: &str) -> i32 {
         }
     };
     let mut stdout = std::io::stdout().lock();
-    match stdout.write_all(&reply(&reading)).and_then(|()| stdout.flush()) {
+    match stdout
+        .write_all(&reply(&reading))
+        .and_then(|()| stdout.flush())
+    {
         Ok(()) => 0,
         Err(_) => 1,
     }

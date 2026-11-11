@@ -10,8 +10,8 @@ use calamine::{Data, Reader as _};
 use regex::Regex;
 use rust_xlsxwriter::{ExcelDateTime, Format, Formula, Workbook};
 
-use super::formula;
 use super::markdown::table_cell;
+use super::{formula, xml, OUTPUT_BUDGET};
 
 pub(super) struct Sheet {
     pub name: String,
@@ -326,9 +326,81 @@ fn date(text: &str) -> Option<Date> {
     })
 }
 
+/// The most cells a sheet's used area may span, and the most cells a
+/// reader may hold for one sheet.
+pub(super) const MAX_CELLS: u64 = 5_000_000;
+
+/// (row, col) -> (cell text, value saved for a formula)
+type Cells = BTreeMap<(u32, u32), (String, Option<String>)>;
+
 /// The workbook in `bytes` (.xlsx or .ods) in the spreadsheet format.
+///
+/// calamine builds each sheet as a dense rows × columns array, so a sheet
+/// with one cell at A1 and one at XFD1048576 would need 17 billion cells.
+/// An .xlsx is therefore read cell by cell into a sparse map, and an .ods
+/// (which calamine expands while opening) is measured first. Both are
+/// fully inflated once with a budget before calamine sees them.
 pub(super) fn read(bytes: &[u8], ods: bool) -> Result<String, String> {
-    let mut book = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec()))
+    xml::Package::open(bytes)?.check_all()?;
+    if ods {
+        check_ods(bytes)?;
+        read_ods(bytes)
+    } else {
+        read_xlsx(bytes)
+    }
+}
+
+fn read_xlsx(bytes: &[u8]) -> Result<String, String> {
+    let mut book: calamine::Xlsx<_> = calamine::Reader::new(Cursor::new(bytes))
+        .map_err(|e| format!("could not open the spreadsheet: {e}"))?;
+    let mut out = String::new();
+    for name in book.sheet_names() {
+        let mut cells = Cells::new();
+        let mut reader = match book.worksheet_cells_reader(&name) {
+            Ok(reader) => Some(reader),
+            Err(calamine::XlsxError::NotAWorksheet(_)) => None,
+            Err(e) => return Err(format!("sheet `{name}`: {e}")),
+        };
+        let mut count: u64 = 0;
+        while let Some(reader) = reader.as_mut() {
+            let Some(cell) = reader
+                .next_cell_with_formula()
+                .map_err(|e| format!("sheet `{name}`: {e}"))?
+            else {
+                break;
+            };
+            count += 1;
+            if count > MAX_CELLS {
+                return Err(too_many_cells(&name));
+            }
+            let value = value_text(&Data::from(cell.value));
+            let formula = cell.formula.filter(|f| !f.trim().is_empty());
+            let entry = match formula {
+                Some(f) => (
+                    format!("={}", formula::from_xlsx(&f)),
+                    value.map(|v| v.trim_start_matches('\'').to_owned()),
+                ),
+                None => match value {
+                    Some(v) => (v, None),
+                    None => continue,
+                },
+            };
+            cells.insert(cell.pos, entry);
+        }
+        check_span(&name, &cells)?;
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        render_sheet(&mut out, &name, cells);
+        if out.len() > OUTPUT_BUDGET {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn read_ods(bytes: &[u8]) -> Result<String, String> {
+    let mut book: calamine::Ods<_> = calamine::Reader::new(Cursor::new(bytes))
         .map_err(|e| format!("could not open the spreadsheet: {e}"))?;
     let mut out = String::new();
     for name in book.sheet_names() {
@@ -336,47 +408,159 @@ pub(super) fn read(bytes: &[u8], ods: bool) -> Result<String, String> {
             .worksheet_range(&name)
             .map_err(|e| format!("sheet `{name}`: {e}"))?;
         let formulas = book.worksheet_formula(&name).ok();
+        let mut cells = Cells::new();
+        let (row0, col0) = values.start().unwrap_or((0, 0));
+        for (r, c, value) in values.cells() {
+            if let Some(text) = value_text(value) {
+                cells.insert((row0 + r as u32, col0 + c as u32), (text, None));
+            }
+        }
+        if let Some(formulas) = &formulas {
+            let (frow0, fcol0) = formulas.start().unwrap_or((0, 0));
+            for (r, c, stored) in formulas.cells() {
+                if stored.trim().is_empty() {
+                    continue;
+                }
+                let at = (frow0 + r as u32, fcol0 + c as u32);
+                let saved = cells
+                    .remove(&at)
+                    .map(|(text, _)| text.trim_start_matches('\'').to_owned());
+                cells.insert(at, (format!("={}", formula::to_excel(stored)), saved));
+            }
+        }
         if !out.is_empty() {
             out.push_str("\n\n");
         }
-        render_sheet(&mut out, &name, &values, formulas.as_ref(), ods);
+        render_sheet(&mut out, &name, cells);
+        if out.len() > OUTPUT_BUDGET {
+            break;
+        }
     }
     Ok(out)
 }
 
-fn render_sheet(
-    out: &mut String,
-    name: &str,
-    values: &calamine::Range<Data>,
-    formulas: Option<&calamine::Range<String>>,
-    ods: bool,
-) {
-    // (row, col) -> (cell text, value saved for a formula)
-    let mut cells: BTreeMap<(u32, u32), (String, Option<String>)> = BTreeMap::new();
-    let (row0, col0) = values.start().unwrap_or((0, 0));
-    for (r, c, value) in values.cells() {
-        if let Some(text) = value_text(value) {
-            cells.insert((row0 + r as u32, col0 + c as u32), (text, None));
-        }
+fn too_many_cells(sheet: &str) -> String {
+    format!("sheet `{sheet}` has more than {MAX_CELLS} cells, too many to read")
+}
+
+/// Refuse a sheet whose used area spans more than [`MAX_CELLS`] cells.
+fn check_span(sheet: &str, cells: &Cells) -> Result<(), String> {
+    let (Some(first), Some(last)) = (cells.keys().next(), cells.keys().next_back()) else {
+        return Ok(());
+    };
+    let rows = u64::from(last.0 - first.0) + 1;
+    let min_col = cells.keys().map(|(_, c)| *c).min().unwrap_or(0);
+    let max_col = cells.keys().map(|(_, c)| *c).max().unwrap_or(0);
+    let cols = u64::from(max_col - min_col) + 1;
+    if rows.saturating_mul(cols) > MAX_CELLS {
+        return Err(format!(
+            "sheet `{sheet}` spans {rows} rows × {cols} columns, more than the {MAX_CELLS} cells \
+             that can be read"
+        ));
     }
-    if let Some(formulas) = formulas {
-        let (frow0, fcol0) = formulas.start().unwrap_or((0, 0));
-        for (r, c, stored) in formulas.cells() {
-            if stored.trim().is_empty() {
-                continue;
+    Ok(())
+}
+
+/// Measure the tables of an .ods before calamine expands them: the cells
+/// it would hold while reading, and the area of its dense result.
+fn check_ods(bytes: &[u8]) -> Result<(), String> {
+    const MAX_ROWS: u64 = 1_048_576;
+    const MAX_COLS: u64 = 16_384;
+    let mut package = xml::Package::open(bytes)?;
+    let Some(content) = package.text("content.xml")? else {
+        return Ok(());
+    };
+    #[derive(Default)]
+    struct Table {
+        name: String,
+        /// Expanded rows so far.
+        row: u64,
+        /// Cells calamine stores while reading (before trimming).
+        stored: u64,
+        rows: Option<(u64, u64)>,
+        max_col: u64,
+        min_col: Option<u64>,
+    }
+    let mut table: Option<Table> = None;
+    let (mut row_repeat, mut col, mut row_last) = (1u64, 0u64, 0u64);
+    let mut row_min_col: Option<u64> = None;
+    // The cell being read: its start column, repeat, whether it has content.
+    let mut cell: Option<(u64, u64, bool)> = None;
+    let number = |attrs: &[(String, String)], name: &str, max: u64| {
+        xml::attr(attrs, name)
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(1)
+            .clamp(1, max)
+    };
+    for node in xml::nodes(&content) {
+        match node? {
+            xml::Node::Open { name, attrs } => match name.as_str() {
+                "table" => {
+                    table = Some(Table {
+                        name: xml::attr(&attrs, "name").unwrap_or_default().to_owned(),
+                        ..Table::default()
+                    })
+                }
+                "table-row" => {
+                    row_repeat = number(&attrs, "number-rows-repeated", MAX_ROWS);
+                    (col, row_last, row_min_col) = (0, 0, None);
+                }
+                "table-cell" | "covered-table-cell" => {
+                    let repeat = number(&attrs, "number-columns-repeated", MAX_COLS);
+                    let valued = xml::attr(&attrs, "value-type").is_some()
+                        || xml::attr(&attrs, "formula").is_some();
+                    cell = Some((col, repeat, valued));
+                }
+                _ => {
+                    if let Some(c) = &mut cell {
+                        c.2 |= name == "p" || name == "s";
+                    }
+                }
+            },
+            xml::Node::Text(text) => {
+                if let Some(c) = &mut cell {
+                    c.2 |= !text.trim().is_empty();
+                }
             }
-            let at = (frow0 + r as u32, fcol0 + c as u32);
-            let excel = if ods {
-                formula::to_excel(stored)
-            } else {
-                formula::from_xlsx(stored)
-            };
-            let saved = cells
-                .remove(&at)
-                .map(|(text, _)| text.trim_start_matches('\'').to_owned());
-            cells.insert(at, (format!("={excel}"), saved));
+            xml::Node::Close(name) => match name.as_str() {
+                "table-cell" | "covered-table-cell" => {
+                    if let Some((start, repeat, filled)) = cell.take() {
+                        col = (start + repeat).min(MAX_COLS);
+                        if filled {
+                            row_last = col;
+                            row_min_col.get_or_insert(start);
+                        }
+                    }
+                }
+                "table-row" => {
+                    if let Some(t) = &mut table {
+                        let first = t.row;
+                        t.row = (t.row + row_repeat).min(MAX_ROWS);
+                        t.stored += row_last;
+                        if let Some(min) = row_min_col {
+                            let (lo, _) = t.rows.unwrap_or((first, 0));
+                            t.rows = Some((lo, t.row - 1));
+                            t.max_col = t.max_col.max(row_last);
+                            t.min_col = Some(t.min_col.map_or(min, |m| m.min(min)));
+                        }
+                        let area = match (t.rows, t.min_col) {
+                            (Some((lo, hi)), Some(min)) => (hi - lo + 1) * (t.max_col - min),
+                            _ => 0,
+                        };
+                        if t.stored > MAX_CELLS || area > MAX_CELLS {
+                            return Err(too_many_cells(&t.name));
+                        }
+                    }
+                }
+                "table" => table = None,
+                _ => {}
+            },
         }
     }
+    Ok(())
+}
+
+fn render_sheet(out: &mut String, name: &str, cells: Cells) {
     let _ = write!(out, "## Sheet: {name}\n\n");
     if cells.is_empty() {
         out.push_str("(empty)");
@@ -387,10 +571,16 @@ fn render_sheet(
     out.push_str("| |");
     for col in first_col..=last_col {
         let _ = write!(out, " {} |", column_letters(col as u16));
+        if out.len() > OUTPUT_BUDGET {
+            return;
+        }
     }
     out.push_str("\n|---|");
     for _ in first_col..=last_col {
         out.push_str("---|");
+        if out.len() > OUTPUT_BUDGET {
+            return;
+        }
     }
     let rows: BTreeSet<u32> = cells.keys().map(|(r, _)| *r).collect();
     for row in rows {
@@ -403,23 +593,29 @@ fn render_sheet(
                 None => out.push_str(" |"),
             }
         }
+        if out.len() > OUTPUT_BUDGET {
+            return;
+        }
     }
-    let saved: Vec<String> = cells
+    let mut saved = cells
         .iter()
-        .filter_map(|((row, col), (_, saved))| {
-            let saved = saved.as_ref()?;
-            Some(format!(
-                "- {}: {}",
-                address(*row, *col as u16),
-                saved.replace('\n', " ")
-            ))
-        })
-        .collect();
-    if !saved.is_empty() {
+        .filter_map(|((row, col), (_, saved))| Some((*row, *col, saved.as_ref()?)))
+        .peekable();
+    if saved.peek().is_some() {
         out.push_str(
-            "\n\nFormula values saved in the file (recalculated when opened; ignored by write):\n",
+            "\n\nFormula values saved in the file (recalculated when opened; ignored by write):",
         );
-        out.push_str(&saved.join("\n"));
+        for (row, col, value) in saved {
+            let _ = write!(
+                out,
+                "\n- {}: {}",
+                address(row, col as u16),
+                value.replace('\n', " ")
+            );
+            if out.len() > OUTPUT_BUDGET {
+                return;
+            }
+        }
     }
 }
 

@@ -43,6 +43,7 @@ base64 = { workspace = true }
 mime_guess = { workspace = true }
 walkdir = { workspace = true }
 zip = { workspace = true }
+flate2 = { workspace = true }
 quick-xml = { workspace = true }
 pulldown-cmark = { workspace = true }
 calamine = { workspace = true }
