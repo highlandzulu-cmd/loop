@@ -260,8 +260,30 @@ impl ToolGate {
         *self.hooks.lock() = Some(hooks);
     }
 
+    /// The `toolPermissions` deny rule that refuses an external agent's
+    /// call, if any. Deny rules name Loop's own tools, so the call is
+    /// checked as each Loop tool of its kind (`bash` for a command, `write`
+    /// and `edit` for an edit, and so on) with the agent's raw input.
+    pub fn agent_call_denied(&self, kind: ToolKind, args: &serde_json::Value) -> Option<String> {
+        let tools: &[&str] = match kind {
+            ToolKind::Execute => &["bash"],
+            ToolKind::Edit | ToolKind::Delete | ToolKind::Move => &["write", "edit"],
+            ToolKind::Read => &["read"],
+            ToolKind::Search => &["grep", "glob", "ls"],
+            ToolKind::Fetch => &["web_fetch", "web_search"],
+            ToolKind::Think | ToolKind::Other => &[],
+        };
+        let rules = self.permissions.lock();
+        let workspace = self.workspace();
+        tools.iter().find_map(|tool| {
+            let call = Call::resolve(tool, kind, args, &workspace);
+            let rule = crate::permissions::rule_for(&rules, &call);
+            (rule.permission == ToolPermission::Deny)
+                .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
+        })
+    }
+
     /// The `tool_call` hooks' decision about an external agent's call.
-    /// Deny rules name Loop's own tools, so they do not apply here.
     pub async fn review_agent_call(&self, info: ToolCallInfo) -> Option<ToolDecision> {
         let hooks = self.hooks()?;
         hooks.emit(HarnessHookEvent::ToolCall(info)).await.decision

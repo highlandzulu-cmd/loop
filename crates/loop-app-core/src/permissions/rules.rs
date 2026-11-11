@@ -131,6 +131,13 @@ pub fn split_command(command: &str) -> Option<Vec<String>> {
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            // An escaped character never opens a quote or ends a part, as
+            // in the shell (and in `words`).
+            '\\' if !single => {
+                current.push(c);
+                current.extend(chars.next());
+                continue;
+            }
             '\'' if !double => single = !single,
             '"' if !single => double = !double,
             '`' if !single => return None,
@@ -191,6 +198,18 @@ pub fn read_only_command(command: &str) -> bool {
 /// The words of one command part, with quotes removed. `None` when it
 /// redirects output (an unquoted `>`).
 fn words(part: &str) -> Option<Vec<String>> {
+    split_words(part, false)
+}
+
+/// One command part as the shell runs it: quotes and escapes removed and
+/// words joined with single spaces, so `\rm`, `r\m` and `'rm'` read as
+/// `rm`. Deny and ask patterns match this as well as the part as written.
+fn normalise(part: &str) -> String {
+    split_words(part, true).unwrap_or_default().join(" ")
+}
+
+/// [`words`], keeping `>` as a character when `redirects` is true.
+fn split_words(part: &str, redirects: bool) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut current = String::new();
     let (mut single, mut double, mut started) = (false, false, false);
@@ -206,7 +225,7 @@ fn words(part: &str) -> Option<Vec<String>> {
                 started = true;
             }
             '\\' if !single => current.extend(chars.next()),
-            '>' if !single && !double => return None,
+            '>' if !single && !double && !redirects => return None,
             c if c.is_whitespace() && !single && !double => {
                 if started || !current.is_empty() {
                     words.push(std::mem::take(&mut current));
@@ -322,10 +341,16 @@ pub fn rule_for(rules: &BTreeMap<String, ToolPermission>, call: &Call) -> Rule {
                 bash_allows.push(pattern);
                 false
             } else {
+                // Deny and ask also match the part with quotes and escapes
+                // removed; allow (above) matches only the part as written.
+                let matches =
+                    |part: &str| glob_match(pattern, part) || glob_match(pattern, &normalise(part));
                 match split_command(subject) {
-                    Some(parts) => parts.iter().any(|part| glob_match(pattern, part)),
+                    Some(parts) => parts.iter().any(|part| matches(part)),
                     None => {
-                        glob_match(pattern, subject) || subject.contains(pattern.trim_matches('*'))
+                        matches(subject)
+                            || subject.contains(pattern.trim_matches('*'))
+                            || normalise(subject).contains(pattern.trim_matches('*'))
                     }
                 }
             }
@@ -484,6 +509,32 @@ mod tests {
         assert_eq!(
             bash_rule(&r, "git status $(rm -rf x)"),
             Rule::plain(ToolPermission::Ask)
+        );
+    }
+
+    #[test]
+    fn deny_and_ask_patterns_see_through_quotes_and_escapes() {
+        let r = rules(&[("bash(rm *)", "deny"), ("bash(curl *)", "ask")]);
+        for cmd in [
+            "\\rm -rf x",
+            "r\\m -rf x",
+            "'rm' -rf x",
+            "\"r\"m -rf x",
+            "ls && \\rm -rf x",
+            "rm  -rf x",
+        ] {
+            assert_eq!(bash_rule(&r, cmd).permission, ToolPermission::Deny, "{cmd}");
+        }
+        assert_eq!(bash_rule(&r, "c\\url x").permission, ToolPermission::Ask);
+        // Allow patterns are not widened by the normalisation.
+        let allow = rules(&[("bash(git status)", "allow"), ("bash", "ask")]);
+        assert_eq!(
+            bash_rule(&allow, "git status").permission,
+            ToolPermission::Allow
+        );
+        assert_eq!(
+            bash_rule(&allow, "'git' status").permission,
+            ToolPermission::Ask
         );
     }
 

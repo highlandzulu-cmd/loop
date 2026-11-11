@@ -97,4 +97,10 @@ impl FileSystem for SessionExecutionEnv {
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError> {
         self.inner.create_temp_dir(prefix).await
     }
+    async fn file_identity(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        self.inner.file_identity(path).await
+    }
 }
