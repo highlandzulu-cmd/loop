@@ -440,24 +440,34 @@ impl Runtime {
         let records = self.log.recovery_records(from).await.map_err(failed)?;
         let (turns, escalations) = unfinished(&records, self.generation);
         let ts_ms = now();
-        let mut events = Vec::with_capacity(turns.len() + escalations.len());
-        for (session, turn_id) in &turns {
-            events.push(Event::update(
-                self.generation,
-                ts_ms,
-                UpdateEnvelope::live(
-                    self.instance.clone(),
+        let mut events = Vec::with_capacity(2 * turns.len() + escalations.len());
+        for turn in &turns {
+            let update = |update| {
+                Event::update(
                     self.generation,
-                    session.clone(),
-                    Some(turn_id.clone()),
-                    0,
-                    SessionUpdate::TurnEnded {
-                        turn_id: turn_id.clone(),
-                        stop: loop_protocol::StopReason::RuntimeRestarted,
-                        error: None,
-                    },
-                ),
-            ));
+                    ts_ms,
+                    UpdateEnvelope::live(
+                        self.instance.clone(),
+                        self.generation,
+                        turn.session.clone(),
+                        Some(turn.turn_id.clone()),
+                        0,
+                        update,
+                    ),
+                )
+            };
+            // A prompt whose turn start never committed may still have run
+            // tools: give it a turn, so it can end uncertain.
+            if turn.unstarted {
+                events.push(update(SessionUpdate::TurnStarted {
+                    turn_id: turn.turn_id.clone(),
+                }));
+            }
+            events.push(update(SessionUpdate::TurnEnded {
+                turn_id: turn.turn_id.clone(),
+                stop: loop_protocol::StopReason::RuntimeRestarted,
+                error: None,
+            }));
         }
         for open in &escalations {
             events.push(Event {

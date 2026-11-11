@@ -368,15 +368,16 @@ fn read(conn: &Connection, session: Option<&SessionKey>, after: u64) -> Result<V
     )
 }
 
-/// Turn boundaries and Escalation records, filtered in SQL so recovery never
-/// loads streamed text.
+/// Turn boundaries, prompts sent, clean stops and Escalation records,
+/// filtered in SQL so recovery never loads streamed text.
 fn recovery(conn: &Connection, from_generation: u64) -> Result<Vec<LoggedEvent>> {
     if from_generation > i64::MAX as u64 {
         return Ok(Vec::new());
     }
     let sql = format!(
         "SELECT {COLUMNS} FROM events WHERE generation>=?1 AND (\
-         kind IN ('escalation_raised','escalation_answered','escalation_withdrawn') \
+         kind IN ('prompt_sent','runtime_stopped',\
+         'escalation_raised','escalation_answered','escalation_withdrawn') \
          OR (kind='update' AND json_extract(payload,'$.event.payload.update.type') \
              IN ('turn_started','turn_ended'))) ORDER BY global_seq"
     );

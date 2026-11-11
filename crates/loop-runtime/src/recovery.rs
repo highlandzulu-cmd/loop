@@ -31,12 +31,39 @@ pub(crate) struct OpenEscalation {
     pub id: Value,
 }
 
+/// A turn recovery must end as `runtime_restarted`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenTurn {
+    pub session: SessionKey,
+    pub turn_id: TurnId,
+    /// The log has no `turn_started` for it: only a `prompt_sent`. Its tools
+    /// may have run before the start committed, so recovery logs the start too.
+    pub unstarted: bool,
+}
+
+/// Id of the turn recovery records for a prompt (at `global_seq`) whose turn
+/// start was never logged. Deterministic, so a repeated pass finds it.
+pub(crate) fn unstarted_turn_id(global_seq: u64) -> TurnId {
+    TurnId(format!("recovered-prompt-{global_seq}"))
+}
+
 /// Unfinished work of generations older than `current`, in first-seen order.
+///
+/// A Session runs one prompt at a time, so a `turn_started` after a
+/// `prompt_sent` belongs to it. The last prompt of a Session with no turn
+/// start after it is unfinished too, unless its generation stopped cleanly.
 pub(crate) fn unfinished(
     records: &[LoggedEvent],
     current: u64,
-) -> (Vec<(SessionKey, TurnId)>, Vec<OpenEscalation>) {
-    let mut turns: HashMap<(SessionKey, TurnId), (u64, bool)> = HashMap::new();
+) -> (Vec<OpenTurn>, Vec<OpenEscalation>) {
+    let mut turns: HashMap<(SessionKey, TurnId), (u64, bool, bool)> = HashMap::new();
+    // Per Session: the last prompt with no turn start yet (seq, generation).
+    let mut prompts: HashMap<SessionKey, (u64, u64)> = HashMap::new();
+    let stopped: std::collections::HashSet<u64> = records
+        .iter()
+        .filter(|r| matches!(r.event.kind, EventKind::RuntimeStopped(_)))
+        .map(|r| r.event.generation)
+        .collect();
     let mut escalations: HashMap<(SessionKey, u64, String), (u64, Option<Value>)> = HashMap::new();
     for record in records {
         let event = &record.event;
@@ -44,13 +71,25 @@ pub(crate) fn unfinished(
             continue;
         };
         match &event.kind {
+            EventKind::PromptSent(_) => {
+                if event.generation < current {
+                    prompts.insert(session.clone(), (record.global_seq, event.generation));
+                } else {
+                    prompts.remove(session);
+                }
+            }
             EventKind::Update(envelope) => match &envelope.update {
                 // A turn that started in this generation is live, not recoverable.
                 SessionUpdate::TurnStarted { turn_id } if event.generation < current => {
+                    prompts.remove(session);
                     turns.insert(
                         (session.clone(), turn_id.clone()),
-                        (record.global_seq, true),
+                        (record.global_seq, true, false),
                     );
+                }
+                // Recovery's own start for an unstarted prompt settles it.
+                SessionUpdate::TurnStarted { .. } => {
+                    prompts.remove(session);
                 }
                 // Ids are process-local counters. A live turn of this generation
                 // must not close an old one; only recovery's own end may.
@@ -87,10 +126,24 @@ pub(crate) fn unfinished(
             _ => {}
         }
     }
+    for (session, (seq, generation)) in prompts {
+        if !stopped.contains(&generation) {
+            turns.insert((session, unstarted_turn_id(seq)), (seq, true, true));
+        }
+    }
     let mut turns: Vec<_> = turns
         .into_iter()
-        .filter(|(_, (_, open))| *open)
-        .map(|(key, (seq, _))| (seq, key))
+        .filter(|(_, (_, open, _))| *open)
+        .map(|((session, turn_id), (seq, _, unstarted))| {
+            (
+                seq,
+                OpenTurn {
+                    session,
+                    turn_id,
+                    unstarted,
+                },
+            )
+        })
         .collect();
     turns.sort_by_key(|(seq, _)| *seq);
     let mut escalations: Vec<_> = escalations
@@ -110,7 +163,7 @@ pub(crate) fn unfinished(
         .collect();
     escalations.sort_by_key(|(seq, _)| *seq);
     (
-        turns.into_iter().map(|(_, key)| key).collect(),
+        turns.into_iter().map(|(_, turn)| turn).collect(),
         escalations.into_iter().map(|(_, open)| open).collect(),
     )
 }
@@ -161,5 +214,72 @@ mod tests {
         let mut recovered = records;
         recovered.push(turn(4, 2, ended(StopReason::RuntimeRestarted)));
         assert!(unfinished(&recovered, 2).0.is_empty());
+    }
+
+    fn prompt(global_seq: u64, generation: u64) -> LoggedEvent {
+        LoggedEvent {
+            global_seq,
+            session_seq: None,
+            event: Event {
+                generation,
+                session_key: Some("s".into()),
+                turn: None,
+                ts_ms: 0,
+                kind: EventKind::PromptSent(serde_json::json!({})),
+            },
+        }
+    }
+
+    #[test]
+    fn the_last_prompt_without_a_turn_start_is_unfinished_unless_its_generation_stopped() {
+        let started = SessionUpdate::TurnStarted {
+            turn_id: TurnId("turn-1".into()),
+        };
+        // A prompt with its turn, then a prompt whose turn start never committed.
+        let mut records = vec![
+            prompt(1, 1),
+            turn(2, 1, started),
+            turn(3, 1, ended(StopReason::EndTurn)),
+            prompt(4, 1),
+        ];
+        let (turns, _) = unfinished(&records, 2);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].unstarted);
+        assert_eq!(turns[0].turn_id, unstarted_turn_id(4));
+        // Recovery's own start and end settle it for a later pass.
+        let id = turns[0].turn_id.clone();
+        let mut recovered = records.clone();
+        for (seq, update) in [
+            (
+                5,
+                SessionUpdate::TurnStarted {
+                    turn_id: id.clone(),
+                },
+            ),
+            (
+                6,
+                SessionUpdate::TurnEnded {
+                    turn_id: id,
+                    stop: StopReason::RuntimeRestarted,
+                    error: None,
+                },
+            ),
+        ] {
+            recovered.push(turn(seq, 2, update));
+        }
+        assert!(unfinished(&recovered, 3).0.is_empty());
+        // A clean stop means the prompt never ran a turn.
+        records.push(LoggedEvent {
+            global_seq: 5,
+            session_seq: None,
+            event: Event {
+                generation: 1,
+                session_key: None,
+                turn: None,
+                ts_ms: 0,
+                kind: EventKind::RuntimeStopped(serde_json::json!({})),
+            },
+        });
+        assert!(unfinished(&records, 2).0.is_empty());
     }
 }

@@ -114,8 +114,8 @@ pub trait EventLog: Send + Sync {
     async fn allocate_generation(&self, owner: &str, pid: u32, started_ms: i64) -> Result<u64>;
     /// Record a clean stop for a previously allocated generation.
     async fn finish_generation(&self, generation: u64, stopped_ms: i64) -> Result<()>;
-    /// Turn boundaries (`turn_started`, `turn_ended` Updates) and Escalation
-    /// records of generations at or after `from_generation`, in `global_seq`
+    /// Turn boundaries (`turn_started`, `turn_ended` Updates), prompts sent,
+    /// clean stops and Escalation records of generations at or after `from_generation`, in `global_seq`
     /// order. Implementations should filter in storage; the default scans the log.
     async fn recovery_records(&self, from_generation: u64) -> Result<Vec<LoggedEvent>> {
         Ok(self
@@ -198,7 +198,9 @@ pub fn is_recovery_record(kind: &EventKind) -> bool {
             loop_protocol::SessionUpdate::TurnStarted { .. }
                 | loop_protocol::SessionUpdate::TurnEnded { .. }
         ),
-        EventKind::EscalationRaised(_)
+        EventKind::PromptSent(_)
+        | EventKind::RuntimeStopped(_)
+        | EventKind::EscalationRaised(_)
         | EventKind::EscalationAnswered(_)
         | EventKind::EscalationWithdrawn(_) => true,
         _ => false,
