@@ -129,7 +129,7 @@ commit.
 
 ## Defects
 
-### D1 — `turn_ended` commits before the tree holds the turn (open)
+### D1 — `turn_ended` commits before the tree holds the turn (fixed, see Re-run after fixes)
 
 - **Where.** The harness writes all tree entries of a turn after the turn
   ends (`crates/loop-agent/src/harness/agent_harness.rs:1391-1410`; entries
@@ -142,13 +142,14 @@ commit.
   already shown the turn as finished. The prompt result itself is safe: it
   waits for the tree writes.
 - **Test.** `crates/loop-runtime/tests/e1_defects.rs`,
-  `d1_a_logged_turn_end_implies_the_tree_holds_the_turn` (ignored, fails).
+  `d1_a_logged_turn_end_implies_the_tree_holds_the_turn` (passes since
+  `4246d1e`).
 - **Fix direction.** Commit `turn_ended` only after the tree writes of the
   turn (hold it in the native backend until `harness.prompt` returns), or
   let recovery compare the tree with the log. Not done here: it changes the
   stream contract.
 
-### D2 — a turn can run tools before its start is in the log (open)
+### D2 — a turn can run tools before its start is in the log (fixed, see Re-run after fixes)
 
 - **Where.** Tools do not wait for the pump. Recovery reads only
   `turn_started`, `turn_ended` and Escalation records
@@ -160,7 +161,7 @@ commit.
   in trials with the slow writer; all 111 D1 cases were in trials without it.
 - **Test.** `e1_defects.rs`,
   `d2_a_prompt_whose_turn_start_was_not_logged_is_recovered_as_uncertain`
-  (ignored, fails).
+  (passes since `a11036d`).
 - **Fix direction.** Recovery also ends, as uncertain, a `prompt_sent` that
   has no later `turn_started` in its generation (this needs a turn id for
   the synthetic end), or the Runtime commits `turn_started` before the
@@ -193,7 +194,81 @@ commit.
   `concurrent_first_opens_of_a_fresh_database_all_succeed` in
   `crates/loop-agent/tests/session_sqlite.rs`.
 
+## Re-run after fixes
+
+Run on 2026-11-11. Code: branch `probe/e1-recovery`, commit `16aed97`
+(fixes in `a11036d` for D2 and `4246d1e` for D1). Same command, same seeds,
+200 trials each.
+
+### Fixes
+
+- **D1.** `crates/loop-agent/src/native_backend.rs`: while a prompt runs, the
+  native backend holds the `TurnEnded` update (and any update after it) in
+  `StreamState::held`. The prompt task releases it after `harness.prompt`
+  returns, that is after the tree writes. So the Runtime pump commits
+  `turn_ended` only when `sessions.db` holds the turn. If the tree writes
+  fail (D3), the held end reports `stop: error` with the failure, instead of
+  `end_turn` and a separate notice.
+- **D2.** `crates/loop-runtime/src/recovery.rs`, `runtime.rs` (`recover`),
+  `log/sqlite.rs` and `log/mod.rs`: recovery also reads `prompt_sent` and
+  `runtime_stopped`. A Session runs one prompt at a time, so the last
+  `prompt_sent` of a Session with no `turn_started` after it, in a
+  generation that did not stop cleanly, can have run tools. Recovery logs a
+  `turn_started` and a `turn_ended: runtime_restarted` for it, with the turn
+  id `recovered-prompt-<global_seq>`. The id is deterministic, so a repeated
+  pass finds nothing more.
+
+### Contract changes
+
+- No wire protocol change: no new message, field or stop reason.
+- Stream timing: a prompted turn's `turn_ended` now reaches the stream
+  after the turn is in the tree, not when the model stops. A turn whose tree
+  writes fail now ends with `stop: error` (it used to send `end_turn`
+  and then an error notice).
+- Recovery can now emit a `turn_started` for a turn id that the native
+  backend never used (`recovered-prompt-N`), immediately followed by its
+  `runtime_restarted` end.
+- The test `d1_...` now holds the Session database lock for 1 s, not until
+  `turn_ended` commits. With the fix, the old version made the tree writes
+  wait until their 6 s deadline. The new version still fails on the old code.
+
+### Numbers
+
+| Criterion | Set A (seed 20261111) | Set B (seed 424242) | Pass? |
+|---|---|---|---|
+| Acknowledged mutations lost | 0 of 20,266 (6,640 Runtime + 13,626 embedded) | 0 of 21,258 (7,232 + 14,026) | Yes |
+| Duplicate side effects | 0 | 0 | Yes |
+| Duplicate recovery records | 0 (and 0 turns found by the extra start after a clean stop) | 0 (0) | Yes |
+| Takeovers of a live owner | 0 of 4,800 (all refused) | 0 of 4,800 | Yes |
+| Every interrupted turn marked uncertain (Runtime) | **0 of 800 not marked** | **0 of 800 not marked** | **Yes** |
+
+Interrupted Runtime turns, set A (set B): 686 (681) marked
+`runtime_restarted`, 50 (64) finished in both stores with only the
+acknowledgement lost, 64 (55) never started (no turn in the log, no tree entry, no
+side effect). D1 cases: 0 (0). D2 cases: 0 (0). Run time 103 s (101 s), 0
+trial failures, 0 notes.
+
+### Decision
+
+E1 passes: all 5 criteria on both seeds. The two-store ordering fixes are
+enough to merge `staging` to `main` with the Runtime as the default, once
+E3 also passes. The Phase 1 recommendation (tree as a projection of the log)
+stands, for the reasons below.
+
+### Remaining risks
+
+- A prompt cancelled or refused before its turn started, as the last prompt
+  of a Session in a generation that crashed, is now also marked
+  `runtime_restarted`, although it did nothing. This is a false "uncertain",
+  not a lost record.
+- Turns the harness runs without `NativeBackend::prompt` (no prompt in
+  flight) are not held; their `turn_ended` can still commit before the tree.
+- Embedded owners are unchanged (no Event Log).
+
 ## Recommendation
+
+Note: written before the fixes. See "Re-run after fixes" for the current
+decision.
 
 1. **Merge `staging` to `main`: no, not now.** Criteria 1 to 4 are strong
    (0 failures in about 42,000 acknowledged turns and 9,600 takeover
