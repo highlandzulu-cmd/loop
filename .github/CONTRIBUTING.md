@@ -131,7 +131,7 @@ cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
 
 Notes:
 
-- CI (`.github/workflows/ci.yml`) runs the format and lint checks on Linux, and the tests on Linux and macOS. Run them locally first to avoid a red build.
+- CI (`.github/workflows/ci.yml`) runs the format and lint checks on Linux, and the tests on Linux and macOS. Run them locally first to avoid a red build. It also lints and tests with `--features loop-cli/orchestration`; if you touch orchestration code, run `cargo clippy -p loop-agent -p loop-runtime -p loop-cli --features loop-cli/orchestration --all-targets --locked -- -D warnings`. See [docs/ci.md](../docs/ci.md).
 - **`--locked` is mandatory.** Do not change `Cargo.lock` unless your PR intentionally adds or updates a dependency. For version bumps use `cargo update -w`, not `cargo generate-lockfile`; the GPUI git dependencies must not be re-resolved (see the comment in `Cargo.toml`).
 - **Live tests** that call real providers or krun microVMs are opt-in through `LOOP_TEST_*` environment variables (for example `LOOP_TEST_BASE_URL`, `LOOP_TEST_MODEL`, `LOOP_TEST_KRUN`). They must skip cleanly when those variables are unset, and they must never run in default CI.
 - If you touch `loop-desktop`, also run `cargo clippy -p loop-desktop -- -D warnings` from `crates/loop-desktop` (nightly).
