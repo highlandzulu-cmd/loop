@@ -8,7 +8,6 @@ workflow has a Windows job or step.
 | Workflow | File | Runs on | Does |
 |----------|------|---------|------|
 | CI | `.github/workflows/ci.yml` | push to `main`; PR into `main` or `staging`; merge queue; manual | Format, lint, tests, desktop check |
-| Probes | `.github/workflows/probes.yml` | nightly (default branch); manual | The `#[ignore]` E1 and E3 probe tests |
 | Release | `.github/workflows/release.yml` | tag `v*.*.*`; manual | Builds, signs, publishes. See [Releasing](releasing.md) |
 
 ## CI jobs
@@ -70,11 +69,9 @@ to the exclude list in `ci.yml`. Clippy is not run on macOS, so the
   them, so per-PR copies do not push the shared caches out of the 10 GB limit.
 - Lint and test have separate keys (`lint`, `test-<os>`): clippy and test
   builds make different files, and a cache key can be saved only once.
-- The feature-set job and the probes restore `test-ubuntu-latest` and never
-  save. Their dependencies are the same.
-- `CARGO_PROFILE_DEV_DEBUG=line-tables-only` keeps `target/` small. rust-cache
-  puts `CARGO_*` variables in the key, so `probes.yml` must keep the same
-  values as `ci.yml`.
+- The feature-set job restores `test-ubuntu-latest` and never saves. Its
+  dependencies are the same.
+- `CARGO_PROFILE_DEV_DEBUG=line-tables-only` keeps `target/` small.
 - `cache-on-failure` saves the cache of a failed run on `main`.
 
 ### Other settings
@@ -92,11 +89,8 @@ to the exclude list in `ci.yml`. Clippy is not run on macOS, so the
 network. E3 needs `--features orchestration`. The E3 harness switches off
 external diff windows, so no probe opens a GUI.
 
-`probes.yml` runs them nightly on the default branch, and on demand (Actions,
-Probes, Run workflow, choose a branch; inputs: E1 trial count and seed). The
-commands are the ones in [E1](probes/e1-results.md) and [E3](probes/e3-results.md).
-They are not part of the PR gate. An E3 `LEAK` fails the job by design: the
-probe fails while a leak is open.
+CI does not run them. Run them by hand with the commands in
+[E1](probes/e1-results.md) and [E3](probes/e3-results.md).
 
 ## Release workflow
 

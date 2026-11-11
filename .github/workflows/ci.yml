@@ -25,8 +25,6 @@ env:
   CARGO_TERM_COLOR: always
   # CI never runs a debugger: line tables keep file and line numbers in
   # panics but make target/ (and so the cache) much smaller.
-  # Keep these two values the same in probes.yml: rust-cache puts CARGO_*
-  # variables into the cache key, and probes.yml reuses the test cache.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 # Action versions are pinned to commit SHAs (the comment gives the tag).
@@ -165,7 +163,7 @@ jobs:
         with:
           toolchain: stable
 
-      # The shared key is read by the feature-set job and by probes.yml.
+      # The shared key is read by the feature-set job.
       - name: Cache cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
