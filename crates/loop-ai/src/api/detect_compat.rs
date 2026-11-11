@@ -221,6 +221,14 @@ mod tests {
     }
 
     #[test]
+    fn supports_metadata_reads_from_model_config() {
+        let o: OpenAICompletionsCompat =
+            serde_json::from_str(r#"{"supportsMetadata": true}"#).unwrap();
+        assert_eq!(o.supports_metadata, Some(true));
+        assert!(resolve_compat("https://gateway.example.com/v1", Some(&o)).supports_metadata);
+    }
+
+    #[test]
     fn zai_uses_the_zai_thinking_format() {
         assert_eq!(
             detect_compat("https://api.z.ai/api/paas/v4").thinking_format,
