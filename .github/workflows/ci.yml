@@ -3,15 +3,17 @@ name: CI
 # What runs where, and why: docs/ci.md. Linux and macOS only.
 
 on:
+  # Pushes to staging run no CI, so staging stays easy to push to.
+  # PRs into staging and main still run it.
   push:
-    branches: [main, staging]
+    branches: [main]
   pull_request:
     branches: [main, staging]
   merge_group:
   workflow_dispatch:
 
-# A new push to a PR cancels that PR's older run. Runs on main and staging
-# always finish, so each merge is fully validated.
+# A new push to a PR cancels that PR's older run. Runs on main always
+# finish, so each merge is fully validated.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -108,14 +110,14 @@ jobs:
       - name: ShellCheck
         run: shellcheck install.sh
 
-      # main and staging save caches. PRs restore them (the base branch, then
-      # main), so per-PR copies do not push them out of the 10 GB repo limit.
+      # Only main saves caches. PRs restore them, so per-PR copies do not push
+      # them out of the 10 GB repo limit.
       # clippy artifacts differ from test artifacts, so lint has its own key.
       - name: Cache cargo
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: lint
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       - name: clippy
@@ -168,7 +170,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: test-${{ matrix.os }}
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       # No separate `cargo build`: `cargo test` builds the same binaries.
@@ -243,7 +245,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: desktop
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
       # A compile check, as the release build does it. Not clippy: nightly

@@ -7,7 +7,7 @@ workflow has a Windows job or step.
 
 | Workflow | File | Runs on | Does |
 |----------|------|---------|------|
-| CI | `.github/workflows/ci.yml` | push to `main` and `staging`; PR into `main` or `staging`; merge queue; manual | Format, lint, tests, desktop check |
+| CI | `.github/workflows/ci.yml` | push to `main`; PR into `main` or `staging`; merge queue; manual | Format, lint, tests, desktop check |
 | Probes | `.github/workflows/probes.yml` | nightly (default branch); manual | The `#[ignore]` E1 and E3 probe tests |
 | Release | `.github/workflows/release.yml` | tag `v*.*.*`; manual | Builds, signs, publishes. See [Releasing](releasing.md) |
 
@@ -28,7 +28,9 @@ builds the same binaries.
 
 ### Which jobs run
 
-- Push to `main` or `staging`, merge queue, manual run: all jobs.
+- Push to `main`, merge queue, manual run: all jobs.
+- Push to `staging`: no CI, so `staging` stays easy to push to. A PR into
+  `staging` or `main` runs CI.
 - PR: `Changes` looks at the files.
   - Only docs (`docs/`, root and `.github/` Markdown files, `resources/`,
     `LICENSE`, issue templates): the Rust jobs are skipped. The gate still
@@ -40,8 +42,8 @@ builds the same binaries.
     change. If the desktop app starts to depend on another crate, add it to the
     `desk` pattern in `ci.yml`.
   - Anything else: all jobs.
-- A new push to a PR cancels the older run of that PR. Runs on `main` and
-  `staging` are never cancelled.
+- A new push to a PR cancels the older run of that PR. Runs on `main` are
+  never cancelled.
 
 ### Why these feature sets
 
@@ -64,7 +66,7 @@ to the exclude list in `ci.yml`. Clippy is not run on macOS, so the
 
 ### Caches
 
-- `Swatinem/rust-cache`. Only `main` and `staging` save caches. PRs restore
+- `Swatinem/rust-cache`. Only `main` saves caches. PRs restore
   them, so per-PR copies do not push the shared caches out of the 10 GB limit.
 - Lint and test have separate keys (`lint`, `test-<os>`): clippy and test
   builds make different files, and a cache key can be saved only once.
@@ -73,7 +75,7 @@ to the exclude list in `ci.yml`. Clippy is not run on macOS, so the
 - `CARGO_PROFILE_DEV_DEBUG=line-tables-only` keeps `target/` small. rust-cache
   puts `CARGO_*` variables in the key, so `probes.yml` must keep the same
   values as `ci.yml`.
-- `cache-on-failure` saves the cache of a failed run on `main` and `staging`.
+- `cache-on-failure` saves the cache of a failed run on `main`.
 
 ### Other settings
 
