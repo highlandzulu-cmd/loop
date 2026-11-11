@@ -4551,15 +4551,22 @@ fn apply_tool_update(
         _ => None,
     };
     let Some(is_error) = finished else {
+        // Progress never reopens a finished call: late output of a command
+        // must not show it running again, in its card or in the status line.
+        let idx = find_tool_index(chat, &id);
+        if idx.is_some_and(|idx| {
+            matches!(chat.get(idx), Some(ChatItem::Tool { status, .. }) if *status != CardStatus::Pending)
+        }) {
+            return;
+        }
         // Still running: show partial output until the result arrives.
         if live {
             if let Some(name) = &update.name {
                 *turn_step = format!("tool · {name}");
             }
         }
-        if let Some(idx) = find_tool_index(chat, &id) {
-            if let Some(ChatItem::Tool { detail, status, .. }) = chat.get_mut(idx) {
-                *status = CardStatus::Pending;
+        if let Some(idx) = idx {
+            if let Some(ChatItem::Tool { detail, .. }) = chat.get_mut(idx) {
                 if detail.is_empty() && !output.is_empty() {
                     *detail = format!("(partial) {output}");
                 }
@@ -6699,6 +6706,50 @@ mod plan_tests {
         assert!(text.contains("✔ read the code"), "{text}");
         assert!(text.contains("◼ fix it"), "{text}");
         assert!(text.contains("☐ test"), "{text}");
+    }
+
+    /// Late output of a finished command must not mark its card running
+    /// again: partial updates may reach the TUI after the result.
+    #[test]
+    fn a_late_partial_update_keeps_a_finished_tool_done() {
+        let call = SessionUpdate::ToolCall(ToolCall {
+            id: ToolCallId("b1".into()),
+            name: Some("bash".into()),
+            title: "bash".into(),
+            kind: ToolKind::Execute,
+            status: ToolCallStatus::InProgress,
+            content: vec![],
+            locations: vec![],
+            raw_input: Some(serde_json::json!({"command": "ls -la"})),
+        });
+        let mut done = ToolCallUpdate::new(ToolCallId("b1".into()));
+        done.name = Some("bash".into());
+        done.status = Some(ToolCallStatus::Completed);
+        let mut partial = ToolCallUpdate::new(ToolCallId("b1".into()));
+        partial.content = Some(vec![]);
+        let chat = chat_from_transcript(vec![
+            call,
+            SessionUpdate::ToolCallUpdate(done),
+            SessionUpdate::ToolCallUpdate(partial),
+        ]);
+        assert!(
+            matches!(
+                &chat[..],
+                [ChatItem::Tool {
+                    status: CardStatus::Success,
+                    ..
+                }]
+            ),
+            "{chat:?}"
+        );
+
+        // Live, the status line does not go back to the tool either.
+        let mut chat = chat;
+        let mut step = String::new();
+        let mut late = ToolCallUpdate::new(ToolCallId("b1".into()));
+        late.name = Some("bash".into());
+        apply_tool_update(late, true, &mut chat, &mut step);
+        assert_eq!(step, "", "{chat:?}");
     }
 
     #[test]

@@ -777,6 +777,10 @@ impl FileSystem for KrunExecutionEnv {
 
 #[async_trait]
 impl Shell for KrunExecutionEnv {
+    fn sandboxed(&self) -> bool {
+        true
+    }
+
     async fn exec(
         &self,
         command: &str,
