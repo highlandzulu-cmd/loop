@@ -1121,10 +1121,11 @@ async fn trial(root: PathBuf, index: u64, seed: u64) -> Tally {
             let failpoint = if attempt == 0 && round < 2 {
                 pick_daemon_failpoint(&mut rng, restart)
             } else if attempt == 0 && round == 2 && rng.chance(20) {
-                pick_daemon_failpoint(&mut rng, true)
-                    .contains("recovery")
-                    .then(|| "after:recovery_batch:1".to_owned())
-                    .unwrap_or_default()
+                if pick_daemon_failpoint(&mut rng, true).contains("recovery") {
+                    "after:recovery_batch:1".to_owned()
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             };
