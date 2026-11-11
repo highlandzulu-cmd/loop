@@ -202,3 +202,30 @@ L1 is fixed. To pass, these must be fixed and the harness run again with 0 leaks
    - Do this so an agent cannot widen a later Session.
 5. **A settings source for Policy layers.** Today only `subagent::confine` makes one.
 6. **External diff launch:** whether a headless or Runtime approver may ever open a GUI editor.
+
+## Re-run after L2–L5 fixes
+
+Branch `probe/e3-enforcement`, commits 0748f78 (L2, L3), 41722a2 (L4, L5), 2db499b (reproductions run as regular tests) and 113923f (L3 on the Runtime path). Same command, seed 42, 143 cases, 95 s.
+
+**Result: 18 leaks, all L6 (14) and L7 (4). L1–L5: 0 leaks.** 0 control failures, 0 unreported refusals.
+
+| Path | Leaks before (after L1) | Leaks now | Remaining |
+|---|---|---|---|
+| embedded | 22 | 18 | L6: 14, L7: 4 |
+| runtime | 4 | 0 | |
+| subagent | 0 | 0 | |
+| workflow | 0 | 0 | |
+| acp | 2 | 0 | |
+| **Total** | **28** | **18** | |
+
+The fixes:
+
+- **L2:** `protected()` (`permissions/capability.rs`) checks the path as written and the resolved path (symlinks followed, the part below the workspace), and compares `.git`, `.loop` and `.env*` without case.
+- **L3:** `resolve()` (`permissions/policy.rs`) follows a dangling symlink to its target (at most 40 links), so `inside_workspace` is false for a link that points out. On the Runtime path the file-edit review runs after the write. A reject removed the link, not the file the write made through it (case 043). `revert_change` (`tool_approval.rs`) now removes the link's target and keeps the link.
+- **L4:** `ToolGate::agent_call_denied` (`tool_gate.rs`) checks an ACP call against the deny rules of the Loop tools of the same kind (`bash` for execute, `write`/`edit` for edit, delete and move, `read`, `grep`/`glob`/`ls`, `web_fetch`/`web_search`), with the agent's raw input.
+- **L5:** `GatedHost::interact` (`agent_gate.rs`) checks the Policy, then deny rules, then the mode's off state, and only then runs hooks.
+
+Limits:
+
+- **Case folding** is applied on every OS, so on a case-sensitive disk `.GIT` also asks. This is stricter, not looser.
+- **L4 pattern rules** match only when the agent's raw input uses Loop's argument names (`command`, `path`, `url`, `query`). A plain tool deny (`"bash": "deny"`) always applies. An ACP call of kind `think` or `other` matches no deny rule.
