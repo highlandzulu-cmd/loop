@@ -100,3 +100,7 @@ Environment variables:
 | `LOOP_CODING_AGENT_DIR` | Use a different config directory |
 | `LOOP_CODING_AGENT_SESSION_DIR` | Use a different directory for `sessions.db` |
 | `LOOP_DEBUG=1` | Write debug logs (same as `--debug`) |
+| `LOOP_PDF_OCR_API_KEY` | Turn on OCR for PDFs without a text layer, through a Mistral-compatible OCR API (needs the `web` feature). Unset, such a PDF reads as empty |
+| `LOOP_PDF_OCR_URL`, `LOOP_PDF_OCR_MODEL` | Use another OCR endpoint or model (defaults: `https://api.mistral.ai/v1/ocr`, `mistral-ocr-latest`) |
+
+Document files: `read` returns a PDF, Word (`.docx`), PowerPoint (`.pptx`) or RTF file as markdown, and an Excel (`.xlsx`) or OpenDocument (`.ods`) spreadsheet as sheet tables with formulas. `write` builds `.docx`, `.pptx`, `.rtf`, `.pdf`, `.xlsx` and `.ods` files from the same text; the tool description lists the format. `edit` refuses a document: read it, then write the whole file again.

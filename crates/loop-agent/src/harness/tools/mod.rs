@@ -1,5 +1,6 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
+mod documents;
 mod file_mutation_queue;
 mod plan;
 mod search;
@@ -47,7 +48,10 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "read",
         "Read",
-        "Read a file's contents (text or image).",
+        format!(
+            "Read a file's contents (text or image).{}",
+            documents::READ_GUIDE
+        ),
         schema_object(
             json!({"path": {"type": "string", "description": "File path"}}),
             &["path"],
@@ -82,6 +86,9 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         terminate: None,
                     });
                 }
+                if let Some(result) = documents::read(env.as_ref(), &abs).await {
+                    return result;
+                }
                 let text = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                 let (text, truncated) = truncate_head(&text, DEFAULT_MAX_BYTES);
                 Ok(AgentToolResult {
@@ -104,7 +111,10 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "write",
         "Write",
-        "Write contents to a file (create or overwrite).",
+        format!(
+            "Write contents to a file (create or overwrite).{}",
+            documents::WRITE_GUIDE
+        ),
         schema_object(
             json!({
                 "path": {"type": "string"},
@@ -124,6 +134,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     let env = Arc::clone(&env);
                     let content = content.clone();
                     async move {
+                        let bytes = documents::encode(&abs, &content).await?;
                         // Only a missing file counts as created. Any other
                         // error (a directory, no permission) fails the write
                         // before it happens, and an existing file that is
@@ -141,21 +152,22 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         let previous_path = write_review_snapshot(env.as_ref(), &abs, &previous)
                             .await
                             .map_err(|e| e.to_string())?;
-                        let diff =
-                            unified_diff(&String::from_utf8_lossy(&previous), &content, &abs);
-                        env.write_file(&abs, content.as_bytes())
+                        // A document diffs as its text, not as its bytes.
+                        let previous_text = documents::text_of(&abs, &previous).await;
+                        let diff = unified_diff(&previous_text, &content, &abs);
+                        env.write_file(&abs, &bytes)
                             .await
                             .map_err(|e| e.to_string())?;
                         let (target_path, created_identity) =
                             written_target(env.as_ref(), &abs, created).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
-                                text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
+                                text: format!("Wrote {} bytes to {}", bytes.len(), abs.display()),
                                 text_signature: None,
                             })],
                             details: json!({
                                 "path": abs,
-                                "bytes": content.len(),
+                                "bytes": bytes.len(),
                                 "created": created,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
@@ -209,6 +221,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     async move {
+                        documents::check_editable(&abs)?;
                         let original = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                         let updated = if original.contains(&old_text) {
                             original.replacen(&old_text, &new_text, 1)
