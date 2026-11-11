@@ -4,7 +4,7 @@ This page is for maintainers.
 
 ## CI and releases
 
-- **CI** (`.github/workflows/ci.yml`) runs on every PR and push to `main`, plus manual **Run workflow**. It builds and tests; it does **not** publish a release.
+- **CI** (`.github/workflows/ci.yml`) runs on every PR and push to `main` and `staging`, plus manual **Run workflow**. It lints and tests; it does **not** publish a release. See [CI](ci.md).
 - **Release** (`.github/workflows/release.yml`) publishes multi-platform binaries only when you cut a version tag (or manually with `create_release`).
 
 Supported release targets:
