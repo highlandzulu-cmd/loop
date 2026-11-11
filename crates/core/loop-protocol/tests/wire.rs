@@ -61,6 +61,23 @@ fn message_chunk() {
 }
 
 #[test]
+fn tool_call_preparing() {
+    roundtrip(
+        &SessionUpdate::ToolCallPreparing {
+            id: "c1".into(),
+            name: "write".into(),
+            kind: ToolKind::Edit,
+        },
+        json!({
+            "type": "tool_call_preparing",
+            "id": "c1",
+            "name": "write",
+            "kind": "edit"
+        }),
+    );
+}
+
+#[test]
 fn tool_call_and_update() {
     roundtrip(
         &SessionUpdate::ToolCall(ToolCall {
