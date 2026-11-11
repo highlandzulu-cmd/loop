@@ -261,8 +261,17 @@ enum SessionCommand {
     },
 }
 
+fn main() {
+    // First, before the async runtime and argument parsing: `loop
+    // __doc-to-text <format>` is the document reader child the read and
+    // write tools start, and in every other process this binary becomes
+    // that reader.
+    loop_agent::harness::run_document_reader_child();
+    async_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     if let Err(e) = real_main().await {
         eprintln!("loop: {e:#}");
         std::process::exit(1);
