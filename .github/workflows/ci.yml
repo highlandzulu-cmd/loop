@@ -1,14 +1,17 @@
 name: CI
 
+# What runs where, and why: docs/ci.md. Linux and macOS only.
+
 on:
   push:
-    branches: [main]
+    branches: [main, staging]
   pull_request:
-    branches: [main]
+    branches: [main, staging]
   merge_group:
   workflow_dispatch:
 
-# A new push to a PR cancels that PR's older run. Runs on main always finish.
+# A new push to a PR cancels that PR's older run. Runs on main and staging
+# always finish, so each merge is fully validated.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -20,33 +23,100 @@ env:
   CARGO_TERM_COLOR: always
   # CI never runs a debugger: line tables keep file and line numbers in
   # panics but make target/ (and so the cache) much smaller.
+  # Keep these two values the same in probes.yml: rust-cache puts CARGO_*
+  # variables into the cache key, and probes.yml reuses the test cache.
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
+# Action versions are pinned to commit SHAs (the comment gives the tag).
+# dependabot.yml opens PRs to move them.
+
 jobs:
+  # Cheap job that decides which of the heavy jobs a PR needs. Everything
+  # else (push, merge queue, manual run) runs all jobs. Skipped jobs count as
+  # passed, and `ci-ok` below is the one check to require.
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      desktop: ${{ steps.filter.outputs.desktop }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # On a PR this is the merge commit; two commits give its first
+          # parent (the base branch tip) for the diff below.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          rust=true
+          desktop=true
+          if [ "$EVENT" = "pull_request" ]; then
+            # An empty or failed diff keeps everything on.
+            files="$(git diff --name-only HEAD^1 HEAD || true)"
+            if [ -n "$files" ]; then
+              echo "Changed files:"; echo "$files"
+              # Docs-only: every file is documentation, a root Markdown file,
+              # the license, images, or an issue template. Nothing under
+              # crates/ is skipped (some crates embed files with include_str!).
+              docs='^(docs/|resources/|\.github/ISSUE_TEMPLATE/|\.github/[^/]+\.md$|[^/]+\.md$|LICENSE$)'
+              if ! echo "$files" | grep -Evq "$docs"; then
+                rust=false
+                desktop=false
+              else
+                # The desktop app depends on these workspace crates only
+                # (cargo metadata: loop-desktop -> ...). loop-cli, loop-runtime,
+                # loop-update and loop-dashboard are not in its tree.
+                desk='^(crates/(loop-desktop|loop-app-core|loop-agent|loop-ai|loop-mcp|loop-orchestration|loop-telemetry|loop-test-support|core|extend/loop-acp)/|Cargo\.(toml|lock)$|\.github/workflows/ci\.yml$)'
+                if ! echo "$files" | grep -Eq "$desk"; then
+                  desktop=false
+                fi
+              fi
+            fi
+          fi
+          echo "rust=$rust" >> "$GITHUB_OUTPUT"
+          echo "desktop=$desktop" >> "$GITHUB_OUTPUT"
+          echo "rust=$rust desktop=$desktop"
+
   lint:
     name: Lint (fmt + clippy)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      # Only main saves caches. PRs restore main's cache, so per-PR copies
-      # don't push main's out of the 10 GB repo limit.
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
+      # Cheap checks first: they need no build cache and fail in seconds.
       - name: rustfmt
         run: cargo fmt --all -- --check
 
       - name: ShellCheck
         run: shellcheck install.sh
+
+      # main and staging save caches. PRs restore them (the base branch, then
+      # main), so per-PR copies do not push them out of the 10 GB repo limit.
+      # clippy artifacts differ from test artifacts, so lint has its own key.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: lint
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
+          cache-on-failure: true
 
       - name: clippy
         run: cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
@@ -57,8 +127,22 @@ jobs:
       - name: clippy (without the usage view)
         run: cargo clippy -p loop-cli --no-default-features --features telemetry --all-targets --locked -- -D warnings
 
+      # `orchestration` is off by default, so the default clippy run never
+      # compiles the code behind it. loop-cli/orchestration turns it on in
+      # loop-agent and loop-runtime too.
+      - name: clippy (with orchestration)
+        run: cargo clippy -p loop-agent -p loop-runtime -p loop-cli --features loop-cli/orchestration --all-targets --locked -- -D warnings
+
+  # Default features. On macOS only the crates with OS-specific code run:
+  # the seatbelt sandbox, host env, sockets, clipboard, update lifecycle and
+  # more. loop-ai, loop-orchestration, loop-protocol, loop-acp and
+  # loop-dashboard have no cfg(target_os)/cfg(unix) code and no process
+  # calls, so Linux covers them. A new crate is tested on macOS until it is
+  # added to the exclude list.
   test:
     name: Test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -66,31 +150,124 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
+            scope: ""
           - os: macos-latest
+            scope: "--workspace --exclude loop-desktop --exclude loop-ai --exclude loop-orchestration --exclude loop-protocol --exclude loop-acp --exclude loop-dashboard"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # Only main saves caches. PRs restore main's cache, so per-PR copies
-      # don't push main's out of the 10 GB repo limit.
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          toolchain: stable
 
-      - name: Build
-        run: cargo build --locked
+      # The shared key is read by the feature-set job and by probes.yml.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: test-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
+          cache-on-failure: true
 
+      # No separate `cargo build`: `cargo test` builds the same binaries.
+      # Default-members exclude loop-desktop (see the desktop job).
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked ${{ matrix.scope }}
 
+      # macOS runs bash 3.2, so this syntax check is a real check there.
       - name: Check installer syntax
         run: bash -n install.sh
 
-      # Telemetry is a default feature of loop-cli, so the steps above cover it.
-      # The builds without it have no OS-specific parts, so they are only tested on Linux.
+  # Feature sets that the default build does not cover. They have no
+  # OS-specific parts, so they run on Linux only. They restore the cache of
+  # the default Linux test job (same dependencies) and never save one.
+  test-features:
+    name: Test (ubuntu-latest, feature sets)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: test-ubuntu-latest
+          save-if: false
+
+      # Telemetry is a default feature of loop-cli, so the default job covers it.
       - name: Test (without telemetry)
-        if: runner.os == 'Linux'
         run: cargo test -p loop-agent -p loop-app-core -p loop-cli --no-default-features --locked
+
+      - name: Test (with orchestration)
+        run: cargo test -p loop-agent -p loop-runtime -p loop-cli --features loop-cli/orchestration --locked
+
+  # loop-desktop (GPUI, nightly) is not a default member and clippy skips
+  # it, so nothing else on a PR compiles it. Release builds it, but only on a
+  # tag. This job runs when the change can reach it (see `changes`).
+  desktop:
+    name: Check desktop (nightly)
+    needs: changes
+    if: needs.changes.outputs.desktop == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (nightly for GPUI)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: nightly
+
+      # Same packages as the Linux desktop release build.
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libvulkan-dev
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: desktop
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/staging' }}
+          cache-on-failure: true
+
+      # A compile check, as the release build does it. Not clippy: nightly
+      # clippy gets new lints every night and would turn unrelated PRs red.
+      - name: cargo check (loop-desktop)
+        env:
+          RUST_FONTCONFIG_DLOPEN: "1"
+        run: cargo check -p loop-desktop --locked
+
+  # The one check to require in branch protection. It passes when every job
+  # passed or was skipped (a docs-only PR), and fails when one failed or was
+  # cancelled.
+  ci-ok:
+    name: CI gate
+    if: always()
+    needs: [changes, lint, test, test-features, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check results
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "Job results: $RESULTS"
+          case " $RESULTS " in
+            *" failure "*|*" cancelled "*) exit 1 ;;
+          esac
