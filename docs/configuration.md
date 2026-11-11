@@ -52,7 +52,7 @@ Common settings in `settings.json`:
 |---|---|---|
 | `defaultProvider`, `defaultModel` | none | Provider and model at startup |
 | `defaultThinkingLevel` | `off` | Reasoning level at startup (`off`, `low`, and so on); `/effort` or **Shift+Tab** changes it for the session |
-| `enabledModels` | empty | Models that **Ctrl+P** cycles through, as glob patterns; see `/scoped-models` |
+| `enabledModels` | empty | Models that **Ctrl+P** cycles through, as exact model ids (`id`) or `provider/id`; no wildcards; see `/scoped-models` |
 | `defaultProjectTrust` | `ask` | Whether a new project's settings are trusted: `ask`, `always` or `never` (global only) |
 | `hideThinkingBlock` | `false` | Hides the model's thinking blocks in the chat |
 | `permissionMode` | `ask` | `read-only`, `ask`, `accept-edits`, `full-access` or `plan`; see [permissions](permissions.md). A project may only choose a stricter mode |
