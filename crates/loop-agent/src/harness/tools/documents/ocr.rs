@@ -139,7 +139,8 @@ pub(super) async fn run(config: &Config, pdf: &[u8]) -> Result<String, String> {
 }
 
 #[cfg(not(feature = "web"))]
-pub(super) async fn run(_config: &Config, _pdf: &[u8]) -> Result<String, String> {
+pub(super) async fn run(config: &Config, _pdf: &[u8]) -> Result<String, String> {
+    config.check()?;
     Err("OCR needs loop-agent's `web` feature".into())
 }
 

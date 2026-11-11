@@ -38,14 +38,14 @@ fn pdf(objects: &[Vec<u8>]) -> Vec<u8> {
     let mut offsets = Vec::new();
     for (i, body) in objects.iter().enumerate() {
         offsets.push(out.len());
-        write!(out, "{} 0 obj\n", i + 1).unwrap();
+        writeln!(out, "{} 0 obj", i + 1).unwrap();
         out.extend_from_slice(body);
         out.extend_from_slice(b"\nendobj\n");
     }
     let xref = out.len();
     write!(out, "xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).unwrap();
     for offset in offsets {
-        write!(out, "{offset:010} 00000 n \n").unwrap();
+        writeln!(out, "{offset:010} 00000 n ").unwrap();
     }
     write!(
         out,

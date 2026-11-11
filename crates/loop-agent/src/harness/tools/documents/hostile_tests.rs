@@ -21,7 +21,7 @@ pub(super) fn pdf(objects: &[Vec<u8>]) -> Vec<u8> {
     let xref = out.len();
     write!(out, "xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).unwrap();
     for offset in offsets {
-        write!(out, "{offset:010} 00000 n \n").unwrap();
+        writeln!(out, "{offset:010} 00000 n ").unwrap();
     }
     write!(
         out,
@@ -310,4 +310,63 @@ fn long_documents_stop_at_the_output_budget() {
 #[test]
 fn oversized_input_is_refused_before_reading() {
     assert!(too_large(MAX_INPUT_BYTES + 1).contains("too large"));
+}
+
+#[tokio::test]
+async fn ocr_is_off_or_refused_without_any_request() {
+    let scanned = || {
+        Reading::Done(Converted {
+            text: "x".into(),
+            truncated: false,
+            pdf: Some(PdfInfo {
+                readable: false,
+                encrypted: false,
+            }),
+        })
+    };
+    // OCR off: the little text there is, and how to turn OCR on.
+    let (c, by) = pdf::finish(scanned(), b"%PDF", None, None).await.unwrap();
+    assert_eq!(by, "reader");
+    assert!(c.text.contains(ocr::KEY_ENV), "{}", c.text);
+    let err = pdf::finish(
+        Reading::Refused {
+            error: "bad".into(),
+            pdf: None,
+        },
+        b"%PDF",
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains(ocr::KEY_ENV), "{err}");
+
+    // OCR on, but the PDF is encrypted: nothing is sent. The endpoint is
+    // TEST-NET, which never answers, so a request would fail the test by
+    // its message.
+    let config = ocr::Config {
+        key: "k".into(),
+        url: "https://192.0.2.1/ocr".into(),
+        model: "m".into(),
+    };
+    let encrypted = Reading::Refused {
+        error: "the PDF is password-protected".into(),
+        pdf: Some(PdfInfo {
+            readable: false,
+            encrypted: true,
+        }),
+    };
+    let err = pdf::finish(encrypted, b"%PDF", Some(config.clone()), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("encrypted, so it is not sent"), "{err}");
+    // The reader could not tell, and the bytes name an /Encrypt dictionary.
+    let unknown = Reading::Refused {
+        error: "bad".into(),
+        pdf: None,
+    };
+    let err = pdf::finish(unknown, b"%PDF << /Encrypt 3 0 R >>", Some(config), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("encrypted"), "{err}");
 }
