@@ -229,8 +229,21 @@ async fn run_budget_ends_a_stalled_generation_without_user_abort() {
 
 /// A text response that stops on the output limit (`max_tokens`).
 fn length_stop(model: &loop_ai::Model, text: &str) -> FauxResponse {
+    length_stop_with(model, text, 100, None)
+}
+
+/// [`length_stop`] with `output` tokens and a provider stop reason.
+fn length_stop_with(
+    model: &loop_ai::Model,
+    text: &str,
+    output: u64,
+    raw_stop_reason: Option<&str>,
+) -> FauxResponse {
     use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
     let mut message = AssistantMessage::pending(model);
+    message.usage.output = output;
+    message.usage.total_tokens = output;
+    message.raw_stop_reason = raw_stop_reason.map(str::to_owned);
     message
         .content
         .push(AssistantContent::Text(loop_ai::TextContent {
@@ -382,5 +395,35 @@ async fn tool_updates_arrive_before_the_tool_end() {
             .filter(|t| *t == "tool_execution_update")
             .count(),
         200
+    );
+}
+
+#[tokio::test]
+async fn a_context_overflow_is_not_continued() {
+    // No output at all: the prompt filled the context window.
+    let msgs = run_script(|m| {
+        vec![
+            length_stop_with(m, "", 0, None),
+            FauxResponse::Text("no".into()),
+        ]
+    })
+    .await;
+    assert_eq!(
+        msgs.iter().filter_map(AgentMessage::as_assistant).count(),
+        1,
+        "{msgs:?}"
+    );
+    // The provider says the context window is full.
+    let msgs = run_script(|m| {
+        vec![
+            length_stop_with(m, "part", 100, Some("model_context_window_exceeded")),
+            FauxResponse::Text("no".into()),
+        ]
+    })
+    .await;
+    assert_eq!(
+        msgs.iter().filter_map(AgentMessage::as_assistant).count(),
+        1,
+        "{msgs:?}"
     );
 }

@@ -283,6 +283,14 @@ const MAX_LENGTH_CONTINUATIONS: u32 = 3;
 pub const LENGTH_CONTINUE_PROMPT: &str = "Your last response stopped at the output token limit. \
 Continue from where you stopped. Do not repeat what you already wrote.";
 
+/// Whether a length stop means the context window is full, not that the
+/// answer was long: asking to continue would only fail again.
+fn context_full(model: &loop_ai::Model, message: &AssistantMessage) -> bool {
+    message.usage.output == 0
+        || loop_ai::is_context_overflow(model, message)
+        || message.raw_stop_reason.as_deref() == Some("model_context_window_exceeded")
+}
+
 async fn run_loop(
     current_context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
@@ -449,6 +457,8 @@ async fn run_loop(
                 && tool_calls.is_empty()
                 && pending_messages.is_empty()
                 && length_continuations < MAX_LENGTH_CONTINUATIONS
+                && !cancel.is_some_and(CancellationToken::is_cancelled)
+                && !context_full(&config.model, &message)
             {
                 length_continuations += 1;
                 pending_messages.push(AgentMessage::user_text(LENGTH_CONTINUE_PROMPT));

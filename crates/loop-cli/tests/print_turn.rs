@@ -323,6 +323,8 @@ fn length_stop(text: &str) -> FauxResponse {
             }));
     }
     message.stop_reason = StopReason::Length;
+    message.usage.output = 100;
+    message.usage.total_tokens = 100;
     FauxResponse::Events(vec![
         AssistantMessageEvent::Start {
             partial: AssistantMessage::pending(&model),
