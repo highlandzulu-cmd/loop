@@ -3261,6 +3261,7 @@ async fn handle_key(
                         )
                         .await?;
                     } else {
+                        let images = images_for(runtime, attachments, chat, &line);
                         submit_user_text(
                             runtime,
                             chat,
@@ -3271,6 +3272,7 @@ async fn handle_key(
                             working,
                             message_queue,
                             line,
+                            images,
                             tx,
                         );
                     }
