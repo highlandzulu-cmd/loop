@@ -1153,7 +1153,7 @@ pub fn startup_permission_mode(
     if let Some(value) = flag {
         let mode = PermissionMode::parse(value).ok_or_else(|| {
             anyhow::anyhow!(
-                "unknown --permission-mode `{value}`: use read-only, ask, accept-edits or full-access"
+                "unknown --permission-mode `{value}`: use read-only, ask, accept-edits, full-access or plan"
             )
         })?;
         return Ok((mode, None));

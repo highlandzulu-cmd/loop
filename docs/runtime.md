@@ -94,7 +94,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | `--listen IP:PORT` | off | Also serve authenticated WebSockets. Loopback addresses only. Other binds are refused. For remote access, use an SSH tunnel |
 | `--max-sessions N` | `runtime.maxSessions`, else 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
 | `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
-| `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits` or `full-access` |
+| `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits`, `full-access` or `plan` |
 | `--cwd DIR` | current folder | Folder for Sessions that name none |
 
 The two limits can also be set in the global `~/.loop/agent/settings.json`
