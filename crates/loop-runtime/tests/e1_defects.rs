@@ -80,13 +80,11 @@ fn locking_model(db: PathBuf, held: Held, reply: &'static str) -> Arc<loop_ai::M
 }
 
 /// The SQLite log; when a `turn_ended` commits, it records whether the tree
-/// already had `needle`, then lets the tree writes go on.
+/// already had `needle`.
 struct AtTurnEnd {
     inner: SqliteEventLog,
     db: PathBuf,
     needle: &'static str,
-    held: Held,
-    release: bool,
     tree_at_end: Mutex<Option<bool>>,
 }
 #[async_trait]
@@ -101,9 +99,6 @@ impl EventLog for AtTurnEnd {
                 .lock()
                 .unwrap()
                 .get_or_insert_with(|| tree_has(&self.db, self.needle));
-            if self.release {
-                self.held.lock().unwrap().take();
-            }
         }
         result
     }
@@ -158,7 +153,7 @@ async fn runtime_with(dir: &Path, models: Arc<loop_ai::Models>, log: Arc<dyn Eve
 /// and does not mark it uncertain. Surfaces that watch the stream have already
 /// shown it as finished.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "E1 defect D1: turn_ended commits before the tree writes"]
+
 async fn d1_a_logged_turn_end_implies_the_tree_holds_the_turn() {
     tokio::time::timeout(LIMIT, async {
         let dir = tempfile::tempdir().unwrap();
@@ -170,9 +165,18 @@ async fn d1_a_logged_turn_end_implies_the_tree_holds_the_turn() {
             inner: SqliteEventLog::open(&agent).await.unwrap(),
             db: db.clone(),
             needle: "reply-d1",
-            held: held.clone(),
-            release: true,
             tree_at_end: Mutex::new(None),
+        });
+        // The lock is held for 1 s after the model answers: long enough for
+        // a turn end that does not wait for the tree to commit first, short
+        // of the 6 s write deadline, so the tree writes then succeed.
+        let releaser = held.clone();
+        std::thread::spawn(move || {
+            while releaser.lock().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            releaser.lock().unwrap().take();
         });
         let models = locking_model(db.clone(), held, "reply-d1");
         let rt = runtime_with(dir.path(), models, log.clone()).await;
@@ -239,7 +243,7 @@ async fn d3_a_completed_turn_is_in_the_tree() {
 /// boundaries, so it records nothing for this turn.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "E1 defect D2: a prompt without a logged turn start is not marked uncertain"]
+
 async fn d2_a_prompt_whose_turn_start_was_not_logged_is_recovered_as_uncertain() {
     tokio::time::timeout(LIMIT, async {
         use loop_agent::harness::session::{sqlite::SqliteSessionStore, SessionStore};

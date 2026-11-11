@@ -202,6 +202,46 @@ struct StreamState {
     /// Turns already numbered per Session this backend streamed before, so
     /// switching back never repeats a turn id.
     turns: std::collections::HashMap<SessionKey, u64>,
+    /// A prompted turn's `TurnEnded` and everything after it, kept back until
+    /// the harness has written the turn to the Session tree. Whoever commits
+    /// the stream (the Runtime's Event Log) then never records a turn end
+    /// the tree does not hold.
+    held: Vec<(Option<TurnId>, SessionUpdate)>,
+}
+
+impl StreamState {
+    /// Number and send one update.
+    fn send(&mut self, instance: &BackendInstanceId, turn: Option<TurnId>, update: SessionUpdate) {
+        self.seq += 1;
+        let envelope = UpdateEnvelope::live(
+            instance.clone(),
+            0,
+            self.session.clone(),
+            turn,
+            self.seq,
+            update,
+        );
+        // No receivers is fine: nobody is listening yet.
+        let _ = self.updates.send(envelope);
+    }
+
+    /// Send the held updates. With `failure`, the turn's tree writes failed:
+    /// the held turn end reports that failure instead of its own stop.
+    /// True when a turn end was held.
+    fn release(&mut self, instance: &BackendInstanceId, failure: Option<&ErrorInfo>) -> bool {
+        let mut ended = false;
+        for (turn, mut update) in std::mem::take(&mut self.held) {
+            if let SessionUpdate::TurnEnded { stop, error, .. } = &mut update {
+                ended = true;
+                if let Some(info) = failure {
+                    *stop = StopReason::Error;
+                    *error = Some(info.clone());
+                }
+            }
+            self.send(instance, turn, update);
+        }
+        ended
+    }
 }
 
 impl NativeBackend {
@@ -218,6 +258,7 @@ impl NativeBackend {
             updates: updates.clone(),
             mapper: NativeEventMapper::new(),
             turns: Default::default(),
+            held: Vec::new(),
         }));
         let level = harness.thinking_level().await;
         let default_model = harness.model().await;
@@ -253,8 +294,10 @@ impl NativeBackend {
         backend.read_config().await;
         let instance = backend.instance.clone();
         let config = Arc::clone(&backend.config);
+        let prompting = Arc::clone(&backend.prompting);
         harness.subscribe(move |event: AgentEvent| {
-            if translate(&instance, &stream, &event) {
+            let hold = prompting.load(Ordering::Acquire);
+            if translate(&instance, &stream, &event, hold) {
                 apply_pending(&instance, &stream, &config);
             }
             async {}
@@ -629,34 +672,32 @@ impl NativeBackend {
     }
 }
 
-/// Translate and send `event`'s updates. True when a turn ended.
+/// Translate and send `event`'s updates. True when a turn ended and its end
+/// was sent. With `hold` (a prompt is running), a turn end and what follows
+/// it are kept back until the prompt releases them.
 fn translate(
     instance: &BackendInstanceId,
     stream: &Mutex<StreamState>,
     event: &AgentEvent,
+    hold: bool,
 ) -> bool {
     let mut state = stream.lock();
     let updates = state.mapper.map(event);
     let mut ended = false;
     for update in updates {
-        ended |= matches!(update, SessionUpdate::TurnEnded { .. });
+        let is_end = matches!(update, SessionUpdate::TurnEnded { .. });
         let turn = match &update {
             SessionUpdate::TurnStarted { turn_id } | SessionUpdate::TurnEnded { turn_id, .. } => {
                 Some(turn_id.clone())
             }
             _ => state.mapper.current_turn().cloned(),
         };
-        state.seq += 1;
-        let envelope = UpdateEnvelope::live(
-            instance.clone(),
-            0,
-            state.session.clone(),
-            turn,
-            state.seq,
-            update,
-        );
-        // No receivers is fine: nobody is listening yet.
-        let _ = state.updates.send(envelope);
+        if !state.held.is_empty() || (hold && is_end) {
+            state.held.push((turn, update));
+            continue;
+        }
+        ended |= is_end;
+        state.send(instance, turn, update);
     }
     ended
 }
@@ -944,7 +985,6 @@ impl AgentBackend for NativeBackend {
         let config = Arc::clone(&self.config);
         tokio::spawn(async move {
             let result = harness.prompt(input).await;
-            drop(slot);
             let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
             // A run that returned a message already ended its turn on the
             // stream, even when the message is an error.
@@ -969,12 +1009,26 @@ impl AgentBackend for NativeBackend {
                     other => ErrorInfo::new(ErrorCategory::Internal, other.to_string()),
                 }),
             };
+            // The harness has written the turn to the tree (or failed to):
+            // only now may its end reach the stream. A run that failed after
+            // its turn ended (its tree writes failed) ends that turn failed.
+            let write_failure = match &outcome {
+                TurnOutcome::Failed(info) if !ran && !rejected_busy => Some(info),
+                _ => None,
+            };
+            let released = stream.lock().release(&instance, write_failure);
+            if released {
+                apply_pending(&instance, &stream, &config);
+            }
+            drop(slot);
             match &outcome {
                 // Another caller of the harness is running a turn; that
                 // turn is not this prompt's to close.
                 TurnOutcome::Failed(info) if rejected_busy => {
                     error_notice(&instance, &stream, info);
                 }
+                // The held turn end already reported this failure.
+                TurnOutcome::Failed(_) if released && !ran => {}
                 TurnOutcome::Failed(info) if !ran => {
                     close_failed_turn(&instance, &stream, turns_before, info);
                     apply_pending(&instance, &stream, &config);
