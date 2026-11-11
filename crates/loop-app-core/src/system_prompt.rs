@@ -97,6 +97,17 @@ pub fn build_system_prompt(opts: BuildSystemPromptOptions<'_>) -> String {
             "Be concise and direct. Prefer action over lengthy explanation.".to_string(),
             "Use tools to inspect the codebase before making changes.".to_string(),
         ];
+        if ["edit", "write", "bash"]
+            .iter()
+            .any(|t| opts.selected_tools.contains(t))
+        {
+            guidelines.push(
+                "Change files in the working directory; never edit a copy elsewhere and report success. \
+                 If a file you own is not writable (permission denied), run `chmod u+w <file>` and retry, \
+                 or say that you could not change it."
+                    .into(),
+            );
+        }
         if opts.selected_tools.contains(&"web_search") {
             guidelines.push(
                 "Discover unfamiliar URLs with web_search before using web_fetch; do not guess domains."
@@ -296,5 +307,19 @@ mod tests {
             .filter(|c| ["root agents", "agents", "claude", "local"].contains(&c.as_str()))
             .collect();
         assert_eq!(contents, ["agents", "claude", "local", "root agents"]);
+    }
+
+    #[test]
+    fn default_prompt_keeps_work_in_the_working_directory() {
+        let prompt = build_system_prompt(BuildSystemPromptOptions {
+            custom_prompt: None,
+            append_system_prompt: None,
+            cwd: Path::new("/work/project"),
+            selected_tools: &["read", "bash", "edit", "write"],
+            tool_snippets: &default_tool_snippets(),
+            context_files: &[],
+        });
+        assert!(prompt.contains("never edit a copy elsewhere"), "{prompt}");
+        assert!(prompt.contains("chmod u+w"), "{prompt}");
     }
 }

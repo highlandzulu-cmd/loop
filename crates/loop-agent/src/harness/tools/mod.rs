@@ -29,6 +29,11 @@ use crate::harness::utils::{execute_shell_with_capture, truncate_head, DEFAULT_M
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{ImageContent, TextContent, ToolResultContent};
 
+/// Added to permission-denied errors from file writes and shell commands, so
+/// the agent fixes the mode instead of working on a copy elsewhere.
+pub const PERMISSION_DENIED_HINT: &str = "Hint: if this file is in the working directory and \
+yours, make it writable with `chmod u+w <file>` and retry; do not edit a copy elsewhere.";
+
 pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
         "type": "object",
@@ -500,9 +505,14 @@ pub fn create_bash_tool_with(
                             e
                         }
                     })?;
+                let mut text = captured.text.clone();
+                if captured.exit_code != 0 && text.to_lowercase().contains("permission denied") {
+                    text.push_str("\n\n");
+                    text.push_str(PERMISSION_DENIED_HINT);
+                }
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
-                        text: captured.text.clone(),
+                        text,
                         text_signature: None,
                     })],
                     details: json!({
