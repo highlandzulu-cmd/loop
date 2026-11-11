@@ -708,11 +708,6 @@ async fn prompt(
                     // Shutdown closes the permit queue first: a queued prompt fails.
                     ctx.bump("failed_at_shutdown");
                 }
-                Kind::Failed(info) if info.contains("cancelled before it started") => {
-                    // Known defect D1 (docs/probes/e7-results.md): a cancel during the
-                    // native backend's prompt preparation ends the turn as Failed.
-                    ctx.bump("failed_cancel_race_d1");
-                }
                 Kind::Failed(info) if mode != "err" => {
                     ctx.violate(format!("UNEXPECTED_FAILED {id} {info}"))
                 }
@@ -1623,7 +1618,7 @@ async fn e7_negative_control() {
 /// sees "failed" for a cancel it asked for. The test cancels at once after the
 /// prompt is accepted, many times, and fails when it sees `Failed`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "known defect D1: fails until a cancel during prompt preparation reports Cancelled"]
+#[ignore = "regression test for defect D1 (fixed in the Runtime); run explicitly"]
 async fn e7_defect_cancel_during_prompt_start_is_not_failed() {
     let dir = std::env::temp_dir().join(format!("e7-d1-{}", std::process::id()));
     let limits = RuntimeLimits {
