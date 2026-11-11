@@ -12,6 +12,20 @@ use std::{
 };
 
 const WAIT: Duration = Duration::from_secs(30);
+
+/// The screen text once it contains `needle`, or after 5 s. The drain thread
+/// can still hold the last bytes when the child has already exited, so a
+/// read right after `wait()` can miss the final message.
+async fn screen_with(screen: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>, needle: &str) -> String {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let shown = String::from_utf8_lossy(&screen.lock().unwrap()).into_owned();
+        if shown.contains(needle) || tokio::time::Instant::now() >= deadline {
+            return shown;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 const PROVIDER_ENV: &[&str] = &[
     "SOKET_API_KEY",
     "TENSORSTUDIO_API_KEY",
@@ -652,7 +666,7 @@ async fn a_stopped_or_incompatible_explicit_owner_is_an_error_never_a_fallback()
             let screen = pty.drain();
             let status = tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap();
             assert!(!status.success(), "an explicit target must not fall back");
-            let shown = String::from_utf8_lossy(&screen.lock().unwrap()).to_string();
+            let shown = screen_with(&screen, "loop: ").await;
             assert!(shown.contains("loop: "), "{shown}");
             assert!(!shown.contains("/help for commands"), "no in-process TUI: {shown}");
             assert_eq!(fx.leases().await, []);
@@ -855,7 +869,7 @@ async fn an_explicit_websocket_target_without_a_token_exits_with_one_clear_error
         let screen = pty.drain();
         let status = tokio::time::timeout(WAIT, child.wait()).await.unwrap().unwrap();
         assert!(!status.success());
-        let shown = String::from_utf8_lossy(&screen.lock().unwrap()).to_string();
+        let shown = screen_with(&screen, "missing token").await;
         assert!(
             shown.contains("could not connect to ws://127.0.0.1:9: missing token, pass --token-file or set LOOP_RUNTIME_TOKEN"),
             "{shown}"
