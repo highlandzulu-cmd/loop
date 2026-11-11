@@ -34,6 +34,21 @@ use loop_ai::{ImageContent, TextContent, ToolResultContent};
 pub const PERMISSION_DENIED_HINT: &str = "Hint: if this file is in the working directory and \
 yours, make it writable with `chmod u+w <file>` and retry; do not edit a copy elsewhere.";
 
+/// A failed file write as tool error text: a permission error on a file
+/// (not a sandbox refusal, which `chmod` cannot fix) carries
+/// [`PERMISSION_DENIED_HINT`], whichever environment raised it.
+fn write_error(error: crate::harness::types::FileError) -> String {
+    let text = error.to_string();
+    if error.code == FileErrorCode::PermissionDenied
+        && !text.contains(PERMISSION_DENIED_HINT)
+        && !text.contains("sandbox")
+    {
+        format!("{text}. {PERMISSION_DENIED_HINT}")
+    } else {
+        text
+    }
+}
+
 pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
         "type": "object",
@@ -153,7 +168,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             unified_diff(&String::from_utf8_lossy(&previous), &content, &abs);
                         env.write_file(&abs, content.as_bytes())
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(write_error)?;
                         let (target_path, created_identity) =
                             written_target(env.as_ref(), &abs, created).await;
                         Ok(AgentToolResult {
@@ -230,7 +245,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(write_error)?;
                         let (target_path, _) = written_target(env.as_ref(), &abs, false).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
@@ -570,5 +585,21 @@ mod bash_limit_tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
         assert!(err.contains("pass timeoutMs (at most 120000)"), "{err}");
         assert!(tool.parameters["properties"]["timeoutMs"].is_object());
+    }
+}
+
+#[cfg(test)]
+mod write_error_tests {
+    use super::*;
+    use crate::harness::types::FileError;
+
+    #[test]
+    fn permission_errors_get_the_hint_once_and_sandbox_refusals_none() {
+        let denied = |m: &str| FileError::new(FileErrorCode::PermissionDenied, m);
+        assert!(write_error(denied("Permission denied (os error 13)")).contains("chmod u+w"));
+        let hinted = write_error(denied(&format!("denied. {PERMISSION_DENIED_HINT}")));
+        assert_eq!(hinted.matches("chmod u+w").count(), 1, "{hinted}");
+        assert!(!write_error(denied("sandbox denies access to /etc/x")).contains("chmod"));
+        assert!(!write_error(FileError::new(FileErrorCode::Io, "disk full")).contains("chmod"));
     }
 }
