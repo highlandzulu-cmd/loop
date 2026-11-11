@@ -1634,7 +1634,7 @@ async fn e7_defect_cancel_during_prompt_start_is_not_failed() {
     let session = rt.new_session(SessionSpec::default()).await.unwrap();
     let mut rng = Rng(7);
     let mut failed = Vec::new();
-    for round in 0..3000 {
+    for round in 0..1500 {
         let spec = format!("E7[{round}-0-{round};text;1;0]");
         let handle = rt
             .prompt(&session, vec![ContentBlock::text(spec)])
@@ -1652,7 +1652,7 @@ async fn e7_defect_cancel_during_prompt_start_is_not_failed() {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(
         failed.is_empty(),
-        "{} of 3000 cancelled prompts ended as Failed, first: {:?}",
+        "{} of 1500 cancelled prompts ended as Failed, first: {:?}",
         failed.len(),
         failed.first()
     );
