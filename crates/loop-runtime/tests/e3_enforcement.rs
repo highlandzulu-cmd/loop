@@ -1076,6 +1076,21 @@ fn symlink_read_cases(v: &mut Vec<Case>) {
             );
         }
     }
+    // Positive control for the L9 fix: a file link to a file the rule does
+    // not deny is still listed by its link name.
+    v.push(
+        Case::new(
+            "symlink-read",
+            Embedded,
+            "ask",
+            calls("glob", json!({"pattern": "*", "path": "pub"})),
+        )
+        .user(rule.clone())
+        .prep(Prep::SecretLinks)
+        .check(Check::Result("pub".into()))
+        .allowed()
+        .note("control: glob a file link to a file that is not denied"),
+    );
 }
 
 // ---------------------------------------------------------------- fixture
@@ -1143,6 +1158,8 @@ impl Dirs {
                 std::fs::write(dirs.ws.join("plain.txt"), "E3PLAIN\n").unwrap();
                 symlink(secret.join("e3key"), dirs.ws.join("notes")).unwrap();
                 symlink(&secret, dirs.ws.join("sec")).unwrap();
+                std::fs::write(dirs.home.join("public.txt"), "E3PUBLIC\n").unwrap();
+                symlink(dirs.home.join("public.txt"), dirs.ws.join("pub")).unwrap();
             }
             Prep::EditLinks => {
                 use std::os::unix::fs::symlink;
