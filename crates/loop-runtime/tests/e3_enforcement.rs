@@ -1267,8 +1267,7 @@ async fn run_case(base: &Path, case: &Case) -> Outcome {
             }
         }
         Route::Runtime | Route::Subagent => {
-            let rt_slot: Arc<Mutex<Option<(Arc<Runtime>, loop_protocol::SessionRef)>>> =
-                Arc::default();
+            let rt_slot: RuntimeSlot = Arc::default();
             let hook: Option<Hook> = case.revoke.then(|| {
                 let slot = rt_slot.clone();
                 let at = revoked_at.clone();
@@ -1504,6 +1503,9 @@ fn permission(kind: ToolKind, command: &str) -> InteractionRequest {
     }
 }
 
+/// The runtime and session a case shares with its approver.
+type RuntimeSlot = Arc<Mutex<Option<(Arc<Runtime>, loop_protocol::SessionRef)>>>;
+
 // ---------------------------------------------------------------- the probe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1586,7 +1588,6 @@ mod leaks {
     /// escaped quote hides a `;` from the split and the read-only check
     /// sees one `echo`. rules.rs:134 (split) vs rules.rs:208 (words).
     #[test]
-    #[ignore = "E3 leak L1"]
     fn l1_escaped_quote_passes_the_read_only_check() {
         assert!(!read_only_command("echo \\' ; touch /tmp/x ; echo \\'"));
         assert!(!read_only_command("echo \\\" ; touch /tmp/x ; echo \\\""));
@@ -1616,7 +1617,6 @@ mod leaks {
     /// symlink into `.loop` and `.GIT` / `.LOOP` on a case-insensitive disk
     /// are edited without asking. capability.rs:97, capability.rs:126.
     #[test]
-    #[ignore = "E3 leak L2"]
     fn l2_protected_paths_by_symlink_and_case() {
         let (_d, ws, _out) = ws();
         std::os::unix::fs::symlink(ws.join(".loop"), ws.join("cfg")).unwrap();
@@ -1629,7 +1629,6 @@ mod leaks {
     /// write tool follows it out. policy.rs:168-185 (`resolve` strips the
     /// last part when it cannot canonicalize it).
     #[test]
-    #[ignore = "E3 leak L3"]
     fn l3_dangling_symlink_counts_as_inside() {
         let (_d, ws, out) = ws();
         std::os::unix::fs::symlink(out.join("m.txt"), ws.join("f.txt")).unwrap();
@@ -1679,7 +1678,6 @@ mod leaks {
     /// `"bash": "deny"` in full-access still picks "allow once".
     /// agent_gate.rs:141, tool_gate.rs:264.
     #[tokio::test]
-    #[ignore = "E3 leak L4"]
     async fn l4_acp_ignores_deny_rules() {
         let (_d, gate) = agent_gate(json!({"bash": "deny"}), PermissionMode::FullAccess, None);
         assert!(!allowed(&acp(gate).await));
@@ -1689,7 +1687,6 @@ mod leaks {
     /// read-only ceiling for ACP agents (native tools refuse it).
     /// agent_gate.rs:127 runs before agent_gate.rs:134.
     #[tokio::test]
-    #[ignore = "E3 leak L5"]
     async fn l5_acp_hook_allow_beats_read_only() {
         let (_d, gate) = agent_gate(
             json!({}),
