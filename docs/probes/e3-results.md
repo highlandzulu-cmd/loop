@@ -229,3 +229,25 @@ Limits:
 
 - **Case folding** is applied on every OS, so on a case-sensitive disk `.GIT` also asks. This is stricter, not looser.
 - **L4 pattern rules** match only when the agent's raw input uses Loop's argument names (`command`, `path`, `url`, `query`). A plain tool deny (`"bash": "deny"`) always applies. An ACP call of kind `think` or `other` matches no deny rule.
+
+## Review fixes
+
+A security review of the L2–L5 fixes found four problems. Commits 78dcb76, 79bd745, aad788c, dd8d83d.
+
+- **HIGH, data loss on reject (fixed).** The `write` tool set `created` on any read error, so a rejected write deleted an existing non-text file. The revert also resolved a symlink at review time, so a link retargeted during review could delete any file.
+  - `write` now sets `created` only when the file is missing (`NotFound`). An existing file gets a byte snapshot and is restored.
+  - The write resolves its target once, right after the write, and records `targetPath`, `createdPath` and `createdIdentity` (dev, ino, size, mtime).
+  - A reject removes only `createdPath`, only while it is still a regular file with that identity (`FileSystem::file_identity`, no symlink follow), through the same env. Nothing is resolved at review time. A directory is never removed.
+- **MEDIUM, escapes in deny patterns (fixed).** Bash deny and ask patterns now also match each part with quotes and escapes removed, so `"bash(rm *)"` matches `\rm`, `r\m`, `'rm'` and `"r"m`. Allow patterns match as before.
+- **LOW, over-protection (fixed).** `accept-edits` checks an absolute path only below the workspace, so a workspace under `~/.loop` or a `.git` directory does not ask on every write.
+- **Docs:** ACP check order (Policy, deny, mode off, hooks, full-access), pattern rules for ACP, protected-name matching, hooks after deny for ACP.
+
+Re-run, seed 42, 143 cases, 94 s: **15 leaks, all L6 (11) and L7 (4). L1–L5: 0 leaks.** 0 control failures. L6 fell from 14 to 11 because rule cases with quotes or escapes in the word (080, 081 and one more) are now refused.
+
+## Open items
+
+- **ACP raw input.** Normalise the agent's raw input before deny matching: `command` as an array, `file_path`, `changes`; calls of kind `other` and `think` match no deny rule.
+- **Check-vs-write TOCTOU.** A path can change between the permission check and the write. Use `openat` with `O_NOFOLLOW` on the write path, as the seatbelt env does. The revert has the same small window between the identity check and the removal.
+- **Hard links.** A file with `nlink > 1` inside the workspace can alias a file outside it. Refuse or ask for such files.
+- **Unicode case folding.** Protected names fold ASCII case only.
+- **Workspace resolve cache.** `protected()` resolves the workspace on every call. Cache it per Session.
