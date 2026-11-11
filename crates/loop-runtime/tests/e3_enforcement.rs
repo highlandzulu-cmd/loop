@@ -135,7 +135,8 @@ enum Check {
 enum Work {
     /// The model's tool calls, one model response per entry.
     Calls(Vec<(String, Value)>),
-    /// A workflow shell task.
+    /// A workflow shell task. Only the `orchestration` build runs it.
+    #[cfg_attr(not(feature = "orchestration"), allow(dead_code))]
     Shell(String),
     /// An ACP agent's permission request: the kind and the command it runs
     /// once allowed.
