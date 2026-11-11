@@ -1,8 +1,10 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
+mod command_policy;
 mod file_mutation_queue;
 mod plan;
 mod search;
+pub mod shell;
 mod todo;
 #[cfg(feature = "web")]
 pub mod web;
@@ -13,6 +15,7 @@ use std::sync::Arc;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
+pub use command_policy::check_command_policy;
 pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
 pub use search::{
     create_glob_tool, create_grep_tool, create_ls_tool, search_tools_with_filter, SearchFilter,
@@ -358,46 +361,6 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
         }
     }
     out
-}
-
-/// Default patterns that are always blocked regardless of user configuration.
-const DEFAULT_BLOCKED_PATTERNS: &[&str] = &[
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "mkfs.",
-    ":(){ :|:& };:",
-    "> /dev/sda",
-    "dd if=/dev/zero of=/dev/",
-    "chmod -r 777 /",
-    "chown -r",
-    "format c:",
-];
-
-/// Check a command against the blocklist. Returns `Err` with a rejection message
-/// if the command matches a blocked pattern.
-pub fn check_command_policy(command: &str, extra_blocked: &[String]) -> Result<(), String> {
-    let lower = command.to_lowercase();
-    let trimmed = lower.trim();
-
-    for pattern in DEFAULT_BLOCKED_PATTERNS {
-        if trimmed.contains(pattern) {
-            return Err(format!(
-                "Command blocked by safety policy: matches blocked pattern `{pattern}`"
-            ));
-        }
-    }
-
-    for pattern in extra_blocked {
-        let pat_lower = pattern.to_lowercase();
-        if trimmed.contains(&pat_lower) {
-            return Err(format!(
-                "Command blocked by safety policy: matches custom blocked pattern `{pattern}`"
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 /// Create a bash tool bound to `env`.
