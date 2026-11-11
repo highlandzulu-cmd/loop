@@ -180,6 +180,8 @@ impl SubscriptionBackend {
             native_id: "subscription-session".into(),
         }
     }
+    /// Only the `/usage` dashboard tests (feature `usage`) push usage updates.
+    #[cfg(feature = "usage")]
     pub(crate) fn usage(&self, usage: loop_protocol::Usage) {
         self.updates
             .send(loop_protocol::UpdateEnvelope::live(
