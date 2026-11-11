@@ -2237,9 +2237,9 @@ mod leaks {
     /// (tool_approval.rs:559-571) shows `path.file_name()` and the path as
     /// written (`details.path`, the join of cwd and the argument); the
     /// resolved `details.targetPath` is not used. The prompt also comes
-    /// after the write.
+    /// after the write. Fixed: when `details.viaLink` is set, the title and
+    /// the detail show `link → target`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "L10: open finding; fails until the prompt names the resolved target"]
     async fn l10_approval_prompt_hides_symlink_target() {
         for host_sink in [false, true] {
             let p = capture_approval(

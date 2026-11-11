@@ -209,6 +209,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             .map_err(write_error)?;
                         let (target_path, created_identity) =
                             written_target(env.as_ref(), &abs, created).await;
+                        let via_link = through_link(env.as_ref(), &abs, &target_path).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
@@ -220,6 +221,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "created": created,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
+                                "viaLink": via_link,
                                 "createdPath": created_identity.map(|_| &target_path),
                                 "createdIdentity": created_identity,
                                 "diff": diff,
@@ -285,6 +287,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             .await
                             .map_err(write_error)?;
                         let (target_path, _) = written_target(env.as_ref(), &abs, false).await;
+                        let via_link = through_link(env.as_ref(), &abs, &target_path).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Edited {}", abs.display()),
@@ -296,6 +299,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "created": false,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
+                                "viaLink": via_link,
                             }),
                             usage: None,
                             added_tool_names: None,
@@ -341,6 +345,29 @@ async fn written_target(
         None
     };
     (target, identity)
+}
+
+/// Whether a write to `abs` landed somewhere its path does not show: a
+/// symlink on the way took it to `target`. Only the working directory is
+/// resolved for the comparison, so a workspace below a link (such as `/var`
+/// on macOS) does not count, and a plain `..` does not either.
+async fn through_link(env: &dyn ExecutionEnv, abs: &Path, target: &Path) -> bool {
+    let cwd = env.cwd();
+    let expected = match (abs.strip_prefix(cwd), env.canonical_path(cwd).await) {
+        (Ok(rest), Ok(root)) => root.join(rest),
+        _ => abs.to_path_buf(),
+    };
+    let mut normal = PathBuf::new();
+    for part in expected.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            part => normal.push(part),
+        }
+    }
+    normal != target
 }
 
 fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<String, String> {

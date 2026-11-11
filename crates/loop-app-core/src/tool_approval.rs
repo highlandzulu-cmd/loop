@@ -562,12 +562,21 @@ impl ToolApprovalBridge {
             .map(|s| s.to_string())
             .unwrap_or_else(|| path.display().to_string());
 
+        // A write through a symlink names where it landed, on both
+        // transports: the title and the detail carry `link → target`.
+        let (summary, detail) = match review.target_path.as_deref().filter(|_| review.via_link) {
+            Some(target) => (
+                format!("{display} → {}", target.display()),
+                format!("{} → {}", path.display(), target.display()),
+            ),
+            None => (display, path.display().to_string()),
+        };
         let decision = self
             .ask_user(
                 ApprovalKind::FileEdit,
                 name,
-                display,
-                path.display().to_string(),
+                summary,
+                detail,
                 cancel.as_ref(),
             )
             .await;
@@ -747,6 +756,8 @@ pub fn permissions_from_settings(
 pub(crate) struct FileReview {
     created: bool,
     target_path: Option<PathBuf>,
+    /// Whether a symlink took the write somewhere its path does not show.
+    via_link: bool,
     created_path: Option<PathBuf>,
     created_identity: Option<loop_agent::harness::types::FileIdentity>,
 }
@@ -760,6 +771,10 @@ impl FileReview {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             target_path: path("targetPath"),
+            via_link: details
+                .get("viaLink")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             created_path: path("createdPath"),
             created_identity: details
                 .get("createdIdentity")
