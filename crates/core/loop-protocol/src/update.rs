@@ -14,6 +14,7 @@ use crate::PROTOCOL_VERSION;
 /// A backend publishes one stream of envelopes for all its sessions; readers
 /// route by `session` and discard envelopes from an older `generation`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateEnvelope {
     /// Protocol version of this envelope.
     pub v: u32,
@@ -59,6 +60,7 @@ impl UpdateEnvelope {
 
 /// Where an update comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Origin {
     /// Produced by the running session.
@@ -70,8 +72,20 @@ pub enum Origin {
 
 /// One change in a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionUpdate {
+    /// Replace the transcript with an immutable branch view.
+    BranchReset {
+        /// The Session revision after the branch change.
+        revision: u64,
+        /// Committed transcript revision.
+        branch_revision: u64,
+        /// Immutable transcript view id; expires explicitly.
+        view_id: String,
+        /// Why the transcript was replaced.
+        reason: String,
+    },
     /// A turn began.
     TurnStarted {
         /// Turn id.
@@ -104,6 +118,17 @@ pub enum SessionUpdate {
         message_id: MessageId,
         /// Content to append.
         content: ContentBlock,
+    },
+    /// The model has started writing a tool call; its input is still
+    /// arriving. A `ToolCall` with the same id follows if the call completes.
+    /// Readers may ignore this.
+    ToolCallPreparing {
+        /// Tool call id.
+        id: ToolCallId,
+        /// The tool's own name.
+        name: String,
+        /// What kind of action the tool performs.
+        kind: ToolKind,
     },
     /// A tool call began.
     ToolCall(ToolCall),
@@ -145,13 +170,85 @@ pub enum SessionUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ErrorInfo>,
     },
+    /// The Session's metadata or public config changed. Replaces the
+    /// previous metadata and config view; the transcript is unchanged.
+    ConfigChanged(ConfigChanged),
+    /// Ordered workflow progress, including its final result.
+    WorkflowProgress(crate::session_services::WorkflowProgress),
     /// An update with a `type` this reader does not know. The raw JSON is kept.
     #[serde(untagged)]
     Unknown(Value),
 }
 
+/// A Session's complete public config after a change (`config_changed`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ConfigChanged {
+    /// The Session revision.
+    pub revision: u64,
+    /// Session metadata.
+    #[serde(default)]
+    pub metadata: SessionMetadata,
+    /// The selected config: what the next turn uses.
+    #[serde(default)]
+    pub config: SessionConfig,
+    /// The config the current turn runs with; equals `config` unless
+    /// `pending`.
+    #[serde(default)]
+    pub effective: SessionConfig,
+    /// Part of `config` waits for the running turn to end.
+    #[serde(default)]
+    pub pending: bool,
+    /// The turn after which `config` takes effect, while `pending`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applies_after_turn: Option<TurnId>,
+    /// Revision of the workspace definitions the Session uses.
+    #[serde(default)]
+    pub workspace_revision: u64,
+}
+
+/// Session metadata carried by [`ConfigChanged`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct SessionMetadata {
+    /// Display name, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// A Session's public config. Absent fields are not offered by the backend
+/// or not known yet. Never holds secrets.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(default)]
+pub struct SessionConfig {
+    /// Skills activated in this Session.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_skills: Vec<String>,
+    /// Model id, as `session/models` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort id, as `session/efforts` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Backend mode id, as `session/modes` names it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// The Session's response-timeout override in ms (`session/ttfb`);
+    /// absent inherits the default, 0 waits indefinitely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_timeout_ms: Option<u64>,
+    /// The sandbox chosen for the Session: `off`, or `local` followed by
+    /// its isolation and runtime when set (`local/full/krun`). Absent uses
+    /// the workspace default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<String>,
+}
+
 /// Who wrote a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
     /// The person using Loop.
@@ -162,6 +259,7 @@ pub enum Role {
 
 /// Why a turn ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     /// The agent finished.
@@ -176,6 +274,8 @@ pub enum StopReason {
     Cancelled,
     /// The turn failed. `TurnEnded::error` says why.
     Error,
+    /// Interrupted by a Runtime restart; effects are uncertain. Never retry automatically.
+    RuntimeRestarted,
     /// A reason this reader does not know.
     #[serde(other)]
     Other,
@@ -183,6 +283,7 @@ pub enum StopReason {
 
 /// A tool call as first reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ToolCall {
     /// Tool call id.
     pub id: ToolCallId,
@@ -208,6 +309,7 @@ pub struct ToolCall {
 
 /// Changed fields of a tool call. `content`, when set, replaces the earlier content.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ToolCallUpdate {
     /// Tool call id.
     pub id: ToolCallId,
@@ -232,6 +334,9 @@ pub struct ToolCallUpdate {
     /// The tool's raw output, as the backend reported it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<Value>,
+    /// The tool's input, when the backend reports or changes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<Value>,
 }
 
 impl ToolCallUpdate {
@@ -246,12 +351,14 @@ impl ToolCallUpdate {
             content: None,
             locations: None,
             raw_output: None,
+            raw_input: None,
         }
     }
 }
 
 /// What kind of action a tool performs. Used for icons and approval policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolKind {
     /// Reads files or data.
@@ -277,6 +384,7 @@ pub enum ToolKind {
 
 /// Progress of a tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ToolCallStatus {
     /// Waiting to start, for example for approval.
@@ -291,6 +399,7 @@ pub enum ToolCallStatus {
 
 /// Output of a tool call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolContent {
     /// Ordinary content: text, an image or a resource link.
@@ -336,6 +445,7 @@ impl ToolContent {
 
 /// A file location a tool call touches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ToolLocation {
     /// File path.
     pub path: String,
@@ -346,6 +456,7 @@ pub struct ToolLocation {
 
 /// One step of the agent's plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct PlanEntry {
     /// What the step does.
     pub content: String,
@@ -355,6 +466,7 @@ pub struct PlanEntry {
 
 /// Progress of a plan step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEntryStatus {
     /// Not started.
@@ -370,6 +482,7 @@ pub enum PlanEntryStatus {
 
 /// Token usage reported by a backend.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct Usage {
     /// Prompt tokens of the latest request.
     pub input_tokens: u64,
@@ -396,6 +509,7 @@ pub struct Usage {
 
 /// Severity of a notice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum NoticeLevel {
     /// Status or progress.

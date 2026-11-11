@@ -30,7 +30,7 @@ use crate::stream_fn::{stream_fn_from_models, StreamFn};
 use crate::types::{
     AfterToolCallContext, AfterToolCallResult, AgentContext, AgentEvent, AgentEventSink,
     AgentLoopConfig, AgentMessage, AgentThinkingLevel, AgentTool, BeforeToolCallContext,
-    BeforeToolCallResult, PromptInput, QueueMode, ToolExecutionMode,
+    BeforeToolCallResult, PromptInput, QueueMode, RunLabels, ToolExecutionMode,
 };
 
 type BeforeToolHook = Arc<
@@ -94,19 +94,27 @@ pub struct TurnSnapshot {
     pub tool_env: Arc<dyn ExecutionEnv>,
 }
 
+/// Whether a tool is offered to the model ([`AgentHarness::set_tool_filter`]).
+pub type ToolFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Called once a prompted turn's tree writes are done, with the write that
+/// failed, if any. See [`AgentHarness::prompt_then_written`].
+pub type TurnWritten = Box<dyn FnOnce(Option<&crate::harness::types::SessionError>) + Send>;
+
 /// Agent harness.
 pub struct AgentHarness {
-    #[allow(dead_code)]
     models: Arc<Models>,
     stream_fn: StreamFn,
     session: Arc<tokio::sync::Mutex<Session>>,
     host_env: Arc<dyn ExecutionEnv>,
+    session_environment: parking_lot::RwLock<Option<std::collections::BTreeMap<String, String>>>,
     model: RwLock<Option<Model>>,
     thinking_level: RwLock<AgentThinkingLevel>,
     /// Synchronous lock: `tools_snapshot` runs inside the MCP server factory on a
     /// Tokio worker, and `tokio::sync::RwLock::blocking_read` panics there.
     tools: parking_lot::RwLock<Vec<AgentTool>>,
     active_tool_names: RwLock<Option<Vec<String>>>,
+    tool_filter: parking_lot::RwLock<Option<ToolFilter>>,
     system_prompt: RwLock<String>,
     resources: RwLock<AgentHarnessResources>,
     /// Skills activated via `/skill:name` (included in `<available_skills>` even
@@ -125,10 +133,16 @@ pub struct AgentHarness {
     hooks: HookRegistry,
     shutting_down: AtomicBool,
     shutdown_notify: Notify,
+    /// Turns in flight, counted from the phase change to after their
+    /// writes and `Settled` hooks.
+    turns_in_flight: std::sync::atomic::AtomicUsize,
+    settled: Notify,
     compaction_settings: RwLock<CompactionSettings>,
     tool_execution: Mutex<ToolExecutionMode>,
     before_tool_call: Mutex<Option<BeforeToolHook>>,
     after_tool_call: Mutex<Option<AfterToolHook>>,
+    should_stop_after_turn: Mutex<Option<crate::types::ShouldStopAfterTurnFn>>,
+    bash_limits: Mutex<crate::harness::tools::BashLimits>,
     #[allow(dead_code)]
     steering_mode: Mutex<QueueMode>,
     #[allow(dead_code)]
@@ -148,10 +162,12 @@ impl AgentHarness {
             stream_fn,
             session: Arc::new(tokio::sync::Mutex::new(options.session)),
             host_env: options.host_env,
+            session_environment: parking_lot::RwLock::new(None),
             model: RwLock::new(options.model),
             thinking_level: RwLock::new(AgentThinkingLevel::Off),
             tools: parking_lot::RwLock::new(options.tools),
             active_tool_names: RwLock::new(None),
+            tool_filter: parking_lot::RwLock::new(None),
             system_prompt: RwLock::new(options.system_prompt),
             resources: RwLock::new(options.resources),
             active_skill_names: RwLock::new(Vec::new()),
@@ -168,15 +184,40 @@ impl AgentHarness {
             hooks: HookRegistry::default(),
             shutting_down: AtomicBool::new(false),
             shutdown_notify: Notify::new(),
+            turns_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            settled: Notify::new(),
             compaction_settings: RwLock::new(CompactionSettings::default()),
             tool_execution: Mutex::new(ToolExecutionMode::Parallel),
             before_tool_call: Mutex::new(None),
             after_tool_call: Mutex::new(None),
+            should_stop_after_turn: Mutex::new(None),
+            bash_limits: Mutex::new(Default::default()),
             steering_mode: Mutex::new(QueueMode::OneAtATime),
             follow_up_mode: Mutex::new(QueueMode::OneAtATime),
             #[cfg(feature = "mcp")]
             mcp_client: Arc::new(loop_mcp::McpClientManager::new()),
         }
+    }
+
+    /// Time limits for shell commands run outside the `bash` tool
+    /// (workflow shell tasks).
+    pub fn set_bash_limits(&self, limits: crate::harness::tools::BashLimits) {
+        *self.bash_limits.lock() = limits;
+    }
+
+    /// The bash time limits.
+    pub fn bash_limits(&self) -> crate::harness::tools::BashLimits {
+        *self.bash_limits.lock()
+    }
+
+    /// The hook registry, for hosts that emit their own events (tool gate).
+    pub fn hooks(&self) -> HookRegistry {
+        self.hooks.clone()
+    }
+
+    /// Working directory of the host environment.
+    pub fn cwd(&self) -> std::path::PathBuf {
+        self.host_env.cwd().to_path_buf()
     }
 
     /// Current session id (also sent on provider API requests).
@@ -237,7 +278,10 @@ impl AgentHarness {
         self.wait_for_idle().await;
 
         let store = self.session.lock().await.store();
-        let reader = store.load(id).await.map_err(AgentHarnessError::Session)?;
+        let reader = store
+            .open_writer(id)
+            .await
+            .map_err(AgentHarnessError::Session)?;
         let new_session = Session::new(store, reader);
         let sid = new_session.metadata().id.clone();
 
@@ -253,6 +297,97 @@ impl AgentHarness {
         self.active_skill_names.write().await.clear();
 
         Ok(sid)
+    }
+
+    /// The current Session's active leaf entry id (one small read).
+    pub async fn session_head(&self) -> Result<Option<String>, AgentHarnessError> {
+        let reader = self.session.lock().await.reader();
+        reader.read_head().await.map_err(AgentHarnessError::Session)
+    }
+
+    /// The current Session's branches as `/tree` rows.
+    pub async fn session_tree(
+        &self,
+    ) -> Result<Vec<crate::harness::session::SessionTreeRow>, AgentHarnessError> {
+        let reader = self.session.lock().await.reader();
+        let head = reader
+            .read_head()
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let entries = reader
+            .read_entries(None)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        Ok(crate::harness::session::session_tree_rows(
+            &entries,
+            head.as_deref(),
+        ))
+    }
+
+    /// The Session the current one was forked or cloned from, and the
+    /// Sessions forked or cloned from it, newest first.
+    pub async fn session_family(
+        &self,
+    ) -> Result<
+        (
+            Option<crate::harness::session::SessionMetadata>,
+            Vec<crate::harness::session::SessionMetadata>,
+        ),
+        AgentHarnessError,
+    > {
+        let (store, meta) = {
+            let session = self.session.lock().await;
+            (session.store(), session.metadata().clone())
+        };
+        let all = store
+            .list(meta.cwd.as_deref())
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let parent = meta
+            .parent_session_id
+            .as_deref()
+            .and_then(|id| all.iter().find(|m| m.id == id).cloned());
+        let mut children: Vec<_> = all
+            .into_iter()
+            .filter(|m| m.parent_session_id.as_deref() == Some(meta.id.as_str()))
+            .collect();
+        children.sort_by_key(|m| std::cmp::Reverse(m.created_at));
+        Ok((parent, children))
+    }
+
+    /// The current Session's active branch, for `/export`.
+    pub async fn export_session(
+        &self,
+    ) -> Result<crate::harness::session::SessionFile, AgentHarnessError> {
+        let reader = self.session.lock().await.reader();
+        crate::harness::session::SessionFile::from_reader(reader.as_ref())
+            .await
+            .map_err(AgentHarnessError::Session)
+    }
+
+    /// Write `file` into this harness's store as a new Session opened in
+    /// `cwd`, and return its id. The current Session stays active.
+    pub async fn import_session(
+        &self,
+        file: &crate::harness::session::SessionFile,
+        cwd: Option<String>,
+    ) -> Result<String, AgentHarnessError> {
+        let store = self.session.lock().await.store();
+        crate::harness::session::import_session_file(store.as_ref(), file, cwd)
+            .await
+            .map_err(AgentHarnessError::Session)
+    }
+
+    /// The sessions with messages in this harness's store, most recently
+    /// used first; only those opened in `cwd`, when given.
+    pub async fn session_summaries(
+        &self,
+        cwd: Option<&str>,
+    ) -> Result<Vec<crate::harness::session::SessionSummary>, AgentHarnessError> {
+        let store = self.session.lock().await.store();
+        crate::harness::session::list_session_summaries(store.as_ref(), cwd)
+            .await
+            .map_err(AgentHarnessError::Session)
     }
 
     /// Set the display name for the active session.
@@ -343,6 +478,12 @@ impl AgentHarness {
         *self.sandbox.write().await = mode;
     }
 
+    /// Replace the sandbox without destroying the previous one, which is
+    /// returned: it may be shared with other Sessions.
+    pub async fn replace_sandbox(&self, mode: SandboxMode) -> SandboxMode {
+        std::mem::replace(&mut *self.sandbox.write().await, mode)
+    }
+
     /// Disable sandbox and destroy the previous instance if any.
     pub async fn clear_sandbox(&self) {
         let prev = std::mem::replace(&mut *self.sandbox.write().await, SandboxMode::Disabled);
@@ -406,10 +547,70 @@ impl AgentHarness {
         *self.thinking_level.write().await = level;
     }
 
+    /// The thinking level the next turn starts with.
+    pub async fn thinking_level(&self) -> AgentThinkingLevel {
+        *self.thinking_level.read().await
+    }
+
+    /// The model registry the harness resolves models from.
+    pub fn models(&self) -> &Arc<Models> {
+        &self.models
+    }
+
+    /// Record a model or effort choice in the active Session's tree before
+    /// returning, also during a turn: a choice that was acknowledged must
+    /// survive a crash. A running turn's own entries are written after it,
+    /// so the choice lands before them on the branch; it is Session config,
+    /// not turn output, and stays when the turn is cancelled.
+    pub async fn record_config(&self, write: PendingSessionWrite) -> Result<(), AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        let session = self.session.lock().await;
+        session
+            .store()
+            .append_entry(&session.metadata().id, write)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        Ok(())
+    }
+
+    /// The active Session's recorded model, effort, name and config revision.
+    pub async fn session_config(
+        &self,
+    ) -> Result<crate::harness::session::types::SessionConfigEntries, AgentHarnessError> {
+        let session = self.session.lock().await;
+        let reader = session.reader();
+        let head = reader
+            .read_head()
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let entries = reader
+            .read_entries(None)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        let mut config =
+            crate::harness::session::types::config_from_entries(&entries, head.as_deref());
+        if config.name.is_none() {
+            config.name = session.metadata().name.clone();
+        }
+        Ok(config)
+    }
+
+    /// Set native streaming deadline settings.
+    pub async fn set_timeouts(
+        &self,
+        policy: loop_ai::TimeoutPolicy,
+        overrides: loop_ai::TimeoutOverrides,
+    ) {
+        let mut options = self.stream_options.write().await;
+        options.base.timeouts = policy;
+        options.base.timeout_overrides = overrides;
+    }
+
     /// Set max wait for model response headers (`0` = wait indefinitely).
     pub async fn set_response_header_timeout_ms(&self, ms: u64) {
         let mut opts = self.stream_options.write().await;
         opts.base.response_header_timeout_ms = Some(ms);
+        opts.base.timeouts.response_header_ms = Some(ms);
     }
 
     /// Current response-header timeout in ms (`0` = disabled / unlimited).
@@ -419,7 +620,7 @@ impl AgentHarness {
             .await
             .base
             .response_header_timeout_ms
-            .unwrap_or(60_000)
+            .unwrap_or(120_000)
     }
 
     /// Set tools (rejects duplicate names).
@@ -526,6 +727,13 @@ impl AgentHarness {
         *self.active_tool_names.write().await = names;
     }
 
+    /// Offer the model only the tools `filter` keeps, from the next turn or
+    /// workflow on.
+    /// Unlike [`Self::set_active_tools`], this is not saved with the session.
+    pub fn set_tool_filter(&self, filter: Option<ToolFilter>) {
+        *self.tool_filter.write() = filter;
+    }
+
     /// Set resources.
     pub async fn set_resources(&self, resources: AgentHarnessResources) {
         *self.resources.write().await = resources;
@@ -593,6 +801,12 @@ impl AgentHarness {
     /// Set after-tool-call hook (e.g. interactive file-edit review).
     pub fn set_after_tool_call(&self, hook: Option<AfterToolHook>) {
         *self.after_tool_call.lock() = hook;
+    }
+
+    /// Decide after each model call whether the run ends there, even with
+    /// tool results pending (for example a Subagent's model-call limit).
+    pub fn set_should_stop_after_turn(&self, hook: Option<crate::types::ShouldStopAfterTurnFn>) {
+        *self.should_stop_after_turn.lock() = hook;
     }
 
     /// Register a harness hook.
@@ -811,6 +1025,39 @@ impl AgentHarness {
         settings: &CompactionSettings,
         custom_instructions: Option<&str>,
     ) -> Result<CompactResult, AgentHarnessError> {
+        let (result, write) = self
+            .prepare_compaction_inner(settings, custom_instructions)
+            .await?;
+        let session = self.session.lock().await;
+        session
+            .store()
+            .append_entry(&session.metadata().id, write)
+            .await
+            .map_err(AgentHarnessError::Session)?;
+        Ok(result)
+    }
+
+    /// Prepare a compaction without writing it (idle only): its summary and
+    /// the tree entry the caller commits itself.
+    pub async fn prepare_compaction(
+        &self,
+        custom_instructions: Option<&str>,
+    ) -> Result<(CompactResult, PendingSessionWrite), AgentHarnessError> {
+        let settings = self.compaction_settings.read().await.clone();
+        self.acquire_idle_phase(AgentHarnessPhase::Compaction)
+            .await?;
+        let result = self
+            .prepare_compaction_inner(&settings, custom_instructions)
+            .await;
+        self.release_to_idle();
+        result
+    }
+
+    async fn prepare_compaction_inner(
+        &self,
+        settings: &CompactionSettings,
+        custom_instructions: Option<&str>,
+    ) -> Result<(CompactResult, PendingSessionWrite), AgentHarnessError> {
         let ctx = {
             let session = self.session.lock().await;
             session
@@ -849,33 +1096,34 @@ impl AgentHarness {
                 .map_err(AgentHarnessError::Session)?
         };
         let first_kept_entry_id = first_kept_entry_id_for_cut(&branch, prep.cut_index);
-
-        {
-            let session = self.session.lock().await;
-            session
-                .store()
-                .append_entry(
-                    &session.metadata().id,
-                    PendingSessionWrite::Compaction {
-                        summary: summary.clone(),
-                        first_kept_entry_id,
-                        details: None,
-                    },
-                )
-                .await
-                .map_err(AgentHarnessError::Session)?;
-        }
-
-        Ok(CompactResult {
-            summary,
-            tokens_before,
-        })
+        let write = PendingSessionWrite::Compaction {
+            summary: summary.clone(),
+            first_kept_entry_id,
+            details: None,
+        };
+        Ok((
+            CompactResult {
+                summary,
+                tokens_before,
+            },
+            write,
+        ))
     }
 
     /// Navigate the session tree to a target entry (idle only).
     pub async fn navigate_tree(
         &self,
         target_id: &str,
+        summarize: bool,
+    ) -> Result<NavigateTreeResult, AgentHarnessError> {
+        self.navigate_tree_to(Some(target_id), summarize).await
+    }
+
+    /// Navigate the session tree to a target entry, or to before the first
+    /// entry when `target_id` is `None` (idle only).
+    pub async fn navigate_tree_to(
+        &self,
+        target_id: Option<&str>,
         summarize: bool,
     ) -> Result<NavigateTreeResult, AgentHarnessError> {
         self.acquire_idle_phase(AgentHarnessPhase::BranchSummary)
@@ -894,13 +1142,13 @@ impl AgentHarness {
 
     async fn navigate_tree_inner(
         &self,
-        target_id: &str,
+        target_id: Option<&str>,
         summarize: bool,
     ) -> Result<NavigateTreeResult, AgentHarnessError> {
         let hook = self
             .hooks
             .emit(HarnessHookEvent::SessionBeforeTree {
-                target_id: target_id.to_string(),
+                target_id: target_id.unwrap_or_default().to_string(),
             })
             .await;
 
@@ -940,7 +1188,7 @@ impl AgentHarness {
         {
             let session = self.session.lock().await;
             session
-                .move_to(Some(target_id.to_string()))
+                .move_to(target_id.map(str::to_string))
                 .await
                 .map_err(AgentHarnessError::Session)?;
         }
@@ -964,6 +1212,21 @@ impl AgentHarness {
         tokio::spawn(async move {
             let _ = hooks.emit(HarnessHookEvent::ShutdownRequested).await;
         });
+    }
+
+    /// Wait until no turn is in flight: its tools, writes and `Settled`
+    /// hooks have all finished. Unlike [`Self::wait_for_idle`], which ends
+    /// when the phase turns Idle, before those hooks run.
+    pub async fn wait_for_settled(&self) {
+        loop {
+            let notified = self.settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.turns_in_flight.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Wait until shutdown was requested and the harness is idle.
@@ -1033,7 +1296,7 @@ impl AgentHarness {
         let resources = self.resources.read().await.clone();
         let all_tools = self.tools.read().clone();
         let active = self.active_tool_names.read().await.clone();
-        let tools = if let Some(names) = active {
+        let mut tools: Vec<AgentTool> = if let Some(names) = active {
             all_tools
                 .into_iter()
                 .filter(|t| names.iter().any(|n| n == &t.name))
@@ -1041,6 +1304,9 @@ impl AgentHarness {
         } else {
             all_tools
         };
+        if let Some(filter) = self.tool_filter.read().clone() {
+            tools.retain(|t| filter(&t.name));
+        }
 
         // Progressive disclosure (pi): only advertise skills when `read` is available
         // so the model can load SKILL.md on demand. User-activated skills
@@ -1078,7 +1344,22 @@ impl AgentHarness {
         input: impl Into<PromptInput>,
     ) -> Result<AgentMessage, AgentHarnessError> {
         self.assert_not_shut_down()?;
-        self.run_turn(Some(input.into())).await
+        self.run_turn(Some(input.into()), None).await
+    }
+
+    /// [`prompt`](Self::prompt), and call `written` once the turn's tree
+    /// writes are done: after the last `append_entry` and before the
+    /// `Settled` hooks run. Its argument is the tree write that failed, if
+    /// one did (then the prompt returns that failure too). Not called when
+    /// the prompt is refused before its turn starts (busy, no model, lost
+    /// lease).
+    pub async fn prompt_then_written(
+        &self,
+        input: impl Into<PromptInput>,
+        written: TurnWritten,
+    ) -> Result<AgentMessage, AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        self.run_turn(Some(input.into()), Some(written)).await
     }
 
     /// Prompt with images.
@@ -1094,9 +1375,20 @@ impl AgentHarness {
     async fn run_turn(
         &self,
         input: Option<PromptInput>,
+        written: Option<TurnWritten>,
     ) -> Result<AgentMessage, AgentHarnessError> {
         // Fail before touching phase or session, so nothing is recorded for the prompt.
         self.require_model().await?;
+        let lease_cancellation = self.session.lock().await.store().write_cancellation();
+        if lease_cancellation
+            .as_ref()
+            .is_some_and(CancellationToken::is_cancelled)
+        {
+            return Err(crate::harness::types::SessionError::Invalid(
+                "Session lease ownership was lost; stop writing and cancel work.".into(),
+            )
+            .into());
+        }
         {
             let mut phase = self.phase.lock();
             if *phase != AgentHarnessPhase::Idle {
@@ -1104,18 +1396,24 @@ impl AgentHarness {
             }
             *phase = AgentHarnessPhase::Turn;
         }
+        // Counted until this whole function ends, also if its future is
+        // dropped: phase turns Idle before the `Settled` hooks run.
+        let _in_flight = InFlight::enter(self);
 
-        let token = CancellationToken::new();
+        let token = lease_cancellation
+            .map(|token| token.child_token())
+            .unwrap_or_default();
         *self.cancel.lock() = Some(token.clone());
         tracing::info!("run_turn: started");
 
         // Always release phase on exit so early failures (sandbox/session/hooks)
         // cannot leave the harness stuck in `Turn` with the CLI showing Working…
-        let result = self.run_turn_inner(input, token.clone()).await;
+        let mut result = self.run_turn_inner(input, token.clone()).await;
 
         let writes = std::mem::take(&mut *self.pending_writes.lock());
         // Aborted turns should leave no session footprint so a follow-up prompt
         // (or UI "stop") behaves as if the turn never ran.
+        let mut write_error = None;
         if !token.is_cancelled() {
             let session = self.session.lock().await;
             let store = session.store();
@@ -1123,8 +1421,22 @@ impl AgentHarness {
             for w in writes {
                 if let Err(e) = store.append_entry(&sid, w).await {
                     tracing::error!(session_id = %sid, "session write failed: {e}");
+                    // A turn the Session does not hold is not complete. Later
+                    // entries would hang off the wrong parent, so stop here.
+                    if result.is_ok() {
+                        write_error = Some(e);
+                    }
+                    break;
                 }
             }
+        }
+        // The tree now holds the turn (or the write failed): tell the caller
+        // before user hooks can delay it.
+        if let Some(written) = written {
+            written(write_error.as_ref());
+        }
+        if let Some(e) = write_error {
+            result = Err(AgentHarnessError::Session(e));
         }
 
         *self.phase.lock() = AgentHarnessPhase::Idle;
@@ -1204,6 +1516,19 @@ impl AgentHarness {
         config.stream_options.reasoning = snapshot.thinking_level.to_reasoning();
         config.before_tool_call = self.before_tool_call.lock().clone();
         config.after_tool_call = self.after_tool_call.lock().clone();
+        config.should_stop_after_turn = self.should_stop_after_turn.lock().clone();
+        config.run_labels = RunLabels {
+            agent: Some(RunLabels::MAIN),
+            skills: self.active_skill_names.read().await.clone(),
+            skill_files: self
+                .resources
+                .read()
+                .await
+                .skills
+                .iter()
+                .map(|skill| (skill.path.clone(), skill.name.clone()))
+                .collect(),
+        };
 
         let steer_q = Arc::clone(&self.steering);
         let follow_q = Arc::clone(&self.follow_up);
@@ -1276,12 +1601,26 @@ impl AgentHarness {
         }
     }
 
+    /// The environment inherited by child Sessions and copies.
+    pub fn session_environment(&self) -> Option<std::collections::BTreeMap<String, String>> {
+        self.session_environment.read().clone()
+    }
+
+    /// Bind tools and user commands to the opening Surface's environment.
+    pub fn set_session_environment(&self, env: Option<std::collections::BTreeMap<String, String>>) {
+        *self.session_environment.write() = env;
+    }
+
     /// Tool env that the current sandbox/host would provide (for rebuilding tools).
     /// Starts the sandbox if needed; needs no model.
     pub async fn tool_env(&self) -> Result<Arc<dyn ExecutionEnv>, AgentHarnessError> {
-        Ok(match self.ensure_sandbox_ready().await? {
+        let env = match self.ensure_sandbox_ready().await? {
             Some(sandbox) => sandbox.env(),
             None => Arc::clone(&self.host_env),
+        };
+        Ok(match self.session_environment.read().as_ref() {
+            Some(values) => super::SessionExecutionEnv::wrap(env, values),
+            None => env,
         })
     }
 
@@ -1323,7 +1662,7 @@ impl AgentHarness {
         >,
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use crate::harness::orchestration::{
-            agent_worker::{AgentWorker, ShellWorker},
+            agent_worker::{AgentWorker, ShellWorker, WorkflowToolHooks},
             WorkflowProgressEvent,
         };
         use loop_orchestration::memory::bus::create_memory_bus;
@@ -1359,22 +1698,37 @@ impl AgentHarness {
 
         let model = self.require_model().await?;
         let system_prompt = self.system_prompt.read().await.clone();
-        let tools = self.tools.read().clone();
-        let host_env = Arc::clone(&self.host_env);
+        let mut tools = self.tools.read().clone();
+        if let Some(filter) = self.tool_filter.read().clone() {
+            tools.retain(|t| filter(&t.name));
+        }
+        let host_env = self.tool_env().await?;
+        // Workflow tasks get the same tool checks as the chat.
+        let hooks = WorkflowToolHooks {
+            before: self.before_tool_call.lock().clone(),
+            after: self.after_tool_call.lock().clone(),
+        };
         let thinking_level = *self.thinking_level.read().await;
         let mut stream_options = self.stream_options.read().await.clone();
         stream_options.reasoning = thinking_level.to_reasoning();
 
-        let agent_worker = Arc::new(AgentWorker::new(
-            Arc::clone(&self.stream_fn),
-            Arc::clone(&host_env),
-            tools,
-            model,
-            system_prompt,
-            stream_options,
-        ));
+        let agent_worker = Arc::new(
+            AgentWorker::new(
+                Arc::clone(&self.stream_fn),
+                Arc::clone(&host_env),
+                tools,
+                model,
+                system_prompt,
+                stream_options,
+            )
+            .with_tool_hooks(hooks.clone()),
+        );
 
-        let shell_worker = Arc::new(ShellWorker::new(Arc::clone(&host_env)));
+        let shell_worker = Arc::new(
+            ShellWorker::new(Arc::clone(&host_env))
+                .with_tool_hooks(hooks)
+                .with_timeout_ms(self.bash_limits.lock().default_timeout_ms),
+        );
 
         let mut pool = WorkerPool::new(scheduler_config.max_concurrency);
         pool.register(agent_worker);
@@ -1461,15 +1815,19 @@ impl AgentHarness {
 
         let scheduler = Scheduler::new(Arc::clone(&engine), pool, shared_memory, scheduler_config);
 
-        let result = scheduler
-            .run(&workflow_id)
-            .await
-            .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
+        let cancel = self.cancel.lock().clone().unwrap_or_default();
+        let run = scheduler.run(&workflow_id);
+        tokio::pin!(run);
+        let result = tokio::select! {
+            result = &mut run => result,
+            _ = cancel.cancelled() => { scheduler.cancel(); run.await }
+        }
+        .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
 
         let _ = self
             .hooks
             .emit(HarnessHookEvent::WorkflowCompleted {
-                workflow_id,
+                workflow_id: workflow_id.clone(),
                 success: result.success,
             })
             .await;
@@ -1498,6 +1856,17 @@ impl AgentHarness {
     ) -> Result<loop_orchestration::workflow::WorkflowResult, AgentHarnessError> {
         use loop_orchestration::planner::{LlmPlanner, Planner};
 
+        self.acquire_idle_phase(AgentHarnessPhase::Workflow).await?;
+        struct Phase<'a>(&'a AgentHarness);
+        impl Drop for Phase<'_> {
+            fn drop(&mut self) {
+                self.0.cancel.lock().take();
+                self.0.release_to_idle();
+            }
+        }
+        let _phase = Phase(self);
+        let cancel = CancellationToken::new();
+        *self.cancel.lock() = Some(cancel.clone());
         let model = self.require_model().await?;
         let planner = LlmPlanner::new(Arc::clone(&self.stream_fn), model);
 
@@ -1515,12 +1884,11 @@ impl AgentHarness {
             }
         });
 
-        let graph = planner
-            .decompose(goal, &ctx)
-            .await
-            .map_err(|e| AgentHarnessError::Other(e.to_string()))?;
-
-        self.start_workflow(graph, config, progress_tx).await
+        let graph = tokio::select! {
+            result = planner.decompose(goal, &ctx) => result.map_err(|e| AgentHarnessError::Other(e.to_string()))?,
+            _ = cancel.cancelled() => return Err(AgentHarnessError::Other("workflow cancelled".into())),
+        };
+        self.run_workflow_inner(graph, config, progress_tx).await
     }
 }
 
@@ -1547,4 +1915,20 @@ fn first_kept_entry_id_for_cut(entries: &[SessionTreeEntry], cut_index: usize) -
         }
     }
     producer_ids.get(cut_index).map(|s| s.to_string())
+}
+
+/// Counts one turn in flight for [`AgentHarness::wait_for_settled`].
+struct InFlight<'a>(&'a AgentHarness);
+impl<'a> InFlight<'a> {
+    fn enter(harness: &'a AgentHarness) -> Self {
+        harness.turns_in_flight.fetch_add(1, Ordering::AcqRel);
+        Self(harness)
+    }
+}
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if self.0.turns_in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.settled.notify_waiters();
+        }
+    }
 }

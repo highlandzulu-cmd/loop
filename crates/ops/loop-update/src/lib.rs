@@ -7,7 +7,7 @@ mod release;
 
 pub use control::{cancellable, plan, update_check_disabled, UpdatePlan};
 pub use install::{default_install_dir, Installation};
-pub use release::{is_newer, platform_target, ReleaseClient, ReleaseVersion};
+pub use release::{is_newer, platform_target, ReleaseClient, ReleaseNotes, ReleaseVersion};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -23,9 +23,6 @@ pub enum Error {
     Version(#[from] semver::Error),
     #[error("Update cancelled; current binary kept")]
     Cancelled,
-    #[cfg(windows)]
-    #[error(transparent)]
-    Zip(#[from] zip::result::ZipError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

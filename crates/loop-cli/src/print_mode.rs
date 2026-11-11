@@ -9,6 +9,7 @@ use loop_agent::AgentMessage;
 use loop_ai::{AssistantContent, Message};
 use loop_protocol::{
     AgentBackend, ContentBlock, Role, SessionRef, SessionUpdate, StopReason, TurnOutcome,
+    UpdateEnvelope, Usage,
 };
 #[cfg(feature = "telemetry")]
 use loop_telemetry::{obs, ObservationExt, TelemetryHandle, TraceAttrs};
@@ -142,12 +143,17 @@ where
     }
 }
 
-/// `loop --print`: run one prompt, print the answer, report the trace id on stderr.
+/// `loop --print`: run one prompt, write the result in `format`, report the
+/// trace id on stderr. Returns the process exit code ([`TurnEnd::exit_code`]).
 pub async fn run_print(
     runtime: &mut CliRuntime,
     prompt: String,
+    format: OutputFormat,
     trace: &TraceArgs,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
+    for notice in std::mem::take(&mut runtime.startup_notices) {
+        eprintln!("loop: {notice}");
+    }
     // No one can approve anything here: external agents get the default
     // host, which rejects every request, so they decline the action.
     match runtime.pending_agent.take() {
@@ -155,19 +161,56 @@ pub async fn run_print(
         Some(PendingAgent::Resume(record)) => runtime.resume_agent(&record).await?,
         None => {}
     }
+    runtime.note_prompt(&prompt);
     let backend = runtime.backend.clone();
     let session = runtime.session_ref();
     let input = prompt.clone();
+    let turn_session = session.clone();
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let report_slot = std::sync::Arc::clone(&slot);
     let outcome = traced_print(&input, trace, &runtime.session_id, || async move {
-        print_turn(backend.as_ref(), &session, prompt).await
+        let report = run_turn(backend.as_ref(), &turn_session, prompt, |envelope| {
+            if format == OutputFormat::StreamJson {
+                print_json_line(&serde_json::to_value(envelope).unwrap_or_default());
+            }
+        })
+        .await;
+        // The trace records the answer, or why there is none.
+        let traced = match report.end.error() {
+            None => Ok(report.text.clone()),
+            Some(error) => Err(anyhow::anyhow!(error)),
+        };
+        *report_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(report);
+        traced
     })
     .await;
     if let Some(trace_id) = &outcome.trace_id {
         eprintln!("{TRACE_ID_PREFIX}{trace_id}");
     }
-    let text = outcome.result?;
-    println!("{text}");
-    Ok(())
+    let report = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(report) = report else {
+        // The run never reached the turn.
+        return outcome.result.map(|_| 1);
+    };
+    match format {
+        OutputFormat::Text => match report.end.error() {
+            None => println!("{}", report.text),
+            Some(error) => eprintln!("loop: {error}"),
+        },
+        OutputFormat::Json | OutputFormat::StreamJson => {
+            print_json_line(&report.result_json(&session))
+        }
+    }
+    Ok(report.exit_code())
+}
+
+/// Write one JSON value as a line on stdout and flush it, so a reader sees
+/// each update as it happens.
+fn print_json_line(value: &serde_json::Value) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{value}");
+    let _ = out.flush();
 }
 
 /// Flush and stop exporting before the process exits; reports a failed last export.
@@ -181,6 +224,217 @@ pub async fn shutdown_telemetry(telemetry: &TelemetryHandle) {
     }
 }
 
+/// How `--print` writes its result.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum OutputFormat {
+    /// The text of the agent's last message.
+    #[default]
+    Text,
+    /// One `result` object when the turn ends.
+    Json,
+    /// Every update of the turn as one JSON line, then the `result` object.
+    StreamJson,
+}
+
+/// How a `--print` turn ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// The turn finished.
+    Completed,
+    /// The turn failed, or could not start.
+    Failed(String),
+    /// The turn was cancelled.
+    Cancelled,
+    /// Contact with the agent was lost mid-turn; edits or commands may have
+    /// run.
+    Uncertain,
+}
+
+impl TurnEnd {
+    /// The process exit code: 0 completed, 1 failed, 3 lost contact, 130
+    /// cancelled. Clap uses 2 for usage errors.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Completed => 0,
+            Self::Failed(_) => 1,
+            Self::Uncertain => 3,
+            Self::Cancelled => 130,
+        }
+    }
+
+    /// Why the turn did not complete.
+    pub fn error(&self) -> Option<String> {
+        match self {
+            Self::Completed => None,
+            Self::Failed(message) => Some(message.clone()),
+            Self::Cancelled => Some("the turn was cancelled".into()),
+            Self::Uncertain => {
+                Some("lost contact with the agent; the turn may be incomplete".into())
+            }
+        }
+    }
+}
+
+/// What one `--print` turn produced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnReport {
+    /// The text of the agent's last message.
+    pub text: String,
+    /// Why the turn ended, when the backend said.
+    pub stop: Option<StopReason>,
+    /// The latest token usage.
+    pub usage: Option<Usage>,
+    /// How it ended.
+    pub end: TurnEnd,
+}
+
+impl TurnReport {
+    /// The process exit code ([`TurnEnd::exit_code`]).
+    pub fn exit_code(&self) -> i32 {
+        self.end.exit_code()
+    }
+
+    /// The `result` object for `--output-format json` and `stream-json`.
+    pub fn result_json(&self, session: &SessionRef) -> serde_json::Value {
+        let stop = self.stop.unwrap_or(match self.end {
+            TurnEnd::Completed => StopReason::EndTurn,
+            TurnEnd::Cancelled => StopReason::Cancelled,
+            TurnEnd::Failed(_) | TurnEnd::Uncertain => StopReason::Error,
+        });
+        serde_json::json!({
+            "type": "result",
+            "session": session.key,
+            "stop": stop,
+            "text": self.text,
+            "usage": self.usage,
+            "error": self.end.error(),
+            "exit_code": self.exit_code(),
+        })
+    }
+}
+
+/// Text shared by print mode and the Runtime's plain-text Surface.
+pub fn agent_text_chunk(update: &SessionUpdate) -> Option<&str> {
+    match update {
+        SessionUpdate::MessageChunk {
+            role: Role::Agent,
+            content,
+            ..
+        } => content.as_text(),
+        _ => None,
+    }
+}
+
+/// Plain-text rendering of a Session's updates for a line terminal: prompts
+/// as `› text`, agent text, one line per tool call and one per finished call,
+/// with each message starting on its own line.
+#[derive(Debug)]
+pub struct TextRenderer {
+    at_line_start: bool,
+    tools: std::collections::HashMap<loop_protocol::ToolCallId, String>,
+    /// The call whose line was the last thing written: its result can
+    /// follow without repeating its name.
+    last_call: Option<loop_protocol::ToolCallId>,
+}
+
+impl Default for TextRenderer {
+    fn default() -> Self {
+        Self {
+            at_line_start: true,
+            tools: Default::default(),
+            last_call: None,
+        }
+    }
+}
+
+impl TextRenderer {
+    /// Text to write for one update; empty when it shows nothing.
+    pub fn render(&mut self, update: &SessionUpdate) -> String {
+        use loop_protocol::ToolCallStatus;
+        let mut out = String::new();
+        let mut last_call = None;
+        match update {
+            SessionUpdate::MessageStarted {
+                role: Role::Agent, ..
+            } => self.break_line(&mut out),
+            SessionUpdate::ToolCall(call) => {
+                self.break_line(&mut out);
+                let label = match call.name.as_deref() {
+                    Some(name) if name != call.title && !call.title.starts_with(name) => {
+                        format!("{name}: {}", call.title)
+                    }
+                    _ => call.title.clone(),
+                };
+                out.push_str(&format!("• {label}\n"));
+                self.tools.insert(call.id.clone(), label);
+                match finished(call.status) {
+                    Some(status) => {
+                        out.push_str(&format!("  └ {status}\n"));
+                        self.tools.remove(&call.id);
+                    }
+                    None => last_call = Some(call.id.clone()),
+                }
+            }
+            SessionUpdate::ToolCallUpdate(update) => {
+                if let Some(status) = update.status.and_then(finished) {
+                    if let Some(label) = self.tools.remove(&update.id) {
+                        self.break_line(&mut out);
+                        // Name the call unless its line is right above.
+                        if self.last_call.as_ref() == Some(&update.id) {
+                            out.push_str(&format!("  └ {status}\n"));
+                        } else {
+                            out.push_str(&format!("  └ {label} {status}\n"));
+                        }
+                    }
+                }
+            }
+            SessionUpdate::TurnEnded { .. } => self.break_line(&mut out),
+            // A prompt: its own line, marked, continuation lines indented.
+            SessionUpdate::MessageChunk {
+                role: Role::User,
+                content,
+                ..
+            } => {
+                if let Some(text) = content.as_text().filter(|t| !t.is_empty()) {
+                    self.break_line(&mut out);
+                    out.push_str("› ");
+                    out.push_str(&text.trim_end_matches('\n').replace('\n', "\n  "));
+                    out.push('\n');
+                }
+            }
+            _ => {
+                if let Some(text) = agent_text_chunk(update) {
+                    out.push_str(text);
+                }
+            }
+        }
+        if !out.is_empty() {
+            self.at_line_start = out.ends_with('\n');
+            self.last_call = last_call;
+        }
+        return out;
+
+        fn finished(status: ToolCallStatus) -> Option<&'static str> {
+            match status {
+                ToolCallStatus::Completed => Some("done"),
+                ToolCallStatus::Failed => Some("failed"),
+                ToolCallStatus::Pending | ToolCallStatus::InProgress => None,
+            }
+        }
+    }
+
+    /// Whether the last text written ended a line.
+    pub fn at_line_start(&self) -> bool {
+        self.at_line_start
+    }
+
+    fn break_line(&self, out: &mut String) {
+        if !self.at_line_start && out.is_empty() {
+            out.push('\n');
+        }
+    }
+}
+
 /// Run one turn and return the text of the agent's last message, or why the
 /// turn failed.
 pub async fn print_turn(
@@ -188,57 +442,90 @@ pub async fn print_turn(
     session: &SessionRef,
     prompt: String,
 ) -> anyhow::Result<String> {
+    let report = run_turn(backend, session, prompt, |_| {}).await;
+    match report.end.error() {
+        None => Ok(report.text),
+        Some(error) => Err(anyhow::anyhow!(error)),
+    }
+}
+
+/// How long `--print` waits, after a turn ends, for the backend to finish
+/// with it (Loop's own agent saves the turn to the Session then).
+const TURN_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run one turn, handing each of its updates to `on_update` as it arrives.
+pub async fn run_turn(
+    backend: &dyn AgentBackend,
+    session: &SessionRef,
+    prompt: String,
+    mut on_update: impl FnMut(&UpdateEnvelope),
+) -> TurnReport {
+    let mut report = TurnReport {
+        text: String::new(),
+        stop: None,
+        usage: None,
+        end: TurnEnd::Completed,
+    };
     // Subscribe before prompting so no update of this turn is missed.
     let mut updates = backend.subscribe();
-    let turn = backend
+    let turn = match backend
         .prompt(session, vec![ContentBlock::text(prompt)])
-        .await?;
-    let mut last_text = String::new();
+        .await
+    {
+        Ok(turn) => turn,
+        Err(err) => {
+            report.end = TurnEnd::Failed(err.to_string());
+            return report;
+        }
+    };
     loop {
         let envelope = match updates.recv().await {
             Ok(envelope) => envelope,
             Err(RecvError::Lagged(missed)) => {
-                anyhow::bail!("missed {missed} updates from the agent")
+                report.end = TurnEnd::Failed(format!("missed {missed} updates from the agent"));
+                return report;
             }
             Err(RecvError::Closed) => break,
         };
         if envelope.session != session.key {
             continue;
         }
+        on_update(&envelope);
+        if let Some(text) = agent_text_chunk(&envelope.update) {
+            report.text.push_str(text);
+        }
         match envelope.update {
             SessionUpdate::MessageStarted {
                 role: Role::Agent, ..
-            } => last_text.clear(),
-            SessionUpdate::MessageChunk {
-                role: Role::Agent,
-                content,
-                ..
-            } => {
-                if let Some(text) = content.as_text() {
-                    last_text.push_str(text);
-                }
-            }
+            } => report.text.clear(),
+            SessionUpdate::Usage(usage) => report.usage = Some(usage),
             SessionUpdate::TurnEnded { stop, error, .. } => {
-                if let Some(error) = error {
-                    anyhow::bail!("{}", error.message);
-                }
-                if stop == StopReason::Cancelled {
-                    anyhow::bail!("the turn was cancelled");
-                }
-                return Ok(last_text);
+                report.stop = Some(stop);
+                report.end = match (error, stop) {
+                    (Some(error), _) => TurnEnd::Failed(error.message),
+                    (None, StopReason::Cancelled) => TurnEnd::Cancelled,
+                    (None, _) => TurnEnd::Completed,
+                };
+                // The backend saves the turn after it ends on the stream;
+                // `--print` exits right after this, so wait for that (with
+                // a bound, in case a backend never settles its handle).
+                let _ = tokio::time::timeout(TURN_SETTLE_TIMEOUT, turn.outcome()).await;
+                return report;
             }
             _ => {}
         }
     }
     // The stream closed without a turn end; the turn's outcome decides.
-    match turn.outcome().await {
-        TurnOutcome::Completed(_) => Ok(last_text),
-        TurnOutcome::Cancelled => anyhow::bail!("the turn was cancelled"),
-        TurnOutcome::Failed(error) => anyhow::bail!("{}", error.message),
-        TurnOutcome::Uncertain => {
-            anyhow::bail!("lost contact with the agent; the turn may be incomplete")
+    report.end = match turn.outcome().await {
+        TurnOutcome::Completed(stop) => {
+            report.stop = Some(stop);
+            TurnEnd::Completed
         }
-    }
+        TurnOutcome::Cancelled => TurnEnd::Cancelled,
+        TurnOutcome::Failed(error) => TurnEnd::Failed(error.message),
+        TurnOutcome::Uncertain => TurnEnd::Uncertain,
+    };
+    report
 }
 
 /// The assistant's text, or an error when the run stopped on error / abort.
@@ -324,6 +611,16 @@ mod tests {
     }
 
     #[test]
+    fn exit_codes_follow_how_the_turn_ended() {
+        assert_eq!(TurnEnd::Completed.exit_code(), 0);
+        assert_eq!(TurnEnd::Failed("x".into()).exit_code(), 1);
+        assert_eq!(TurnEnd::Uncertain.exit_code(), 3);
+        assert_eq!(TurnEnd::Cancelled.exit_code(), 130);
+        assert_eq!(TurnEnd::Completed.error(), None);
+        assert!(TurnEnd::Uncertain.error().unwrap().contains("lost contact"));
+    }
+
+    #[test]
     fn final_text_joins_text_blocks_and_fails_on_error() {
         let mut assistant = loop_ai::AssistantMessage {
             content: vec![
@@ -355,5 +652,139 @@ mod tests {
         assistant.error_message = Some("rate limited".into());
         let err = final_text(&AgentMessage::assistant(assistant)).unwrap_err();
         assert_eq!(err.to_string(), "rate limited");
+    }
+
+    fn agent_text(message: &str, text: &str) -> SessionUpdate {
+        SessionUpdate::MessageChunk {
+            message_id: loop_protocol::MessageId(message.into()),
+            role: Role::Agent,
+            content: ContentBlock::text(text),
+        }
+    }
+    fn started(message: &str) -> SessionUpdate {
+        SessionUpdate::MessageStarted {
+            message_id: loop_protocol::MessageId(message.into()),
+            role: Role::Agent,
+        }
+    }
+    fn render(updates: &[SessionUpdate]) -> String {
+        let mut renderer = TextRenderer::default();
+        updates.iter().map(|u| renderer.render(u)).collect()
+    }
+
+    #[test]
+    fn parallel_tool_results_name_their_call() {
+        let call = |id: &str, name: &str, title: &str| {
+            SessionUpdate::ToolCall(loop_protocol::ToolCall {
+                id: id.into(),
+                name: Some(name.into()),
+                title: title.into(),
+                kind: loop_protocol::ToolKind::Read,
+                status: loop_protocol::ToolCallStatus::InProgress,
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input: None,
+            })
+        };
+        let end = |id: &str, status| {
+            let mut update = loop_protocol::ToolCallUpdate::new(id.into());
+            update.status = Some(status);
+            SessionUpdate::ToolCallUpdate(update)
+        };
+        use loop_protocol::ToolCallStatus::{Completed, Failed};
+        let text = render(&[
+            call("a", "ls", "ls ."),
+            call("b", "read", "read notes.txt"),
+            end("a", Completed),
+            end("b", Failed),
+            // A call ending right after it started needs no name.
+            call("c", "ls", "ls src"),
+            end("c", Completed),
+        ]);
+        assert_eq!(
+            text,
+            "• ls .\n• read notes.txt\n  └ ls . done\n  └ read notes.txt failed\n• ls src\n  └ done\n"
+        );
+    }
+
+    #[test]
+    fn text_renderer_shows_user_messages_on_their_own_line() {
+        let user = |message: &str, text: &str| {
+            [
+                SessionUpdate::MessageStarted {
+                    message_id: loop_protocol::MessageId(message.into()),
+                    role: Role::User,
+                },
+                SessionUpdate::MessageChunk {
+                    message_id: loop_protocol::MessageId(message.into()),
+                    role: Role::User,
+                    content: ContentBlock::text(text),
+                },
+                SessionUpdate::MessageEnded {
+                    message_id: loop_protocol::MessageId(message.into()),
+                },
+            ]
+        };
+        let mut updates = Vec::new();
+        updates.extend(user("u1", "first\nquestion"));
+        updates.push(started("m1"));
+        updates.push(agent_text("m1", "answer"));
+        updates.extend(user("u2", "next"));
+        assert_eq!(render(&updates), "› first\n  question\nanswer\n› next\n");
+    }
+
+    #[test]
+    fn text_renderer_separates_messages_and_shows_tool_calls_compactly() {
+        let mut ls = loop_protocol::ToolCall {
+            id: "call-1".into(),
+            name: Some("ls".into()),
+            title: "ls .".into(),
+            kind: loop_protocol::ToolKind::Read,
+            status: loop_protocol::ToolCallStatus::InProgress,
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: None,
+        };
+        let mut done = loop_protocol::ToolCallUpdate::new("call-1".into());
+        done.status = Some(loop_protocol::ToolCallStatus::Completed);
+        let mut partial = loop_protocol::ToolCallUpdate::new("call-1".into());
+        partial.content = Some(Vec::new());
+        let text = render(&[
+            started("m1"),
+            agent_text("m1", "LIVE-OK"),
+            SessionUpdate::ToolCall(ls.clone()),
+            SessionUpdate::ToolCallUpdate(partial),
+            SessionUpdate::ToolCallUpdate(done),
+            started("m2"),
+            agent_text("m2", "The folder has one file."),
+        ]);
+        assert_eq!(text, "LIVE-OK\n• ls .\n  └ done\nThe folder has one file.");
+
+        ls.id = "call-2".into();
+        ls.name = Some("bash".into());
+        ls.title = "rm -rf build".into();
+        let mut failed = loop_protocol::ToolCallUpdate::new("call-2".into());
+        failed.status = Some(loop_protocol::ToolCallStatus::Failed);
+        let text = render(&[
+            SessionUpdate::ToolCall(ls),
+            SessionUpdate::ToolCallUpdate(failed),
+            started("m3"),
+            agent_text("m3", "Second\n"),
+            started("m4"),
+            agent_text("m4", "Third"),
+        ]);
+        assert_eq!(text, "• bash: rm -rf build\n  └ failed\nSecond\nThird");
+    }
+
+    #[test]
+    fn text_renderer_ends_a_turn_on_its_own_line_once() {
+        let end = SessionUpdate::TurnEnded {
+            turn_id: loop_protocol::TurnId("turn-1".into()),
+            stop: loop_protocol::StopReason::EndTurn,
+            error: None,
+        };
+        assert_eq!(render(&[agent_text("m", "hi"), end.clone()]), "hi\n");
+        assert_eq!(render(&[agent_text("m", "hi\n"), end.clone()]), "hi\n");
+        assert_eq!(render(std::slice::from_ref(&end)), "");
     }
 }

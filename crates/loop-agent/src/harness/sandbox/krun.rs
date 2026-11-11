@@ -733,6 +733,46 @@ impl FileSystem for KrunExecutionEnv {
         self.create_dir(&host_path).await?;
         Ok(host_path)
     }
+
+    async fn file_identity(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        if let Some(fs) = &self.host_fs {
+            return fs.file_identity(path).await;
+        }
+        // `stat` without `-L` does not follow a final symlink.
+        let guest = self.guest_path(path)?;
+        let script = format!(
+            "if [ -L {p} ]; then echo OTHER; elif [ ! -e {p} ]; then echo MISSING; \
+             elif [ -f {p} ]; then stat -c '%d %i %s %Y' -- {p}; else echo OTHER; fi",
+            p = sh_quote(&guest.to_string_lossy())
+        );
+        let out = self
+            .exec_sh(&script, None, None)
+            .await
+            .map_err(map_exec_file)?;
+        let line = out.stdout.trim();
+        if line == "MISSING" {
+            return Err(FileError::new(
+                FileErrorCode::NotFound,
+                format!("not found: {}", path.display()),
+            ));
+        }
+        let parts: Vec<u64> = line
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .collect();
+        match parts.as_slice() {
+            [dev, ino, size, mtime] => Ok(Some(crate::harness::types::FileIdentity {
+                dev: Some(*dev),
+                ino: Some(*ino),
+                size: *size,
+                mtime_ns: Some(i128::from(*mtime) * 1_000_000_000),
+            })),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[async_trait]
@@ -850,5 +890,13 @@ impl FileSystem for JailedHostFs {
         let path = self.root.join(name);
         self.inner.create_dir(&path).await?;
         Ok(path)
+    }
+
+    async fn file_identity(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        let path = self.assert_in_root(path)?;
+        self.inner.file_identity(&path).await
     }
 }

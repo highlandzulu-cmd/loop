@@ -2,8 +2,8 @@
 
 ## Install
 
-Linux (glibc), macOS and WSL use `install.sh`. Native Windows x64 uses
-`install.ps1`. Both download a platform archive from GitHub Releases, verify
+Loop supports Linux (glibc) and macOS only; on Windows, use WSL. `install.sh`
+downloads a platform archive from GitHub Releases, verify
 its SHA-256 checksum, and check the staged binary with `--version` before
 replacing the installed program. A missing checksum, missing SHA-256 tool,
 checksum mismatch, or failed binary check stops the operation.
@@ -16,31 +16,21 @@ From a clone:
 ./install.sh --no-modify-path
 ```
 
-```powershell
-.\install.ps1 -Version 0.3.4
-.\install.ps1 -NoModifyPath
-```
-
-The release workflow also publishes these installer scripts as release assets.
+The release workflow also publishes this installer script as release assets.
 This applies to releases made after these changes are merged; older releases
 contain only the existing archives and checksums.
 
-The default program directory is `~/.loop/bin` (`$HOME\.loop\bin` on Windows).
-Set `LOOP_INSTALL_DIR` to use a custom directory. On Windows, `-InstallDir` also
-selects the install directory. Later commands recognize custom installs through
+The default program directory is `~/.loop/bin`.
+Set `LOOP_INSTALL_DIR` to use a custom directory. Later commands recognize custom installs through
 the real `.loop-update` directory beside the running executable. The variable
 does not need to stay set. The default path is also recognized for legacy installs.
-The installers can add this directory to shell or user PATH. Use the option
+The installer can add this directory to your shell PATH. Use the option
 above to skip PATH edits.
 
 For a locally built executable, supply its SHA-256 hash explicitly:
 
 ```bash
 ./install.sh --binary target/release/loop --checksum <sha256>
-```
-
-```powershell
-.\install.ps1 -Binary target\release\loop.exe -Checksum <sha256>
 ```
 
 This verifies a local file against the supplied hash. The caller is responsible
@@ -90,13 +80,13 @@ loop rollback
 ```
 
 Before replacement, Loop saves the installed binary under
-`bin/.loop-update/previous-<sha256>[.exe]`. `rollback.json` records the current
+`bin/.loop-update/previous-<sha256>`. `rollback.json` records the current
 hash, previous hash, previous version, and record schema. Rollback verifies both
 the current and saved binary hashes and checks that the saved binary runs.
 Rollback also saves the outgoing binary, so a second rollback can undo it when
 both versions contain the update commands. If you restore an older release
 without these commands, use the installer to install a newer release again.
-Re-running either installer also records a usable previous binary in this format.
+Re-running the installer also records a usable previous binary in this format.
 If the old binary cannot run, the installer repairs it after checking the new
 binary and removes the unusable rollback record. A failed final check restores
 the previous working binary when one is available.
@@ -108,8 +98,7 @@ they are included in updates.
 An atomic directory lock at `bin/.loop-update/operation.lock` prevents concurrent
 install, update, rollback and uninstall operations. A hard crash can leave this
 lock behind. Downloads do not hold the lock. Ctrl-C, SIGHUP and SIGTERM cancel
-the Rust update operation and clean up staging files and locks; Ctrl-C applies
-on Windows. An uncatchable kill or power loss can leave the lock behind.
+the Rust update operation and clean up staging files and locks. An uncatchable kill or power loss can leave the lock behind.
 Confirm that no such operation is running, then remove this empty
 lock directory and retry. Do not remove it during an active operation.
 
@@ -117,7 +106,7 @@ A failed download or preflight leaves the current binary intact. An interruption
 after the rollback record is written can leave a record whose current hash
 does not match the installed binary. Rollback fails closed in that case. Retry
 the update or run the installer to restore a checked release. Temporary files
-can remain after a power loss, including Windows replacement helper files.
+can remain after a power loss.
 
 ## Uninstall
 
@@ -125,17 +114,16 @@ can remain after a power loss, including Windows replacement helper files.
 loop uninstall
 ```
 
-This removes `loop` or `loop.exe` and its reserved `.loop-update` directory.
+This removes `loop` and its reserved `.loop-update` directory.
 It keeps settings, credentials, session databases, session files, skills and
-other files in the installation directory. On Windows, deletion of the running
-binary completes after the command exits. PATH entries are kept because the
+other files in the installation directory. PATH entries are kept because the
 directory can hold other commands; remove them manually if no longer needed.
 
 ## Validation
 
 `cargo test -p loop-update --locked` runs a local release fixture and checks:
 
-- Bash or PowerShell installation and repair of a broken binary.
+- Bash installation and repair of a broken binary.
 - Release lookup and checked archive download.
 - Rejection of missing and incorrect checksums.
 - Replacement of a running executable and version validation.
@@ -145,7 +133,6 @@ directory can hold other commands; remove them manually if no longer needed.
 - Redirect lookup and reuse, expiration and repair of the startup cache.
 - Uninstall with settings, credentials, skills and sessions preserved.
 
-CI runs these tests on Linux, macOS and Windows, with both PowerShell 7 and
-Windows PowerShell 5.1 on Windows. Platform support should be
+CI runs these tests on Linux and macOS. Platform support should be
 confirmed from that run before release; local macOS results do not establish
-Linux or Windows success.
+Linux success.

@@ -41,13 +41,26 @@ pub struct PendingInteraction {
 #[derive(Clone)]
 pub struct InteractionQueue {
     tx: mpsc::UnboundedSender<PendingInteraction>,
+    detach_preserves: bool,
 }
 
 impl InteractionQueue {
+    /// A remote Surface detaches when its reply is dropped; leave approval parked.
+    pub fn new_detaching() -> (Self, mpsc::UnboundedReceiver<PendingInteraction>) {
+        let (mut queue, rx) = Self::new();
+        queue.detach_preserves = true;
+        (queue, rx)
+    }
     /// A queue and the receiver the surface drains.
     pub fn new() -> (Self, mpsc::UnboundedReceiver<PendingInteraction>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        (Self { tx }, rx)
+        (
+            Self {
+                tx,
+                detach_preserves: false,
+            },
+            rx,
+        )
     }
 }
 
@@ -60,11 +73,18 @@ impl HostServices for InteractionQueue {
             .send(PendingInteraction { request, respond })
             .is_err()
         {
+            if self.detach_preserves {
+                return std::future::pending().await;
+            }
             return InteractionOutcome::Rejected {
                 reason: "no surface is attached to answer".into(),
             };
         }
-        answer.await.unwrap_or(InteractionOutcome::Cancelled)
+        match answer.await {
+            Ok(outcome) => outcome,
+            Err(_) if self.detach_preserves => std::future::pending().await,
+            Err(_) => InteractionOutcome::Cancelled,
+        }
     }
 }
 
@@ -84,6 +104,7 @@ pub fn native_permission_request(
         ApprovalKind::FileEdit => ToolKind::Edit,
         ApprovalKind::Bash => ToolKind::Execute,
         ApprovalKind::Web => ToolKind::Fetch,
+        ApprovalKind::Plan => ToolKind::Think,
     });
     if !detail.is_empty() {
         tool_call.content = Some(vec![ToolContent::text(detail)]);
@@ -97,13 +118,21 @@ pub fn native_permission_request(
         id: InteractionId(format!("approval-{n}")),
         tool_call: Some(tool_call),
         options: vec![
-            option(native_options::ACCEPT, "Accept", PermissionKind::AllowOnce),
+            option(
+                native_options::ACCEPT,
+                kind.accept_label(),
+                PermissionKind::AllowOnce,
+            ),
             option(
                 native_options::ACCEPT_SESSION,
                 kind.accept_all_label(),
                 PermissionKind::AllowAlways,
             ),
-            option(native_options::REJECT, "Reject", PermissionKind::RejectOnce),
+            option(
+                native_options::REJECT,
+                kind.reject_label(),
+                PermissionKind::RejectOnce,
+            ),
         ],
     }
 }
@@ -165,6 +194,11 @@ impl ApprovalReply {
     /// Label for the "accept" row.
     pub fn accept_label(&self) -> String {
         label(&self.accept, "Accept (not offered)")
+    }
+
+    /// Label for the "reject" row.
+    pub fn reject_label(&self) -> String {
+        label(&self.reject, "Reject")
     }
 
     /// Label for the "accept for this session" row.
@@ -287,6 +321,32 @@ mod tests {
             native_decision(asking.await.unwrap()),
             ApprovalDecision::Accept
         );
+    }
+
+    #[tokio::test]
+    async fn detaching_queue_never_answers_when_the_reply_or_surface_is_dropped() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            use std::future::Future;
+            let (queue, mut rx) = InteractionQueue::new_detaching();
+            let request =
+                native_permission_request(ApprovalKind::Bash, "bash", "x".into(), String::new());
+            let waiting = queue.interact(request);
+            tokio::pin!(waiting);
+            std::future::poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            drop(rx.recv().await.unwrap());
+            drop(rx);
+            std::future::poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

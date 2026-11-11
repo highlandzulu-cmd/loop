@@ -44,17 +44,18 @@ fn theme_builtins_load() {
 fn parse_local_sandbox_flags_defaults_and_options() {
     use loop_agent::harness::{KrunIsolation, LocalSandboxRuntime};
 
-    let (iso, rt) = commands::parse_local_sandbox_flags(&[]).unwrap();
-    assert_eq!(iso, KrunIsolation::Full);
-    assert_eq!(rt, LocalSandboxRuntime::Runc);
+    // Flags left out stay unset, so the platform default applies.
+    let flags = commands::parse_local_sandbox_flags(&[]).unwrap();
+    assert_eq!(flags.isolation, None);
+    assert_eq!(flags.runtime, None);
 
-    let (iso, rt) = commands::parse_local_sandbox_flags(&["--partial", "--krun"]).unwrap();
-    assert_eq!(iso, KrunIsolation::Partial);
-    assert_eq!(rt, LocalSandboxRuntime::Krun);
+    let flags = commands::parse_local_sandbox_flags(&["--partial", "--krun"]).unwrap();
+    assert_eq!(flags.isolation, Some(KrunIsolation::Partial));
+    assert_eq!(flags.runtime, Some(LocalSandboxRuntime::Krun));
 
-    let (iso, rt) = commands::parse_local_sandbox_flags(&["full", "runsc"]).unwrap();
-    assert_eq!(iso, KrunIsolation::Full);
-    assert_eq!(rt, LocalSandboxRuntime::Runsc);
+    let flags = commands::parse_local_sandbox_flags(&["full", "runsc"]).unwrap();
+    assert_eq!(flags.isolation, Some(KrunIsolation::Full));
+    assert_eq!(flags.runtime, Some(LocalSandboxRuntime::Runsc));
 
     assert!(commands::parse_local_sandbox_flags(&["--crun", "--krun"]).is_err());
     assert!(commands::parse_local_sandbox_flags(&["--full", "--partial"]).is_err());
@@ -76,8 +77,10 @@ fn settings_defaults_soket() {
         Some("allow")
     );
     assert_eq!(s.sandbox.mode, "off");
-    assert_eq!(s.sandbox.isolation, "full");
-    assert_eq!(s.sandbox.runtime, "runc");
+    assert_eq!(s.sandbox.isolation, None);
+    assert_eq!(s.sandbox.runtime, None);
+    assert!(!s.sandbox.network());
+    assert!(s.sandbox.allow_write.is_empty());
 }
 
 #[test]

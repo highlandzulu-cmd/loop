@@ -145,14 +145,23 @@ fn krun_runtime_present() -> bool {
 }
 
 fn missing_deps_message(runtime: &str, missing: &[MissingDep]) -> String {
+    if missing.contains(&MissingDep::Platform) {
+        let message = format!(
+            "cannot enable local sandbox (--{runtime}) — Linux only (macOS support is planned)."
+        );
+        #[cfg(target_os = "macos")]
+        let message = format!(
+            "{message} On macOS, use `--permission-mode read-only` or `--permission-mode ask` to control tool permissions."
+        );
+        return message;
+    }
+
     let mut lines = vec![format!(
         "cannot enable local sandbox (--{runtime}) — required tools are missing:"
     )];
     for dep in missing {
         match dep {
-            MissingDep::Platform => {
-                lines.push("  • platform: local sandbox requires Linux".into());
-            }
+            MissingDep::Platform => unreachable!("unsupported platforms return above"),
             MissingDep::Podman => {
                 lines.push("  • podman — not found in PATH".into());
                 lines.push("      install: sudo dnf install podman   (Fedora/RHEL)".into());
@@ -398,6 +407,7 @@ impl PodmanClient for RealPodmanClient {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             exit_code: output.status.code().unwrap_or(-1),
+            truncated: false,
         })
     }
 
@@ -421,6 +431,35 @@ impl PodmanClient for RealPodmanClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsupported_platform_message_is_actionable() {
+        let msg = missing_deps_message("runc", &[MissingDep::Platform]);
+        assert!(msg.contains("Linux only (macOS support is planned)"));
+        assert!(!msg.contains("required tools are missing"));
+        assert!(!msg.contains("Install the missing tools"));
+        assert!(!msg.contains("/sandbox local --runc"));
+        #[cfg(target_os = "macos")]
+        {
+            assert!(msg.contains("--permission-mode read-only"));
+            assert!(msg.contains("--permission-mode ask"));
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[tokio::test]
+    async fn local_sandbox_preflight_reports_unsupported_platform() {
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            check_local_sandbox_deps("runc"),
+        )
+        .await
+        .expect("preflight timed out")
+        .expect_err("local sandbox requires Linux");
+        assert!(err
+            .to_string()
+            .contains(&missing_deps_message("runc", &[MissingDep::Platform],)));
+    }
 
     #[test]
     fn missing_deps_message_includes_install_hints() {

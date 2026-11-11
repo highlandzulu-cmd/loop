@@ -26,6 +26,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             description: "Show or change sandbox mode",
             args_hint: Some("[status|off|local [--full|--partial] [--crun|--runc|--runsc|--krun]]"),
         },
+        #[cfg(feature = "usage")]
+        SlashCommand {
+            name: "usage",
+            description: "Usage: live agents, tokens, models, tools, sessions",
+            args_hint: None,
+        },
         #[cfg(feature = "telemetry")]
         SlashCommand {
             name: "tracing",
@@ -43,6 +49,16 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[provider/model]"),
         },
         SlashCommand {
+            name: "permissions",
+            description: "Show or set what tools may do without asking",
+            args_hint: Some("[read-only|ask|accept-edits|full-access|plan]"),
+        },
+        SlashCommand {
+            name: "plan",
+            description: "Plan first: investigate and propose a plan to approve before changes",
+            args_hint: None,
+        },
+        SlashCommand {
             name: "websearch",
             description: "Loop's web search and fetch: status, on/off, or provider",
             args_hint: Some("[on|off|soket|tavily|tinyfish|brave]"),
@@ -53,18 +69,23 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
             args_hint: Some("[level]"),
         },
         SlashCommand {
+            name: "default",
+            description: "Save this Session's model and effort for new Sessions",
+            args_hint: None,
+        },
+        SlashCommand {
             name: "scoped-models",
             description: "Manage models for Ctrl+P cycling",
             args_hint: None,
         },
         SlashCommand {
             name: "export",
-            description: "Export session to JSONL/HTML path",
-            args_hint: Some("[path]"),
+            description: "Save this session as Markdown and a session file",
+            args_hint: Some("[--force] [path]"),
         },
         SlashCommand {
             name: "import",
-            description: "Import a JSONL session",
+            description: "Open an exported session file as a new session",
             args_hint: Some("<path>"),
         },
         SlashCommand {
@@ -84,7 +105,7 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "changelog",
-            description: "Show changelog",
+            description: "Show the release notes for this version",
             args_hint: None,
         },
         SlashCommand {
@@ -129,13 +150,13 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "review",
-            description: "Tool approval policy (files + bash)",
-            args_hint: Some("[newSession|always|never]"),
+            description: "Show session approvals and tool permissions",
+            args_hint: None,
         },
         SlashCommand {
             name: "ttfb",
             description: "Model response-header wait (off for long-running)",
-            args_hint: Some("[off|on|60s|120000]"),
+            args_hint: Some("[off|on|60s|120000|inherit|default <duration>]"),
         },
         SlashCommand {
             name: "compact",
@@ -144,7 +165,12 @@ pub fn builtin_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "resume",
-            description: "Resume a previous session",
+            description: "Resume a session: pick one, or give its id",
+            args_hint: Some("[session-id]"),
+        },
+        SlashCommand {
+            name: "sessions",
+            description: "Pick a session from this folder to resume",
             args_hint: None,
         },
         SlashCommand {
@@ -258,61 +284,7 @@ pub fn parse_command(line: &str) -> Option<ParsedCommand> {
     Some(ParsedCommand { name, args })
 }
 
-/// Parse flags after `/sandbox local` (`--full|--partial`, `--crun|--runc|--runsc|--krun`).
-///
-/// Defaults: `--full` and `--runc`. Positional `full`/`partial`/`runc`/… are accepted too.
-pub fn parse_local_sandbox_flags(
-    args: &[&str],
-) -> Result<
-    (
-        loop_agent::harness::KrunIsolation,
-        loop_agent::harness::LocalSandboxRuntime,
-    ),
-    String,
-> {
-    use loop_agent::harness::{KrunIsolation, LocalSandboxRuntime};
-
-    let mut isolation: Option<KrunIsolation> = None;
-    let mut runtime: Option<LocalSandboxRuntime> = None;
-
-    for tok in args {
-        let raw = tok.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let key = raw.trim_start_matches('-').to_ascii_lowercase();
-        match key.as_str() {
-            "full" => {
-                if isolation.is_some() {
-                    return Err("specify only one of --full / --partial".into());
-                }
-                isolation = Some(KrunIsolation::Full);
-            }
-            "partial" => {
-                if isolation.is_some() {
-                    return Err("specify only one of --full / --partial".into());
-                }
-                isolation = Some(KrunIsolation::Partial);
-            }
-            "crun" | "runc" | "runsc" | "gvisor" | "krun" => {
-                if runtime.is_some() {
-                    return Err("specify only one runtime (--crun|--runc|--runsc|--krun)".into());
-                }
-                runtime = LocalSandboxRuntime::parse(&key);
-            }
-            other => {
-                return Err(format!(
-                    "unknown sandbox option '{other}' (use --full|--partial and --crun|--runc|--runsc|--krun)"
-                ));
-            }
-        }
-    }
-
-    Ok((
-        isolation.unwrap_or(KrunIsolation::Full),
-        runtime.unwrap_or(LocalSandboxRuntime::Runc),
-    ))
-}
+pub use loop_app_core::sandbox_builder::parse_local_sandbox_flags;
 
 /// Shared command side-effect messages for the UI.
 #[derive(Debug, Clone)]
@@ -327,13 +299,20 @@ pub enum CommandEffect {
     SelectModel(Option<String>),
     /// Web tools status (None), `on`/`off`, or a search provider.
     WebSearch(Option<String>),
+    /// `/permissions [mode]`: show or switch the permission mode.
+    Permissions(Option<String>),
     /// Show the reasoning effort levels (None) or set one.
     Effort(Option<String>),
+    /// `/default`: save the Session's model and effort for new Sessions.
+    SaveDefaults,
     /// Sandbox mode change.
     SetSandbox(String),
     /// Langfuse tracing control.
     #[cfg(feature = "telemetry")]
     Tracing(TracingCommand),
+    /// Open the local usage view.
+    #[cfg(feature = "usage")]
+    Usage,
     /// Login flow.
     Login(Option<String>),
     /// Logout.
@@ -362,8 +341,8 @@ pub enum CommandEffect {
     Reload,
     /// `/skills` sub-command.
     Skills(SkillsCommand),
-    /// Resume picker.
-    Resume,
+    /// Resume the session with this id, or open the session picker.
+    Resume(Option<String>),
     /// Tree view.
     Tree,
     /// Set session name.
@@ -530,6 +509,8 @@ pub fn dispatch(
             }
         }
         "sandbox" => CommandEffect::SetSandbox(cmd.args.clone()),
+        #[cfg(feature = "usage")]
+        "usage" => CommandEffect::Usage,
         #[cfg(feature = "telemetry")]
         "tracing" => match parse_tracing(&cmd.args) {
             Ok(command) => CommandEffect::Tracing(command),
@@ -540,11 +521,18 @@ pub fn dispatch(
         } else {
             Some(cmd.args.clone())
         }),
+        "permissions" => CommandEffect::Permissions(if cmd.args.is_empty() {
+            None
+        } else {
+            Some(cmd.args.trim().to_owned())
+        }),
+        "plan" => CommandEffect::Permissions(Some("plan".into())),
         "websearch" => CommandEffect::WebSearch(if cmd.args.is_empty() {
             None
         } else {
             Some(cmd.args.trim().to_owned())
         }),
+        "default" => CommandEffect::SaveDefaults,
         "effort" => CommandEffect::Effort(if cmd.args.is_empty() {
             None
         } else {
@@ -591,7 +579,10 @@ pub fn dispatch(
             Ok(command) => CommandEffect::Skills(command),
             Err(usage) => CommandEffect::Status(usage),
         },
-        "resume" => CommandEffect::Resume,
+        "resume" => {
+            CommandEffect::Resume(Some(cmd.args.trim().to_owned()).filter(|id| !id.is_empty()))
+        }
+        "sessions" => CommandEffect::Resume(None),
         "tree" => CommandEffect::Tree,
         "name" => CommandEffect::SetName(cmd.args.clone()),
         "export" => CommandEffect::Export(if cmd.args.is_empty() {
@@ -601,7 +592,7 @@ pub fn dispatch(
         }),
         "import" => {
             if cmd.args.is_empty() {
-                CommandEffect::Status("Usage: /import <path.jsonl>".into())
+                CommandEffect::Status("Usage: /import <file.loop.jsonl>".into())
             } else {
                 CommandEffect::Import(cmd.args.clone())
             }
@@ -649,8 +640,13 @@ pub fn dispatch(
 
 /// Format /help text.
 pub fn help_text(extra: &[(String, String)]) -> String {
+    help_text_for(extra, builtin_commands())
+}
+
+/// Format help for the commands available to the current Surface.
+pub fn help_text_for(extra: &[(String, String)], commands: Vec<SlashCommand>) -> String {
     let mut lines = vec!["Slash commands:".to_string()];
-    for c in builtin_commands() {
+    for c in commands {
         let hint = c.args_hint.unwrap_or("");
         lines.push(format!("  /{} {} — {}", c.name, hint, c.description));
     }
@@ -716,5 +712,25 @@ mod tests {
         assert!(parse_mcp("enable").is_err());
         assert!(parse_mcp("login").is_err());
         assert!(parse_mcp("nope").is_err());
+    }
+
+    #[test]
+    fn resume_takes_an_optional_id_and_sessions_opens_the_picker() {
+        let run = |line: &str| dispatch(&parse_command(line).unwrap(), &[], &[]);
+        assert!(matches!(run("/resume"), CommandEffect::Resume(None)));
+        assert!(matches!(run("/sessions"), CommandEffect::Resume(None)));
+        assert!(matches!(
+            run("/resume 01a15e8f"),
+            CommandEffect::Resume(Some(id)) if id == "01a15e8f"
+        ));
+    }
+
+    #[test]
+    fn plan_switches_to_plan_mode() {
+        let run = |line: &str| dispatch(&parse_command(line).unwrap(), &[], &[]);
+        assert!(matches!(
+            run("/plan"),
+            CommandEffect::Permissions(Some(mode)) if mode == "plan"
+        ));
     }
 }

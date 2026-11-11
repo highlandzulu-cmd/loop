@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/loop-ai",
     "crates/loop-orchestration",
+    "crates/loop-runtime",
     "crates/loop-mcp",
     "crates/loop-agent",
     "crates/loop-app-core",
@@ -11,13 +12,16 @@ members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/core/loop-wire",
     "crates/extend/loop-acp",
+    "crates/extend/loop-dashboard",
     "crates/loop-desktop"
 ]
 
 default-members = [
     "crates/loop-ai",
     "crates/loop-orchestration",
+    "crates/loop-runtime",
     "crates/loop-mcp",
     "crates/loop-agent",
     "crates/loop-app-core",
@@ -26,11 +30,13 @@ default-members = [
     "crates/loop-cli",
     "crates/ops/loop-update",
     "crates/core/loop-protocol",
+    "crates/core/loop-wire",
     "crates/extend/loop-acp",
+    "crates/extend/loop-dashboard",
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/soketlabs/loop"
@@ -41,19 +47,21 @@ loop-ai = { path = "crates/loop-ai" }
 loop-agent = { path = "crates/loop-agent" }
 loop-app-core = { path = "crates/loop-app-core" }
 loop-orchestration = { path = "crates/loop-orchestration" }
+loop-runtime = { path = "crates/loop-runtime" }
 loop-mcp = { path = "crates/loop-mcp" }
 loop-telemetry = { path = "crates/loop-telemetry" }
 loop-test-support = { path = "crates/loop-test-support" }
 loop-update = { path = "crates/ops/loop-update" }
 loop-protocol = { path = "crates/core/loop-protocol" }
+loop-wire = { path = "crates/core/loop-wire" }
 loop-acp = { path = "crates/extend/loop-acp" }
+loop-dashboard = { path = "crates/extend/loop-dashboard" }
 agent-client-protocol-schema = { version = "1.11", default-features = false }
 sha2 = "0.10"
 semver = "1"
 self-replace = "1.5"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
-zip = { version = "2", default-features = false, features = ["deflate-flate2", "flate2"] }
 percent-encoding = "2"
 
 serde = { version = "1", features = ["derive"] }
@@ -63,6 +71,8 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process", "io-util", "signal", "net"] }
 tokio-util = { version = "0.7", default-features = true }
 futures = "0.3"
+schemars = "1"
+tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "handshake"] }
 async-stream = "0.3"
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -97,6 +107,7 @@ ansi-to-tui = { version = "8", default-features = false }
 syntect = { version = "5", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy", "dump-load"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 arboard = "3"
+png = "0.18"
 rhai = { version = "1.21", default-features = false, features = ["std", "sync"] }
 rustyline = "15"
 unicode-width = "0.2"
