@@ -182,21 +182,35 @@ async fn overwriting_a_document_warns_that_it_is_rebuilt_from_text() {
     );
     assert!(diff.contains("-# One") && diff.contains("+# Two"), "{diff}");
 
-    // A previous file the reader cannot read shows as such, not as empty.
+    // A previous file the reader cannot read is not rebuilt from text the
+    // model never saw.
     std::fs::write(dir.path().join("broken.docx"), b"not a zip").unwrap();
-    let r = (write.execute)(
+    let err = (write.execute)(
         "3".into(),
         json!({"path": "broken.docx", "content": "# New"}),
         None,
         None,
     )
     .await
-    .unwrap();
-    let diff = r.details["diff"].as_str().unwrap();
+    .unwrap_err();
     assert!(
-        diff.contains("-(could not read the previous document)"),
-        "{diff}"
+        err.contains("could not be read") && err.contains("another path"),
+        "{err}"
     );
+    assert_eq!(
+        std::fs::read(dir.path().join("broken.docx")).unwrap(),
+        b"not a zip"
+    );
+    // An empty file has nothing to lose.
+    std::fs::write(dir.path().join("empty.docx"), b"").unwrap();
+    (write.execute)(
+        "3b".into(),
+        json!({"path": "empty.docx", "content": "# New"}),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
 
     // A document with more text than read shows is not overwritten.
     let long = (0..3000)

@@ -168,8 +168,13 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         let rebuilt = !created && documents::is_document(&abs);
                         let previous_text = match previous_text {
                             documents::Previous::Text(text) => text,
-                            documents::Previous::Unreadable => {
-                                documents::UNREADABLE_BEFORE.to_owned()
+                            documents::Previous::Unreadable(why) => {
+                                return Err(format!(
+                                    "{} could not be read ({why}), so writing it from text \
+                                     would replace content you have not seen. Write the new \
+                                     document to another path instead.",
+                                    abs.display()
+                                ))
                             }
                             documents::Previous::TooLong => {
                                 return Err(format!(
