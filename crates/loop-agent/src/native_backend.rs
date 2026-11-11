@@ -1475,12 +1475,14 @@ impl NativeBackend {
 mod hold_tests {
     use super::*;
 
-    fn parts() -> (
+    type Parts = (
         BackendInstanceId,
         Arc<Mutex<StreamState>>,
         Arc<Mutex<ConfigState>>,
         broadcast::Receiver<UpdateEnvelope>,
-    ) {
+    );
+
+    fn parts() -> Parts {
         let (updates, rx) = broadcast::channel(64);
         let stream = Arc::new(Mutex::new(StreamState {
             session: SessionKey("s".into()),

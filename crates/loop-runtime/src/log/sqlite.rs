@@ -380,8 +380,7 @@ fn recovery(conn: &Connection, from_generation: u64) -> Result<Vec<LoggedEvent>>
         return Ok(Vec::new());
     }
     // Same columns as `COLUMNS`, with a prompt's payload left out.
-    let sql = concat!(
-        "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,\
+    let sql = "SELECT global_seq,generation,session_key,session_seq,kind,turn,ts_ms,\
          CASE WHEN kind='prompt_sent' \
          THEN '{\"v\":1,\"event\":{\"kind\":\"prompt_sent\",\"payload\":{}}}' \
          ELSE payload END \
@@ -389,8 +388,7 @@ fn recovery(conn: &Connection, from_generation: u64) -> Result<Vec<LoggedEvent>>
          kind IN ('prompt_sent','prompt_settled','runtime_stopped',\
          'escalation_raised','escalation_answered','escalation_withdrawn') \
          OR (kind='update' AND json_extract(payload,'$.event.payload.update.type') \
-             IN ('turn_started','turn_ended'))) ORDER BY global_seq"
-    );
+             IN ('turn_started','turn_ended'))) ORDER BY global_seq";
     rows(conn, sql, params![from_generation as i64])
 }
 
