@@ -1041,6 +1041,7 @@ async fn session_settings_and_usage_commands_keep_their_reports_and_local_state(
         ui.effect(&mut runtime, CommandEffect::Settings).await;
         assert!(ui.text().contains("permissionMode: ask"));
         assert!(ui.text().contains("responseHeaderTimeoutMs:"));
+        assert!(!ui.text().contains("ui: "), "the ui setting has no effect");
         #[cfg(feature = "usage")]
         {
             ui.effect(&mut runtime, CommandEffect::Usage).await;
