@@ -22,8 +22,9 @@ parallel lanes. Their contracts are included here; their implementation is separ
 
 Not in S3: the desktop migration, the S4 Policy gate, cloud hosting,
 Event Log retention or timed idle unloading. S2 already unloads unneeded Sessions
-at capacity. Non-loopback WebSocket serving and URL/QR control wait for S3.8b with
-TLS. They are not part of S3.8's loopback listener.
+at capacity. Non-loopback WebSocket serving is not planned: remote access uses an SSH tunnel
+to the loopback listener. URL/QR control moves to Phase 2 as a relay through the
+Soket edge gateway. Neither is part of S3.8's loopback listener.
 
 Use the existing terms Session, Runtime, Surface, Event Log, Escalation, Policy
 and Capability. A workspace is a host directory with a canonical identity. Its
@@ -518,9 +519,12 @@ symlinks and unsafe ownership on creation/read. Do not print the token in status
 URLs, QR codes or diagnostics. Read it from `LOOP_RUNTIME_TOKEN` or `--token-file`.
 Do not pass it to agent subprocesses.
 
-Refuse every non-loopback bind until S3.8b supplies `wss://` with certificate
-validation. A token alone does not permit plaintext remote exposure. In S3 use an
-SSH tunnel to the host's loopback listener. Host-only checks still treat the
+Refuse every non-loopback bind. The Runtime has no TLS in Phase 0, and a token
+alone does not permit plaintext remote exposure. Use an SSH tunnel to the host's
+loopback listener. For URL/QR control, Phase 2 adds a relay: the Runtime opens an
+authenticated outbound connection to the Soket edge gateway, so user machines need
+no inbound port and no certificates. Optional later: `--tls-cert` and `--tls-key`
+for self-hosters, if users ask. Host-only checks still treat the
 WebSocket endpoint as remote, including traffic arriving through a tunnel.
 Do not reuse HTTP MCP's weaker loopback authentication policy. Fix its `==` token
 comparison at `crates/loop-cli/src/mcp_serve.rs:30` in the listener slice.
@@ -605,7 +609,7 @@ Do not switch the default early to simplify an intermediate slice.
 | S3.9 | Embedded owner mode, scoped recovery, trust startup and default `loop` cutover | S3.7, S3.6 and S3.4; concurrent-owner/recovery checks pass; coordinate S3.8 security checks |
 | S3.10 | User docs, protocol docs and manual live check across native/ACP, embedded/socket/WebSocket | S3.1–S3.9 plus sandbox/GLM lanes in release scope |
 
-S3.8b is a later TLS/URL/QR slice. It is not a dependency for embedded startup.
+S3.8b part 1 is replaced by SSH-tunnel docs. Part 2 (URL/QR control) moves to the Phase 2 relay. Neither is a dependency for embedded startup.
 S3.5 merges one group at a time: model/effort; Session operations; sandbox/MCP/
 permissions/trust; skills/templates/workflows; dashboards; login/tracing. Existing
 native and ACP paths remain usable during those merges. Characterize each first.
@@ -674,7 +678,7 @@ Original questions:
   Ordinary requested effort/mode changes take effect next turn.
 - The revision plan adds host usage history to a host-only group. This design
   therefore disables that history over WebSocket. Confirm that boundary before
-  later TLS sharing introduces any narrower read-only authority.
+  a later relay introduces any narrower read-only authority.
 
 ## Decision record
 
@@ -694,7 +698,7 @@ The Runtime owns Session execution and workspace definitions. Credentials and
 host telemetry stay host-only. The Surface owns its display, local files and
 composer. Forks get new leases. Embedded owners have no daemon lock and no
 lock-based recovery privilege. WebSockets require tokens on loopback and cannot
-bind remotely before TLS. These boundaries are part of the proposed decision,
+bind remotely. These boundaries are part of the proposed decision,
 not incidental details for each implementation slice to redefine.
 
 ## S3.5 implementation TODO: completed groups 1–6
