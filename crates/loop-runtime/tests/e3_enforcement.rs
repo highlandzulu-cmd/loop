@@ -977,7 +977,7 @@ fn symlink_read_cases(v: &mut Vec<Case>) {
                         .user(rule.clone())
                         .prep(Prep::SecretLinks)
                         .check(Check::Result((*token).into()))
-                        .note(*note),
+                        .note(note),
                 );
             }
             // glob of a file link: lists the link's own name only. A
