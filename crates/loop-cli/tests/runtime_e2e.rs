@@ -1245,7 +1245,10 @@ async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket()
         assert!(offered.workspace_reload && offered.workspace_skills && offered.workspace_trust);
         assert!(offered.permission_mode && offered.session_sandbox);
         // The 0600 Unix socket is host-local: host-only methods are offered.
-        assert!(offered.host_defaults && offered.host_usage);
+        assert!(offered.host_defaults);
+        // The usage history is the `usage` feature's: without it the daemon does
+        // not offer it, even host-locally.
+        assert_eq!(offered.host_usage, cfg!(feature = "usage"));
 
         let session = client
             .new_session(loop_protocol::SessionSpec {
@@ -1289,8 +1292,11 @@ async fn the_daemon_serves_workspace_admin_and_host_only_methods_on_its_socket()
         assert_eq!(saved.response_header_timeout_ms, Some(45_000));
         let settings = std::fs::read_to_string(fx.agent.join("settings.json")).unwrap();
         assert!(settings.contains("45000"), "{settings}");
-        let usage = client.usage(UsageParams::default()).await.unwrap();
-        assert!(usage.next_cursor.is_none());
+        #[cfg(feature = "usage")]
+        {
+            let usage = client.usage(UsageParams::default()).await.unwrap();
+            assert!(usage.next_cursor.is_none());
+        }
         serve.stop().await;
     })
     .await
