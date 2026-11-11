@@ -131,6 +131,13 @@ pub fn split_command(command: &str) -> Option<Vec<String>> {
     let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            // An escaped character never opens a quote or ends a part, as
+            // in the shell (and in `words`).
+            '\\' if !single => {
+                current.push(c);
+                current.extend(chars.next());
+                continue;
+            }
             '\'' if !double => single = !single,
             '"' if !single => double = !double,
             '`' if !single => return None,
