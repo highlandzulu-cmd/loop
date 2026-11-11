@@ -673,7 +673,19 @@ impl ToolApprovalBridge {
         created: bool,
     ) -> Result<(), String> {
         if created {
-            let _ = self.env.remove(path).await;
+            // A write through a dangling symlink created the link's target:
+            // remove that file and leave the link as it was.
+            let is_link = tokio::fs::symlink_metadata(path)
+                .await
+                .is_ok_and(|m| m.file_type().is_symlink());
+            let created_path = if is_link {
+                tokio::fs::canonicalize(path)
+                    .await
+                    .unwrap_or_else(|_| path.to_path_buf())
+            } else {
+                path.to_path_buf()
+            };
+            let _ = self.env.remove(&created_path).await;
             return Ok(());
         }
         let Some(prev) = previous_path else {
