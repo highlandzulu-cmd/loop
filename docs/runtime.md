@@ -29,8 +29,8 @@ loop --connect ws://127.0.0.1:8765 --token-file /private/runtime.token
 ```
 
 WebSockets require `LOOP_RUNTIME_TOKEN` or a private `--token-file`. For another
-host, tunnel its loopback listener over SSH. WebSocket clients have no host-only
-credential or telemetry access.
+host, tunnel its loopback listener over SSH (see "Remote use and WebSocket
+clients"). WebSocket clients have no host-only credential or telemetry access.
 
 Each new Session receives the caller's cwd and environment for tools and
 `!shell`. Provider credentials resolve in the Runtime. A notice warns when an
@@ -91,7 +91,7 @@ running after you close the terminal, use your usual tool, such as `nohup`,
 | Flag | Default | Meaning |
 |---|---|---|
 | `--socket PATH` | `~/.loop/agent/run/runtime.sock` | Where Surfaces connect |
-| `--listen IP:PORT` | off | Also serve authenticated WebSockets. Loopback addresses only; other binds are refused until TLS exists |
+| `--listen IP:PORT` | off | Also serve authenticated WebSockets. Loopback addresses only. Other binds are refused. For remote access, use an SSH tunnel |
 | `--max-sessions N` | `runtime.maxSessions`, else 16 | Most Sessions loaded at once. At the limit, the least recently active idle Session is unloaded to make room |
 | `--max-active-turns N` | `runtime.maxActiveTurns`, else 8 | Most turns running at once. More turns wait in a queue; they are not refused |
 | `--permission-mode MODE` | from settings | `read-only`, `ask`, `accept-edits` or `full-access` |
@@ -140,9 +140,51 @@ its pid may now belong to another program.
 
 ### Remote use and WebSocket clients
 
-To use a Runtime from another machine, start it with `--listen 127.0.0.1:PORT`,
-open an SSH tunnel to that port, and copy the token file (see below). The TUI
-then connects with `loop --connect ws://127.0.0.1:PORT --token-file FILE`.
+The Runtime does not serve TLS (`wss://`) and does not manage certificates.
+Loop decided in Phase 0 not to add them. Today, remote access means an SSH tunnel
+to the Runtime's loopback listener. SSH encrypts and authenticates the link, so
+the Runtime opens no port to the network.
+
+1. On the host, start the Runtime on loopback:
+
+   ```bash
+   loop runtime start --listen 127.0.0.1:PORT
+   ```
+
+2. On the client, open the tunnel and leave it running:
+
+   ```bash
+   ssh -N -L PORT:127.0.0.1:PORT user@host
+   ```
+
+3. Get the token to the client. Each start makes a new token, so copy it again
+   after a restart. Copy the file into a private (0700) directory, for example:
+
+   ```bash
+   mkdir -m 700 -p ~/.loop-remote
+   scp user@host:.loop/agent/run/runtime.token ~/.loop-remote/runtime.token
+   ```
+
+   Or set `LOOP_RUNTIME_TOKEN` to its contents instead of using a file.
+
+4. Connect through the tunnel:
+
+   ```bash
+   loop --connect ws://127.0.0.1:PORT/ --token-file ~/.loop-remote/runtime.token
+   loop session attach SESSION_ID --url ws://127.0.0.1:PORT/ --token-file ~/.loop-remote/runtime.token
+   ```
+
+Traffic that arrives through the tunnel is still remote. The Runtime cannot tell
+it from any other WebSocket client, so host-only methods are refused (see
+below). Use the host's Unix socket for those.
+
+URL or QR remote control is planned for Phase 2 as a relay. The Runtime will open
+an authenticated outbound connection to the Soket edge gateway, and a phone or
+browser will pair with a one-time code in a QR. It needs no inbound port and no
+certificates on your machines. Until then, use the SSH tunnel. Later, Loop may
+add `--tls-cert` and `--tls-key` for self-hosters if users ask.
+
+Local examples on the host itself:
 
 ```bash
 loop runtime start --listen 127.0.0.1:8080
@@ -158,9 +200,9 @@ clean shutdown. `loop runtime status` shows the WebSocket URL, never the token.
 Clients can use `LOOP_RUNTIME_TOKEN` instead of `--token-file`; an explicit file
 takes precedence. Tokens are required even on loopback.
 
-Only loopback binds are supported until TLS is available. For another host, use
-an SSH tunnel to its loopback listener and keep any copied token in a private
-directory. Authenticated WebSocket clients have remote authority: host-only
+Only loopback binds are supported, and non-loopback binds are refused. For another
+host, use an SSH tunnel to its loopback listener and keep any copied token in a
+private directory. Authenticated WebSocket clients have remote authority: host-only
 methods, including Runtime stop, provider and MCP credentials, tracing, saved
 defaults and usage history, and workspace trust writes are refused. The host's protected Unix socket still
 serves those operations. A slow WebSocket client is disconnected when its queues

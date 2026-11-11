@@ -44,7 +44,7 @@ A transport sends and receives whole messages (`Stream<Item = String>` + `Sink<S
 
 Security (see `tui-client.md` §7):
 - **Unix socket:** created with mode 0600, under the agent directory's private `run/` directory.
-- **WebSocket:** `loop runtime start --listen IP:PORT` accepts loopback binds only until TLS exists. It always requires a freshly generated bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. The token lives in `run/runtime.token` (0600) under a user-owned 0700 directory, outside sandbox-readable paths. WebSocket connections carry Remote authority, including through SSH tunnels. Handshakes have a five-second deadline. Each WebSocket transport queue holds at most 128 messages and 64 MiB; overflow disconnects the client for replay.
+- **WebSocket:** `loop runtime start --listen IP:PORT` accepts loopback binds only. Remote access uses an SSH tunnel; the Runtime adds no TLS in Phase 0, and Phase 2 adds a relay for URL/QR control. It always requires a freshly generated bearer token, even on loopback, because any web page can open `ws://127.0.0.1`. The token lives in `run/runtime.token` (0600) under a user-owned 0700 directory, outside sandbox-readable paths. WebSocket connections carry Remote authority, including through SSH tunnels. Handshakes have a five-second deadline. Each WebSocket transport queue holds at most 128 messages and 64 MiB; overflow disconnects the client for replay.
 
 ## 4. Methods
 

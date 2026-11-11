@@ -16,7 +16,7 @@ Loop supports Linux and macOS only. Windows is not supported, and the build fail
 there with a compile error.
 
 Not in S2 (the TUI as a Runtime client, `--connect` and model control over the wire were delivered in S3):
-- URL or QR remote control;
+- URL or QR remote control (Phase 2, as a relay through the Soket edge gateway; until then, an SSH tunnel to the loopback listener);
 - ACP Sessions inside the Runtime (ACP agents still run in-process);
 - one Policy gate across all execution paths (S4);
 - the Task Board, Mailboxes and coordination MCP (Phase 2);
