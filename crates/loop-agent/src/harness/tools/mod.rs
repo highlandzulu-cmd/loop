@@ -1,6 +1,7 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
 mod command_policy;
+mod documents;
 mod file_mutation_queue;
 mod plan;
 mod search;
@@ -16,6 +17,10 @@ use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
 pub use command_policy::check_command_policy;
+pub use documents::{
+    run_document_reader_child, set_document_reader, DocumentReader,
+    CHILD_ARG as DOCUMENT_READER_ARG,
+};
 pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
 pub use search::{
     create_glob_tool, create_grep_tool, create_ls_tool, search_tools_with_filter, SearchFilter,
@@ -108,12 +113,15 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "read",
         "Read",
-        "Read a file's contents (text or image).",
+        format!(
+            "Read a file's contents (text or image).{}",
+            documents::READ_GUIDE
+        ),
         schema_object(
             json!({"path": {"type": "string", "description": "File path"}}),
             &["path"],
         ),
-        move |_id, args, _cancel, _on_update| {
+        move |_id, args, cancel, _on_update| {
             let env = Arc::clone(&env);
             async move {
                 let path = arg_str(&args, "path")?;
@@ -143,6 +151,10 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         terminate: None,
                     });
                 }
+                let document = documents::read(env.as_ref(), &abs, info.size, cancel.as_ref());
+                if let Some(result) = until_cancelled(cancel.as_ref(), document).await? {
+                    return result;
+                }
                 let text = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                 let (text, truncated) = truncate_head(&text, DEFAULT_MAX_BYTES);
                 Ok(AgentToolResult {
@@ -165,7 +177,10 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "write",
         "Write",
-        "Write contents to a file (create or overwrite).",
+        format!(
+            "Write contents to a file (create or overwrite).{}",
+            documents::WRITE_GUIDE
+        ),
         schema_object(
             json!({
                 "path": {"type": "string"},
@@ -173,7 +188,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
             }),
             &["path", "content"],
         ),
-        move |_id, args, _cancel, _on_update| {
+        move |_id, args, cancel, _on_update| {
             let env = Arc::clone(&env);
             async move {
                 let path = arg_str(&args, "path")?;
@@ -184,7 +199,11 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     let content = content.clone();
+                    let cancel = cancel.clone();
                     async move {
+                        let cancel = cancel.as_ref();
+                        let bytes =
+                            until_cancelled(cancel, documents::encode(&abs, &content)).await??;
                         // Only a missing file counts as created. Any other
                         // error (a directory, no permission) fails the write
                         // before it happens, and an existing file that is
@@ -199,25 +218,65 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         };
                         let created = previous.is_none();
                         let previous = previous.unwrap_or_default();
+                        // A document diffs as its text, not as its bytes,
+                        // read back by the document reader.
+                        let previous_text = if created {
+                            documents::Previous::Text(String::new())
+                        } else {
+                            until_cancelled(
+                                cancel,
+                                documents::text_of(&abs, &previous, cancel, env.cwd()),
+                            )
+                            .await??
+                        };
+                        let rebuilt = !created && documents::is_document(&abs);
+                        let previous_text = match previous_text {
+                            documents::Previous::Text(text) => text,
+                            documents::Previous::Unreadable(why) => {
+                                return Err(format!(
+                                    "{} could not be read ({why}), so writing it from text \
+                                     would replace content you have not seen. Write the new \
+                                     document to another path instead.",
+                                    abs.display()
+                                ))
+                            }
+                            documents::Previous::TooLong => {
+                                return Err(format!(
+                                    "{} has more text than read can show, so writing it from \
+                                     text would drop the rest. Write the new document to \
+                                     another path instead.",
+                                    abs.display()
+                                ))
+                            }
+                        };
+                        let mut diff = unified_diff(&previous_text, &content, &abs);
+                        if rebuilt {
+                            diff = format!("# {}\n{diff}", documents::REBUILT_NOTE);
+                        }
+                        // Past this point the write runs to the end: a
+                        // cancel mid-write could leave half a file.
+                        if cancel.is_some_and(|c| c.is_cancelled()) {
+                            return Err("cancelled".into());
+                        }
                         let previous_path = write_review_snapshot(env.as_ref(), &abs, &previous)
                             .await
                             .map_err(|e| e.to_string())?;
-                        let diff =
-                            unified_diff(&String::from_utf8_lossy(&previous), &content, &abs);
-                        env.write_file(&abs, content.as_bytes())
-                            .await
-                            .map_err(write_error)?;
+                        env.write_file(&abs, &bytes).await.map_err(write_error)?;
                         let (target_path, created_identity) =
                             written_target(env.as_ref(), &abs, created).await;
                         let via_link = through_link(env.as_ref(), &abs, &target_path).await;
+                        let mut text = format!("Wrote {} bytes to {}", bytes.len(), abs.display());
+                        if rebuilt {
+                            text = format!("{text}. {}", documents::REBUILT_NOTE);
+                        }
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
-                                text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
+                                text,
                                 text_signature: None,
                             })],
                             details: json!({
                                 "path": abs,
-                                "bytes": content.len(),
+                                "bytes": bytes.len(),
                                 "created": created,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
@@ -236,6 +295,21 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
             }
         },
     )
+}
+
+/// `work`, or an error as soon as `cancel` fires (dropping `work`, which
+/// kills a document reader child).
+async fn until_cancelled<T>(
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    match cancel {
+        Some(token) => tokio::select! {
+            r = work => Ok(r),
+            _ = token.cancelled() => Err("cancelled".into()),
+        },
+        None => Ok(work.await),
+    }
 }
 
 /// Create an edit tool (exact/fuzzy replace) bound to `env`.
@@ -272,6 +346,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     async move {
+                        documents::check_editable(&abs)?;
                         let original = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                         let updated = if original.contains(&old_text) {
                             original.replacen(&old_text, &new_text, 1)

@@ -15,7 +15,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::Size;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
@@ -450,7 +451,7 @@ async fn run_loop(
     let mut expand_details = false;
     let mut redraw_request = false;
     let mut purge_ui_events = false;
-    let mut last_width = terminal.size()?.width;
+    let mut last_size = terminal.size()?;
     let mut hide_thinking = runtime.local_preferences().hide_thinking;
     let mut pending_setup: Option<SetupPrompt> = if runtime.needs_provider_setup() {
         ProviderSetup::start(None, login_agents(runtime), runtime.connected_providers())
@@ -546,6 +547,18 @@ async fn run_loop(
     let mut dashboard: Option<dashboard::Screen> = None;
 
     while !should_quit {
+        if let Ok(current_size) = terminal.size() {
+            if current_size.width != last_size.width || current_size.height != last_size.height {
+                note_terminal_resize(
+                    terminal,
+                    current_size.width,
+                    current_size.height,
+                    &mut last_size,
+                    &mut redraw_request,
+                );
+            }
+        }
+
         if runtime.take_transcript_redraw() {
             reset_and_redraw(
                 terminal,
@@ -604,7 +617,7 @@ async fn run_loop(
                     let resized = dashboard.take().map(dashboard::Screen::close);
                     if let Some(width) = resized.transpose()?.flatten() {
                         let _ = terminal.autoresize();
-                        last_width = width;
+                        last_size.width = width;
                         redraw_request = true;
                     }
                     continue;
@@ -645,6 +658,25 @@ async fn run_loop(
             hide_thinking,
         )? {
             redraw_request = true;
+        }
+
+        if redraw_request {
+            redraw_request = false;
+            reset_and_redraw(
+                terminal,
+                runtime,
+                version,
+                &chat,
+                &mut flushed,
+                &mut live_frozen,
+                streaming_assistant,
+                streaming_thinking,
+                expand_details,
+                hide_thinking,
+            )?;
+            if let Ok(sz) = terminal.size() {
+                last_size = sz;
+            }
         }
 
         let model_line = match runtime.active_model_label() {
@@ -935,15 +967,20 @@ async fn run_loop(
             refresh_token_bar = false;
         }
         let usage_line = token_bar.usage_line();
-        let term_width = terminal.size()?.width;
-        let live_h =
-            footer_live_height(FOOTER_HEIGHT, term_width, input.as_str(), &picker) as usize;
+        let term_size = terminal.size().unwrap_or(last_size);
+        let effective_footer_height = FOOTER_HEIGHT.min(term_size.height.saturating_sub(1).max(1));
+        let live_h = footer_live_height(
+            effective_footer_height,
+            term_size.width,
+            input.as_str(),
+            &picker,
+        ) as usize;
         let live_lines = format_live_lines(
             &live,
             runtime.theme(),
             expand_details,
             hide_thinking,
-            term_width,
+            term_size.width,
             working,
             spinner_frame,
             &status_line,
@@ -1032,11 +1069,12 @@ async fn run_loop(
                         &mut chat,
                     );
                     for ev in &batch {
-                        if let Event::Resize(w, _) = ev {
+                        if let Event::Resize(w, h) = ev {
                             note_terminal_resize(
                                 terminal,
                                 *w,
-                                &mut last_width,
+                                *h,
+                                &mut last_size,
                                 &mut redraw_request,
                             );
                         }
@@ -1108,8 +1146,8 @@ async fn run_loop(
                         .await?;
                         token_bar.sync_window(runtime);
                     }
-                    Event::Resize(w, _) => {
-                        note_terminal_resize(terminal, w, &mut last_width, &mut redraw_request);
+                    Event::Resize(w, h) => {
+                        note_terminal_resize(terminal, w, h, &mut last_size, &mut redraw_request);
                     }
                     _ => {}
                 }
@@ -1156,6 +1194,9 @@ async fn run_loop(
                 expand_details,
                 hide_thinking,
             )?;
+            if let Ok(sz) = terminal.size() {
+                last_size = sz;
+            }
         }
 
         drain_ui_events(
@@ -2290,17 +2331,21 @@ fn unbracketed_paste_keys(events: &[Event]) -> Option<Vec<KeyEvent>> {
     Some(keys)
 }
 
-fn note_terminal_resize(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+fn note_terminal_resize<B: Backend>(
+    terminal: &mut Terminal<B>,
     width: u16,
-    last_width: &mut u16,
+    height: u16,
+    last_size: &mut Size,
     redraw_request: &mut bool,
 ) {
     let _ = terminal.autoresize();
     // Re-wrapping invalidates the whole transcript.
-    if width != *last_width {
-        *last_width = width;
-        *redraw_request = true;
+    if width != last_size.width || height != last_size.height {
+        if width != last_size.width {
+            *redraw_request = true;
+        }
+        last_size.width = width;
+        last_size.height = height;
     }
 }
 
@@ -3215,7 +3260,7 @@ async fn handle_key(
                         command,
                     )
                     .await;
-                } else if line.starts_with('/') {
+                } else if let Some(cmd) = commands::parse_command(&line) {
                     let skill_names: Vec<_> = runtime
                         .resource_view()
                         .skills
@@ -3232,7 +3277,7 @@ async fn handle_key(
                         .iter()
                         .map(|p| p.name.clone())
                         .collect();
-                    if let Some(cmd) = commands::parse_command(&line) {
+                    if commands::is_command(&cmd, &skill_names, &template_names) {
                         let effect = commands::dispatch(&cmd, &skill_names, &template_names);
                         *should_quit = apply_effect(
                             effect,
@@ -3260,6 +3305,21 @@ async fn handle_key(
                             refresh_token_bar,
                         )
                         .await?;
+                    } else {
+                        let images = images_for(runtime, attachments, chat, &line);
+                        submit_user_text(
+                            runtime,
+                            chat,
+                            status,
+                            turn_step,
+                            streaming_assistant,
+                            streaming_thinking,
+                            working,
+                            message_queue,
+                            line,
+                            images,
+                            tx,
+                        );
                     }
                 } else {
                     let images = images_for(runtime, attachments, chat, &line);
@@ -6458,6 +6518,39 @@ mod tests {
         assert!(chat
             .iter()
             .any(|item| matches!(item, ChatItem::Assistant { text } if text == "hello")));
+    }
+
+    #[test]
+    fn note_terminal_resize_updates_size_and_flags_width_change() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut last_size = Size {
+            width: 80,
+            height: 24,
+        };
+        let mut redraw_request = false;
+
+        // Height only change: updates size, does not request full transcript re-wrap
+        note_terminal_resize(&mut terminal, 80, 30, &mut last_size, &mut redraw_request);
+        assert_eq!(
+            last_size,
+            Size {
+                width: 80,
+                height: 30
+            }
+        );
+        assert!(!redraw_request);
+
+        // Width change: updates size and triggers redraw_request
+        note_terminal_resize(&mut terminal, 100, 30, &mut last_size, &mut redraw_request);
+        assert_eq!(
+            last_size,
+            Size {
+                width: 100,
+                height: 30
+            }
+        );
+        assert!(redraw_request);
     }
 }
 

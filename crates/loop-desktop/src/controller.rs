@@ -24,7 +24,8 @@ use crate::state::{ChatRow, ComposerStats, PendingFileChange, SessionRow, ToolCa
 #[derive(Debug, Clone)]
 struct FileEditSnapshot {
     path: PathBuf,
-    before: Option<String>,
+    /// The file's bytes before the tool ran (any file, text or not).
+    before: Option<Vec<u8>>,
     /// `write` args `content` — used when the on-disk read is unavailable.
     after_hint: Option<String>,
 }
@@ -1044,7 +1045,7 @@ fn apply_agent_event(
             if tool_name == "write" || tool_name == "edit" {
                 if let Some(rel) = path_from_tool_args(args) {
                     let path = resolve_project_path(&s.cwd, &rel);
-                    let before = std::fs::read_to_string(&path).ok();
+                    let before = std::fs::read(&path).ok();
                     let after_hint = if tool_name == "write" {
                         args.get("content")
                             .and_then(|v| v.as_str())
@@ -1359,18 +1360,18 @@ fn pending_change_from_write(
         })?;
     let path = resolve_project_path(cwd, &path);
 
-    let before = snapshot
+    let original = snapshot
         .as_ref()
         .and_then(|s| s.before.clone())
         .or_else(|| {
             details
                 .get("previousPath")
                 .and_then(|v| v.as_str())
-                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|p| std::fs::read(p).ok())
         })
         .or_else(|| {
             if details.get("created").and_then(|v| v.as_bool()) == Some(true) {
-                Some(String::new())
+                Some(Vec::new())
             } else {
                 None
             }
@@ -1381,7 +1382,7 @@ fn pending_change_from_write(
         .or_else(|| snapshot.and_then(|s| s.after_hint))
         .unwrap_or_default();
 
-    Some(PendingFileChange::from_paths(path, before, after))
+    Some(PendingFileChange::from_original(path, original, after))
 }
 
 fn looks_like_path(s: &str) -> bool {
@@ -1618,5 +1619,49 @@ mod tests {
         assert_eq!(change.removed, 0);
         assert_eq!(change.after, after);
         assert_eq!(change.before.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn rejecting_an_overwritten_document_restores_its_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let abs = dir.path().join("report.docx");
+        let original = vec![b'P', b'K', 3, 4, 0xff, 0xfe, 0x00, 0x10];
+        // The tool already overwrote the file and its snapshot is gone.
+        std::fs::write(&abs, b"PK rebuilt").unwrap();
+        let result = AgentToolResult {
+            content: vec![],
+            details: json!({
+                "path": abs,
+                "created": false,
+                "previousPath": dir.path().join("missing.before"),
+            }),
+            usage: None,
+            added_tool_names: None,
+            terminate: None,
+        };
+        let change = pending_change_from_write(
+            &result,
+            Some(FileEditSnapshot {
+                path: abs.clone(),
+                before: Some(original.clone()),
+                after_hint: Some("# Rebuilt".into()),
+            }),
+            dir.path(),
+        )
+        .expect("change");
+        crate::state::reject_change(&change).unwrap();
+        assert_eq!(std::fs::read(&abs).unwrap(), original);
+
+        // From the review snapshot when there is no start snapshot.
+        let snapshot = dir.path().join("report.docx.before");
+        std::fs::write(&snapshot, &original).unwrap();
+        std::fs::write(&abs, b"PK rebuilt").unwrap();
+        let result = AgentToolResult {
+            details: json!({"path": abs, "created": false, "previousPath": snapshot}),
+            ..result
+        };
+        let change = pending_change_from_write(&result, None, dir.path()).expect("change");
+        crate::state::reject_change(&change).unwrap();
+        assert_eq!(std::fs::read(&abs).unwrap(), original);
     }
 }

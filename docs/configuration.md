@@ -51,9 +51,15 @@ Common settings in `settings.json`:
 | Key | Default | Purpose |
 |---|---|---|
 | `defaultProvider`, `defaultModel` | none | Provider and model at startup |
+| `defaultThinkingLevel` | `off` | Reasoning level at startup (`off`, `low`, and so on); `/effort` or **Shift+Tab** changes it for the session |
+| `enabledModels` | empty | Models that **Ctrl+P** cycles through, as glob patterns; see `/scoped-models` |
+| `defaultProjectTrust` | `ask` | Whether a new project's settings are trusted: `ask`, `always` or `never` (global only) |
+| `hideThinkingBlock` | `false` | Hides the model's thinking blocks in the chat |
 | `permissionMode` | `ask` | `read-only`, `ask`, `accept-edits`, `full-access` or `plan`; see [permissions](permissions.md). A project may only choose a stricter mode |
 | `toolPermissions` | `write`, `edit`, `bash`: `ask`; `read`, `grep`, `glob`, `ls`, `web_fetch`, `web_search`: `allow` | Per-tool rules, `allow`, `ask` or `deny`, with optional patterns such as `bash(git status*)`. `deny` applies in every mode; with nobody to ask, `ask` refuses the call. A project may only add `ask`/`deny` rules |
 | `bash.defaultTimeoutMs`, `bash.maxTimeoutMs` | `120000`, `600000` | `bash` time limits; a call may ask for up to the maximum (global only) |
+| `doubleEscapeAction` | `tree` | What pressing **Esc** twice quickly does while Loop is idle (one **Esc** interrupts a running turn): `tree` opens `/tree`, `fork` opens `/fork`, anything else does nothing |
+| `responseHeaderTimeoutMs` | `120000` | How long to wait for the model's response headers before a request fails; `0` waits indefinitely (for slow models or long-running work). `timeouts.responseHeaderMs` takes precedence when set; see [stream timeouts](stream-timeouts.md). `/ttfb [off\|on\|60s\|120000]` changes it for the session; `/ttfb on` chooses 120 seconds. Esc still aborts the turn |
 | `fileEditReview` | `newSession` | Kept for old settings files: with no `permissionMode`, `never` starts in `accept-edits`. Other values change nothing |
 | `sandbox.mode` | `off` | `off` or `local`. Podman on Linux, Seatbelt partial isolation on macOS. A project may enable the sandbox, never turn it off |
 | `sandbox.isolation` | platform default | `full` or `partial`. Unset means `full` on Linux and `partial` on macOS. `full` on macOS is an error. Any other value is an error when `mode` is `local`. A project value overrides the global one only when the project sets it |
@@ -100,3 +106,15 @@ Environment variables:
 | `LOOP_CODING_AGENT_DIR` | Use a different config directory |
 | `LOOP_CODING_AGENT_SESSION_DIR` | Use a different directory for `sessions.db` |
 | `LOOP_DEBUG=1` | Write debug logs (same as `--debug`) |
+| `LOOP_PDF_OCR_API_KEY` | Turn on OCR for PDFs without a text layer, through a Mistral-compatible OCR API (needs the `web` feature). Unset, such a PDF reads as empty. **OCR uploads the whole PDF** to the endpoint, see below |
+| `LOOP_PDF_OCR_URL`, `LOOP_PDF_OCR_MODEL` | Use another OCR endpoint or model (defaults: `https://api.mistral.ai/v1/ocr`, `mistral-ocr-latest`). The URL must be `https://` |
+
+Document files: `read` returns a PDF, Word (`.docx`), PowerPoint (`.pptx`) or RTF file as markdown, and an Excel (`.xlsx`) or OpenDocument (`.ods`) spreadsheet as sheet tables with formulas. `write` builds `.docx`, `.pptx`, `.rtf`, `.pdf`, `.xlsx` and `.ods` files from the same text; the tool description lists the format. `edit` refuses a document: read it, then write the whole file again.
+
+Documents are parsed in a separate process, `loop __doc-to-text <format>`, never in the Loop process or the Runtime, so a damaged or hostile file cannot stop your Sessions. In a sandboxed Session the file's bytes are read through the sandbox and parsed by this child on the host. The child gets an empty environment (no API keys), no core dumps, a CPU limit and a file-size limit of 0 (it cannot write data into files; that limit does not stop it from creating, renaming or deleting files). Its code makes no network calls and has no keys, but the operating system does not block network access for it. It is stopped after 30 seconds, above 2 GB of memory, or when the tool call is cancelled; the tool call then fails with "could not read this document safely". At most 3 readers run at once. On Linux the memory limit is `RLIMIT_AS`. macOS does not enforce that limit, so Loop polls the child's memory and stops it above the limit (or when it cannot read the child's memory); a very fast allocation can briefly pass the limit before the poll sees it. Further limits: at most 50 MB per document, 256 MB unpacked from one Office or OpenDocument file, 5 000 000 cells per sheet, 5 000 slides, and 50 KB of returned text (the rest is cut off, and `read` says so).
+
+The reader runs on the host, so it must be the program Loop started from. On Linux it is the running image (`/proc/self/exe`). On macOS Loop records the executable's identity at start, refuses to start the reader if the file changed (restart Loop after an update), and refuses an executable inside the Session's workspace or the temp directory, where a Session could replace it: run Loop from a copy installed outside the workspace. A replacement between that check and the start is still possible there.
+
+Writing over an existing document rebuilds it from the text: formatting, images, comments and anything else the text does not show are not kept. The review diff and the tool result say this, and rejecting the change in review restores the original file. A document with more text than `read` returns cannot be overwritten, and neither can a non-empty document the reader cannot read (too large, damaged, or the reader failed): write the new version to another path.
+
+OCR: with `LOOP_PDF_OCR_API_KEY` set, a PDF whose text layer is missing is sent, whole and base64-encoded, from the Loop process (the Runtime host) to the OCR endpoint. This upload does not go through the Session's sandbox, its network settings, web permissions or permission rules. Loop only sends it over `https`, only for PDFs of at most 20 MB that are not encrypted, only after the document reader found no usable text, and never when the reader crashed or timed out; the response is limited to 32 MB. Do not set the key where documents must not leave the machine.

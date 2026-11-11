@@ -7,7 +7,11 @@ use std::path::PathBuf;
 pub struct PendingFileChange {
     pub id: String,
     pub path: PathBuf,
+    /// The previous text, for the diff view (`None` when it is not text).
     pub before: Option<String>,
+    /// The previous bytes, which a reject writes back; `None` when they
+    /// were not recorded, and a reject then refuses.
+    pub original: Option<Vec<u8>>,
     pub after: String,
     pub added: usize,
     pub removed: usize,
@@ -16,11 +20,21 @@ pub struct PendingFileChange {
 
 impl PendingFileChange {
     pub fn from_paths(path: PathBuf, before: Option<String>, after: String) -> Self {
+        let original = before.clone().map(String::into_bytes);
+        Self::from_original(path, original, after)
+    }
+
+    /// A change whose previous contents were `original` (any bytes).
+    pub fn from_original(path: PathBuf, original: Option<Vec<u8>>, after: String) -> Self {
+        let before = original
+            .as_ref()
+            .and_then(|bytes| String::from_utf8(bytes.clone()).ok());
         let (added, removed) = diff_stats(before.as_deref().unwrap_or(""), &after);
         Self {
             id: uuid::Uuid::now_v7().to_string(),
             path,
             before,
+            original,
             after,
             added,
             removed,
@@ -133,6 +147,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reject_writes_back_binary_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.docx");
+        let original = vec![b'P', b'K', 3, 4, 0xff, 0x00, 0x80];
+        std::fs::write(&path, b"rebuilt").unwrap();
+        let change =
+            PendingFileChange::from_original(path.clone(), Some(original.clone()), "# x".into());
+        assert_eq!(change.before, None, "binary is not shown as text");
+        reject_change(&change).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn reject_without_the_original_refuses_and_leaves_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, b"user edits").unwrap();
+        let change = PendingFileChange::from_original(path.clone(), None, "x".into());
+        assert!(reject_change(&change).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"user edits");
+    }
+
+    #[test]
     fn preview_prefers_changed_lines() {
         let before = "a\nb\nc\n";
         let after = "a\nB\nc\n";
@@ -142,20 +179,19 @@ mod tests {
     }
 }
 
-/// Reject a pending change by restoring `before` or git checkout.
+/// Reject a pending change by writing its previous bytes back. Without
+/// them it refuses: a `git checkout` would drop untracked files and the
+/// user's uncommitted edits, and a document cannot be rebuilt from text.
 pub fn reject_change(change: &PendingFileChange) -> anyhow::Result<()> {
-    if let Some(before) = &change.before {
-        if let Some(parent) = change.path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&change.path, before)?;
-        return Ok(());
+    let Some(original) = &change.original else {
+        anyhow::bail!(
+            "could not revert {}: its previous contents were not recorded",
+            change.path.display()
+        );
+    };
+    if let Some(parent) = change.path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    let status = std::process::Command::new("git")
-        .args(["checkout", "--", change.path.to_string_lossy().as_ref()])
-        .status();
-    match status {
-        Ok(s) if s.success() => Ok(()),
-        _ => anyhow::bail!("could not revert {}", change.path.display()),
-    }
+    std::fs::write(&change.path, original)?;
+    Ok(())
 }

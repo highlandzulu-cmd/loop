@@ -1048,6 +1048,30 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn rejected_document_overwrite_restores_the_original_bytes() {
+            loop_agent::harness::set_document_reader(
+                loop_agent::harness::DocumentReader::InProcess,
+            );
+            let ws = tempfile::tempdir().unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let tool = create_write_tool(Arc::clone(&env));
+            let args = json!({"path": "report.docx", "content": "# Original\n\n- kept"});
+            (tool.execute)("w1".into(), args, None, None).await.unwrap();
+            let file = ws.path().join("report.docx");
+            let original = std::fs::read(&file).unwrap();
+            let args = json!({"path": "report.docx", "content": "# Rewritten"});
+            let details = (tool.execute)("w2".into(), args, None, None)
+                .await
+                .unwrap()
+                .details;
+            assert_eq!(details["created"], false);
+            assert!(details["diff"].as_str().unwrap().contains("rebuilt"));
+            assert_ne!(std::fs::read(&file).unwrap(), original);
+            reject(&bridge, &details).await;
+            assert_eq!(std::fs::read(&file).unwrap(), original);
+        }
+
+        #[tokio::test]
         async fn link_to_existing_outside_file_is_restored() {
             let ws = tempfile::tempdir().unwrap();
             let outside = tempfile::tempdir().unwrap();
