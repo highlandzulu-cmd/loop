@@ -123,7 +123,10 @@ impl HostServices for GatedHost {
             }
             // Deny rules and the mode's "off" come before hooks: a hook's
             // allow can't lift either (docs/hooks.md).
-            if let Some(reason) = self.gate.agent_call_denied(judged.kind, &judged.args) {
+            if let Some(reason) = self
+                .gate
+                .agent_call_denied(judged.kind, &judged.args, &self.cwd)
+            {
                 return reject(reason);
             }
             let mode = self.gate.mode();

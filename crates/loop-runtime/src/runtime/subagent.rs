@@ -174,6 +174,14 @@ pub(super) async fn confine(parent: &LiveSession, child: &OpenedSession) -> Path
         child.workspace.cwd.clone()
     };
     target.set_workspace(workspace.clone());
+    if workspace != parent.workspace {
+        // The parent's relative deny and ask rules were written for its git
+        // root and cwd: they still apply to the child's calls.
+        target.set_rule_bases(vec![
+            parent.workspace.clone(),
+            parent.opened.workspace.cwd.clone(),
+        ]);
+    }
     workspace
 }
 

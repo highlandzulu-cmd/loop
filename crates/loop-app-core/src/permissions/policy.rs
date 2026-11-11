@@ -40,6 +40,9 @@ pub struct Call {
     /// The directory the tools open a relative path against; it can be
     /// below `workspace` (the git root). [`Call::new`] sets the workspace.
     pub cwd: PathBuf,
+    /// More directories relative `deny` and `ask` patterns match against,
+    /// such as a parent Session's git root and cwd for a subagent.
+    pub rule_bases: Vec<PathBuf>,
     /// The home directory, for `~/` in path patterns.
     pub home: Option<PathBuf>,
     /// Whether the call's `path` resolves inside `workspace`, following
@@ -56,6 +59,7 @@ impl Call {
             kind: loop_agent::protocol_events::tool_kind(tool),
             args,
             cwd: workspace.clone(),
+            rule_bases: Vec::new(),
             workspace,
             home: None,
             inside_workspace: false,
@@ -260,6 +264,31 @@ mod tests {
             _ => matches!(got, Decision::Deny(_)),
         };
         assert!(ok, "{row}: want {want}, got {got:?}");
+    }
+
+    /// The workspace check and the protected names join a relative path
+    /// to the cwd, which can be below the git root.
+    #[cfg(unix)]
+    #[test]
+    fn accept_edits_with_the_cwd_below_the_git_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().canonicalize().unwrap().join("repo");
+        let svc = repo.join("svc");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&svc).unwrap();
+        let decision = |path: &str| {
+            let call = Call::resolve_in(
+                "write",
+                ToolKind::Edit,
+                &json!({ "path": path }),
+                &repo,
+                &svc,
+            );
+            decide(AcceptEdits, &defaults(), &call)
+        };
+        want("../.git/config", &decision("../.git/config"), "ask");
+        want("../x", &decision("../x"), "allow");
+        want("../../outside", &decision("../../outside"), "ask");
     }
 
     #[test]
