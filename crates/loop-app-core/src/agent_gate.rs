@@ -5,8 +5,13 @@
 //! - **permission requests**, which [`GatedHost`] passes through the gate's
 //!   `tool_call` hooks before the user is asked. A block picks the agent's
 //!   own "reject once" option and an allow its "allow once" option (never an
-//!   "always" one). Then the permission mode: `full-access` allows once,
-//!   `read-only` rejects edits and commands; otherwise the user is asked.
+//!   "always" one). The call is judged by kind against the same Capability
+//!   table as Loop's own tools: a Policy layer that turns its Capability off
+//!   rejects it, a `toolPermissions` deny rule for a Loop tool of the same
+//!   kind rejects it, and so does a mode that turns it off (`read-only`
+//!   rejects edits and commands), all before hooks run. A layer's "ask"
+//!   always reaches the user. Then `full-access` allows once; otherwise the
+//!   user is asked.
 //! - **tool-call updates**, which [`AgentToolObserver`] turns into
 //!   `tool_result` events once a call finishes. These are observe-only: the
 //!   agent already ran the tool.
@@ -23,7 +28,7 @@ use loop_protocol::{
     ToolCallUpdate, ToolContent, ToolKind,
 };
 
-use crate::permissions::PermissionMode;
+use crate::permissions::{Call, Capability, Ceiling, PermissionMode, State};
 use crate::tool_gate::ToolGate;
 
 /// A host that runs the gate's hooks on an agent's permission requests
@@ -94,34 +99,56 @@ impl HostServices for GatedHost {
                     }
                 })
             };
+            // An agent's tool names aren't Loop's, so its call is judged by
+            // kind; one with no kind may run anything.
+            let judged = Call {
+                kind: call.kind.unwrap_or(ToolKind::Execute),
+                ..Call::new(
+                    "agent",
+                    call.raw_input.clone().unwrap_or_default(),
+                    self.cwd.clone(),
+                )
+            };
+            let ceiling = self.gate.policy().ceiling(&judged);
+            if let Some(Ceiling {
+                state: State::Off,
+                source,
+            }) = ceiling
+            {
+                return reject(format!(
+                    "{} turns off {}",
+                    source.label(),
+                    Capability::of(&judged).label()
+                ));
+            }
+            // Deny rules and the mode's "off" come before hooks: a hook's
+            // allow can't lift either (docs/hooks.md).
+            if let Some(reason) = self.gate.agent_call_denied(judged.kind, &judged.args) {
+                return reject(reason);
+            }
+            let mode = self.gate.mode();
+            if mode.setting(&Capability::of(&judged)).state_for(&judged) == State::Off {
+                return reject(format!(
+                    "Loop is in {} mode; the user can switch with /permissions",
+                    mode.as_str()
+                ));
+            }
+            // A Policy layer's "ask" goes to the user, whatever the mode or
+            // a hook says.
+            let must_ask = ceiling.is_some_and(|c| c.state == State::Ask);
             match self.gate.review_agent_call(self.info(call)).await {
                 Some(ToolDecision::Block { reason }) => return reject(reason),
-                Some(ToolDecision::Allow) => {
+                Some(ToolDecision::Allow) if !must_ask => {
                     if let Some(outcome) = allow_once() {
                         return outcome;
                     }
-                }
-                None => {}
-            }
-            match self.gate.mode() {
-                PermissionMode::FullAccess => {
-                    if let Some(outcome) = allow_once() {
-                        return outcome;
-                    }
-                }
-                PermissionMode::ReadOnly
-                    if matches!(
-                        call.kind,
-                        Some(
-                            ToolKind::Edit | ToolKind::Delete | ToolKind::Move | ToolKind::Execute
-                        ) | None
-                    ) =>
-                {
-                    return reject(
-                        "Loop is in read-only mode; the user can switch with /permissions".into(),
-                    );
                 }
                 _ => {}
+            }
+            if mode == PermissionMode::FullAccess && !must_ask {
+                if let Some(outcome) = allow_once() {
+                    return outcome;
+                }
             }
         }
         self.inner.interact(request).await
@@ -453,6 +480,35 @@ mod tests {
             ToolSource::Agent {
                 id: "chatgpt".into()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_layers_tighten_agent_requests() {
+        use crate::permissions::{Capability, Layer, LayerSource, Policy, Setting, State};
+        let layer = |state| {
+            Policy::new(vec![
+                Layer::new(LayerSource::Org).set(Capability::Shell, Setting::always(state))
+            ])
+            .0
+        };
+        let (_dir, gate) = gate_with(json!({"on": "tool_call", "action": {"allow": true}}));
+        gate.set_mode(PermissionMode::FullAccess);
+
+        gate.set_policy(layer(State::Off));
+        let (outcome, asked) = ask(Arc::clone(&gate), exec_request("ls")).await;
+        assert!(!asked);
+        assert!(
+            matches!(&outcome, InteractionOutcome::Selected { native_id, note: Some(note) }
+                if native_id == "no" && note.contains("Org Policy turns off the shell")),
+            "{outcome:?}"
+        );
+
+        gate.set_policy(layer(State::Ask));
+        let (_, asked) = ask(Arc::clone(&gate), exec_request("ls")).await;
+        assert!(
+            asked,
+            "a layer's ask reaches the user despite full-access and a hook allow"
         );
     }
 

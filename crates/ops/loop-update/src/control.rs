@@ -42,19 +42,14 @@ pub async fn cancellable<T>(operation: impl Future<Output = Result<T>>) -> Resul
 }
 
 async fn termination_signal() -> Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut hup = signal(SignalKind::hangup())?;
-        let mut term = signal(SignalKind::terminate())?;
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => result?,
-            _ = hup.recv() => (),
-            _ = term.recv() => (),
-        }
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut hup = signal(SignalKind::hangup())?;
+    let mut term = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = hup.recv() => (),
+        _ = term.recv() => (),
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
     Ok(())
 }
 

@@ -6,12 +6,12 @@ use std::sync::Arc;
 use anyhow::bail;
 
 use loop_agent::harness::{
-    create_bash_tool_with, create_edit_tool, create_read_tool, create_session_repository,
-    create_sqlite_session_store, create_write_tool, verify_web_search_key, AgentHarness,
-    AgentHarnessOptions, AgentHarnessResources, HostExecutionEnv, KrunIsolation, KrunSandbox,
-    LocalSandboxRuntime, Sandbox, SandboxMode, WebSearchConfig,
+    create_bash_tool_with, create_edit_tool, create_exit_plan_tool, create_read_tool,
+    create_session_repository, create_sqlite_session_store, create_todo_tool, create_write_tool,
+    search_tools_with_filter, verify_web_search_key, AgentHarness, AgentHarnessOptions,
+    AgentHarnessResources, HostExecutionEnv, SandboxMode, WebSearchConfig,
 };
-use loop_agent::types::{AgentThinkingLevel, AgentTool};
+use loop_agent::types::AgentTool;
 use loop_ai::providers::{custom_provider, CustomModelSpec, CustomProviderConfig};
 use loop_ai::{CreateModelsOptions, FileModelsStore, Models, ModelsRefreshOptions};
 
@@ -28,13 +28,18 @@ use crate::config::trust::TrustStore;
 use crate::model_selection::StartupModel;
 use crate::resources::{load_resources, LoadedResources};
 use crate::system_prompt::{
-    build_system_prompt, default_tool_snippets, load_context_files, resolve_system_prompt_files,
-    BuildSystemPromptOptions, ContextFile,
+    build_system_prompt, default_tool_snippets, load_context_files, BuildSystemPromptOptions,
+    ContextFile,
 };
 use crate::theme::{theme_search_dirs, Theme};
 use loop_ai::CredentialStore;
 
-/// Fully constructed interactive runtime.
+#[path = "session_factory.rs"]
+mod session_factory;
+pub use session_factory::{GlobalResources, OpenedSession, SessionFactory, WorkspaceResources};
+
+/// Fully constructed application bootstrap result.
+/// The multi-Session owner is the future `loop_runtime::Runtime`.
 pub struct Runtime {
     /// Agent config dir.
     pub agent_dir: PathBuf,
@@ -103,6 +108,90 @@ pub struct Runtime {
     /// Process telemetry, when the host application installed it.
     #[cfg(feature = "telemetry")]
     pub telemetry: Option<loop_telemetry::TelemetryHandle>,
+    /// This Surface's Session store, which holds its Session leases.
+    pub session_store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+}
+
+/// Ends a standalone Surface's Session work and releases its leases. Take it
+/// before the [`Runtime`] is moved, so every exit path can still run it.
+#[derive(Clone)]
+pub struct SessionShutdown {
+    harness: Arc<AgentHarness>,
+    store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    /// Releases work queued for the next turn.
+    native: Option<Arc<loop_agent::native_backend::NativeBackend>>,
+    grace: std::time::Duration,
+}
+
+/// How long shutdown waits for the current turn to stop.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl SessionShutdown {
+    /// Shut down `harness`, then release the leases `store` holds.
+    pub fn new(
+        harness: Arc<AgentHarness>,
+        store: Option<Arc<dyn loop_agent::harness::session::SessionStore>>,
+    ) -> Self {
+        Self {
+            harness,
+            store,
+            native: None,
+            grace: SHUTDOWN_GRACE,
+        }
+    }
+
+    /// Also release what `native` holds for the next turn, such as a
+    /// sandbox started ahead of it.
+    pub fn with_native(mut self, native: Arc<loop_agent::native_backend::NativeBackend>) -> Self {
+        self.native = Some(native);
+        self
+    }
+
+    /// How long to wait for the current turn to stop (default 5 s).
+    pub fn with_grace(mut self, grace: std::time::Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// Stop admission, cancel the current turn and wait for it to finish:
+    /// its tools, writes and `Settled` hooks. Only then release this store's
+    /// leases. A turn still running after the grace keeps them, and this
+    /// returns an error: the Session is not handed on while work in this
+    /// process may still touch it. Safe to repeat.
+    pub async fn run(&self) -> anyhow::Result<()> {
+        // Requested once per harness: it clears queued work and runs the
+        // `shutdown_requested` hooks, which must not fire again on a repeat.
+        if !self.harness.is_shutting_down() {
+            self.harness.request_shutdown();
+        }
+        if let Some(native) = &self.native {
+            native.release_next_turn().await;
+        }
+        if tokio::time::timeout(self.grace, self.harness.wait_for_settled())
+            .await
+            .is_err()
+        {
+            anyhow::bail!(
+                "the turn did not stop within {} s; its Session lease is kept until this process exits and expires 30 s later",
+                self.grace.as_secs_f32()
+            );
+        }
+        if let Some(store) = &self.store {
+            store
+                .release_leases()
+                .await
+                .map_err(|e| anyhow::anyhow!("could not release Session leases: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Runtime {
+    /// A handle that ends this Surface's Session work and releases its leases.
+    pub fn session_shutdown(&self) -> SessionShutdown {
+        SessionShutdown::new(Arc::clone(&self.harness), self.session_store.clone())
+            .with_native(Arc::clone(&self.native))
+    }
 }
 
 impl Runtime {
@@ -148,57 +237,53 @@ impl Runtime {
     }
 
     /// The reasoning effort Loop's own agent uses with the selected model:
-    /// the saved level, or `off` when the model does not accept it.
+    /// the Session's level, or `off` when the model does not accept it.
     pub fn native_effort(&self) -> String {
-        let saved = self.settings.default_thinking_level.to_lowercase();
-        if native_efforts(self.selected_model.as_ref(), &NATIVE_EFFORTS).contains(&saved) {
-            saved
-        } else {
-            "off".into()
-        }
+        loop_agent::effort::effective_effort(
+            self.selected_model.as_ref(),
+            self.native.thinking_level(),
+        )
     }
 
     /// The reasoning effort levels on offer, and the current one.
     pub async fn efforts(&self) -> anyhow::Result<(Vec<String>, String)> {
-        if self.is_native() {
-            let current = self.native_effort();
-            return Ok((
-                native_efforts(self.selected_model.as_ref(), &NATIVE_EFFORTS),
-                current,
-            ));
-        }
+        let session = self.session_ref();
         let control = self
             .backend
             .model_control()
             .ok_or_else(|| anyhow::anyhow!("this subscription has no reasoning effort setting"))?;
-        let choices = control.efforts(&self.session_ref()).await?;
+        let choices = control.efforts(&session).await?;
         let levels = choices.models.into_iter().map(|m| m.id).collect();
         Ok((levels, choices.current.unwrap_or_default()))
     }
 
-    /// Set the reasoning effort to `level` and remember it for the next
-    /// session. Returns the level set.
+    /// Set the Session's reasoning effort to `level` and remember it for the
+    /// next session. Returns the level set.
     pub async fn set_effort(&mut self, level: &str) -> anyhow::Result<String> {
         let level = level.trim().to_lowercase();
-        let (levels, _) = self.efforts().await?;
-        if !levels.contains(&level) {
-            anyhow::bail!(
-                "unknown effort `{level}`; choose one of: {}",
-                levels.join(", ")
-            );
-        }
+        let session = self.session_ref();
+        let control = self
+            .backend
+            .model_control()
+            .ok_or_else(|| anyhow::anyhow!("this subscription has no reasoning effort setting"))?;
         match self.active_agent.clone() {
             None => {
-                self.harness
-                    .set_thinking_level(parse_thinking(&level))
-                    .await;
+                control.set_effort(&session, &level, None).await?;
+                // Today's TUI also makes the choice the default for new Sessions.
                 self.settings.default_thinking_level = level.clone();
+                self.native
+                    .set_default_effort(loop_agent::effort::parse_thinking(&level));
                 self.save_settings()?;
             }
             Some(id) => {
-                if let Some(control) = self.backend.model_control() {
-                    control.set_effort(&self.session_ref(), &level).await?;
+                let (levels, _) = self.efforts().await?;
+                if !levels.contains(&level) {
+                    anyhow::bail!(
+                        "unknown effort `{level}`; choose one of: {}",
+                        levels.join(", ")
+                    );
                 }
+                control.set_effort(&session, &level, None).await?;
                 self.agents.remember_effort(&id, &level)?;
                 self.agent_effort = Some(level.clone());
             }
@@ -210,9 +295,9 @@ impl Runtime {
     /// off → low → medium → high.
     pub async fn cycle_effort(&mut self) -> anyhow::Result<String> {
         let (levels, current) = if self.is_native() {
-            let levels = native_efforts(
+            let levels = loop_agent::effort::native_efforts(
                 self.selected_model.as_ref(),
-                &["off", "low", "medium", "high"],
+                &loop_agent::effort::CYCLE_EFFORTS,
             );
             (levels, self.native_effort())
         } else {
@@ -242,6 +327,7 @@ impl Runtime {
     /// Save `provider/model` as the default for the next start.
     pub fn remember_model(&mut self, provider: &str, model: &str) -> anyhow::Result<()> {
         self.settings.set_selected_model(provider, model);
+        self.sync_native_default_model();
         self.save_settings()
     }
 
@@ -292,6 +378,101 @@ impl Runtime {
         self.agent_effort = None;
     }
 
+    /// Sessions opened in this folder, Loop's own and subscription ones,
+    /// most recently used first.
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<crate::sessions::SessionChoice>> {
+        let cwd = self.cwd.to_string_lossy();
+        let native = self.harness.session_summaries(Some(&cwd)).await?;
+        Ok(crate::sessions::merge(
+            native,
+            self.agents.sessions_in(&self.cwd),
+        ))
+    }
+
+    /// Write the current Session as a Markdown transcript and a session file
+    /// (see [`crate::sessions::export_paths`]); returns both paths.
+    pub async fn export_session(
+        &self,
+        path: Option<&str>,
+    ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
+        if !self.is_native() {
+            bail!("/export saves Loop's own sessions; this one runs in a subscription agent");
+        }
+        let file = self.harness.export_session().await?;
+        let (markdown, session_file) =
+            crate::sessions::export_paths(&self.cwd, &self.session_id, path);
+        if let Some(dir) = markdown.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&markdown, file.markdown())?;
+        std::fs::write(&session_file, file.to_jsonl())?;
+        Ok((markdown, session_file))
+    }
+
+    /// Read a session file written by `/export` into a new Session opened in
+    /// this folder, and return its id. The current Session stays active.
+    pub async fn import_session(&self, path: &str) -> anyhow::Result<String> {
+        let path = self.cwd.join(path);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("could not read {}: {e}", path.display()))?;
+        let file = loop_agent::harness::session::SessionFile::from_jsonl(&text)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let cwd = Some(self.cwd.to_string_lossy().into_owned());
+        Ok(self.harness.import_session(&file, cwd).await?)
+    }
+
+    /// Switch to Loop's own session `id`, leaving any subscription, and go
+    /// back to the model it last used when one is recorded and still
+    /// available (as `--resume` does; the saved default is left alone).
+    /// The session's own "accept all" approvals replace the previous ones.
+    pub async fn open_native_session(&mut self, id: &str) -> anyhow::Result<()> {
+        if !self.is_native() {
+            self.use_native().await;
+        }
+        let id = self.harness.switch_session(id).await?;
+        self.native.adopt_session(&id);
+        self.session_id = id;
+        self.resumed = true;
+        self.active_skills.clear();
+        if let Some(bridge) = &self.tool_approval {
+            bridge.clear_session_grants();
+            if let Ok(entries) = self.harness.read_session_entries().await {
+                for group in crate::tool_approval::auto_approve_from_entries(&entries) {
+                    bridge.grant_session(&group);
+                }
+            }
+        }
+        self.native.restore_config().await?;
+        let restored = self.harness.model().await;
+        if restored.as_ref().map(|m| (&m.provider, &m.id))
+            != self.selected_model.as_ref().map(|m| (&m.provider, &m.id))
+        {
+            self.selected_model = restored;
+            self.model_note = None;
+        }
+        Ok(())
+    }
+
+    /// Name the active session; `/sessions` shows the name as its title.
+    pub async fn rename_session(&self, name: &str) -> anyhow::Result<()> {
+        if self.is_native() {
+            self.harness.set_session_name(name).await?;
+        } else {
+            self.agents.rename(&self.session_id, name)?;
+        }
+        Ok(())
+    }
+
+    /// Note a prompt the user sent, so a subscription session gets a title.
+    pub fn note_prompt(&self, prompt: &str) {
+        if self.is_native() {
+            return;
+        }
+        if let Err(e) = self.agents.note_prompt(&self.session_id, prompt) {
+            tracing::warn!("could not record the session title: {e:#}");
+        }
+    }
+
     /// Start a new session with the active agent.
     pub async fn new_session(&mut self) -> anyhow::Result<()> {
         match self.active_agent.clone() {
@@ -305,12 +486,32 @@ impl Runtime {
                     .new_session(loop_protocol::SessionSpec {
                         cwd: Some(self.cwd.clone()),
                         name: None,
+                        ..Default::default()
                     })
                     .await?;
                 self.session_id = session.native_id;
+                // A new Session starts on the default model.
+                self.selected_model = self.harness.model().await;
                 Ok(())
             }
         }
+    }
+
+    /// Point Loop's own new Sessions at the saved default model. A default
+    /// that is a subscription agent leaves the native default unchanged.
+    fn sync_native_default_model(&self) {
+        let Some((provider, id)) = self.settings.selected_model() else {
+            self.native.set_default_model(None);
+            return;
+        };
+        if self.agents.entry(provider).is_some() {
+            return;
+        }
+        let model = self
+            .models
+            .get_model(provider, id)
+            .filter(|m| !self.credentials.is_logged_out(&m.provider));
+        self.native.set_default_model(model);
     }
 
     /// The active session as the backend interface names it.
@@ -441,9 +642,26 @@ impl Runtime {
                 .await
                 .map_err(|e| anyhow::anyhow!("{name} rejected the key: {e}"))?;
         }
-        let entry = request.custom_entry();
+        let mut entry = request.custom_entry();
+        if let Some(entry) = &mut entry {
+            if entry.models.is_none() {
+                entry.models = self
+                    .settings
+                    .providers
+                    .iter()
+                    .find(|saved| saved.id == entry.id)
+                    .and_then(|saved| saved.models.clone());
+            }
+        }
         let provider = match &entry {
-            Some(entry) => Arc::new(entry.provider()),
+            Some(entry) => {
+                let candidate = Models::new();
+                candidate.set_provider(entry.provider());
+                load_custom_models_json(&self.agent_dir, &candidate, std::slice::from_ref(entry))?;
+                candidate
+                    .get_provider(&id)
+                    .expect("registered custom provider")
+            }
             None => self
                 .models
                 .get_provider(&id)
@@ -484,7 +702,40 @@ impl Runtime {
             }
             return Err(error.context("could not save login"));
         }
+        for model in provider.get_models() {
+            let previous = self.models.get_model(&id, &model.id);
+            if previous.as_ref().is_none_or(|previous| {
+                previous.base_url != model.base_url
+                    || loop_ai::resolve_compat(&previous.base_url, previous.compat.as_ref())
+                        .thinking_format
+                        != loop_ai::resolve_compat(&model.base_url, model.compat.as_ref())
+                            .thinking_format
+            }) {
+                loop_ai::clear_reasoning_rejection(&model);
+            }
+        }
         self.models.set_provider(provider);
+        if let Some(model_id) = self
+            .selected_model
+            .as_ref()
+            .filter(|model| model.provider == id)
+            .map(|model| model.id.clone())
+        {
+            if let Some(model) = self.models.get_model(&id, &model_id) {
+                self.harness.set_model(model.clone()).await;
+                self.selected_model = Some(model);
+            } else {
+                self.harness.clear_model().await;
+                self.selected_model = None;
+                self.model_note = Some(format!(
+                    "{id}/{model_id} is no longer available; select a model with /model"
+                ));
+                self.settings.clear_selected_model();
+                self.save_settings()?;
+            }
+        }
+        // The default's metadata may have changed with the provider.
+        self.sync_native_default_model();
         self.needs_provider_setup = false;
         if id == loop_ai::providers::SOKET_PROVIDER_ID {
             // The Soket key also powers the default web search and fetch.
@@ -603,7 +854,7 @@ impl Runtime {
             .iter()
             .find(|m| offered.models.iter().any(|o| o.id == **m))?;
         if offered.current.as_deref() != Some(*wanted) {
-            if let Err(e) = control.set_mode(&session, wanted).await {
+            if let Err(e) = control.set_mode(&session, wanted, None).await {
                 tracing::warn!("could not set the agent's mode to {wanted}: {e}");
                 return offered.current;
             }
@@ -671,7 +922,12 @@ impl Runtime {
             .tool_env()
             .await
             .map_err(|e| anyhow::anyhow!("tool env: {e}"))?;
-        let tools = build_tools(env, &self.web_tools(), self.bash_limits());
+        let tools = build_tools(
+            env,
+            &self.web_tools(),
+            self.bash_limits(),
+            self.tool_gate.search_filter(),
+        );
         self.harness
             .set_tools(tools)
             .await
@@ -740,6 +996,7 @@ impl Runtime {
             self.selected_model = None;
             self.harness.clear_model().await;
             self.settings.clear_selected_model();
+            self.sync_native_default_model();
             self.save_settings()?;
         }
         if id == loop_ai::providers::SOKET_PROVIDER_ID {
@@ -750,7 +1007,8 @@ impl Runtime {
         Ok(name)
     }
 
-    /// Select `provider/id` for this and future runs (harness + saved settings).
+    /// Select `provider/id` for Loop's own Session and future runs (the
+    /// Session records it; the TUI also saves it as the default).
     pub async fn select_model(
         &mut self,
         provider: &str,
@@ -763,8 +1021,16 @@ impl Runtime {
             .models
             .get_model(provider, id)
             .ok_or_else(|| anyhow::anyhow!("model not found: {provider}/{id}"))?;
-        self.harness.set_model(model.clone()).await;
+        let session = self.native.current_session().await;
+        loop_protocol::ModelControl::set_model(
+            self.native.as_ref(),
+            &session,
+            &format!("{provider}/{id}"),
+            None,
+        )
+        .await?;
         self.settings.set_selected_model(provider, id);
+        self.sync_native_default_model();
         self.selected_model = Some(model.clone());
         self.model_note = None;
         self.save_settings()?;
@@ -795,13 +1061,28 @@ impl Runtime {
 
 #[cfg(feature = "telemetry")]
 impl Runtime {
-    /// Take ownership of the process telemetry and apply saved tracing settings.
+    /// Take ownership of the process telemetry, start the usage log and apply saved
+    /// tracing settings.
     pub fn attach_telemetry(
         &mut self,
         handle: loop_telemetry::TelemetryHandle,
     ) -> anyhow::Result<loop_telemetry::TelemetryStatus> {
+        handle.install_local(&crate::config::paths::usage_dir(&self.agent_dir));
         self.telemetry = Some(handle);
         self.tracing_control()?.apply()
+    }
+
+    /// The usage log behind `/usage`, once telemetry is attached.
+    pub fn usage_log(&self) -> Option<loop_telemetry::UsageLog> {
+        self.telemetry.as_ref().and_then(|t| t.usage_log())
+    }
+
+    /// Write spans queued for the usage log, on a blocking thread so the caller never
+    /// waits for it.
+    pub fn flush_usage_log(&self) {
+        if let Some(telemetry) = self.telemetry.clone() {
+            tokio::task::spawn_blocking(move || telemetry.flush_local());
+        }
     }
 
     /// Current tracing state, if telemetry is attached.
@@ -940,18 +1221,23 @@ pub struct BootstrapOpts {
 }
 
 /// Build the standard tool set bound to an execution environment, plus the
-/// web tools `web` asks for (see [`crate::web_tools`]).
+/// web tools `web` asks for (see [`crate::web_tools`]). The search tools
+/// hide what `search` refuses ([`crate::tool_gate::ToolGate::search_filter`]).
 pub fn build_tools(
     env: Arc<dyn loop_agent::harness::ExecutionEnv>,
     web: &crate::web_tools::WebTools,
     bash: loop_agent::harness::BashLimits,
+    search: loop_agent::harness::SearchFilter,
 ) -> Vec<AgentTool> {
-    let mut tools = vec![
-        create_read_tool(Arc::clone(&env)),
+    let mut tools = vec![create_read_tool(Arc::clone(&env))];
+    tools.extend(search_tools_with_filter(Arc::clone(&env), search));
+    tools.extend([
         create_write_tool(Arc::clone(&env)),
         create_edit_tool(Arc::clone(&env)),
         create_bash_tool_with(env, None, bash),
-    ];
+        create_todo_tool(),
+        create_exit_plan_tool(),
+    ]);
     tools.extend(web.build());
     tools
 }
@@ -971,8 +1257,8 @@ pub fn ensure_provider_connected(
     }
     if !interactive {
         bail!(
-            "No LLM provider connected. Set SOKET_API_KEY, OPENROUTER_API_KEY or OPENAI_API_KEY, \
-             or run `loop` and use /login. Logged-out providers must reconnect through /login."
+            "No LLM provider connected. Set SOKET_API_KEY, OPENROUTER_API_KEY, OPENAI_API_KEY, \
+             ANTHROPIC_API_KEY or GEMINI_API_KEY, or run `loop` and use /login. Logged-out providers must reconnect through /login."
         );
     }
     Ok(true)
@@ -990,11 +1276,35 @@ pub fn build_models(
         models_store: Some(store),
     }));
     crate::config::providers::register_providers(&models, custom);
-    load_custom_models_json(agent_dir, &models)?;
+    load_custom_models_json(agent_dir, &models, custom)?;
     Ok(models)
 }
 
-fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<()> {
+/// Reread `models.json` and the settings' custom providers into `models`,
+/// replacing providers of the same id, then rehydrate from the local
+/// catalog cache. Never touches the network.
+pub async fn reload_model_definitions(
+    agent_dir: &Path,
+    models: &Models,
+    custom: &[crate::config::CustomProviderEntry],
+) -> anyhow::Result<()> {
+    crate::config::providers::register_providers(models, custom);
+    load_custom_models_json(agent_dir, models, custom)?;
+    let _ = models
+        .refresh(ModelsRefreshOptions {
+            allow_network: Some(false),
+            force: false,
+            provider_id: None,
+        })
+        .await;
+    Ok(())
+}
+
+fn load_custom_models_json(
+    agent_dir: &Path,
+    models: &Models,
+    custom: &[crate::config::CustomProviderEntry],
+) -> anyhow::Result<()> {
     let path = models_json_path(agent_dir);
     if !path.exists() {
         return Ok(());
@@ -1023,7 +1333,7 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            let model_specs = p
+            let mut model_specs = p
                 .get("models")
                 .and_then(|v| v.as_array())
                 .map(|a| {
@@ -1040,6 +1350,13 @@ fn load_custom_models_json(agent_dir: &Path, models: &Models) -> anyhow::Result<
                 .unwrap_or_default();
             if model_specs.is_empty() {
                 continue;
+            }
+            if let Some(entry) = custom.iter().find(|entry| entry.id == id) {
+                for saved in entry.models.iter().flatten() {
+                    if !model_specs.iter().any(|spec| spec.id == saved.id) {
+                        model_specs.push(saved.spec());
+                    }
+                }
             }
             models.set_provider(custom_provider(CustomProviderConfig {
                 id: id.into(),
@@ -1065,7 +1382,7 @@ fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
             .or_else(|| m.get(snake))
             .and_then(|v| v.as_u64())
     };
-    CustomModelSpec::new(id)
+    let mut spec = CustomModelSpec::new(id)
         .with_reasoning(
             m.get("reasoning")
                 .and_then(|v| v.as_bool())
@@ -1073,7 +1390,18 @@ fn parse_model_spec(m: &serde_json::Value, id: &str) -> CustomModelSpec {
         )
         .with_name(m.get("name").and_then(|v| v.as_str()))
         .with_context_window(field("contextWindow", "context_window"))
-        .with_max_tokens(field("maxTokens", "max_tokens"))
+        .with_max_tokens(field("maxTokens", "max_tokens"));
+    if let Some(format) = m
+        .get("thinkingFormat")
+        .or_else(|| m.get("thinking_format"))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+    {
+        spec = spec.with_compat(loop_ai::OpenAICompletionsCompat {
+            thinking_format: Some(format),
+            ..Default::default()
+        });
+    }
+    spec
 }
 
 /// Resolve project trust (ask interactively when needed).
@@ -1114,57 +1442,8 @@ pub fn resolve_trust(
     }
 }
 
-/// Reasoning effort levels of Loop's own agent, as `/effort` names them.
-const NATIVE_EFFORTS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-
-/// The levels of `candidates` that `model` accepts: only `off` for a model
-/// without reasoning, and none its thinking map marks unsupported.
-fn native_efforts(model: Option<&loop_ai::Model>, candidates: &[&str]) -> Vec<String> {
-    candidates
-        .iter()
-        .filter(|level| {
-            let Some(model) = model else {
-                return true;
-            };
-            let Some(reasoning) = parse_thinking(level).to_reasoning() else {
-                return true; // "off" is always available
-            };
-            model.reasoning
-                && !loop_ai::reasoning_rejected(model)
-                && model.thinking_level_map.as_ref().is_none_or(|map| {
-                    map.get(&loop_ai::ModelThinkingLevel::from(reasoning)) != Some(&None)
-                })
-        })
-        .map(|level| (*level).to_owned())
-        .collect()
-}
-
-fn parse_thinking(s: &str) -> AgentThinkingLevel {
-    match s.to_lowercase().as_str() {
-        "minimal" => AgentThinkingLevel::Minimal,
-        "low" => AgentThinkingLevel::Low,
-        "medium" => AgentThinkingLevel::Medium,
-        "high" => AgentThinkingLevel::High,
-        "xhigh" => AgentThinkingLevel::XHigh,
-        "max" => AgentThinkingLevel::Max,
-        _ => AgentThinkingLevel::Off,
-    }
-}
-
-fn thinking_label(level: AgentThinkingLevel) -> &'static str {
-    match level {
-        AgentThinkingLevel::Off => "off",
-        AgentThinkingLevel::Minimal => "minimal",
-        AgentThinkingLevel::Low => "low",
-        AgentThinkingLevel::Medium => "medium",
-        AgentThinkingLevel::High => "high",
-        AgentThinkingLevel::XHigh => "xhigh",
-        AgentThinkingLevel::Max => "max",
-    }
-}
-
-/// Bootstrap the full runtime.
-pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
+/// Bootstrap the full application Runtime, preserving interactive trust and sandbox fallback.
+pub async fn bootstrap(mut opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     let agent_dir = get_agent_dir();
     ensure_agent_dirs(&agent_dir)?;
     std::env::set_var("LOOP_CODING_AGENT", "true");
@@ -1197,221 +1476,38 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         && !subscribed
         && ensure_provider_connected(&credentials, &settings.providers, opts.interactive)?;
 
-    let models = build_models(&agent_dir, Arc::clone(&credentials), &settings.providers)?;
-    // Hydrate every provider from models-store.json before resolving a model. Without
-    // this, `--print` races the background `/v1/models` refresh.
-    let _ = models
-        .refresh(ModelsRefreshOptions {
-            allow_network: Some(false),
-            force: false,
-            provider_id: None,
-        })
-        .await;
-    if !needs_provider_setup {
-        // Network catalog refresh in the background so interactive startup
-        // isn't blocked by a slow API. Cached models are already in memory.
-        let bg_models = Arc::clone(&models);
-        tokio::spawn(async move {
-            let refresh = bg_models
-                .refresh(ModelsRefreshOptions {
-                    allow_network: Some(true),
-                    force: true,
-                    // Providers without a key stay on their cache (see the fetcher).
-                    provider_id: None,
-                })
-                .await;
-            for (pid, err) in &refresh.errors {
-                tracing::warn!("model refresh {pid}: {err}");
-            }
-        });
-    }
-
-    // A saved subscription model is started by the surface, not Loop's agent.
-    let saved = settings
-        .selected_model()
-        .filter(|(provider, _)| agents.entry(provider).is_none());
-    let (mut model, mut model_note) = match crate::model_selection::resolve_startup_model(
-        &models,
-        saved,
-        opts.provider.as_deref(),
-        opts.model.as_deref(),
-    )? {
-        StartupModel::Selected(model) => (Some(*model), None),
-        StartupModel::NotSelected { reason } => (None, reason),
-    };
-    if model
-        .as_ref()
-        .is_some_and(|m| credentials.is_logged_out(&m.provider))
-    {
-        if opts.provider.is_some() || opts.model.is_some() {
-            bail!("selected provider is logged out; run /login before selecting its model");
-        }
-        model = None;
-        model_note = Some("saved provider is logged out; use /login or /model".into());
-    }
-    if let Some(m) = &model {
-        settings.set_selected_model(&m.provider, &m.id);
-    }
-
-    let resources = load_resources(&agent_dir, &opts.cwd, project_trusted, &settings);
-    let context_files = if opts.no_context_files {
-        vec![]
-    } else {
-        load_context_files(&opts.cwd, &agent_dir)
-    };
-    let (custom, append) = resolve_system_prompt_files(
-        &opts.cwd,
-        project_trusted,
-        opts.system_prompt.as_deref(),
-        opts.append_system_prompt.as_deref(),
+    let globals = Arc::new(
+        GlobalResources::load(
+            agent_dir.clone(),
+            &settings.providers,
+            !needs_provider_setup,
+        )
+        .await?,
     );
-
-    let sessions_db = sessions_db_path(&agent_dir);
-    let store = create_sqlite_session_store(&sessions_db)
-        .map_err(|e| anyhow::anyhow!("sqlite session store: {e}"))?;
-    let repo = create_session_repository(store, None);
-    let resumed = opts.session_id.is_some();
-    let session = if let Some(id) = &opts.session_id {
-        repo.open(id)
-            .await
-            .map_err(|e| anyhow::anyhow!("load session: {e}"))?
-    } else {
-        repo.create(Some(opts.cwd.to_string_lossy().into_owned()), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("create session: {e}"))?
-    };
-
-    // Restore model from the session branch when resuming (unless CLI overrides).
-    if resumed {
-        if let Ok(ctx) = session.build_context().await {
-            if opts.provider.is_none() && opts.model.is_none() {
-                if let Some((p, m)) = &ctx.model {
-                    if let Some(resolved) = models
-                        .get_model(p, m)
-                        .filter(|_| !credentials.is_logged_out(p))
-                    {
-                        settings.set_selected_model(p, m);
-                        model = Some(resolved);
-                        model_note = None;
-                    }
-                }
-            }
-            // Thinking-level changes are recorded on the branch when present.
-            if !matches!(ctx.thinking_level, AgentThinkingLevel::Off) {
-                settings.default_thinking_level = thinking_label(ctx.thinking_level).into();
-            }
-        }
-    }
-
-    let host: Arc<dyn loop_agent::harness::ExecutionEnv> =
-        Arc::new(HostExecutionEnv::new(&opts.cwd));
-
-    let (sandbox, tool_env): (SandboxMode, Arc<dyn loop_agent::harness::ExecutionEnv>) =
-        match settings.sandbox.mode.as_str() {
-            "local" => {
-                let isolation = KrunIsolation::parse(&settings.sandbox.isolation)
-                    .unwrap_or(KrunIsolation::Full);
-                let oci_runtime = LocalSandboxRuntime::parse(&settings.sandbox.runtime)
-                    .unwrap_or(LocalSandboxRuntime::Runc);
-                settings.sandbox.isolation = isolation.as_str().into();
-                settings.sandbox.runtime = oci_runtime.as_str().into();
-                let sb = KrunSandbox::new(KrunSandbox::config_for(
-                    opts.cwd.clone(),
-                    isolation,
-                    oci_runtime,
-                ));
-                match sb.start().await {
-                    Ok(()) => {
-                        let env = sb.env();
-                        (
-                            SandboxMode::Enabled {
-                                sandbox: Arc::new(sb),
-                            },
-                            env,
-                        )
-                    }
-                    Err(e) => {
-                        tracing::warn!("local sandbox disabled at startup: {e}");
-                        eprintln!("warning: local sandbox not enabled:\n{e}");
-                        settings.sandbox.mode = "off".into();
-                        (SandboxMode::Disabled, Arc::clone(&host))
-                    }
-                }
-            }
-            _ => {
-                settings.sandbox.mode = "off".into();
-                (SandboxMode::Disabled, Arc::clone(&host))
-            }
-        };
-
-    let web = crate::web_tools::WebTools::from_settings(
-        &settings,
-        Some(Arc::clone(&credentials)),
-        opts.no_web,
+    let workspace = Arc::new(
+        WorkspaceResources::load_resolved(&globals, &opts, project_trusted, settings, true).await?,
     );
-    let bash_limits = settings.bash.unwrap_or_default().limits();
-    let tools = build_tools(Arc::clone(&tool_env), &web, bash_limits);
-
-    // The prompt lists the tools that were actually built (web_search may be
-    // unconfigured), so it can never promise a tool the agent cannot call.
-    let snippets = default_tool_snippets();
-    let selected: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
-    let system_prompt = build_system_prompt(BuildSystemPromptOptions {
-        custom_prompt: custom.as_deref(),
-        append_system_prompt: append.as_deref(),
-        cwd: &opts.cwd,
-        selected_tools: &selected,
-        tool_snippets: &snippets,
-        context_files: &context_files,
-    });
-
-    let session_id = session.metadata().id.clone();
-    let harness = Arc::new(AgentHarness::new(AgentHarnessOptions {
-        models: Arc::clone(&models),
-        model: model.clone(),
-        session,
-        host_env: host,
-        tools,
-        system_prompt,
-        sandbox,
-        resources: AgentHarnessResources {
-            skills: resources.skills.clone(),
-            prompt_templates: resources.prompts.clone(),
-        },
-    }));
-    harness
-        .set_thinking_level(parse_thinking(&settings.default_thinking_level))
-        .await;
-    harness.set_bash_limits(bash_limits);
-    harness
-        .set_response_header_timeout_ms(settings.response_header_timeout_ms)
-        .await;
-
-    let native = loop_agent::native_backend::NativeBackend::new(Arc::clone(&harness)).await;
-    let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
-
-    let tool_gate = crate::tool_gate::ToolGate::new(
-        crate::tool_approval::permissions_from_settings(&settings.tool_permissions),
-    );
-    tool_gate.install(&harness);
+    let factory = SessionFactory::new(Arc::clone(&globals));
+    // Standalone context discovery has already walked the caller's lexical path.
+    // Session identity and execution use the normalized workspace from here on.
+    opts.cwd = workspace.cwd.clone();
+    let opened = factory.open(Arc::clone(&workspace), &opts).await?;
+    let OpenedSession {
+        harness,
+        native,
+        tool_gate,
+        settings,
+        session_id,
+        selected_model,
+        model_note,
+        startup_notices,
+        session_store,
+        ..
+    } = opened;
+    // Standalone Surfaces install their own approval transport, as before.
+    tool_gate.set_approver(None);
     agents.set_gate(Arc::clone(&tool_gate));
-    let mut startup_notices =
-        crate::hooks_load::register_json_hooks(&harness, &resources.hook_paths);
-    let (mode, mode_notice) = startup_permission_mode(
-        opts.permission_mode.as_deref(),
-        settings.permission_mode.as_deref(),
-        &settings.file_edit_review,
-        opts.interactive,
-    )?;
-    tool_gate.set_mode(mode);
-    startup_notices.extend(mode_notice);
-    if mode == crate::permissions::PermissionMode::FullAccess {
-        startup_notices.push(
-            "⚠ full access: every tool call runs without asking, including shell commands \
-             and file deletion (deny rules and hooks still apply)"
-                .into(),
-        );
-    }
+    let resources = workspace.resources.clone();
     let ext = crate::extensions::load_extensions(&resources.extension_paths);
     for n in &ext.notices {
         tracing::info!("extension: {n}");
@@ -1425,42 +1521,16 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
     );
     let theme = Theme::load(&settings.theme, &theme_dirs).unwrap_or_else(|_| Theme::dark());
 
-    let mcp_client = Arc::new(loop_mcp::McpClientManager::with_oauth_dir(
-        agent_dir.join("mcp-auth"),
-    ));
-    tool_gate.set_mcp(Arc::clone(&mcp_client));
-    let entries = enabled_mcp_server_entries(&settings.mcp_servers, &settings.disabled_mcp_servers);
-    if !entries.is_empty() {
-        let results = mcp_client.connect_all(&entries).await;
-        for (name, result) in &results {
-            match result {
-                Ok(count) => tracing::info!("mcp: connected to '{name}' ({count} tools)"),
-                Err(e) => tracing::warn!("mcp: failed to connect to '{name}': {e}"),
-            }
-        }
-        let mcp_tools = loop_agent::harness::mcp::bridge::mcp_tools_to_agent_tools_async(
-            mcp_client.connections(),
-        )
-        .await;
-        if !mcp_tools.is_empty() {
-            let mut all_tools = harness.get_tools().await;
-            all_tools.extend(mcp_tools);
-            harness
-                .set_tools(all_tools)
-                .await
-                .map_err(|e| anyhow::anyhow!("set MCP tools: {e}"))?;
-        }
-    }
-
+    let backend: Arc<dyn loop_protocol::AgentBackend> = native.clone();
     Ok(Runtime {
         agent_dir,
-        cwd: opts.cwd,
-        custom_system_prompt: custom,
-        append_system_prompt: append,
-        context_files,
+        cwd: workspace.cwd.clone(),
+        custom_system_prompt: workspace.custom_system_prompt.clone(),
+        append_system_prompt: workspace.append_system_prompt.clone(),
+        context_files: workspace.context_files.clone(),
         settings,
-        models,
-        credentials,
+        models: Arc::clone(&globals.models),
+        credentials: Arc::clone(&globals.credentials),
         harness,
         backend,
         native,
@@ -1472,20 +1542,21 @@ pub async fn bootstrap(opts: BootstrapOpts) -> anyhow::Result<Runtime> {
         resources,
         project_trusted,
         trust,
-        sessions_db,
+        sessions_db: globals.sessions_db.clone(),
         session_id,
-        resumed,
+        resumed: opts.session_id.is_some(),
         needs_provider_setup,
-        selected_model: model,
+        selected_model,
         model_note,
         tool_approval: None,
         tool_gate,
         startup_notices,
-        mcp_client,
+        mcp_client: Arc::clone(&workspace.mcp_client),
         active_skills: Vec::new(),
         web_disabled_for_run: opts.no_web,
         #[cfg(feature = "telemetry")]
         telemetry: None,
+        session_store,
     })
 }
 
@@ -1553,6 +1624,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_standard_tools_include_search_and_todo() {
+        let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
+            loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
+        );
+        let web = crate::web_tools::WebTools::from_settings(&Default::default(), None, true);
+        let tools = build_tools(env, &web, Default::default(), Arc::new(|_, _| true));
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        for name in [
+            "read", "write", "edit", "bash", "grep", "glob", "ls", "todo",
+        ] {
+            assert!(names.contains(&name), "{name}: {names:?}");
+        }
+        let snippets = crate::system_prompt::default_tool_snippets();
+        for name in ["grep", "glob", "ls", "todo"] {
+            assert!(snippets.iter().any(|(n, _)| *n == name), "{name} snippet");
+        }
+    }
+
+    #[test]
     fn models_json_pins_model_metadata() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1577,7 +1667,7 @@ mod tests {
             credentials: None,
             models_store: None,
         });
-        load_custom_models_json(dir.path(), &models).unwrap();
+        load_custom_models_json(dir.path(), &models, &[]).unwrap();
 
         let pinned = models.get_model("zai", "glm-5.3-flash").unwrap();
         assert_eq!(pinned.context_window, 1_000_000);
@@ -1604,20 +1694,35 @@ mod tests {
     }
 
     #[test]
-    fn native_efforts_follow_the_model() {
-        let all = ["off", "low", "high"];
-        let mut model = loop_ai::providers::soket_seed_models().remove(0);
-        assert_eq!(native_efforts(Some(&model), &all), ["off", "low", "high"]);
-
-        model.thinking_level_map = Some(std::collections::HashMap::from([(
-            loop_ai::ModelThinkingLevel::High,
-            None,
-        )]));
-        assert_eq!(native_efforts(Some(&model), &all), ["off", "low"]);
-
-        model.reasoning = false;
-        assert_eq!(native_efforts(Some(&model), &all), ["off"]);
-        assert_eq!(native_efforts(None, &all), ["off", "low", "high"]);
+    fn models_json_overrides_matching_settings_models_and_keeps_other_pins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            models_json_path(dir.path()),
+            serde_json::json!({
+                "providers": [{"id": "gateway", "baseUrl": "http://localhost/v1",
+                    "models": [{"id": "override", "reasoning": false}]}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let entry: crate::config::CustomProviderEntry = serde_json::from_value(serde_json::json!({
+            "id": "gateway", "name": "Gateway", "baseUrl": "http://localhost/v1",
+            "models": [
+                {"id": "override", "reasoning": true, "thinkingFormat": "zai"},
+                {"id": "keep", "reasoning": true, "thinkingFormat": "zai"}
+            ]
+        }))
+        .unwrap();
+        let models = Models::new();
+        models.set_provider(entry.provider());
+        load_custom_models_json(dir.path(), &models, &[entry]).unwrap();
+        assert!(!models.get_model("gateway", "override").unwrap().reasoning);
+        let kept = models.get_model("gateway", "keep").unwrap();
+        assert!(kept.reasoning);
+        assert_eq!(
+            kept.compat.unwrap().thinking_format,
+            Some(loop_ai::ThinkingFormat::Zai)
+        );
     }
 }
 

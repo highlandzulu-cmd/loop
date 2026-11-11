@@ -11,6 +11,9 @@ pub mod model_selection;
 pub mod permissions;
 pub mod resources;
 pub mod runtime;
+pub mod runtime_instance;
+pub mod sandbox_builder;
+pub mod sessions;
 pub mod system_prompt;
 pub mod theme;
 pub mod tool_approval;
@@ -20,6 +23,6 @@ pub mod web_tools;
 pub use config::*;
 pub use runtime::{
     bootstrap, build_models, build_tools, mcp_server_entries, BootstrapOpts, ConnectedProvider,
-    Runtime,
+    GlobalResources, OpenedSession, Runtime, SessionFactory, WorkspaceResources,
 };
 pub use tool_approval::ToolApprovalBridge;

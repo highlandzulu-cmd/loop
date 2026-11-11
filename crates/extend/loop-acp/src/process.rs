@@ -29,18 +29,6 @@ const INHERITED_ENV: &[&str] = &[
     "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
     "XDG_RUNTIME_DIR",
-    // Windows essentials.
-    "SYSTEMROOT",
-    "WINDIR",
-    "COMSPEC",
-    "PATHEXT",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-    "PROGRAMFILES",
-    "HOMEDRIVE",
-    "HOMEPATH",
 ];
 
 /// One configured external agent.
@@ -105,7 +93,7 @@ pub struct ProcessConnector;
 #[async_trait]
 impl Connector for ProcessConnector {
     async fn connect(&self, config: &AgentConfig, cwd: &Path) -> std::io::Result<AgentLink> {
-        let mut command = Command::new(resolve_program(&config.command));
+        let mut command = Command::new(&config.command);
         command
             .args(&config.args)
             .current_dir(cwd)
@@ -121,7 +109,6 @@ impl Connector for ProcessConnector {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         // Own process group, so killing the agent also kills what it started.
-        #[cfg(unix)]
         command.process_group(0);
 
         let mut child = command.spawn()?;
@@ -145,31 +132,6 @@ impl Connector for ProcessConnector {
     }
 }
 
-/// On Windows, `npx` and similar tools are `.cmd` scripts that
-/// `CreateProcess` cannot run by bare name.
-fn resolve_program(command: &str) -> String {
-    #[cfg(windows)]
-    {
-        let path = std::path::Path::new(command);
-        if path.extension().is_none() && !command.contains(['/', '\\']) {
-            for ext in [".exe", ".cmd", ".bat"] {
-                let candidate = format!("{command}{ext}");
-                if which_on_path(&candidate) {
-                    return candidate;
-                }
-            }
-        }
-    }
-    command.to_owned()
-}
-
-#[cfg(windows)]
-fn which_on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
-        .unwrap_or(false)
-}
-
 /// A running agent process.
 pub struct AgentProcess {
     child: Child,
@@ -178,7 +140,6 @@ pub struct AgentProcess {
 impl AgentProcess {
     /// Kill the agent and every process it started.
     pub async fn kill_tree(&mut self) {
-        #[cfg(unix)]
         if let Some(pid) = self.child.id() {
             // The child leads its own process group (see `process_group(0)`).
             let _ = Command::new("kill")
@@ -188,20 +149,11 @@ impl AgentProcess {
                 .status()
                 .await;
         }
-        #[cfg(windows)]
-        if let Some(pid) = self.child.id() {
-            let _ = Command::new("taskkill")
-                .args(["/T", "/F", "/PID", &pid.to_string()])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await;
-        }
         let _ = self.child.kill().await;
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

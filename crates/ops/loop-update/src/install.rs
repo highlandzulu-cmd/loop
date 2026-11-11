@@ -19,7 +19,7 @@ pub fn default_install_dir() -> Result<PathBuf> {
         .ok_or_else(|| Error::Invalid("Cannot find the home directory".into()))
 }
 
-/// Ownership is limited to `loop[.exe]` and the reserved `.loop-update/` folder.
+/// Ownership is limited to `loop` and the reserved `.loop-update/` folder.
 /// Installers use the same layout. No config or session paths are accepted.
 pub struct Installation {
     executable: PathBuf,
@@ -67,10 +67,10 @@ impl Installation {
     pub fn managed_executable() -> Result<PathBuf> {
         let executable = std::env::current_exe()?;
         let dir = default_install_dir()?;
-        let expected = dir.join(if cfg!(windows) { "loop.exe" } else { "loop" });
+        let expected = dir.join("loop");
         if !managed_at(&executable, &expected) {
             return Err(Error::Invalid(format!(
-                "Cannot self-update {}: no installer ownership marker (.loop-update/). Use its package manager or install.sh/install.ps1. LOOP_INSTALL_DIR currently resolves to {}",
+                "Cannot self-update {}: no installer ownership marker (.loop-update/). Use its package manager or install.sh. LOOP_INSTALL_DIR currently resolves to {}",
                 executable.display(), dir.display()
             )));
         }
@@ -181,10 +181,7 @@ impl Installation {
     }
 
     fn backup_path(&self, hash: &str) -> PathBuf {
-        self.state_dir.join(format!(
-            "previous-{hash}{}",
-            if cfg!(windows) { ".exe" } else { "" }
-        ))
+        self.state_dir.join(format!("previous-{hash}"))
     }
 
     fn replace(&self, candidate: &Path, record: Rollback) -> Result<()> {
@@ -242,8 +239,8 @@ impl Installation {
         record: &Rollback,
     ) -> Vec<String> {
         let mut failures = Vec::new();
-        // Windows replacement can move the old executable before a later
-        // copy/rename fails. Restore its public path before returning.
+        // A failed replacement can leave the old executable missing. Restore
+        // its public path before returning.
         if !self.executable.exists() {
             let restore = || -> Result<()> {
                 let mut temp = tempfile::NamedTempFile::new_in(self.install_dir()?)?;
@@ -286,7 +283,6 @@ impl Installation {
         temp.as_file().sync_all()?;
         temp.persist(self.state_dir.join("rollback.json"))
             .map_err(|e| e.error)?;
-        #[cfg(unix)]
         fs::File::open(&self.state_dir)?.sync_all()?;
         Ok(())
     }
@@ -296,7 +292,7 @@ impl Installation {
             self_replace::self_replace(candidate)?;
         } else {
             // Used by installers and embedding callers; never copy over a
-            // live executable in place. Windows fails safely if it is in use.
+            // live executable in place.
             let mut temp = tempfile::NamedTempFile::new_in(self.install_dir()?)?;
             std::io::copy(&mut fs::File::open(candidate)?, &mut temp)?;
             temp.as_file().sync_all()?;
@@ -370,13 +366,7 @@ impl Installation {
 }
 
 fn managed_at(executable: &Path, default: &Path) -> bool {
-    if regular(executable).is_err()
-        || executable.file_name()
-            != Some(std::ffi::OsStr::new(if cfg!(windows) {
-                "loop.exe"
-            } else {
-                "loop"
-            }))
+    if regular(executable).is_err() || executable.file_name() != Some(std::ffi::OsStr::new("loop"))
     {
         return false;
     }
@@ -416,9 +406,7 @@ mod tests {
     #[test]
     fn ownership_is_lock_free_and_supports_custom_installs() {
         let tmp = tempfile::tempdir().unwrap();
-        let exe = tmp
-            .path()
-            .join(if cfg!(windows) { "loop.exe" } else { "loop" });
+        let exe = tmp.path().join("loop");
         let default = tmp.path().join("other/loop");
         fs::write(&exe, "fixture").unwrap();
         assert!(!managed_at(&exe, &default));
@@ -435,9 +423,7 @@ mod tests {
     fn failed_replace_keeps_original_error_and_record() {
         for old_record in [Some(b"{\"previous\":true}".to_vec()), None] {
             let tmp = tempfile::tempdir().unwrap();
-            let exe = tmp
-                .path()
-                .join(if cfg!(windows) { "loop.exe" } else { "loop" });
+            let exe = tmp.path().join("loop");
             fs::write(&exe, "old").unwrap();
             let installation = Installation::at(exe.clone()).unwrap();
             let record_path = installation.state_dir.join("rollback.json");
@@ -464,7 +450,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlink_markers_do_not_establish_ownership() {
         let tmp = tempfile::tempdir().unwrap();

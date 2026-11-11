@@ -106,7 +106,7 @@ Hooks and deny rules apply in **every** mode, `full-access` included, because th
 { "on": "tool_call", "match": { "kind": "edit" },
   "action": { "command": ["python3", "~/.loop/agent/hooks/check_edit.py"], "timeoutMs": 10000, "onError": "block" } }
 ```
-- **`command`:** an argv array, with `~` expanded. It's never a shell string, so hooks behave the same on Windows.
+- **`command`:** an argv array, with `~` expanded. It's never a shell string, so hooks don't depend on shell quoting.
   - Runs with the session's cwd.
   - Environment: `LOOP_HOOK_EVENT`, `LOOP_SESSION_ID`, `LOOP_PROJECT_DIR`, `LOOP_PERMISSION_MODE`.
 - **stdin:** the event as JSON. Tool output is capped at 64 KB.
@@ -119,7 +119,7 @@ Hooks and deny rules apply in **every** mode, `full-access` included, because th
 - **Errors, timeouts and crashes:** `onError: "block"` blocks the call; `"ignore"` lets it through and shows a warning.
   - Default for `tool_call`: `block`. Default for every other event: `ignore`.
   - `timeoutMs`: default 10000, maximum 120000.
-- **Cancellation:** the hook runs in its own process group (Unix) or job object (Windows). It's killed on timeout or when the turn is cancelled.
+- **Cancellation:** the hook runs in its own process group. It's killed on timeout or when the turn is cancelled.
 - **Concurrency:** hooks run outside the approval prompt's lock, so parallel tool calls run their hooks in parallel. Only the user prompt is serialized.
 
 ### A.6 External agents (ACP)
@@ -242,7 +242,7 @@ Hooks and deny rules apply in **every** mode, `full-access` included, because th
 - **Command hooks:**
   - each exit-code case; malformed stdout; timeout; crash; `onError` both ways; capped stdout;
   - cancelling the turn kills the child;
-  - argv-only on Unix and Windows.
+  - argv-only.
 - **ACP (fake agent):**
   - a hook `Block` answers `reject_once` without asking the host;
   - `Allow` answers `allow_once`;
@@ -269,5 +269,4 @@ Hooks and deny rules apply in **every** mode, `full-access` included, because th
 - **`fileEditReview` no longer turns prompts off.** With no `permissionMode`, `never` starts in `accept-edits` with a notice each start (no state is kept to show it once). The bridge's per-session `policy_active` switch is gone, so a resumed session asks like a new one.
 - **`read-only` runs read-only bash commands** (a fixed list, checked part by part after `split_command`), instead of refusing all bash.
 - **Web tools default to `allow`** in every mode, as decided. Saved `ask` entries are kept.
-- **Hook processes on Windows** are stopped with `taskkill /T`, as in `loop-acp`, not a job object. A hook that exits and leaves orphans behind isn't covered there.
 - **`full-access` from settings** falls back to `ask` without a terminal. This covers `--print` and `mcp serve`, and also the desktop app, which bootstraps as non-interactive.

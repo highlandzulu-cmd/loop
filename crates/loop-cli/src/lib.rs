@@ -11,7 +11,13 @@ pub mod keybindings;
 pub mod mcp_serve;
 pub mod print_mode;
 pub mod provider_setup;
+pub mod runtime_cmd;
+pub mod runtime_launch;
+pub mod runtime_signals;
+pub mod session_cmd;
 pub mod setup_prompt;
+pub mod surface_client;
+pub use surface_client::SurfaceClient;
 #[cfg(feature = "telemetry")]
 pub mod tracing_setup;
 pub mod tui;
@@ -46,6 +52,22 @@ pub struct CliRuntime {
     /// `/permissions full-access` was asked for once and needs repeating to
     /// confirm.
     pub confirm_full_access: bool,
+    /// `/export` was asked to overwrite files with this path argument and
+    /// needs repeating to confirm.
+    pub confirm_export: Option<String>,
+    /// `--resume` with no id or `--continue`: what to do once the TUI is up.
+    pub startup_sessions: Option<StartupSessions>,
+    /// `/usage` asked for the usage view; the chat loop opens it.
+    pub usage_requested: bool,
+}
+
+/// Session choice to make when the TUI starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupSessions {
+    /// `--resume` with no id: open the session picker.
+    Pick,
+    /// `--continue`: resume the most recent session in this folder.
+    Latest,
 }
 
 /// An external agent to start when the surface is ready.
@@ -88,9 +110,12 @@ pub async fn bootstrap_cli(opts: BootstrapOpts) -> anyhow::Result<CliRuntime> {
         debug_log_path: None,
         pending_agent: None,
         starting_agent: None,
+        startup_sessions: None,
         signing_in: None,
         forwarded: Default::default(),
         reasoning_notices: Default::default(),
         confirm_full_access: false,
+        confirm_export: None,
+        usage_requested: false,
     })
 }

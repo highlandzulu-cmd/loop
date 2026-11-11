@@ -20,7 +20,7 @@ fi
 
 usage() {
     cat <<EOF
-Loop Installer (macOS, Linux, WSL; use install.ps1 for native Windows)
+Loop Installer (macOS, Linux, WSL)
 
 Usage:
     ./install.sh [options]
@@ -191,7 +191,6 @@ detect_platform() {
             OS="linux"
             if grep -qi microsoft /proc/version 2>/dev/null; then IS_WSL=true; fi
             ;;
-        MINGW*|MSYS*|CYGWIN*) OS="windows"; EXT="zip"; BIN_NAME="${APP}.exe" ;;
         *) die "Unsupported operating system: ${raw_os}" "Supported releases: ${RELEASES_URL}" ;;
     esac
 
@@ -219,7 +218,6 @@ detect_platform() {
             TARGET="${ARCH}-unknown-linux-gnu"
             ;;
         darwin-*) TARGET="${ARCH}-apple-darwin" ;;
-        windows-x86_64) TARGET="x86_64-pc-windows-msvc" ;;
         *) die "Unsupported platform: ${OS}/${ARCH}" "Supported releases: ${RELEASES_URL}" ;;
     esac
 }
@@ -309,7 +307,6 @@ place_binary() {
         if [[ "$old_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][A-Za-z0-9.-]+)?$ ]]; then
             old_hash=$(sha256_of "$dest") || die "Cannot verify previous binary"
             backup="$STATE_DIR/previous-${old_hash}"
-            [ "$OS" != windows ] || backup="${backup}.exe"
             if [ -e "$backup" ] || [ -L "$backup" ]; then
                 if [ ! -f "$backup" ] || [ -L "$backup" ]; then
                     die "Previous binary must be a regular file"
@@ -398,11 +395,7 @@ download_and_install() {
     step 5 "Installing to ${INSTALL_DIR}"
     info "    Extracting..."
     extracted="$TMP_DIR/$BIN_NAME"
-    if [ "$EXT" = tar.gz ]; then
-        tar -xzOf "$archive" "${APP}-${TARGET}/${BIN_NAME}" > "$extracted" || die "Archive did not contain ${BIN_NAME}"
-    else
-        unzip -p "$archive" "${APP}-${TARGET}/${BIN_NAME}" > "$extracted" || die "Archive did not contain ${BIN_NAME}"
-    fi
+    tar -xzOf "$archive" "${APP}-${TARGET}/${BIN_NAME}" > "$extracted" || die "Archive did not contain ${BIN_NAME}"
     place_binary "$extracted"
     ok "Installed ${INSTALL_DIR}/${BIN_NAME}"
 }
@@ -460,11 +453,6 @@ configure_path() {
         ash|sh) config_files="$HOME/.ashrc $HOME/.profile /etc/profile" ;;
         *)    config_files="$HOME/.bashrc $HOME/.bash_profile $xdg/bash/.bashrc $xdg/bash/.bash_profile" ;;
     esac
-
-    if [ "$OS" = "windows" ]; then
-        warn "Windows support is still in testing."
-        info "    This only puts loop on PATH inside Git Bash; add ${INSTALL_DIR} to your Windows PATH for PowerShell/cmd."
-    fi
 
     for file in $config_files; do
         if [[ -f "$file" ]]; then config_file="$file"; break; fi

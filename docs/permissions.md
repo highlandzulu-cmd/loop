@@ -13,11 +13,15 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 |---|---|---|---|---|
 | `read-only` | allow | deny | read-only commands only | allow if the server marks the tool read-only, else deny |
 | `ask` (default) | per `toolPermissions` | ask | ask | per `toolPermissions` |
-| `accept-edits` | allow | allow inside the workspace; ask outside it and for `.git/`, `.loop/`, `.env*` | per `toolPermissions` | per `toolPermissions` |
+| `accept-edits` | allow | allow inside the workspace; ask outside it and for `.git/`, `.loop/`, `.env*` (see below) | per `toolPermissions` | per `toolPermissions` |
 | `full-access` | allow | allow | allow | allow |
+| `plan` | as `read-only`, until you approve the plan ([below](#plan-mode)) | deny | read-only commands only | as `read-only` |
 
+- **Search tools** (`grep`, `glob` and `ls`) only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; `.git/` is never searched. They also skip every file a `read` deny rule (or the tool's own pattern deny) refuses for that file's path, so `"read(~/.ssh/*)": "deny"` keeps `~/.ssh` out of a search of your home directory; the result says how many paths were hidden.
+- **Protected names in `accept-edits`:** `.git`, `.loop` and `.env*` match without case (`.GIT` too), on the path as written and after symlinks are resolved. Only the part below the workspace counts. A path Loop cannot resolve asks.
 - **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
+- **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop mcp serve`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
 - **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), `$(…)`, backticks, variable assignments, and options that write or run programs (`find -exec`/`-delete`, `sort -o`, `rg --pre`, `git --output`) are refused.
 - **MCP tools in `read-only`** run when their server marks them read-only (`readOnlyHint`). The server sets that hint, so deny a tool in `toolPermissions` if you don't trust it.
 - **Session approvals:** "Accept all … for this session" in a prompt stops further prompts for that group (file edits, bash or web) in this session, including after `--resume`.
@@ -30,6 +34,18 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **One run:** `loop --permission-mode read-only`.
 - **This session:** `/permissions` lists the modes; `/permissions accept-edits` switches. The footer shows the current mode.
 
+### Plan mode
+
+- **Turning it on:** `/plan` (or `/permissions plan`, `--permission-mode plan`). The footer shows `plan`.
+- **While on:** the agent works as in `read-only`: it reads, searches and runs read-only commands, but can't edit files or run commands that change things. It writes its plan and calls `exit_plan` to ask you to approve it. The plan shows in the transcript.
+- **Approving:**
+  - **Approve the plan:** plan mode ends and the mode goes back to the one you had before `/plan`. The agent starts the work in the same turn.
+  - **Approve and accept edits from now on:** the same, but the mode becomes `accept-edits`.
+  - **Keep planning** (add a reason with **Tab**): the agent stays in plan mode and revises the plan.
+- **Unattended runs** (`--print`): nobody can approve, so the agent gives the plan as its answer and changes nothing.
+- **Subscription agents** get their `read-only` mode in plan mode; `exit_plan` is Loop's own tool.
+- Plan mode isn't one of the four modes `/permissions` switches between; it's listed after them.
+
 ### `full-access`
 
 - **Switching:** `/permissions full-access` asks you to repeat the command before it switches.
@@ -40,7 +56,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 
 ## Rules
 
-`toolPermissions` maps a tool to `allow`, `ask` or `deny`. A key can carry a pattern on the call's main argument: the command for `bash`, the path for `read`/`write`/`edit`, the URL for `web_fetch`, the query for `web_search`.
+`toolPermissions` maps a tool to `allow`, `ask` or `deny`. A key can carry a pattern on the call's main argument: the command for `bash`, the path for `read`/`write`/`edit`, the search root for `grep`/`glob`/`ls` (`.` when the call names none), the URL for `web_fetch`, the query for `web_search`.
 
 ```json
 {
@@ -50,6 +66,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
     "bash(cargo test*)": "allow",
     "bash(rm -rf *)": "deny",
     "write(~/secrets/*)": "deny",
+    "grep(~/secrets/*)": "deny",
     "write(src/generated/*)": "ask",
     "web_fetch(https://docs.rs/*)": "allow",
     "mcp__slack__*": "deny"
@@ -64,7 +81,7 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
   - An `allow` pattern applies only if **every** part matches an `allow` pattern. So `git status && rm -rf x` still asks.
   - A command that uses `$(…)`, backticks or `<(…)` never matches an `allow` pattern.
 - **A pattern `ask` still asks in `accept-edits`.**
-- **Loop has an approval prompt only for `write`, `edit`, `bash`, `web_fetch` and `web_search`.** An `ask` rule on any other tool (for example `read(~/.ssh/*)` or an MCP tool) refuses the call. Use `allow` or `deny` for those.
+- **Loop has an approval prompt only for `write`, `edit`, `bash`, `web_fetch`, `web_search` and plan mode's `exit_plan`.** An `ask` rule on any other tool (for example `read(~/.ssh/*)` or an MCP tool) refuses the call. Use `allow` or `deny` for those.
 - **A project's `.loop/settings.json`** can add `ask` and `deny` rules or make a rule stricter. It can't add `allow` rules or loosen a global rule.
 
 ## Subscription agents
@@ -77,12 +94,14 @@ Agents such as ChatGPT (codex-acp) run their own tools. Loop sets the agent's ow
 | `accept-edits` | `workspace-write` |
 | `full-access` | `agent-full-access` |
 
-The agent's permission requests then pass through hooks and the mode:
+The agent's permission requests are checked in this order:
 
-- **A hook block or allow** chooses the agent's own "reject once" or "allow once" option, never an "always" one.
-- **`full-access`** allows once.
-- **`read-only`** rejects edits and commands.
-- **Otherwise**, you are asked.
+1. **Session Policy off** rejects.
+2. **Deny rules** reject. A plain deny (`"bash": "deny"`) always applies. A pattern rule (`"bash(rm *)": "deny"`) matches only when the agent sends Loop's argument names: `command` as a string, `path`, `url` or `query`.
+3. **The mode's off state** rejects (`read-only` rejects edits and commands).
+4. **Hooks:** a block or allow chooses the agent's own "reject once" or "allow once" option, never an "always" one.
+5. **`full-access`** allows once.
+6. **Otherwise**, you are asked.
 
 Codex runs some commands without asking: read-only commands in `read-only` mode, and sandboxed commands in `workspace-write`. Loop sees those only as tool-call updates, after they run.
 

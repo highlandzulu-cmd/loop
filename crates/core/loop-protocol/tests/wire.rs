@@ -5,7 +5,7 @@
 use loop_protocol::{
     ContentBlock, ErrorCategory, ErrorInfo, InteractionOutcome, InteractionRequest, PermissionKind,
     PermissionOption, Role, SessionUpdate, StopReason, ToolCall, ToolCallStatus, ToolCallUpdate,
-    ToolContent, ToolKind, ToolLocation, UpdateEnvelope, PROTOCOL_VERSION,
+    ToolContent, ToolKind, ToolLocation, TurnOutcome, UpdateEnvelope, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 
@@ -56,6 +56,23 @@ fn message_chunk() {
             "message_id": "m1",
             "role": "agent",
             "content": {"type": "text", "text": "hi"}
+        }),
+    );
+}
+
+#[test]
+fn tool_call_preparing() {
+    roundtrip(
+        &SessionUpdate::ToolCallPreparing {
+            id: "c1".into(),
+            name: "write".into(),
+            kind: ToolKind::Edit,
+        },
+        json!({
+            "type": "tool_call_preparing",
+            "id": "c1",
+            "name": "write",
+            "kind": "edit"
         }),
     );
 }
@@ -208,4 +225,19 @@ fn retryable_follows_category() {
     assert!(ErrorInfo::new(ErrorCategory::Network, "x").retryable);
     assert!(!ErrorInfo::new(ErrorCategory::Quota, "x").retryable);
     assert!(!ErrorInfo::new(ErrorCategory::Auth, "x").retryable);
+}
+
+#[test]
+fn runtime_restart_ends_an_uncertain_turn() {
+    roundtrip(
+        &SessionUpdate::TurnEnded {
+            turn_id: "t1".into(),
+            stop: StopReason::RuntimeRestarted,
+            error: None,
+        },
+        json!({"type":"turn_ended","turn_id":"t1","stop":"runtime_restarted"}),
+    );
+    let result: loop_protocol::rpc::PromptResult =
+        serde_json::from_value(json!({"stop":"runtime_restarted"})).unwrap();
+    assert_eq!(TurnOutcome::from(result), TurnOutcome::Uncertain);
 }

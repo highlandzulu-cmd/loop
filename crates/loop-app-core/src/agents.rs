@@ -146,6 +146,12 @@ pub struct AgentSessionRecord {
     pub cwd: PathBuf,
     /// Unix epoch milliseconds.
     pub created_at: i64,
+    /// The first prompt sent, shortened; `/sessions` shows it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// When the last prompt was sent (unix ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<i64>,
 }
 
 /// Answers every interaction "rejected": used when no surface can ask the
@@ -286,6 +292,7 @@ impl AgentManager {
             .new_session(SessionSpec {
                 cwd: Some(self.cwd.clone()),
                 name: None,
+                ..Default::default()
             })
             .await?;
         self.refresh_models(id, backend.as_ref(), &probe).await
@@ -363,6 +370,7 @@ impl AgentManager {
             .new_session(SessionSpec {
                 cwd: Some(self.cwd.clone()),
                 name: None,
+                ..Default::default()
             })
             .await?;
         // Keep the cache current; a failure here is not worth failing the session.
@@ -371,7 +379,7 @@ impl AgentManager {
             let control = backend
                 .model_control()
                 .ok_or_else(|| anyhow!("{id} does not let Loop choose its model"))?;
-            control.set_model(&session, model).await?;
+            control.set_model(&session, model, None).await?;
         }
         // Carry the last chosen effort over when this model offers it.
         if let (Some(effort), Some(control)) = (self.effort(id), backend.model_control()) {
@@ -380,7 +388,7 @@ impl AgentManager {
                 .await
                 .is_ok_and(|e| e.models.iter().any(|m| m.id == effort));
             if offered {
-                let _ = control.set_effort(&session, &effort).await;
+                let _ = control.set_effort(&session, &effort, None).await;
             }
         }
         self.record(AgentSessionRecord {
@@ -388,6 +396,8 @@ impl AgentManager {
             agent: id.to_owned(),
             cwd: self.cwd.clone(),
             created_at: now_ms(),
+            title: None,
+            updated_at: None,
         })?;
         Ok((backend, session))
     }
@@ -419,6 +429,7 @@ impl AgentManager {
                 SessionSpec {
                     cwd: Some(record.cwd.clone()),
                     name: None,
+                    ..Default::default()
                 },
             )
             .await
@@ -505,6 +516,39 @@ impl AgentManager {
 
     fn models_path(&self, id: &str) -> PathBuf {
         self.state_dir.join(id).join("models.json")
+    }
+
+    /// Note a prompt sent in the recorded session `session_id`: the first
+    /// one becomes its title. Sessions Loop did not record are ignored.
+    pub fn note_prompt(&self, session_id: &str, prompt: &str) -> anyhow::Result<()> {
+        let mut records = read_index(&self.index_path).unwrap_or_default();
+        let Some(record) = records.iter_mut().find(|r| r.id == session_id) else {
+            return Ok(());
+        };
+        if record.title.is_none() {
+            record.title = crate::sessions::short_title(prompt);
+        }
+        record.updated_at = Some(now_ms());
+        write_index(&self.index_path, &records)
+    }
+
+    /// Give the recorded session `session_id` the title `name`.
+    pub fn rename(&self, session_id: &str, name: &str) -> anyhow::Result<()> {
+        let mut records = read_index(&self.index_path).unwrap_or_default();
+        if let Some(record) = records.iter_mut().find(|r| r.id == session_id) {
+            record.title = crate::sessions::short_title(name);
+            write_index(&self.index_path, &records)?;
+        }
+        Ok(())
+    }
+
+    /// Recorded sessions opened in `cwd` that had a prompt.
+    pub fn sessions_in(&self, cwd: &Path) -> Vec<AgentSessionRecord> {
+        read_index(&self.index_path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.cwd == cwd && r.title.is_some())
+            .collect()
     }
 
     fn record(&self, record: AgentSessionRecord) -> anyhow::Result<()> {
@@ -614,11 +658,48 @@ mod tests {
             agent: agent.into(),
             cwd: dir.path().into(),
             created_at: 1,
+            title: None,
+            updated_at: None,
         };
         manager.record(record("chatgpt")).unwrap();
         manager.record(record("other")).unwrap();
         assert_eq!(manager.find_session("s1").unwrap().agent, "other");
         assert!(manager.find_session("nope").is_none());
+    }
+
+    #[test]
+    fn the_first_prompt_titles_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = AgentManager::new(Vec::new(), dir.path().into(), dir.path());
+        manager
+            .record(AgentSessionRecord {
+                id: "s1".into(),
+                agent: "chatgpt".into(),
+                cwd: dir.path().into(),
+                created_at: 1,
+                title: None,
+                updated_at: None,
+            })
+            .unwrap();
+        assert!(
+            manager.sessions_in(dir.path()).is_empty(),
+            "a session without a prompt is not listed"
+        );
+        manager.note_prompt("s1", "Refactor\n the parser").unwrap();
+        manager.note_prompt("s1", "and then the lexer").unwrap();
+        manager.note_prompt("unknown", "ignored").unwrap();
+        let listed = manager.sessions_in(dir.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title.as_deref(), Some("Refactor the parser"));
+        assert!(listed[0].updated_at.is_some());
+        assert!(manager.sessions_in(Path::new("/elsewhere")).is_empty());
+    }
+
+    #[test]
+    fn old_session_records_still_load() {
+        let old = r#"[{"id":"s1","agent":"codex","cwd":"/w","createdAt":5}]"#;
+        let records: Vec<AgentSessionRecord> = serde_json::from_str(old).unwrap();
+        assert_eq!(records[0].title, None);
     }
 
     #[tokio::test]

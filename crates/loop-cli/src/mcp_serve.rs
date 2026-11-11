@@ -27,7 +27,11 @@ async fn bearer_auth(expected: Arc<Option<String>>, req: Request, next: Next) ->
             .and_then(|v| v.to_str().ok());
 
         match auth_header {
-            Some(value) if value == format!("Bearer {token}") => {}
+            Some(value)
+                if loop_wire::socket::constant_time_eq(
+                    value.as_bytes(),
+                    format!("Bearer {token}").as_bytes(),
+                ) => {}
             _ => {
                 return (
                     StatusCode::UNAUTHORIZED,
@@ -85,7 +89,8 @@ pub async fn run_mcp_server(
 
     let service = StreamableHttpService::new(
         move || {
-            let tools = harness.tools_snapshot();
+            let mut tools = harness.tools_snapshot();
+            tools.retain(|tool| gate.available(&tool.name));
             // Calls from MCP clients pass the same checks as the agent's.
             let provider = Arc::new(
                 LoopToolProvider::new(tools)

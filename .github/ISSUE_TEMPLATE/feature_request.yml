@@ -93,7 +93,7 @@ body:
     attributes:
       label: Alternatives and trade-offs
       description: |
-        What other designs did you consider, and why is this one better? Cover performance (latency, memory, allocations on hot paths), security/isolation impact, platform support (Linux/macOS/Windows), and maintenance cost. Mention prior art in other agent runtimes, if any.
+        What other designs did you consider, and why is this one better? Cover performance (latency, memory, allocations on hot paths), security/isolation impact, platform support (Linux/macOS), and maintenance cost. Mention prior art in other agent runtimes, if any.
     validations:
       required: true
 

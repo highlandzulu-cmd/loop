@@ -63,6 +63,45 @@ fn text(s: &str) -> Vec<ContentBlock> {
     vec![ContentBlock::text(s)]
 }
 
+/// The composer sends an attached image as an image block after the text;
+/// it reaches the Session's user message.
+#[tokio::test]
+async fn a_prompt_with_an_image_sends_it_with_the_text() {
+    use loop_agent::harness::SessionTreeEntry;
+    use loop_ai::{Message, UserContent, UserMessageContent};
+    let harness = harness(vec![FauxResponse::Text("a red square".into())], vec![]).await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = backend.current_session().await;
+    let image = ContentBlock::Image {
+        data: "iVBORw0KGgo=".into(),
+        mime_type: "image/png".into(),
+    };
+    let handle = backend
+        .prompt(
+            &session,
+            vec![ContentBlock::text("what is [image #1]"), image],
+        )
+        .await
+        .unwrap();
+    handle.outcome().await;
+    let entries = harness.read_session_entries().await.unwrap();
+    let user = entries
+        .iter()
+        .find_map(|entry| match entry {
+            SessionTreeEntry::Message { message, .. } => match message.as_llm() {
+                Some(Message::User(user)) => Some(user.clone()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the prompt is saved");
+    let UserMessageContent::Blocks(blocks) = &user.content else {
+        panic!("text and image blocks: {:?}", user.content);
+    };
+    assert!(matches!(&blocks[0], UserContent::Text(t) if t.text == "what is [image #1]"));
+    assert!(matches!(&blocks[1], UserContent::Image(i) if i.mime_type == "image/png"));
+}
+
 #[tokio::test]
 async fn prompt_streams_envelopes_and_resolves_once() {
     let backend = backend(vec![FauxResponse::Text("hello".into())], vec![]).await;
@@ -214,7 +253,7 @@ async fn services_are_available() {
     let shell = backend
         .local_shell()
         .unwrap()
-        .run(&session, "echo native-shell")
+        .run(&session, "echo native-shell", None)
         .await
         .unwrap();
     assert_eq!(shell.exit_code, 0);
@@ -333,4 +372,133 @@ async fn a_provider_error_is_reported_once() {
         })
         .count();
     assert_eq!(reports, 1, "{updates:?}");
+}
+
+fn turn_id(envelopes: &[UpdateEnvelope]) -> String {
+    envelopes
+        .iter()
+        .find_map(|e| match &e.update {
+            SessionUpdate::TurnStarted { turn_id } => Some(turn_id.0.clone()),
+            _ => None,
+        })
+        .expect("a turn start")
+}
+
+#[tokio::test]
+async fn switching_back_to_a_session_continues_its_turn_numbering() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let responses = (0..4)
+            .map(|n| FauxResponse::Text(format!("r{n}")))
+            .collect();
+        let backend = backend(responses, vec![]).await;
+        let first = backend.current_session().await;
+        // Turns recorded elsewhere, for example in the Runtime's Event Log.
+        backend.continue_turns_after(10);
+        let mut rx = backend.subscribe();
+        backend
+            .prompt(&first, text("a"))
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        assert_eq!(turn_id(&collect_turn(&mut rx).await), "turn-11");
+
+        let second = backend.new_session(SessionSpec::default()).await.unwrap();
+        backend
+            .prompt(&second, text("b"))
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        assert_eq!(turn_id(&collect_turn(&mut rx).await), "turn-1");
+
+        let first = backend
+            .load_session(&first, SessionSpec::default())
+            .await
+            .unwrap();
+        let mut rx = backend.subscribe();
+        backend
+            .prompt(&first, text("c"))
+            .await
+            .unwrap()
+            .outcome()
+            .await;
+        assert_eq!(turn_id(&collect_turn(&mut rx).await), "turn-12");
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn a_user_command_defaults_to_the_bash_maximum() {
+    let harness = harness(Vec::new(), Vec::new()).await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    // Unconfigured: 600 s, the bash.maxTimeoutMs default.
+    assert_eq!(backend.shell_timeout(None).unwrap(), 600_000);
+    harness.set_bash_limits(loop_agent::harness::tools::BashLimits {
+        default_timeout_ms: 1_000,
+        max_timeout_ms: 30_000,
+    });
+    // Not the bash tool's per-call default: the configured maximum.
+    assert_eq!(backend.shell_timeout(None).unwrap(), 30_000);
+    assert_eq!(backend.shell_timeout(Some(30_000)).unwrap(), 30_000);
+    assert!(backend.shell_timeout(Some(30_001)).is_err());
+    assert!(backend.shell_timeout(Some(0)).is_err());
+    let session = backend.current_session().await;
+    let refused = backend
+        .local_shell()
+        .unwrap()
+        .run(&session, "true", Some(30_001))
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("30000"), "{refused}");
+}
+
+/// A cancel after the turn's end, while its tree writes are pending, still
+/// releases the held end; the next prompt's updates flow.
+#[tokio::test]
+async fn a_cancel_while_the_turn_end_is_held_does_not_block_the_stream() {
+    let harness = harness(
+        vec![
+            FauxResponse::Text("first".into()),
+            FauxResponse::Text("second".into()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    let cancel = std::sync::Mutex::new(Some((Arc::clone(&backend), session.clone())));
+    harness.subscribe(move |event: loop_agent::AgentEvent| {
+        if matches!(event, loop_agent::AgentEvent::AgentEnd { .. }) {
+            if let Some((backend, session)) = cancel.lock().unwrap().take() {
+                backend.cancel(&session);
+            }
+        }
+        async {}
+    });
+    let first = backend.prompt(&session, text("one")).await.unwrap();
+    let _ = first.outcome().await;
+    assert!(collect_turn(&mut rx)
+        .await
+        .iter()
+        .any(|e| matches!(e.update, SessionUpdate::TurnEnded { .. })));
+    let second = backend.prompt(&session, text("two")).await.unwrap();
+    assert!(matches!(second.outcome().await, TurnOutcome::Completed(_)));
+    let updates: Vec<_> = collect_turn(&mut rx)
+        .await
+        .into_iter()
+        .map(|e| e.update)
+        .collect();
+    assert!(
+        matches!(
+            updates.last(),
+            Some(SessionUpdate::TurnEnded {
+                stop: StopReason::EndTurn,
+                ..
+            })
+        ),
+        "{updates:?}"
+    );
 }

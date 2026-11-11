@@ -220,3 +220,89 @@ async fn print_mode_refuses_what_needs_approval_unless_full_access() {
         );
     }
 }
+
+#[tokio::test]
+async fn stream_json_sees_every_update_and_json_gets_the_result() {
+    use loop_cli::print_mode::run_turn;
+    use loop_protocol::SessionUpdate;
+    let backend = backend(vec![FauxResponse::Text("hello".into())], true).await;
+    let session = backend.current_session().await;
+    let mut seen = Vec::new();
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |envelope| {
+        seen.push(serde_json::to_value(envelope).unwrap());
+    })
+    .await;
+    assert_eq!(report.exit_code(), 0);
+    let types: Vec<&str> = seen
+        .iter()
+        .map(|e| e["update"]["type"].as_str().unwrap())
+        .collect();
+    // Progress notices ("preparing turn…") may come before the turn starts.
+    assert_eq!(
+        types.iter().find(|t| **t != "notice"),
+        Some(&"turn_started"),
+        "{types:?}"
+    );
+    assert_eq!(types.last(), Some(&"turn_ended"), "{types:?}");
+    assert!(seen.iter().all(|e| e["session"] == session.key.to_string()));
+    assert!(matches!(
+        serde_json::from_value::<SessionUpdate>(seen.last().unwrap()["update"].clone()).unwrap(),
+        SessionUpdate::TurnEnded { .. }
+    ));
+
+    let result = report.result_json(&session);
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["text"], "hello");
+    assert_eq!(result["stop"], "end_turn");
+    assert_eq!(result["session"], session.key.to_string());
+    assert!(result["error"].is_null());
+}
+
+#[tokio::test]
+async fn a_failed_turn_exits_1_with_the_error_in_the_result() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(
+        vec![FauxResponse::Error("HTTP 502 Bad Gateway".into())],
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |_| {}).await;
+    assert_eq!(report.exit_code(), 1);
+    let result = report.result_json(&session);
+    assert_eq!(result["stop"], "error");
+    assert!(
+        result["error"].as_str().unwrap().contains("502"),
+        "{result}"
+    );
+}
+
+/// `--print` exits right after it prints, so the turn must be saved by
+/// then, or `--resume` finds only the prompt. The real binary runs on
+/// several threads, where the turn's task may still be saving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_turn_is_saved_before_print_returns() {
+    use loop_agent::harness::SessionTreeEntry;
+    let (backend, harness) =
+        backend_with(vec![FauxResponse::Text("saved".into())], true, vec![]).await;
+    let session = backend.current_session().await;
+    print_turn(backend.as_ref(), &session, "hi".into())
+        .await
+        .unwrap();
+    // The harness saves the turn, then goes idle.
+    assert_eq!(
+        harness.phase(),
+        loop_agent::harness::AgentHarnessPhase::Idle
+    );
+    let roles: Vec<String> = harness
+        .read_session_entries()
+        .await
+        .unwrap()
+        .iter()
+        .filter_map(|entry| match entry {
+            SessionTreeEntry::Message { message, .. } => Some(message.role().to_owned()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(roles, ["user", "assistant"]);
+}

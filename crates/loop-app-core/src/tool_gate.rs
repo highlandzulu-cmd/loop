@@ -19,16 +19,20 @@ use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
 use loop_agent::harness::{
-    AgentHarness, HarnessHookEvent, HookRegistry, ToolCallInfo, ToolDecision, ToolSource,
+    AgentHarness, HarnessHookEvent, HookRegistry, SearchFilter, ToolCallInfo, ToolDecision,
+    ToolSource, EXIT_PLAN_TOOL,
 };
-use loop_agent::{AfterToolCallFn, BeforeToolCallFn, BeforeToolCallResult, ToolCall};
+use loop_agent::{
+    AfterToolCallFn, BeforeToolCallContext, BeforeToolCallFn, BeforeToolCallResult, ToolCall,
+};
 use loop_ai::{TextContent, ToolResultContent};
 use parking_lot::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use loop_protocol::ToolKind;
 
-use crate::permissions::{Decision, PermissionMode};
-use crate::tool_approval::{ToolApprovalBridge, ToolPermission};
+use crate::permissions::{Call, Decision, PermissionMode, Policy};
+use crate::tool_approval::{PlanReview, ToolApprovalBridge, ToolPermission};
 
 /// Why a call that needs approval is refused when nobody can approve it,
 /// naming a mode that would allow it.
@@ -63,6 +67,10 @@ pub struct ToolGate {
     hooks: Mutex<Option<HookRegistry>>,
     harness: Mutex<Weak<AgentHarness>>,
     mode: Mutex<PermissionMode>,
+    /// The mode plan mode was entered from, which approving a plan returns
+    /// to.
+    plan_return: Mutex<PermissionMode>,
+    policy: Mutex<Policy>,
     workspace: Mutex<Option<PathBuf>>,
     /// Calls allowed without asking, counted by [`call_key`]; their
     /// after-call review is skipped. Keyed by more than the id, which a
@@ -70,6 +78,33 @@ pub struct ToolGate {
     allowed: Mutex<HashMap<String, usize>>,
     /// MCP servers, for the tools they mark read-only.
     mcp: Mutex<Option<Arc<loop_mcp::McpClientManager>>>,
+    /// Told the new mode when approving a plan changes it, so the Session
+    /// can record it for every attached Surface.
+    mode_recorder: Mutex<Option<ModeRecorder>>,
+}
+
+/// See [`ToolGate::set_mode_recorder`].
+pub type ModeRecorder = Arc<
+    dyn Fn(PermissionMode) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// A recorder that writes the mode into `native`'s current Session. It holds
+/// the backend weakly, so the gate never keeps it alive.
+pub fn mode_recorder(native: &Arc<loop_agent::native_backend::NativeBackend>) -> ModeRecorder {
+    let native = Arc::downgrade(native);
+    Arc::new(move |mode| {
+        let native = native.clone();
+        Box::pin(async move {
+            let Some(native) = native.upgrade() else {
+                return;
+            };
+            if let Err(error) = native.record_gate_mode(mode.as_str()).await {
+                tracing::warn!(%error, "record permission mode");
+            }
+        })
+    })
 }
 
 impl ToolGate {
@@ -81,6 +116,17 @@ impl ToolGate {
         })
     }
 
+    /// Create a gate bound to a Session's workspace before tools are built.
+    /// Relative call paths and Policy checks never use the process cwd.
+    pub fn new_for_workspace(
+        permissions: BTreeMap<String, ToolPermission>,
+        cwd: &std::path::Path,
+    ) -> Arc<Self> {
+        let gate = Self::new(permissions);
+        gate.set_workspace(crate::permissions::workspace_root(cwd));
+        gate
+    }
+
     /// Install the gate into `harness`'s tool slots and run its hooks.
     pub fn install(self: &Arc<Self>, harness: &Arc<AgentHarness>) {
         self.workspace
@@ -90,6 +136,57 @@ impl ToolGate {
         *self.harness.lock() = Arc::downgrade(harness);
         harness.set_before_tool_call(Some(self.before_hook()));
         harness.set_after_tool_call(Some(self.after_hook()));
+        let gate = Arc::clone(self);
+        harness.set_tool_filter(Some(Arc::new(move |tool| gate.available(tool))));
+    }
+
+    /// Whether `tool` is offered to the model: a tool whose Capability is
+    /// off is taken out of the toolset, not just refused.
+    pub fn available(&self, tool: &str) -> bool {
+        let call = Call {
+            kind: self.kind_now(tool),
+            ..Call::new(tool, serde_json::Value::Null, self.workspace())
+        };
+        self.policy.lock().available(self.mode(), &call)
+    }
+
+    /// The Policy layers over the mode.
+    pub fn policy(&self) -> Policy {
+        self.policy.lock().clone()
+    }
+
+    /// Replace the Policy layers over the mode; applies to the next call.
+    pub fn set_policy(&self, policy: Policy) {
+        *self.policy.lock() = policy;
+        self.allowed.lock().clear();
+    }
+
+    /// [`Self::kind`] without waiting. While the MCP server list is being
+    /// changed, an MCP tool counts as a read, so it stays listed; the gate
+    /// still checks each call.
+    fn kind_now(&self, tool: &str) -> ToolKind {
+        let kind = loop_agent::protocol_events::tool_kind(tool);
+        let mcp = self.mcp.lock().clone();
+        let (Some(mcp), Some((server, name))) = (
+            mcp,
+            loop_agent::harness::mcp::bridge::parse_mcp_tool_name(tool),
+        ) else {
+            return kind;
+        };
+        let read_only = match mcp.connections().try_read() {
+            Ok(connections) => connections.get(server).is_some_and(|conn| {
+                conn.tools.iter().any(|t| {
+                    t.name == name
+                        && t.annotations.as_ref().and_then(|a| a.read_only_hint) == Some(true)
+                })
+            }),
+            Err(_) => true,
+        };
+        if read_only {
+            ToolKind::Read
+        } else {
+            kind
+        }
     }
 
     /// The active permission mode.
@@ -99,9 +196,17 @@ impl ToolGate {
 
     /// Switch the permission mode; applies to the next call.
     pub fn set_mode(&self, mode: PermissionMode) {
-        *self.mode.lock() = mode;
+        let before = std::mem::replace(&mut *self.mode.lock(), mode);
+        if mode == PermissionMode::Plan && before != PermissionMode::Plan {
+            *self.plan_return.lock() = before;
+        }
         // A call allowed under the old mode is reviewed under the new one.
         self.allowed.lock().clear();
+    }
+
+    /// Call `recorder` with the new mode when approving a plan changes it.
+    pub fn set_mode_recorder(&self, recorder: Option<ModeRecorder>) {
+        *self.mode_recorder.lock() = recorder;
     }
 
     /// Look up MCP tools' `readOnlyHint` in `mcp`'s servers.
@@ -137,18 +242,17 @@ impl ToolGate {
             .unwrap_or_default()
     }
 
-    /// What the mode says about a call, before hooks and the approver.
+    /// What the mode and the Policy say about a call, before hooks and the
+    /// approver.
     pub async fn decide(&self, tool: &str, args: &serde_json::Value) -> Decision {
-        let workspace = self.workspace();
-        let rule = crate::permissions::rule_for(&self.permissions.lock(), tool, args, &workspace);
-        crate::permissions::decide(
-            self.mode(),
-            rule,
-            tool,
-            self.kind(tool).await,
-            args,
-            &workspace,
-        )
+        let call = self.call(tool, args).await;
+        self.policy
+            .lock()
+            .decide(self.mode(), &self.permissions.lock(), &call)
+    }
+
+    async fn call(&self, tool: &str, args: &serde_json::Value) -> Call {
+        Call::resolve(tool, self.kind(tool).await, args, &self.workspace())
     }
 
     /// Run `hooks` without a harness (tests, hosts that only gate agents).
@@ -156,8 +260,30 @@ impl ToolGate {
         *self.hooks.lock() = Some(hooks);
     }
 
+    /// The `toolPermissions` deny rule that refuses an external agent's
+    /// call, if any. Deny rules name Loop's own tools, so the call is
+    /// checked as each Loop tool of its kind (`bash` for a command, `write`
+    /// and `edit` for an edit, and so on) with the agent's raw input.
+    pub fn agent_call_denied(&self, kind: ToolKind, args: &serde_json::Value) -> Option<String> {
+        let tools: &[&str] = match kind {
+            ToolKind::Execute => &["bash"],
+            ToolKind::Edit | ToolKind::Delete | ToolKind::Move => &["write", "edit"],
+            ToolKind::Read => &["read"],
+            ToolKind::Search => &["grep", "glob", "ls"],
+            ToolKind::Fetch => &["web_fetch", "web_search"],
+            ToolKind::Think | ToolKind::Other => &[],
+        };
+        let rules = self.permissions.lock();
+        let workspace = self.workspace();
+        tools.iter().find_map(|tool| {
+            let call = Call::resolve(tool, kind, args, &workspace);
+            let rule = crate::permissions::rule_for(&rules, &call);
+            (rule.permission == ToolPermission::Deny)
+                .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
+        })
+    }
+
     /// The `tool_call` hooks' decision about an external agent's call.
-    /// Deny rules name Loop's own tools, so they do not apply here.
     pub async fn review_agent_call(&self, info: ToolCallInfo) -> Option<ToolDecision> {
         let hooks = self.hooks()?;
         hooks.emit(HarnessHookEvent::ToolCall(info)).await.decision
@@ -197,29 +323,37 @@ impl ToolGate {
 
     /// Ask the user through `approver` (TUI, desktop); `None` runs headless.
     pub fn set_approver(&self, approver: Option<Arc<ToolApprovalBridge>>) {
-        if let Some(approver) = &approver {
-            approver.set_permissions(self.permissions.lock().clone());
-        }
         *self.approver.lock() = approver;
+    }
+
+    /// What the search tools hide: files the current `toolPermissions` deny
+    /// to `read` or to the tool itself ([`crate::permissions::search_may_show`]).
+    pub fn search_filter(self: &Arc<Self>) -> SearchFilter {
+        let gate = Arc::downgrade(self);
+        let home = dirs::home_dir();
+        Arc::new(move |tool: &str, path: &std::path::Path| {
+            let Some(gate) = gate.upgrade() else {
+                return true;
+            };
+            let workspace = gate.workspace();
+            let rules = gate.permissions.lock();
+            crate::permissions::search_may_show(&rules, tool, path, &workspace, home.as_deref())
+        })
+    }
+
+    /// The `toolPermissions` rules in force.
+    pub fn permissions(&self) -> BTreeMap<String, ToolPermission> {
+        self.permissions.lock().clone()
     }
 
     /// Replace the per-tool permissions (settings changed).
     pub fn set_permissions(&self, permissions: BTreeMap<String, ToolPermission>) {
-        if let Some(approver) = self.approver() {
-            approver.set_permissions(permissions.clone());
-        }
         *self.permissions.lock() = permissions;
         self.allowed.lock().clear();
     }
 
     fn approver(&self) -> Option<Arc<ToolApprovalBridge>> {
         self.approver.lock().clone()
-    }
-
-    /// Why `tool` may not run at all, by its plain `toolPermissions` rule.
-    pub fn denied(&self, tool: &str) -> Option<String> {
-        (self.permissions.lock().get(tool) == Some(&ToolPermission::Deny))
-            .then(|| format!("Tool `{tool}` is denied by settings.toolPermissions"))
     }
 
     fn mark_allowed(&self, call: &ToolCall, args: &serde_json::Value) {
@@ -243,6 +377,60 @@ impl ToolGate {
         }
     }
 
+    /// Ask the user to approve the plan in an `exit_plan` call. Approved,
+    /// the call runs and the mode goes back to the one plan mode was entered
+    /// from (or to `accept-edits`, if the user chose that).
+    async fn review_plan(
+        &self,
+        ctx: &BeforeToolCallContext,
+        cancel: Option<CancellationToken>,
+    ) -> Option<BeforeToolCallResult> {
+        let block = |reason: String| {
+            Some(BeforeToolCallResult {
+                block: true,
+                reason: Some(reason),
+            })
+        };
+        let Some(approver) = self.approver() else {
+            return block(
+                "Plan mode ends when the user approves the plan, and nobody can approve it in \
+                 this run. Give the plan as your answer instead."
+                    .into(),
+            );
+        };
+        let plan = ctx
+            .args
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let back = *self.plan_return.lock();
+        match approver.review_plan(plan, back.as_str(), cancel).await {
+            PlanReview::Approved { accept_edits } => {
+                let mode = if accept_edits {
+                    PermissionMode::AcceptEdits
+                } else {
+                    back
+                };
+                self.set_mode(mode);
+                let recorder = self.mode_recorder.lock().clone();
+                if let Some(recorder) = recorder {
+                    recorder(mode).await;
+                }
+                None
+            }
+            PlanReview::KeepPlanning(reason) => block(match reason {
+                Some(reason) => format!(
+                    "The user wants changes to the plan: {reason}. Stay in plan mode, revise the \
+                     plan and call {EXIT_PLAN_TOOL} again."
+                ),
+                None => format!(
+                    "The user did not approve the plan. Stay in plan mode: ask what to change, \
+                     or revise the plan and call {EXIT_PLAN_TOOL} again."
+                ),
+            }),
+        }
+    }
+
     /// The gate's before-call check, for callers outside the harness
     /// (`mcp serve`).
     pub fn before_hook(self: &Arc<Self>) -> BeforeToolCallFn {
@@ -260,6 +448,10 @@ impl ToolGate {
                 if let Decision::Deny(reason) = decision {
                     return block(reason);
                 }
+                // Only the user ends plan mode: hooks don't decide this one.
+                if ctx.tool_call.name == EXIT_PLAN_TOOL {
+                    return gate.review_plan(&ctx, cancel).await;
+                }
                 if let Some(hooks) = gate.hooks() {
                     let info = gate.call_info(&ctx.tool_call, &ctx.args).await;
                     let emit = hooks.emit(HarnessHookEvent::ToolCall(info));
@@ -275,8 +467,12 @@ impl ToolGate {
                     match outcome.decision {
                         Some(ToolDecision::Block { reason }) => return block(reason),
                         Some(ToolDecision::Allow) => {
-                            gate.mark_allowed(&ctx.tool_call, &ctx.args);
-                            return None;
+                            // A Policy layer's "ask" holds even against a hook.
+                            let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
+                            if !gate.policy.lock().requires_ask(&call) {
+                                gate.mark_allowed(&ctx.tool_call, &ctx.args);
+                                return None;
+                            }
                         }
                         None => {}
                     }
@@ -298,7 +494,13 @@ impl ToolGate {
                             ctx.tool_call.name
                         ))
                     }
-                    Some(approver) => approver.review_before_tool(ctx, cancel).await,
+                    Some(approver) => {
+                        let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
+                        let ignore_grants = gate.policy.lock().requires_ask(&call);
+                        approver
+                            .review_before_tool(ctx, cancel, ignore_grants)
+                            .await
+                    }
                     None => block(headless_refusal(&ctx.tool_call.name, gate.mode())),
                 }
             })
@@ -314,7 +516,11 @@ impl ToolGate {
                 let allowed = gate.take_allowed(&ctx.tool_call, &ctx.args);
                 let patch = match gate.approver() {
                     Some(approver) if !allowed => {
-                        approver.review_after_file_tool(ctx.clone(), cancel).await
+                        let call = gate.call(&ctx.tool_call.name, &ctx.args).await;
+                        let ignore_grants = gate.policy.lock().requires_ask(&call);
+                        approver
+                            .review_after_file_tool(ctx.clone(), cancel, ignore_grants)
+                            .await
                     }
                     _ => None,
                 };
@@ -465,11 +671,11 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         );
-        let gate = ToolGate::new(permissions.clone());
+        let gate = ToolGate::new(permissions);
         let env: Arc<dyn loop_agent::harness::ExecutionEnv> = Arc::new(
             loop_agent::harness::HostExecutionEnv::new(std::env::temp_dir()),
         );
-        let (bridge, prompts) = ToolApprovalBridge::new(env, None, permissions, Default::default());
+        let (bridge, prompts) = ToolApprovalBridge::new(env, None, Default::default());
         gate.set_approver(Some(Arc::new(bridge)));
         (gate, prompts)
     }
@@ -650,6 +856,171 @@ mod tests {
         assert!(
             !gate.take_allowed(&inside.tool_call, &inside.args),
             "changing mode forgets earlier allows"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_takes_off_tools_out_of_the_toolset() {
+        let gate = ToolGate::new(BTreeMap::new());
+        gate.set_mode(PermissionMode::ReadOnly);
+        for (tool, offered) in [
+            ("read", true),
+            ("bash", true),
+            ("web_fetch", true),
+            ("write", false),
+            ("edit", false),
+            ("mcp__github__create_issue", false),
+        ] {
+            assert_eq!(gate.available(tool), offered, "{tool}");
+        }
+        let refused = gate.before_hook()(call("write"), None).await.unwrap();
+        assert!(refused.block, "a call to a removed tool is still refused");
+        gate.set_mode(PermissionMode::Ask);
+        assert!(gate.available("write") && gate.available("mcp__github__create_issue"));
+    }
+
+    #[tokio::test]
+    async fn policy_layers_beat_the_mode_and_hooks() {
+        use crate::permissions::{Capability, Layer, LayerSource, Policy, Setting, State};
+        let (gate, mut prompts) = gate_with_approver(&[("bash", "ask")]);
+        gate.set_mode(PermissionMode::FullAccess);
+        let (_dir, registry) = hooks(&[serde_json::json!(
+            {"on": "tool_call", "action": {"allow": true}}
+        )]);
+        gate.set_hooks(registry);
+        let (policy, _) = Policy::new(vec![
+            Layer::new(LayerSource::Org).set(Capability::WriteFiles, Setting::always(State::Off)),
+            Layer::new(LayerSource::Org).set(Capability::Shell, Setting::always(State::Ask)),
+        ]);
+        gate.set_policy(policy);
+
+        let write = gate.before_hook()(call("write"), None).await.unwrap();
+        assert!(write.reason.unwrap().contains("Org Policy turns off"));
+        assert!(
+            !gate.available("write"),
+            "off in a layer leaves the toolset"
+        );
+
+        gate.approver().unwrap().grant_session("bash");
+        let gate_for_bash = Arc::clone(&gate);
+        let bash =
+            tokio::spawn(async move { gate_for_bash.before_hook()(call("bash"), None).await });
+        let prompt = prompts
+            .recv()
+            .await
+            .expect("a layer's ask is not skipped by a hook");
+        assert_eq!(prompt.tool_name, "bash");
+        drop(prompt);
+        let _ = bash.await;
+    }
+
+    fn exit_plan() -> BeforeToolCallContext {
+        let mut ctx = call("exit_plan");
+        ctx.args = serde_json::json!({"plan": "1. Edit main.rs\n2. Run the tests"});
+        ctx.tool_call.arguments = ctx.args.clone();
+        ctx
+    }
+
+    #[tokio::test]
+    async fn the_user_approves_the_plan_to_leave_plan_mode() {
+        use crate::tool_approval::{ApprovalDecision, ApprovalKind};
+        let (gate, mut prompts) = gate_with_approver(&[]);
+        for (decision, then) in [
+            (ApprovalDecision::Accept, PermissionMode::Ask),
+            (ApprovalDecision::AcceptSession, PermissionMode::AcceptEdits),
+        ] {
+            gate.set_mode(PermissionMode::Ask);
+            gate.set_mode(PermissionMode::Plan);
+            let before = gate.before_hook();
+            let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+            let prompt = prompts.recv().await.unwrap();
+            assert_eq!(prompt.kind, ApprovalKind::Plan);
+            assert!(prompt.detail.contains("Run the tests"), "{}", prompt.detail);
+            prompt.response_tx.send(decision).unwrap();
+            assert!(pending.await.unwrap().is_none(), "approved: the call runs");
+            assert_eq!(gate.mode(), then);
+        }
+
+        gate.set_mode(PermissionMode::Plan);
+        let before = gate.before_hook();
+        let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+        let prompt = prompts.recv().await.unwrap();
+        prompt
+            .response_tx
+            .send(ApprovalDecision::Reject {
+                reason: Some("also update the docs".into()),
+            })
+            .unwrap();
+        let blocked = pending.await.unwrap().expect("kept planning");
+        assert!(blocked.reason.unwrap().contains("also update the docs"));
+        assert_eq!(gate.mode(), PermissionMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn approving_a_plan_tells_the_recorder_the_new_mode() {
+        let (gate, mut prompts) = gate_with_approver(&[]);
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let sink = told.clone();
+        gate.set_mode_recorder(Some(Arc::new(move |mode| {
+            let sink = sink.clone();
+            Box::pin(async move { sink.lock().push(mode) })
+        })));
+        gate.set_mode(PermissionMode::FullAccess);
+        gate.set_mode(PermissionMode::Plan);
+        let before = gate.before_hook();
+        let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+        let prompt = prompts.recv().await.unwrap();
+        assert!(told.lock().is_empty(), "entering plan is not the gate's");
+        prompt
+            .response_tx
+            .send(crate::tool_approval::ApprovalDecision::Accept)
+            .unwrap();
+        assert!(pending.await.unwrap().is_none());
+        assert_eq!(*told.lock(), vec![PermissionMode::FullAccess]);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_returns_to_the_mode_it_was_entered_from() {
+        let (gate, mut prompts) = gate_with_approver(&[]);
+        gate.set_mode(PermissionMode::FullAccess);
+        gate.set_mode(PermissionMode::Plan);
+        gate.set_mode(PermissionMode::Plan);
+        let before = gate.before_hook();
+        let pending = tokio::spawn(async move { before(exit_plan(), None).await });
+        let prompt = prompts.recv().await.unwrap();
+        prompt
+            .response_tx
+            .send(crate::tool_approval::ApprovalDecision::Accept)
+            .unwrap();
+        assert!(pending.await.unwrap().is_none());
+        assert_eq!(gate.mode(), PermissionMode::FullAccess);
+    }
+
+    #[tokio::test]
+    async fn nobody_can_approve_a_plan_headless() {
+        let gate = ToolGate::new(BTreeMap::new());
+        gate.set_mode(PermissionMode::Plan);
+        let blocked = gate.before_hook()(exit_plan(), None)
+            .await
+            .expect("refused");
+        assert!(blocked.reason.unwrap().contains("nobody can approve"));
+        assert_eq!(gate.mode(), PermissionMode::Plan);
+    }
+
+    #[test]
+    fn the_search_filter_hides_what_the_rules_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ToolGate::new(crate::tool_approval::permissions_from_settings(
+            &BTreeMap::from([("read(secret/*)".into(), "deny".into())]),
+        ));
+        gate.set_workspace(dir.path().to_path_buf());
+        let filter = gate.search_filter();
+        assert!(!filter("grep", &dir.path().join("secret/key")));
+        assert!(filter("grep", &dir.path().join("src/main.rs")));
+        gate.set_permissions(BTreeMap::new());
+        assert!(
+            filter("grep", &dir.path().join("secret/key")),
+            "the filter reads the rules at each call"
         );
     }
 

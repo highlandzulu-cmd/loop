@@ -1,0 +1,5567 @@
+{
+  "$defs": {
+    "AdminAction": {
+      "description": "What `workspace/mcp` and `workspace/skills` do.",
+      "oneOf": [
+        {
+          "const": "list",
+          "description": "Read the current state.",
+          "type": "string"
+        },
+        {
+          "const": "enable",
+          "description": "Enable `name`.",
+          "type": "string"
+        },
+        {
+          "const": "disable",
+          "description": "Disable `name`.",
+          "type": "string"
+        },
+        {
+          "const": "reload",
+          "description": "Reconnect every enabled server (`workspace/mcp` only).",
+          "type": "string"
+        }
+      ]
+    },
+    "AttachParams": {
+      "description": "`session/attach` params.",
+      "properties": {
+        "after_seq": {
+          "description": "Last processed update sequence; zero replays from the beginning.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session to attach."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "AttachResult": {
+      "description": "`session/attach` result, sent before replay and live updates.",
+      "properties": {
+        "generation": {
+          "description": "Runtime generation of the snapshot.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "latest_seq": {
+          "description": "Last update sequence in the replay snapshot, not an audit cursor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "snapshot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Session's state at `latest_seq`, from servers with the\n`attach_snapshot` capability."
+        }
+      },
+      "required": [
+        "latest_seq",
+        "generation"
+      ],
+      "type": "object"
+    },
+    "BackendInstanceId": {
+      "description": "One configured backend: an agent kind plus its account and settings.",
+      "type": "string"
+    },
+    "Capabilities": {
+      "description": "Features a backend declares. Each must match what the backend can actually\ndo: a surface hides or rejects an operation whose capability is false.",
+      "properties": {
+        "attach": {
+          "default": false,
+          "description": "Supports attach, cursor replay and detach.",
+          "type": "boolean"
+        },
+        "attach_snapshot": {
+          "default": false,
+          "description": "`session/attach` returns a Session snapshot with its result.",
+          "type": "boolean"
+        },
+        "branch_snapshot": {
+          "description": "Serves immutable transcript pages.",
+          "type": "boolean"
+        },
+        "compaction": {
+          "description": "Compacts the Session's context on request (`session/compact`).",
+          "type": "boolean"
+        },
+        "efforts": {
+          "default": false,
+          "description": "Has selectable reasoning effort levels (`session/efforts`).",
+          "type": "boolean"
+        },
+        "fs_client": {
+          "default": false,
+          "description": "Sends file reads and writes to Loop instead of touching disk itself.",
+          "type": "boolean"
+        },
+        "host_defaults": {
+          "description": "Reads and saves new-Session defaults (`runtime/defaults`); host-local only.",
+          "type": "boolean"
+        },
+        "host_mcp_auth": {
+          "description": "MCP OAuth credentials; host-local only.",
+          "type": "boolean"
+        },
+        "host_providers": {
+          "description": "Provider credentials; host-local only.",
+          "type": "boolean"
+        },
+        "host_tracing": {
+          "description": "Telemetry configuration; host-local only.",
+          "type": "boolean"
+        },
+        "host_usage": {
+          "description": "Pages the host's usage log (`runtime/usage`); host-local only.",
+          "type": "boolean"
+        },
+        "images": {
+          "default": false,
+          "description": "Accepts images in prompts.",
+          "type": "boolean"
+        },
+        "load_session": {
+          "default": false,
+          "description": "Can reopen a past session, replaying its history.",
+          "type": "boolean"
+        },
+        "local_shell": {
+          "description": "Runs a user command in the Session's environment (`session/shell`).",
+          "type": "boolean"
+        },
+        "modes": {
+          "default": false,
+          "description": "Has selectable session modes.",
+          "type": "boolean"
+        },
+        "multi_session": {
+          "default": false,
+          "description": "Manages several Sessions through list and close requests.",
+          "type": "boolean"
+        },
+        "permission_mode": {
+          "description": "Reads and sets the Session's permission mode (`session/permission_mode`).",
+          "type": "boolean"
+        },
+        "resume_session": {
+          "default": false,
+          "description": "Can reopen a past session without replaying history.",
+          "type": "boolean"
+        },
+        "runtime_sessions": {
+          "description": "Lists loaded Sessions for the Runtime panel (`runtime/sessions`).",
+          "type": "boolean"
+        },
+        "runtime_stop_empty": {
+          "description": "Host-local, atomic stop only when no Sessions are loaded.",
+          "type": "boolean"
+        },
+        "session_config": {
+          "description": "Returns the current Session snapshot without attaching.",
+          "type": "boolean"
+        },
+        "session_environment": {
+          "description": "Accepts a caller environment in session/new.",
+          "type": "boolean"
+        },
+        "session_fork": {
+          "description": "Creates separately leased forks and clones.",
+          "type": "boolean"
+        },
+        "session_rename": {
+          "description": "Changes Session metadata.",
+          "type": "boolean"
+        },
+        "session_sandbox": {
+          "description": "Reads and replaces the Session's sandbox (`session/sandbox`).",
+          "type": "boolean"
+        },
+        "session_skills": {
+          "description": "Activates Session skills.",
+          "type": "boolean"
+        },
+        "session_stats": {
+          "description": "Reports Session token statistics (`session/stats`).",
+          "type": "boolean"
+        },
+        "session_transfer": {
+          "description": "Transfers bounded Session payloads.",
+          "type": "boolean"
+        },
+        "session_tree": {
+          "description": "Lists and navigates Session branches.",
+          "type": "boolean"
+        },
+        "session_ttfb": {
+          "description": "Reads and overrides the Session's response timeout (`session/ttfb`).",
+          "type": "boolean"
+        },
+        "set_model": {
+          "default": false,
+          "description": "Can switch models within a session.",
+          "type": "boolean"
+        },
+        "steering": {
+          "default": false,
+          "description": "Accepts more input while a turn is running.",
+          "type": "boolean"
+        },
+        "terminal_client": {
+          "default": false,
+          "description": "Runs commands through Loop's terminal instead of its own.",
+          "type": "boolean"
+        },
+        "usage": {
+          "default": false,
+          "description": "Reports token usage.",
+          "type": "boolean"
+        },
+        "workflow": {
+          "description": "Starts workflows and streams progress.",
+          "type": "boolean"
+        },
+        "workspace_mcp": {
+          "description": "Lists and toggles workspace MCP servers (`workspace/mcp`).",
+          "type": "boolean"
+        },
+        "workspace_reload": {
+          "description": "Rereads workspace definitions (`workspace/reload`).",
+          "type": "boolean"
+        },
+        "workspace_settings": {
+          "description": "Reads redacted effective workspace settings.",
+          "type": "boolean"
+        },
+        "workspace_skills": {
+          "description": "Lists and toggles workspace skills (`workspace/skills`).",
+          "type": "boolean"
+        },
+        "workspace_templates": {
+          "description": "Lists and renders prompt templates (`workspace/templates`).",
+          "type": "boolean"
+        },
+        "workspace_trust": {
+          "description": "Reads workspace trust; changes it host-locally (`workspace/trust`).",
+          "type": "boolean"
+        },
+        "workspace_web_search": {
+          "description": "Reads and changes workspace web search (`workspace/web_search`).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Choice": {
+      "description": "One choice in a question.",
+      "properties": {
+        "label": {
+          "description": "Label to show.",
+          "type": "string"
+        },
+        "native_id": {
+          "description": "The backend's own choice id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "native_id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "ChoiceInfo": {
+      "description": "One effort level or mode.",
+      "properties": {
+        "id": {
+          "description": "Id to pass to the setter.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "ChoicesResult": {
+      "description": "`session/efforts` and `session/modes` result.",
+      "properties": {
+        "choices": {
+          "description": "Every choice on offer.",
+          "items": {
+            "$ref": "#/$defs/ChoiceInfo"
+          },
+          "type": "array"
+        },
+        "current": {
+          "description": "The current choice's id, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "choices",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "ClientCapabilities": {
+      "description": "What a client can do for the server.",
+      "properties": {
+        "branch_reset": {
+          "description": "Replaces its transcript when a branch reset arrives.",
+          "type": "boolean"
+        },
+        "interact": {
+          "default": false,
+          "description": "Answers `host/interact` (permission prompts, questions).",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "CloneParams": {
+      "description": "Copy a whole committed active branch into a new Session.",
+      "properties": {
+        "name": {
+          "default": null,
+          "description": "Session display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "description": "Stable retry id; reuse only for identical parameters.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "CloseParams": {
+      "description": "`session/close` params. Closing a busy Session requires `force`.",
+      "properties": {
+        "force": {
+          "description": "Cancel a running turn before closing. Defaults to false.",
+          "type": "boolean"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session to close."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "CompactParams": {
+      "description": "`session/compact` params.",
+      "properties": {
+        "instructions": {
+          "description": "Guidance for the summary.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "CompactionReport": {
+      "description": "Result of compacting a conversation (`session/compact`).",
+      "properties": {
+        "branch_revision": {
+          "default": 0,
+          "description": "The committed branch revision after compaction; 0 when the backend\ndoes not count branch changes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "default": 0,
+          "description": "The update sequence that announced the compaction; 0 when the\nbackend keeps no ordered Event Log.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "summary": {
+          "description": "The summary that replaced the earlier conversation.",
+          "type": "string"
+        },
+        "tokens_before": {
+          "description": "Estimated tokens before compaction, when known.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "summary"
+      ],
+      "type": "object"
+    },
+    "ConfigChanged": {
+      "description": "A Session's complete public config after a change (`config_changed`).",
+      "properties": {
+        "applies_after_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn after which `config` takes effect, while `pending`."
+        },
+        "config": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The selected config: what the next turn uses."
+        },
+        "effective": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The config the current turn runs with; equals `config` unless\n`pending`."
+        },
+        "metadata": {
+          "$ref": "#/$defs/SessionMetadata",
+          "default": {},
+          "description": "Session metadata."
+        },
+        "pending": {
+          "default": false,
+          "description": "Part of `config` waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workspace_revision": {
+          "default": 0,
+          "description": "Revision of the workspace definitions the Session uses.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "type": "object"
+    },
+    "ContentBlock": {
+      "anyOf": [
+        {
+          "description": "Plain text.",
+          "properties": {
+            "text": {
+              "description": "Text payload.",
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Base64-encoded image.",
+          "properties": {
+            "data": {
+              "description": "Base64 data.",
+              "type": "string"
+            },
+            "mime_type": {
+              "description": "MIME type, such as `image/png`.",
+              "type": "string"
+            },
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "data",
+            "mime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A reference to a resource the reader may fetch or open.",
+          "properties": {
+            "name": {
+              "description": "Display name.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "resource_link",
+              "type": "string"
+            },
+            "uri": {
+              "description": "Resource URI.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "uri"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A block with a `type` this reader does not know. The raw JSON is kept."
+        }
+      ],
+      "description": "A unit of content."
+    },
+    "DefaultsParams": {
+      "description": "`runtime/defaults` params. Without `patch` it reads.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the defaults are at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "patch": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DefaultsPatch"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What to save."
+        },
+        "workspace_id": {
+          "description": "Host workspace id, for workspace-specific values.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DefaultsPatch": {
+      "description": "Changes to saved defaults for new Sessions.",
+      "properties": {
+        "effort": {
+          "description": "Default reasoning effort for new Sessions.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Default model for new Sessions, `provider/id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response_header_timeout_ms": {
+          "description": "Response-header timeout for new Sessions in ms; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "DefaultsResult": {
+      "description": "`runtime/defaults` result.",
+      "properties": {
+        "effort": {
+          "description": "Default reasoning effort.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Default permission mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Default model, `provider/id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response_header_timeout_ms": {
+          "description": "Response-header timeout for new Sessions in ms; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "Defaults revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "type": "object"
+    },
+    "DestinationResult": {
+      "description": "A newly admitted destination; source subscriptions are unchanged.",
+      "properties": {
+        "draft": {
+          "description": "Excluded user message to restore in the initiating composer.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "source_branch_revision": {
+          "description": "Source revision captured by a copy.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "ErrorCategory": {
+      "description": "Why a turn failed, as far as Loop can tell.",
+      "oneOf": [
+        {
+          "const": "auth",
+          "description": "Sign-in missing, expired or rejected.",
+          "type": "string"
+        },
+        {
+          "const": "quota",
+          "description": "The plan's usage allowance is used up. Retrying will not help until it resets.",
+          "type": "string"
+        },
+        {
+          "const": "rate_limit",
+          "description": "Temporarily throttled. Retrying later can succeed.",
+          "type": "string"
+        },
+        {
+          "const": "network",
+          "description": "The backend or provider could not be reached, or the connection dropped.",
+          "type": "string"
+        },
+        {
+          "const": "protocol",
+          "description": "A message violated the protocol, or versions do not match.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "The agent or model reported a failure.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The user or caller cancelled the turn.",
+          "type": "string"
+        },
+        {
+          "const": "internal",
+          "description": "A bug or unexpected state inside Loop.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A category this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "ErrorInfo": {
+      "description": "A failure with enough structure for a surface to decide what to do next.",
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/ErrorCategory",
+          "description": "Failure category."
+        },
+        "message": {
+          "description": "Human-readable description. Never contains secrets.",
+          "type": "string"
+        },
+        "retryable": {
+          "description": "Whether retrying the same request can succeed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "category",
+        "retryable",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ExportResult": {
+      "description": "Bounded payloads written to files by the Surface.",
+      "properties": {
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "format_version": {
+          "description": "Session JSONL format version.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "jsonl": {
+          "description": "UTF-8 versioned Session payload.",
+          "type": "string"
+        },
+        "markdown": {
+          "description": "Readable branch transcript.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "format_version",
+        "markdown",
+        "jsonl",
+        "branch_revision"
+      ],
+      "type": "object"
+    },
+    "ForkParams": {
+      "description": "Create a new Session before a user message on the source branch.",
+      "properties": {
+        "before_entry_id": {
+          "description": "User message excluded from the destination branch.",
+          "type": "string"
+        },
+        "name": {
+          "default": null,
+          "description": "Session display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_id": {
+          "description": "Stable retry id; reuse only for identical parameters.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session",
+        "before_entry_id",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "ForkPoint": {
+      "description": "A user-message fork point returned with its tree page.",
+      "properties": {
+        "entry_id": {
+          "description": "Persisted user-message entry id.",
+          "type": "string"
+        },
+        "index": {
+          "description": "One-based user-message index.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "preview": {
+          "description": "Short display text.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Full draft text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "entry_id",
+        "index",
+        "text",
+        "preview"
+      ],
+      "type": "object"
+    },
+    "HostAction": {
+      "description": "Requested host operation; each service validates its own allowed actions.",
+      "oneOf": [
+        {
+          "const": "list",
+          "description": "Read connected providers.",
+          "type": "string"
+        },
+        {
+          "const": "connect",
+          "description": "Verify and connect a provider.",
+          "type": "string"
+        },
+        {
+          "const": "disconnect",
+          "description": "Disconnect a provider.",
+          "type": "string"
+        },
+        {
+          "const": "status",
+          "description": "Read telemetry state.",
+          "type": "string"
+        },
+        {
+          "const": "enable",
+          "description": "Enable telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "disable",
+          "description": "Disable telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "setup",
+          "description": "Configure telemetry.",
+          "type": "string"
+        },
+        {
+          "const": "login",
+          "description": "Start MCP OAuth.",
+          "type": "string"
+        },
+        {
+          "const": "logout",
+          "description": "Remove MCP OAuth credentials.",
+          "type": "string"
+        }
+      ]
+    },
+    "ImportParams": {
+      "description": "Import bytes into a known host workspace, never a supplied host path.",
+      "properties": {
+        "jsonl": {
+          "description": "UTF-8 versioned Session payload.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Stable retry id; reuse only for identical parameters.",
+          "type": "string"
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "jsonl",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "InitializeParams": {
+      "description": "`initialize` params.",
+      "properties": {
+        "client_capabilities": {
+          "$ref": "#/$defs/ClientCapabilities",
+          "default": {
+            "interact": false
+          },
+          "description": "What the client can do."
+        },
+        "client_info": {
+          "$ref": "#/$defs/PeerInfo",
+          "description": "The client."
+        },
+        "protocol_version": {
+          "description": "The highest version the client speaks.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "client_info"
+      ],
+      "type": "object"
+    },
+    "InitializeResult": {
+      "description": "`initialize` result.",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities",
+          "description": "What the backend supports."
+        },
+        "instance": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "The backend instance behind the server."
+        },
+        "protocol_version": {
+          "description": "The version to use: the client's, when the server speaks it, or else\nthe server's highest. A client that can't use it closes.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "server_info": {
+          "$ref": "#/$defs/PeerInfo",
+          "description": "The server."
+        }
+      },
+      "required": [
+        "protocol_version",
+        "server_info",
+        "instance",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "InteractParams": {
+      "description": "`host/interact` params, preserving the v1 interaction shape.\n\nRouting lives at the wire boundary so local backends can continue producing\nSession-independent requests. Flattening keeps old v1 messages compatible.",
+      "oneOf": [
+        {
+          "description": "Approve or reject a tool call.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "permission",
+              "type": "string"
+            },
+            "options": {
+              "description": "The choices the backend offers, in its order.",
+              "items": {
+                "$ref": "#/$defs/PermissionOption"
+              },
+              "type": "array"
+            },
+            "tool_call": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolCallUpdate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tool call awaiting approval, when the backend names one."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A free-text or multiple-choice question.",
+          "properties": {
+            "choices": {
+              "description": "Offered answers. `None` means free text.",
+              "items": {
+                "$ref": "#/$defs/Choice"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "question",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "Question text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "prompt"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A structured form. The answer is a JSON value matching `schema`.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "form",
+              "type": "string"
+            },
+            "schema": {
+              "description": "JSON Schema of the expected answer."
+            },
+            "title": {
+              "description": "Form title.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "schema"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The user must open a URL, for example to sign in.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "url",
+              "type": "string"
+            },
+            "purpose": {
+              "description": "Why the backend needs it.",
+              "type": "string"
+            },
+            "url": {
+              "description": "URL to open.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "url",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A request this Loop version cannot present. It is answered with an\nexplicit error, never left pending.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "unsupported",
+              "type": "string"
+            },
+            "method": {
+              "description": "The backend's method or request type.",
+              "type": "string"
+            },
+            "raw": {
+              "description": "The raw request."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "method",
+            "raw"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "session": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Session awaiting an answer. Absent on single-Session v1 peers."
+        }
+      },
+      "type": "object"
+    },
+    "InteractWithdrawnParams": {
+      "description": "`host/interact_withdrawn` notification params.",
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/InteractionId",
+          "description": "The original interaction id, not a connection's JSON-RPC request id."
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session whose Escalation is no longer pending."
+        }
+      },
+      "required": [
+        "session",
+        "id"
+      ],
+      "type": "object"
+    },
+    "InteractionId": {
+      "description": "One pending interaction (permission prompt, question, form or URL flow).",
+      "type": "string"
+    },
+    "InteractionOutcome": {
+      "description": "The user's answer to an interaction.",
+      "oneOf": [
+        {
+          "description": "A permission option or question choice, by its native id.",
+          "properties": {
+            "native_id": {
+              "description": "The chosen native id.",
+              "type": "string"
+            },
+            "note": {
+              "description": "Optional note from the user, such as why they rejected a call.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "outcome": {
+              "const": "selected",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "native_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A free-text or form answer.",
+          "properties": {
+            "outcome": {
+              "const": "answered",
+              "type": "string"
+            },
+            "value": {
+              "description": "The answer."
+            }
+          },
+          "required": [
+            "outcome",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The interaction was withdrawn, for example because the turn was cancelled.",
+          "properties": {
+            "outcome": {
+              "const": "cancelled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Loop could not present the interaction.",
+          "properties": {
+            "outcome": {
+              "const": "rejected",
+              "type": "string"
+            },
+            "reason": {
+              "description": "Why.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "InteractionRequest": {
+      "description": "Something the backend needs from the user before it can continue.",
+      "oneOf": [
+        {
+          "description": "Approve or reject a tool call.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "permission",
+              "type": "string"
+            },
+            "options": {
+              "description": "The choices the backend offers, in its order.",
+              "items": {
+                "$ref": "#/$defs/PermissionOption"
+              },
+              "type": "array"
+            },
+            "tool_call": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ToolCallUpdate"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The tool call awaiting approval, when the backend names one."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A free-text or multiple-choice question.",
+          "properties": {
+            "choices": {
+              "description": "Offered answers. `None` means free text.",
+              "items": {
+                "$ref": "#/$defs/Choice"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "question",
+              "type": "string"
+            },
+            "prompt": {
+              "description": "Question text.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "prompt"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A structured form. The answer is a JSON value matching `schema`.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "form",
+              "type": "string"
+            },
+            "schema": {
+              "description": "JSON Schema of the expected answer."
+            },
+            "title": {
+              "description": "Form title.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "schema"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The user must open a URL, for example to sign in.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "url",
+              "type": "string"
+            },
+            "purpose": {
+              "description": "Why the backend needs it.",
+              "type": "string"
+            },
+            "url": {
+              "description": "URL to open.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "url",
+            "purpose"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A request this Loop version cannot present. It is answered with an\nexplicit error, never left pending.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "kind": {
+              "const": "unsupported",
+              "type": "string"
+            },
+            "method": {
+              "description": "The backend's method or request type.",
+              "type": "string"
+            },
+            "raw": {
+              "description": "The raw request."
+            }
+          },
+          "required": [
+            "kind",
+            "id",
+            "method",
+            "raw"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "LoadParams": {
+      "description": "`session/load` params.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The session to reopen."
+        },
+        "spec": {
+          "$ref": "#/$defs/SessionSpec",
+          "default": {},
+          "description": "How to open it."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "McpAuthParams": {
+      "description": "Host MCP OAuth request.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Login or logout."
+        },
+        "name": {
+          "description": "Configured server name.",
+          "type": "string"
+        },
+        "workspace_id": {
+          "description": "Opaque workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "action",
+        "name"
+      ],
+      "type": "object"
+    },
+    "McpAuthResult": {
+      "description": "Host MCP OAuth result.",
+      "properties": {
+        "notices": {
+          "description": "Public status messages.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "description": "Authorized, not_required, removed or absent.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "notices"
+      ],
+      "type": "object"
+    },
+    "McpParams": {
+      "description": "`workspace/mcp` params.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/AdminAction",
+          "default": "list",
+          "description": "What to do; list by default."
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the workspace is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The server to enable or disable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "McpResult": {
+      "description": "`workspace/mcp` result.",
+      "properties": {
+        "pending_sessions": {
+          "description": "Busy Sessions that pick the change up when their turn ends.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "description": "Workspace revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "servers": {
+          "description": "Configured servers.",
+          "items": {
+            "$ref": "#/$defs/McpServerStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "revision",
+        "servers",
+        "pending_sessions"
+      ],
+      "type": "object"
+    },
+    "McpServerStatus": {
+      "description": "One configured MCP server.",
+      "properties": {
+        "connected": {
+          "description": "Connected now.",
+          "type": "boolean"
+        },
+        "enabled": {
+          "description": "Enabled in settings.",
+          "type": "boolean"
+        },
+        "error": {
+          "description": "Why it is not connected, when it failed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Configured name.",
+          "type": "string"
+        },
+        "tools": {
+          "description": "Tools it offers.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name",
+        "enabled",
+        "connected",
+        "tools"
+      ],
+      "type": "object"
+    },
+    "MessageId": {
+      "description": "One user or agent message within a turn.",
+      "type": "string"
+    },
+    "ModelInfo": {
+      "description": "One model in `session/models`.",
+      "properties": {
+        "backend": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "The backend instance that runs the model."
+        },
+        "description": {
+          "description": "Short description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Id to pass to `session/set_model`.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "backend"
+      ],
+      "type": "object"
+    },
+    "ModelsResult": {
+      "description": "`session/models` result.",
+      "properties": {
+        "current": {
+          "description": "The current model's id, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "models": {
+          "description": "Every model on offer.",
+          "items": {
+            "$ref": "#/$defs/ModelInfo"
+          },
+          "type": "array"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "models",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "MutationResult": {
+      "description": "What a committed Session setter changed (`MutationResult` on the wire).",
+      "properties": {
+        "applies_after_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn after which a pending change takes effect."
+        },
+        "pending": {
+          "default": false,
+          "description": "The change waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session revision after the change.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "Sequence of the `config_changed` update that announced it; zero when\nthe backend publishes no such update.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "NavigateParams": {
+      "description": "Move the active branch. None means before its first entry.",
+      "properties": {
+        "expected_revision": {
+          "default": null,
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "summarize": {
+          "default": false,
+          "description": "Add a summary of the previous branch.",
+          "type": "boolean"
+        },
+        "target_entry_id": {
+          "default": null,
+          "description": "Destination entry, or None for the root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "NavigateResult": {
+      "description": "Ordered branch mutation result.",
+      "properties": {
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "description": "The Session revision after the branch change.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "Committed update sequence.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "branch_revision",
+        "seq"
+      ],
+      "type": "object"
+    },
+    "NoticeLevel": {
+      "description": "Severity of a notice.",
+      "oneOf": [
+        {
+          "const": "info",
+          "description": "Status or progress.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Something the user may want to act on.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Something went wrong but the turn continues.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A level this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "Origin": {
+      "description": "Where an update comes from.",
+      "oneOf": [
+        {
+          "const": "live",
+          "description": "Produced by the running session.",
+          "type": "string"
+        },
+        {
+          "const": "replay",
+          "description": "Replayed history from reopening a session. Rebuilds the display; never\nstored again.",
+          "type": "string"
+        }
+      ]
+    },
+    "PeerInfo": {
+      "description": "Who is on the other end, for logs. Never used for feature checks.",
+      "properties": {
+        "name": {
+          "description": "Program name, e.g. `loop`.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Program version.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
+    "PermissionKind": {
+      "description": "The meaning of a permission option, as a presentation hint.",
+      "oneOf": [
+        {
+          "const": "allow_once",
+          "description": "Allow this call.",
+          "type": "string"
+        },
+        {
+          "const": "allow_always",
+          "description": "Allow this call and remember the choice.",
+          "type": "string"
+        },
+        {
+          "const": "reject_once",
+          "description": "Reject this call.",
+          "type": "string"
+        },
+        {
+          "const": "reject_always",
+          "description": "Reject this call and remember the choice.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A kind this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "PermissionModeParams": {
+      "description": "`session/permission_mode` params. Without `mode` it reads.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "`read-only`, `ask`, `accept-edits`, `full-access` or `plan`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "PermissionModeResult": {
+      "description": "`session/permission_mode` result.",
+      "properties": {
+        "effective_policy": {
+          "description": "What the mode allows, in words.",
+          "type": "string"
+        },
+        "mode": {
+          "description": "The Session's permission mode.",
+          "type": "string"
+        },
+        "pending": {
+          "description": "The change waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "The update sequence that announced a change; absent for a read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode",
+        "effective_policy",
+        "revision",
+        "pending"
+      ],
+      "type": "object"
+    },
+    "PermissionOption": {
+      "description": "One choice in a permission prompt.",
+      "properties": {
+        "kind_hint": {
+          "$ref": "#/$defs/PermissionKind",
+          "description": "What the option means, for presentation only. Loop does not infer a\ngrant or suppress later prompts from it: the backend defines the scope."
+        },
+        "label": {
+          "description": "Label to show.",
+          "type": "string"
+        },
+        "native_id": {
+          "description": "The backend's own option id, sent back unchanged.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "native_id",
+        "label",
+        "kind_hint"
+      ],
+      "type": "object"
+    },
+    "PlanEntry": {
+      "description": "One step of the agent's plan.",
+      "properties": {
+        "content": {
+          "description": "What the step does.",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/PlanEntryStatus",
+          "description": "Progress."
+        }
+      },
+      "required": [
+        "content",
+        "status"
+      ],
+      "type": "object"
+    },
+    "PlanEntryStatus": {
+      "description": "Progress of a plan step.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Not started.",
+          "type": "string"
+        },
+        {
+          "const": "in_progress",
+          "description": "Under way.",
+          "type": "string"
+        },
+        {
+          "const": "completed",
+          "description": "Done.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A status this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "PromptParams": {
+      "description": "`session/prompt` params.",
+      "properties": {
+        "content": {
+          "description": "The prompt.",
+          "items": {
+            "$ref": "#/$defs/ContentBlock"
+          },
+          "type": "array"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session",
+        "content"
+      ],
+      "type": "object"
+    },
+    "PromptResult": {
+      "description": "`session/prompt` result: how the turn ended.",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ErrorInfo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Failure details when `stop` is `error`."
+        },
+        "stop": {
+          "$ref": "#/$defs/StopReason",
+          "description": "Why the turn ended."
+        },
+        "uncertain": {
+          "description": "The backend lost contact with its agent mid-turn: edits or commands\nmay already have run, so the prompt must not be re-sent automatically.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "stop"
+      ],
+      "type": "object"
+    },
+    "ProviderInfo": {
+      "description": "A provider's public connection state.",
+      "properties": {
+        "connected": {
+          "description": "Credentials are connected.",
+          "type": "boolean"
+        },
+        "id": {
+          "description": "Stable provider id.",
+          "type": "string"
+        },
+        "model_count": {
+          "description": "Models found during connect, when known.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "connected"
+      ],
+      "type": "object"
+    },
+    "ProvidersParams": {
+      "description": "Provider request. Login payloads are never part of Session history or Debug output.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Operation."
+        },
+        "login": {
+          "description": "Validated provider setup payload; may contain secrets."
+        },
+        "provider": {
+          "description": "Provider identity for disconnect.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "ProvidersResult": {
+      "description": "Redacted provider result.",
+      "properties": {
+        "notices": {
+          "description": "Status notices, without credentials.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "providers": {
+          "description": "Public provider rows.",
+          "items": {
+            "$ref": "#/$defs/ProviderInfo"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "providers",
+        "notices"
+      ],
+      "type": "object"
+    },
+    "ReloadParams": {
+      "description": "`workspace/reload` params.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the workspace is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "ReloadResult": {
+      "description": "`workspace/reload` result.",
+      "properties": {
+        "notices": {
+          "description": "What the reload reported.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pending_sessions": {
+          "description": "Busy Sessions that pick the change up when their turn ends.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "description": "Workspace revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "notices",
+        "pending_sessions"
+      ],
+      "type": "object"
+    },
+    "RenameParams": {
+      "description": "Change only the Session display name.",
+      "properties": {
+        "expected_revision": {
+          "default": null,
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Session display name.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session",
+        "name"
+      ],
+      "type": "object"
+    },
+    "Role": {
+      "description": "Who wrote a message.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "The person using Loop.",
+          "type": "string"
+        },
+        {
+          "const": "agent",
+          "description": "The agent.",
+          "type": "string"
+        }
+      ]
+    },
+    "RpcErrorBody": {
+      "description": "A JSON-RPC error: code, message and optional data.",
+      "properties": {
+        "code": {
+          "description": "Error code.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "data": {
+          "description": "Structured details."
+        },
+        "message": {
+          "description": "Message.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "RuntimeSessionRow": {
+      "description": "One loaded Session in `runtime/sessions`.",
+      "properties": {
+        "model": {
+          "description": "Selected model, `provider/id`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "state": {
+          "description": "`idle`, `busy`, or `parked` (waiting on an Escalation).",
+          "type": "string"
+        },
+        "tokens": {
+          "description": "Tokens billed so far; absent when unknown.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "workspace_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "RuntimeSessionTotals": {
+      "description": "Totals over the listed rows only.",
+      "properties": {
+        "busy": {
+          "description": "Sessions with work running.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessions": {
+          "description": "Loaded Sessions, children counted separately.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "tokens": {
+          "description": "Known tokens over the rows.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unknown_tokens": {
+          "description": "Rows whose tokens are unknown.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessions",
+        "busy",
+        "tokens",
+        "unknown_tokens"
+      ],
+      "type": "object"
+    },
+    "RuntimeSessionsResult": {
+      "description": "`runtime/sessions` result: the Runtime panel.",
+      "properties": {
+        "sessions": {
+          "description": "One row per loaded Session.",
+          "items": {
+            "$ref": "#/$defs/RuntimeSessionRow"
+          },
+          "type": "array"
+        },
+        "taken_at_ms": {
+          "description": "When the rows were read, in ms since the epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totals": {
+          "$ref": "#/$defs/RuntimeSessionTotals",
+          "description": "Totals for these rows."
+        }
+      },
+      "required": [
+        "sessions",
+        "totals",
+        "taken_at_ms"
+      ],
+      "type": "object"
+    },
+    "RuntimeStatus": {
+      "description": "`runtime/status` result: the Runtime process and its Session counts.",
+      "properties": {
+        "auto_started": {
+          "description": "True only for an owner started automatically by a Surface.",
+          "type": "boolean"
+        },
+        "busy": {
+          "description": "Loaded Sessions with a turn running.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "generation": {
+          "description": "The Runtime generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "listen_url": {
+          "description": "Loopback WebSocket endpoint, without credentials.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loaded": {
+          "description": "Sessions held in memory.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_active_turns": {
+          "description": "Most turns running at once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_active_turns_from": {
+          "description": "Where `max_active_turns` came from: `flag`, `settings` or `default`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "max_sessions": {
+          "description": "Most Sessions held at once.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_sessions_from": {
+          "description": "Where `max_sessions` came from: `flag`, `settings` or `default`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pid": {
+          "description": "The Runtime's process id.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "socket": {
+          "description": "The socket this connection reached.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pid",
+        "socket",
+        "generation",
+        "loaded",
+        "busy",
+        "max_sessions",
+        "max_active_turns"
+      ],
+      "type": "object"
+    },
+    "SandboxAction": {
+      "description": "What `session/sandbox` does.",
+      "oneOf": [
+        {
+          "const": "status",
+          "description": "Read the Session's sandbox.",
+          "type": "string"
+        },
+        {
+          "const": "set",
+          "description": "Replace it with `config`.",
+          "type": "string"
+        }
+      ]
+    },
+    "SandboxChoice": {
+      "description": "A Session's sandbox choice.",
+      "properties": {
+        "isolation": {
+          "description": "Local isolation (`full` or `partial`); the platform default when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "`off` or `local`.",
+          "type": "string"
+        },
+        "runtime": {
+          "description": "Local container runtime; the platform default when absent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "mode"
+      ],
+      "type": "object"
+    },
+    "SandboxParams": {
+      "description": "`session/sandbox` params.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/SandboxAction",
+          "default": "status",
+          "description": "What to do; status by default."
+        },
+        "config": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SandboxChoice"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The new sandbox, for `set`."
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "SandboxResult": {
+      "description": "`session/sandbox` result.",
+      "properties": {
+        "config": {
+          "$ref": "#/$defs/SandboxChoice",
+          "description": "The Session's sandbox now."
+        },
+        "info": {
+          "description": "Readable status, as `/sandbox status` prints it.",
+          "type": "string"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "The update sequence that announced a change; absent for a read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "config",
+        "info",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "SessionConfig": {
+      "description": "A Session's public config. Absent fields are not offered by the backend\nor not known yet. Never holds secrets.",
+      "properties": {
+        "active_skills": {
+          "description": "Skills activated in this Session.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "effort": {
+          "description": "Reasoning effort id, as `session/efforts` names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "Backend mode id, as `session/modes` names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "Model id, as `session/models` names it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "response_timeout_ms": {
+          "description": "The Session's response-timeout override in ms (`session/ttfb`);\nabsent inherits the default, 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "sandbox": {
+          "description": "The sandbox chosen for the Session: `off`, or `local` followed by\nits isolation and runtime when set (`local/full/krun`). Absent uses\nthe workspace default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionInfo": {
+      "description": "One Session in the Runtime's list, including closed Sessions.",
+      "properties": {
+        "availability": {
+          "description": "Loaded, loadable or owned_elsewhere.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "backend": {
+          "description": "Backend kind.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "busy": {
+          "description": "Whether a turn is running.",
+          "type": "boolean"
+        },
+        "created_ms": {
+          "description": "Creation time in milliseconds since the Unix epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cwd": {
+          "description": "Working directory.",
+          "type": "string"
+        },
+        "first_prompt": {
+          "description": "First user prompt preview.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fork_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Source Session for a fork or clone."
+        },
+        "last_active_ms": {
+          "description": "Last activity time in milliseconds since the Unix epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "live": {
+          "description": "Whether the Runtime currently holds this Session open.",
+          "type": "boolean"
+        },
+        "message_count": {
+          "description": "Number of user and assistant messages.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "default": null,
+          "description": "Display name, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "owner_kind": {
+          "description": "Current lease owner kind, when leased.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Parent Session, when this is a Subagent."
+        },
+        "ref": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The full Session reference."
+        },
+        "selected_model": {
+          "description": "Selected provider/model id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "ref",
+        "cwd",
+        "live",
+        "busy",
+        "created_ms",
+        "last_active_ms"
+      ],
+      "type": "object"
+    },
+    "SessionKey": {
+      "description": "A conversation as Loop knows it. Stable across process restarts.",
+      "type": "string"
+    },
+    "SessionMetadata": {
+      "description": "Session metadata carried by [`ConfigChanged`].",
+      "properties": {
+        "name": {
+          "description": "Display name, when set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionOptions": {
+      "description": "Startup overrides for a native Runtime Session.",
+      "properties": {
+        "append_system_prompt": {
+          "default": null,
+          "description": "Append to the system prompt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "default": null,
+          "description": "Model override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "no_context_files": {
+          "default": false,
+          "description": "Skip context discovery.",
+          "type": "boolean"
+        },
+        "no_web": {
+          "default": false,
+          "description": "Disable web tools for this Session.",
+          "type": "boolean"
+        },
+        "permission_mode": {
+          "default": null,
+          "description": "Explicit permission mode.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provider": {
+          "default": null,
+          "description": "Provider override.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "system_prompt": {
+          "default": null,
+          "description": "Replace the system prompt.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "SessionParams": {
+      "description": "Params naming one session.",
+      "properties": {
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "SessionRef": {
+      "description": "A session as both Loop and the backend know it.",
+      "properties": {
+        "instance": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "Backend instance that owns the session."
+        },
+        "key": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "Loop's key for the session."
+        },
+        "native_id": {
+          "description": "The backend's own id for the session.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance",
+        "key",
+        "native_id"
+      ],
+      "type": "object"
+    },
+    "SessionSnapshot": {
+      "description": "A Session's state at one committed update sequence. Excludes secrets.",
+      "properties": {
+        "at_seq": {
+          "description": "The update sequence the snapshot was taken at: the replay's last\nupdate. Not the client's processed cursor.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "branch_revision": {
+          "default": 0,
+          "description": "The active branch's revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities",
+          "default": {
+            "attach": false,
+            "attach_snapshot": false,
+            "efforts": false,
+            "fs_client": false,
+            "images": false,
+            "load_session": false,
+            "modes": false,
+            "multi_session": false,
+            "resume_session": false,
+            "set_model": false,
+            "steering": false,
+            "terminal_client": false,
+            "usage": false
+          },
+          "description": "What this Session supports."
+        },
+        "config": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The selected config."
+        },
+        "effective": {
+          "$ref": "#/$defs/SessionConfig",
+          "default": {},
+          "description": "The config the current turn runs with."
+        },
+        "metadata": {
+          "$ref": "#/$defs/SessionMetadata",
+          "default": {},
+          "description": "Session metadata."
+        },
+        "notices": {
+          "description": "Public startup notices, including credential-environment differences.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pending": {
+          "default": false,
+          "description": "Part of `config` waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        },
+        "stats": {
+          "description": "Public stats; unknown values are omitted."
+        },
+        "turn_state": {
+          "description": "Idle, busy or parked, when known.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "view_id": {
+          "description": "Immutable transcript view at `at_seq`, for servers with the\n`branch_snapshot` capability.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Opaque host workspace identity, when the server reports one.",
+          "type": "string"
+        },
+        "workspace_revision": {
+          "default": 0,
+          "description": "Revision of the workspace definitions the Session uses.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session",
+        "at_seq",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "SessionSpec": {
+      "description": "How to open a session.",
+      "properties": {
+        "cwd": {
+          "description": "Absolute working directory for the session.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "env": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Caller environment for tools; omitted means use the host defaults.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Display name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "options": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionOptions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Per-run startup choices; ignored by legacy backends."
+        }
+      },
+      "type": "object"
+    },
+    "SessionUpdate": {
+      "anyOf": [
+        {
+          "description": "Replace the transcript with an immutable branch view.",
+          "properties": {
+            "branch_revision": {
+              "description": "Committed transcript revision.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reason": {
+              "description": "Why the transcript was replaced.",
+              "type": "string"
+            },
+            "revision": {
+              "description": "The Session revision after the branch change.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "branch_reset",
+              "type": "string"
+            },
+            "view_id": {
+              "description": "Immutable transcript view id; expires explicitly.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "revision",
+            "branch_revision",
+            "view_id",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A turn began.",
+          "properties": {
+            "turn_id": {
+              "$ref": "#/$defs/TurnId",
+              "description": "Turn id."
+            },
+            "type": {
+              "const": "turn_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A message began.",
+          "properties": {
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message id."
+            },
+            "role": {
+              "$ref": "#/$defs/Role",
+              "description": "Author."
+            },
+            "type": {
+              "const": "message_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id",
+            "role"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Part of a message.",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/ContentBlock",
+              "description": "Content to append."
+            },
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message id."
+            },
+            "role": {
+              "$ref": "#/$defs/Role",
+              "description": "Author."
+            },
+            "type": {
+              "const": "message_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id",
+            "role",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A message is complete.",
+          "properties": {
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message id."
+            },
+            "type": {
+              "const": "message_ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Part of the agent's reasoning.",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/ContentBlock",
+              "description": "Content to append."
+            },
+            "message_id": {
+              "$ref": "#/$defs/MessageId",
+              "description": "Message the thought belongs to."
+            },
+            "type": {
+              "const": "thought_chunk",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message_id",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The model has started writing a tool call; its input is still\narriving. A `ToolCall` with the same id follows if the call completes.\nReaders may ignore this.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/ToolCallId",
+              "description": "Tool call id."
+            },
+            "kind": {
+              "$ref": "#/$defs/ToolKind",
+              "description": "What kind of action the tool performs."
+            },
+            "name": {
+              "description": "The tool's own name.",
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_call_preparing",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ToolCall",
+          "description": "A tool call began.",
+          "properties": {
+            "type": {
+              "const": "tool_call",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ToolCallUpdate",
+          "description": "A tool call changed. Only changed fields are set.",
+          "properties": {
+            "type": {
+              "const": "tool_call_update",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent's plan, replacing any earlier plan.",
+          "properties": {
+            "entries": {
+              "description": "Plan entries in order.",
+              "items": {
+                "$ref": "#/$defs/PlanEntry"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "plan",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "entries"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Usage",
+          "description": "Token usage so far.",
+          "properties": {
+            "type": {
+              "const": "usage",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Something to show that is not part of the conversation.",
+          "properties": {
+            "level": {
+              "$ref": "#/$defs/NoticeLevel",
+              "description": "Severity."
+            },
+            "text": {
+              "description": "Text to show.",
+              "type": "string"
+            },
+            "type": {
+              "const": "notice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "level",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The backend is waiting for the user.",
+          "properties": {
+            "request": {
+              "$ref": "#/$defs/InteractionRequest",
+              "description": "The request."
+            },
+            "type": {
+              "const": "interaction_requested",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A pending interaction was answered or withdrawn.",
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/InteractionId",
+              "description": "Interaction id."
+            },
+            "outcome": {
+              "$ref": "#/$defs/InteractionOutcome",
+              "description": "The answer."
+            },
+            "type": {
+              "const": "interaction_resolved",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The turn is over. Emitted exactly once per turn.",
+          "properties": {
+            "error": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ErrorInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Failure details when `stop` is `Error`."
+            },
+            "stop": {
+              "$ref": "#/$defs/StopReason",
+              "description": "Why it ended."
+            },
+            "turn_id": {
+              "$ref": "#/$defs/TurnId",
+              "description": "Turn id."
+            },
+            "type": {
+              "const": "turn_ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn_id",
+            "stop"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ConfigChanged",
+          "description": "The Session's metadata or public config changed. Replaces the\nprevious metadata and config view; the transcript is unchanged.",
+          "properties": {
+            "type": {
+              "const": "config_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/WorkflowProgress",
+          "description": "Ordered workflow progress, including its final result.",
+          "properties": {
+            "type": {
+              "const": "workflow_progress",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An update with a `type` this reader does not know. The raw JSON is kept."
+        }
+      ],
+      "description": "One change in a session."
+    },
+    "SetEffortParams": {
+      "description": "`session/set_effort` params.",
+      "properties": {
+        "effort": {
+          "description": "A [`ChoiceInfo::id`] from `session/efforts`.",
+          "type": "string"
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "effort"
+      ],
+      "type": "object"
+    },
+    "SetModeParams": {
+      "description": "`session/set_mode` params.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "mode": {
+          "description": "A [`ChoiceInfo::id`] from `session/modes`.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "SetModelParams": {
+      "description": "`session/set_model` params.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "A [`ModelInfo::id`].",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "The Session."
+        }
+      },
+      "required": [
+        "session",
+        "model"
+      ],
+      "type": "object"
+    },
+    "SettingsParams": {
+      "description": "Read the effective, redacted workspace settings.",
+      "properties": {
+        "workspace_id": {
+          "description": "Opaque host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "SettingsResult": {
+      "description": "Public workspace settings and resource counts.",
+      "properties": {
+        "effective": {
+          "description": "Explicitly whitelisted effective settings; credentials are excluded."
+        },
+        "enabled_models": {
+          "description": "Model cycle filter.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "resource_counts": {
+          "additionalProperties": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "description": "Resource counts by kind.",
+          "type": "object"
+        },
+        "revision": {
+          "description": "Workspace generation.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision",
+        "effective",
+        "enabled_models",
+        "resource_counts"
+      ],
+      "type": "object"
+    },
+    "ShellParams": {
+      "description": "`session/shell` params.",
+      "properties": {
+        "command": {
+          "description": "The command line, run by the Session's shell.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "timeout_ms": {
+          "description": "At most this long; the default and the maximum are the host's\n`bash.maxTimeoutMs` (600 s unless configured).",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session",
+        "command"
+      ],
+      "type": "object"
+    },
+    "ShellResult": {
+      "description": "Output of a command run for the user (`session/shell`).",
+      "properties": {
+        "exit_code": {
+          "description": "Exit code.",
+          "format": "int32",
+          "type": "integer"
+        },
+        "stderr": {
+          "description": "Standard error, at most [`SHELL_OUTPUT_LIMIT`] bytes.",
+          "type": "string"
+        },
+        "stdout": {
+          "description": "Standard output, at most [`SHELL_OUTPUT_LIMIT`] bytes.",
+          "type": "string"
+        },
+        "truncated": {
+          "default": false,
+          "description": "A stream was cut at [`SHELL_OUTPUT_LIMIT`].",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "stdout",
+        "stderr",
+        "exit_code"
+      ],
+      "type": "object"
+    },
+    "SkillParams": {
+      "description": "Activate or deactivate one Session skill.",
+      "properties": {
+        "active": {
+          "default": true,
+          "description": "Activate when true; deactivate when false.",
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "default": null,
+          "description": "Optimistic Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "Discovered skill name.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Target Session."
+        }
+      },
+      "required": [
+        "session",
+        "name"
+      ],
+      "type": "object"
+    },
+    "SkillStatus": {
+      "description": "One discovered skill.",
+      "properties": {
+        "description": {
+          "description": "What it is for.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Offered to Sessions.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "Skill name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "SkillsParams": {
+      "description": "`workspace/skills` params.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/AdminAction",
+          "default": "list",
+          "description": "What to do; list by default. `reload` is not accepted."
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the workspace is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The skill to enable or disable.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "SkillsResult": {
+      "description": "`workspace/skills` result.",
+      "properties": {
+        "pending_sessions": {
+          "description": "Busy Sessions that pick the change up when their turn ends.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "description": "Workspace revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skills": {
+          "description": "Discovered skills.",
+          "items": {
+            "$ref": "#/$defs/SkillStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "revision",
+        "skills",
+        "pending_sessions"
+      ],
+      "type": "object"
+    },
+    "StatsResult": {
+      "description": "`session/stats` result. Unknown values are omitted.",
+      "properties": {
+        "context_tokens": {
+          "description": "Tokens in the current context.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "The Session model's context window.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "report": {
+          "description": "Multi-line report for display.",
+          "type": "string"
+        },
+        "taken_at_ms": {
+          "description": "When the server read these values, in Unix milliseconds.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_tokens": {
+          "description": "All tokens billed in the Session.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "turn_state": {
+          "description": "Idle, busy or parked.",
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Usage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Usage of the latest model call."
+        }
+      },
+      "required": [
+        "total_tokens",
+        "report",
+        "turn_state",
+        "taken_at_ms"
+      ],
+      "type": "object"
+    },
+    "StopReason": {
+      "description": "Why a turn ended.",
+      "oneOf": [
+        {
+          "const": "end_turn",
+          "description": "The agent finished.",
+          "type": "string"
+        },
+        {
+          "const": "max_tokens",
+          "description": "The model hit its output limit.",
+          "type": "string"
+        },
+        {
+          "const": "max_turn_requests",
+          "description": "The turn hit its request limit.",
+          "type": "string"
+        },
+        {
+          "const": "refusal",
+          "description": "The model refused.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The turn was cancelled.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The turn failed. `TurnEnded::error` says why.",
+          "type": "string"
+        },
+        {
+          "const": "runtime_restarted",
+          "description": "Interrupted by a Runtime restart; effects are uncertain. Never retry automatically.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "A reason this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "TemplateInfo": {
+      "description": "One prompt template.",
+      "properties": {
+        "description": {
+          "description": "What it is for.",
+          "type": "string"
+        },
+        "name": {
+          "description": "Template name, used as `/<name>`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "type": "object"
+    },
+    "TemplatesParams": {
+      "description": "`workspace/templates` params. With `name` it renders that template.",
+      "properties": {
+        "args": {
+          "description": "Arguments for the template.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "The template to render.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "TemplatesResult": {
+      "description": "`workspace/templates` result: the list, or one rendered text.",
+      "properties": {
+        "revision": {
+          "description": "Workspace revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "templates": {
+          "description": "Templates, for a list.",
+          "items": {
+            "$ref": "#/$defs/TemplateInfo"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "Rendered prompt text, for a render.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "type": "object"
+    },
+    "ToolCall": {
+      "description": "A tool call as first reported.",
+      "properties": {
+        "content": {
+          "description": "Output so far.",
+          "items": {
+            "$ref": "#/$defs/ToolContent"
+          },
+          "type": "array"
+        },
+        "id": {
+          "$ref": "#/$defs/ToolCallId",
+          "description": "Tool call id."
+        },
+        "kind": {
+          "$ref": "#/$defs/ToolKind",
+          "description": "What kind of action the tool performs."
+        },
+        "locations": {
+          "description": "Files the call touches.",
+          "items": {
+            "$ref": "#/$defs/ToolLocation"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "The tool's own name, when the backend reports one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "raw_input": {
+          "description": "The tool's input, as the backend reported it."
+        },
+        "status": {
+          "$ref": "#/$defs/ToolCallStatus",
+          "description": "Current status."
+        },
+        "title": {
+          "description": "Short description to show, such as `edit src/main.rs`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title",
+        "kind",
+        "status"
+      ],
+      "type": "object"
+    },
+    "ToolCallId": {
+      "description": "One tool call, as named by the backend.",
+      "type": "string"
+    },
+    "ToolCallStatus": {
+      "description": "Progress of a tool call.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Waiting to start, for example for approval.",
+          "type": "string"
+        },
+        {
+          "const": "in_progress",
+          "description": "Running.",
+          "type": "string"
+        },
+        {
+          "const": "completed",
+          "description": "Finished successfully.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Failed or was rejected.",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolCallUpdate": {
+      "description": "Changed fields of a tool call. `content`, when set, replaces the earlier content.",
+      "properties": {
+        "content": {
+          "description": "Replacement content.",
+          "items": {
+            "$ref": "#/$defs/ToolContent"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/ToolCallId",
+          "description": "Tool call id."
+        },
+        "kind": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "New kind."
+        },
+        "locations": {
+          "description": "Replacement locations.",
+          "items": {
+            "$ref": "#/$defs/ToolLocation"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "name": {
+          "description": "The tool's own name, when the backend reports one.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "raw_input": {
+          "description": "The tool's input, when the backend reports or changes it."
+        },
+        "raw_output": {
+          "description": "The tool's raw output, as the backend reported it."
+        },
+        "status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ToolCallStatus"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "New status."
+        },
+        "title": {
+          "description": "New title.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "ToolContent": {
+      "anyOf": [
+        {
+          "description": "Ordinary content: text, an image or a resource link.",
+          "properties": {
+            "content": {
+              "$ref": "#/$defs/ContentBlock",
+              "description": "The content."
+            },
+            "type": {
+              "const": "content",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A file change as full before and after text.",
+          "properties": {
+            "new_text": {
+              "description": "New text.",
+              "type": "string"
+            },
+            "old_text": {
+              "description": "Previous text. `None` for a new file.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "File path.",
+              "type": "string"
+            },
+            "type": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "new_text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A file change as a unified diff.",
+          "properties": {
+            "diff": {
+              "description": "Unified diff text.",
+              "type": "string"
+            },
+            "path": {
+              "description": "File path.",
+              "type": "string"
+            },
+            "type": {
+              "const": "unified_diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "diff"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Live output of a terminal Loop runs for the backend.",
+          "properties": {
+            "terminal_id": {
+              "description": "Terminal id.",
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "terminal_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Tool content with a `type` this reader does not know. The raw JSON is kept."
+        }
+      ],
+      "description": "Output of a tool call."
+    },
+    "ToolKind": {
+      "description": "What kind of action a tool performs. Used for icons and approval policy.",
+      "oneOf": [
+        {
+          "const": "read",
+          "description": "Reads files or data.",
+          "type": "string"
+        },
+        {
+          "const": "edit",
+          "description": "Changes files.",
+          "type": "string"
+        },
+        {
+          "const": "delete",
+          "description": "Deletes files.",
+          "type": "string"
+        },
+        {
+          "const": "move",
+          "description": "Moves or renames files.",
+          "type": "string"
+        },
+        {
+          "const": "search",
+          "description": "Searches files or data.",
+          "type": "string"
+        },
+        {
+          "const": "execute",
+          "description": "Runs a command.",
+          "type": "string"
+        },
+        {
+          "const": "fetch",
+          "description": "Fetches from the network.",
+          "type": "string"
+        },
+        {
+          "const": "think",
+          "description": "Internal reasoning step.",
+          "type": "string"
+        },
+        {
+          "const": "other",
+          "description": "Anything else, including kinds this reader does not know.",
+          "type": "string"
+        }
+      ]
+    },
+    "ToolLocation": {
+      "description": "A file location a tool call touches.",
+      "properties": {
+        "line": {
+          "description": "1-based line, when known.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "File path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "TracingParams": {
+      "description": "Host telemetry operation; setup payloads may contain credentials.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/HostAction",
+          "description": "Operation."
+        },
+        "config": {
+          "description": "Validated setup payload."
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    },
+    "TracingResult": {
+      "description": "Redacted telemetry state.",
+      "properties": {
+        "backend": {
+          "description": "Chosen backend.",
+          "type": "string"
+        },
+        "enabled": {
+          "description": "Enabled preference.",
+          "type": "boolean"
+        },
+        "status": {
+          "description": "Human-readable redacted status.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "enabled",
+        "backend",
+        "status"
+      ],
+      "type": "object"
+    },
+    "TreeEntry": {
+      "description": "One tree row, including its branch membership and editable user text.",
+      "properties": {
+        "current": {
+          "description": "Whether this is the current position.",
+          "type": "boolean"
+        },
+        "depth": {
+          "description": "Indentation level.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "entry_id": {
+          "description": "Persisted entry id.",
+          "type": "string"
+        },
+        "kind": {
+          "description": "User, assistant or summary.",
+          "type": "string"
+        },
+        "on_branch": {
+          "description": "Whether this row is on the active branch.",
+          "type": "boolean"
+        },
+        "parent_id": {
+          "description": "Parent entry, or the root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "preview": {
+          "description": "Short display text.",
+          "type": "string"
+        },
+        "text": {
+          "description": "Full editable prompt, for user rows.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entry_id",
+        "depth",
+        "kind",
+        "preview",
+        "on_branch",
+        "current"
+      ],
+      "type": "object"
+    },
+    "TreeParams": {
+      "description": "A page of tree entries; cursors are offsets within the captured tree revision.",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Opaque continuation cursor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Page size: defaults to 100, at most 1000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "TreeResult": {
+      "description": "Tree rows and fork points use the native tree's versioned JSON entry format.",
+      "properties": {
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "entries": {
+          "description": "Tree rows in display order.",
+          "items": {
+            "$ref": "#/$defs/TreeEntry"
+          },
+          "type": "array"
+        },
+        "family": {
+          "description": "Related Session references.",
+          "items": {
+            "$ref": "#/$defs/SessionRef"
+          },
+          "type": "array"
+        },
+        "fork_points": {
+          "description": "User-message fork points.",
+          "items": {
+            "$ref": "#/$defs/ForkPoint"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "description": "Continuation cursor, absent at the end.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "entries",
+        "fork_points",
+        "family",
+        "branch_revision"
+      ],
+      "type": "object"
+    },
+    "TrustParams": {
+      "description": "`workspace/trust` params. Without `trusted` it reads; a write needs\nhost-local authority.",
+      "properties": {
+        "expected_revision": {
+          "description": "Fail with a conflict unless the workspace is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "trusted": {
+          "description": "Trust or distrust the workspace's project files.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "TrustResult": {
+      "description": "`workspace/trust` result.",
+      "properties": {
+        "pending_sessions": {
+          "description": "Busy Sessions that pick the change up when their turn ends.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "revision": {
+          "description": "Workspace revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "trusted": {
+          "description": "Whether project files are trusted.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "revision",
+        "trusted",
+        "pending_sessions"
+      ],
+      "type": "object"
+    },
+    "TtfbParams": {
+      "description": "`session/ttfb` params. Without `timeout_ms` or `clear_override` it reads.",
+      "properties": {
+        "clear_override": {
+          "default": false,
+          "description": "Remove the override and inherit the default. Not with `timeout_ms`.",
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the Session is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "timeout_ms": {
+          "description": "New override in ms; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "type": "object"
+    },
+    "TtfbResult": {
+      "description": "`session/ttfb` result.",
+      "properties": {
+        "effective_ms": {
+          "description": "The timeout the next turn uses; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "override_ms": {
+          "description": "The Session's override, when it has one; 0 waits indefinitely.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pending": {
+          "default": false,
+          "description": "The change waits for the running turn to end.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The Session revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "seq": {
+          "description": "The update sequence that announced a change; absent for a read.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "effective_ms",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "TurnId": {
+      "description": "One user prompt and everything the agent does in response.",
+      "type": "string"
+    },
+    "UpdateEnvelope": {
+      "description": "An update together with everything needed to route it.\n\nA backend publishes one stream of envelopes for all its sessions; readers\nroute by `session` and discard envelopes from an older `generation`.",
+      "properties": {
+        "generation": {
+          "description": "Process generation. Increases each time the backend's process restarts.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "instance": {
+          "$ref": "#/$defs/BackendInstanceId",
+          "description": "Backend instance that produced the update."
+        },
+        "origin": {
+          "$ref": "#/$defs/Origin",
+          "description": "Whether this is live activity or replayed history."
+        },
+        "seq": {
+          "description": "Position in the backend's stream for this session. Strictly increasing.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionKey",
+          "description": "Session the update belongs to."
+        },
+        "turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Turn the update belongs to, when it belongs to one."
+        },
+        "update": {
+          "$ref": "#/$defs/SessionUpdate",
+          "description": "The update."
+        },
+        "v": {
+          "description": "Protocol version of this envelope.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "v",
+        "instance",
+        "generation",
+        "session",
+        "seq",
+        "origin",
+        "update"
+      ],
+      "type": "object"
+    },
+    "Usage": {
+      "description": "Token usage reported by a backend.",
+      "properties": {
+        "cache_write_tokens": {
+          "description": "Prompt tokens written to cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cached_input_tokens": {
+          "description": "Prompt tokens served from cache.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "context_window": {
+          "description": "The model's context window, when known.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cost_usd": {
+          "description": "Cost of the latest request in US dollars, when known.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input_tokens": {
+          "description": "Prompt tokens of the latest request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "description": "Output tokens of the latest request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reasoning_tokens": {
+          "description": "Reasoning tokens, when reported separately.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "total_tokens": {
+          "description": "Tokens in the context after the latest request.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens"
+      ],
+      "type": "object"
+    },
+    "UsageParams": {
+      "description": "`runtime/usage` params.",
+      "properties": {
+        "cursor": {
+          "description": "Page cursor from a previous result.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "days": {
+          "description": "Only the last this many days; all retained history when absent.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "limit": {
+          "description": "Rows per page: 100 by default, at most 1000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "UsageResult": {
+      "description": "`runtime/usage` result: the host's usage log, one row per Session.",
+      "properties": {
+        "log_status": {
+          "description": "Whether the log could be read, in words.",
+          "type": "string"
+        },
+        "next_cursor": {
+          "description": "Cursor for the next page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rows": {
+          "description": "Session rows, most recent first.",
+          "items": true,
+          "type": "array"
+        },
+        "summary": {
+          "description": "Full dashboard aggregates for the selected period, when offered."
+        },
+        "taken_at_ms": {
+          "description": "When the log was read, in ms since the epoch.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totals": {
+          "description": "Totals over the whole period."
+        }
+      },
+      "required": [
+        "rows",
+        "totals",
+        "taken_at_ms",
+        "log_status"
+      ],
+      "type": "object"
+    },
+    "ViewParams": {
+      "description": "An immutable transcript page request.",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Opaque continuation cursor.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Page size: defaults to 100, at most 1000.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Session reference."
+        },
+        "view_id": {
+          "description": "Immutable transcript view id; expires explicitly.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session",
+        "view_id"
+      ],
+      "type": "object"
+    },
+    "ViewResult": {
+      "description": "A page from an immutable transcript view.",
+      "properties": {
+        "at_seq": {
+          "description": "Event Log high-water mark at capture.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "branch_revision": {
+          "description": "Committed transcript revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "next_cursor": {
+          "description": "Continuation cursor, absent at the end.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "updates": {
+          "description": "Transcript projection for this page.",
+          "items": {
+            "$ref": "#/$defs/SessionUpdate"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "updates",
+        "branch_revision",
+        "at_seq"
+      ],
+      "type": "object"
+    },
+    "WebSearchParams": {
+      "description": "`workspace/web_search` params. Without `enabled` or `provider` it reads.",
+      "properties": {
+        "enabled": {
+          "description": "Turn Loop's web tools on or off.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "expected_revision": {
+          "description": "Fail with a conflict unless the workspace is at this revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "provider": {
+          "description": "Search with this provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "description": "Host workspace id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "WebSearchResult": {
+      "description": "`workspace/web_search` result.",
+      "properties": {
+        "enabled": {
+          "description": "Whether the web tools are on.",
+          "type": "boolean"
+        },
+        "pending_sessions": {
+          "description": "Busy Sessions that pick the change up when their turn ends.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "provider": {
+          "description": "Configured search provider.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "Workspace revision.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "description": "Readable status; never contains keys.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "revision",
+        "enabled",
+        "status",
+        "pending_sessions"
+      ],
+      "type": "object"
+    },
+    "WorkflowCompletion": {
+      "description": "Final workflow output.",
+      "properties": {
+        "artifacts": {
+          "description": "Written artifacts.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "completed_count": {
+          "description": "Successful task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "failed_count": {
+          "description": "Failed task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output": {
+          "description": "Combined output.",
+          "type": "string"
+        },
+        "success": {
+          "description": "All tasks succeeded.",
+          "type": "boolean"
+        },
+        "total_count": {
+          "description": "Total task count.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "success",
+        "completed_count",
+        "failed_count",
+        "total_count",
+        "output",
+        "artifacts"
+      ],
+      "type": "object"
+    },
+    "WorkflowParams": {
+      "description": "Start a workflow. Repeating the same request id returns the same workflow.",
+      "properties": {
+        "concurrency": {
+          "description": "Maximum parallel tasks, from 1 through 64.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "goal": {
+          "description": "Goal to plan and execute.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Caller-generated id for deduplication.",
+          "type": "string"
+        },
+        "session": {
+          "$ref": "#/$defs/SessionRef",
+          "description": "Target Session."
+        }
+      },
+      "required": [
+        "session",
+        "goal",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "WorkflowProgress": {
+      "description": "Progress through the same ordered stream as all Session updates.",
+      "properties": {
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowCompletion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Final result, only on ended."
+        },
+        "description": {
+          "description": "Task description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "error": {
+          "description": "Failure message.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mermaid": {
+          "description": "Mermaid graph.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outline": {
+          "description": "Planned outline.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "output": {
+          "description": "Task output.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/WorkflowState",
+          "description": "Lifecycle state."
+        },
+        "task_id": {
+          "description": "Task identity.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "description": "Workflow identity.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "WorkflowResult": {
+      "description": "An accepted workflow; execution reports on the Session update stream.",
+      "properties": {
+        "workflow_id": {
+          "description": "Stable workflow id.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "workflow_id"
+      ],
+      "type": "object"
+    },
+    "WorkflowState": {
+      "description": "Workflow lifecycle state.",
+      "oneOf": [
+        {
+          "const": "planned",
+          "description": "Planning completed.",
+          "type": "string"
+        },
+        {
+          "const": "task_started",
+          "description": "A task started.",
+          "type": "string"
+        },
+        {
+          "const": "task_completed",
+          "description": "A task succeeded.",
+          "type": "string"
+        },
+        {
+          "const": "task_failed",
+          "description": "A task failed.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "Execution ended, including planning errors and cancellation.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Loop's wire format: JSON-RPC 2.0 methods and the event model. See docs/design/protocol-wire.md.",
+  "error": {
+    "$ref": "#/$defs/RpcErrorBody"
+  },
+  "limits": {
+    "encoded_response_bytes": 16777216,
+    "page_default": 100,
+    "page_max": 1000,
+    "session_transfer_bytes": 8388608,
+    "shell_output_bytes": 1048576
+  },
+  "methods": {
+    "host/interact": {
+      "direction": "server_to_client",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/InteractParams"
+      },
+      "result": {
+        "$ref": "#/$defs/InteractionOutcome"
+      }
+    },
+    "host/interact_withdrawn": {
+      "direction": "server_to_client",
+      "kind": "notification",
+      "params": {
+        "$ref": "#/$defs/InteractWithdrawnParams"
+      }
+    },
+    "initialize": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/InitializeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/InitializeResult"
+      }
+    },
+    "runtime/defaults": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/DefaultsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DefaultsResult"
+      }
+    },
+    "runtime/mcp_auth": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/McpAuthParams"
+      },
+      "result": {
+        "$ref": "#/$defs/McpAuthResult"
+      }
+    },
+    "runtime/providers": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ProvidersParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ProvidersResult"
+      }
+    },
+    "runtime/sessions": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "$ref": "#/$defs/RuntimeSessionsResult"
+      }
+    },
+    "runtime/status": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "$ref": "#/$defs/RuntimeStatus"
+      }
+    },
+    "runtime/stop": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "runtime/stop_empty": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "runtime/tracing": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TracingParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TracingResult"
+      }
+    },
+    "runtime/usage": {
+      "direction": "client_to_server",
+      "host_only": true,
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/UsageParams"
+      },
+      "result": {
+        "$ref": "#/$defs/UsageResult"
+      }
+    },
+    "session/attach": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/AttachParams"
+      },
+      "result": {
+        "$ref": "#/$defs/AttachResult"
+      }
+    },
+    "session/cancel": {
+      "direction": "client_to_server",
+      "kind": "notification",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      }
+    },
+    "session/clone": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/CloneParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DestinationResult"
+      }
+    },
+    "session/close": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/CloseParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/compact": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/CompactParams"
+      },
+      "result": {
+        "$ref": "#/$defs/CompactionReport"
+      }
+    },
+    "session/config": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionSnapshot"
+      }
+    },
+    "session/detach": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "session/efforts": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ChoicesResult"
+      }
+    },
+    "session/export": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ExportResult"
+      }
+    },
+    "session/fork": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ForkParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DestinationResult"
+      }
+    },
+    "session/import": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ImportParams"
+      },
+      "result": {
+        "$ref": "#/$defs/DestinationResult"
+      }
+    },
+    "session/list": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "items": {
+          "$ref": "#/$defs/SessionInfo"
+        },
+        "type": "array"
+      }
+    },
+    "session/load": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/LoadParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionRef"
+      }
+    },
+    "session/models": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ModelsResult"
+      }
+    },
+    "session/modes": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ChoicesResult"
+      }
+    },
+    "session/navigate": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/NavigateParams"
+      },
+      "result": {
+        "$ref": "#/$defs/NavigateResult"
+      }
+    },
+    "session/new": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionSpec"
+      },
+      "result": {
+        "$ref": "#/$defs/SessionRef"
+      }
+    },
+    "session/permission_mode": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/PermissionModeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PermissionModeResult"
+      }
+    },
+    "session/prompt": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/PromptParams"
+      },
+      "result": {
+        "$ref": "#/$defs/PromptResult"
+      }
+    },
+    "session/rename": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/RenameParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
+    "session/sandbox": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SandboxParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SandboxResult"
+      }
+    },
+    "session/set_effort": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SetEffortParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
+    "session/set_mode": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SetModeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
+    "session/set_model": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SetModelParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
+    "session/shell": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ShellParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ShellResult"
+      }
+    },
+    "session/skill": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SkillParams"
+      },
+      "result": {
+        "$ref": "#/$defs/MutationResult"
+      }
+    },
+    "session/stats": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "$ref": "#/$defs/StatsResult"
+      }
+    },
+    "session/transcript": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SessionParams"
+      },
+      "result": {
+        "items": {
+          "$ref": "#/$defs/SessionUpdate"
+        },
+        "type": "array"
+      }
+    },
+    "session/tree": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TreeParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TreeResult"
+      }
+    },
+    "session/ttfb": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TtfbParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TtfbResult"
+      }
+    },
+    "session/update": {
+      "direction": "server_to_client",
+      "kind": "notification",
+      "params": {
+        "$ref": "#/$defs/UpdateEnvelope"
+      }
+    },
+    "session/view": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ViewParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ViewResult"
+      }
+    },
+    "session/workflow": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/WorkflowParams"
+      },
+      "result": {
+        "$ref": "#/$defs/WorkflowResult"
+      }
+    },
+    "shutdown": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "type": "object"
+      },
+      "result": {
+        "type": "object"
+      }
+    },
+    "workspace/mcp": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/McpParams"
+      },
+      "result": {
+        "$ref": "#/$defs/McpResult"
+      }
+    },
+    "workspace/reload": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/ReloadParams"
+      },
+      "result": {
+        "$ref": "#/$defs/ReloadResult"
+      }
+    },
+    "workspace/settings": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SettingsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SettingsResult"
+      }
+    },
+    "workspace/skills": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/SkillsParams"
+      },
+      "result": {
+        "$ref": "#/$defs/SkillsResult"
+      }
+    },
+    "workspace/templates": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TemplatesParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TemplatesResult"
+      }
+    },
+    "workspace/trust": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/TrustParams"
+      },
+      "result": {
+        "$ref": "#/$defs/TrustResult"
+      }
+    },
+    "workspace/web_search": {
+      "direction": "client_to_server",
+      "kind": "request",
+      "params": {
+        "$ref": "#/$defs/WebSearchParams"
+      },
+      "result": {
+        "$ref": "#/$defs/WebSearchResult"
+      }
+    }
+  },
+  "protocol_version": 1,
+  "title": "loop-protocol"
+}
