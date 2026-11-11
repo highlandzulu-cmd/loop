@@ -41,6 +41,33 @@ async fn sqlite_migrations_include_branch_tips() {
     .expect("branch_tips exists");
 }
 
+/// Two `loop` processes that start at the same moment both open a fresh
+/// Session database. Each must see the other's migration as applied, not
+/// fail with "table already exists" or a duplicate `migrations.id`.
+#[test]
+fn concurrent_first_opens_of_a_fresh_database_all_succeed() {
+    for round in 0..20 {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let openers: Vec<_> = (0..8)
+            .map(|_| {
+                let (path, start) = (path.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    loop_agent::harness::session::sqlite::SqliteSessionStore::open(&path)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+            })
+            .collect();
+        for opener in openers {
+            let result = opener.join().unwrap();
+            assert!(result.is_ok(), "round {round}: {result:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn sqlite_branch_cache_after_append() {
     let dir = tempfile::tempdir().unwrap();
