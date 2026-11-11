@@ -954,6 +954,21 @@ impl FileSystem for JailedHostFs {
         self.create_dir(&path).await?;
         Ok(path)
     }
+    async fn file_identity(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        // `open` uses O_NOFOLLOW on every component: a symlink is refused.
+        let file = match self.open(path, false, rustix::fs::OFlags::RDONLY, false) {
+            Ok(file) => file,
+            Err(e) if e.code == FileErrorCode::NotFound => return Err(e),
+            Err(_) => return Ok(None),
+        };
+        let meta = file.metadata().map_err(io_error)?;
+        Ok(meta
+            .is_file()
+            .then(|| crate::harness::types::FileIdentity::from_metadata(&meta)))
+    }
 }
 
 #[cfg(unix)]
@@ -1329,6 +1344,12 @@ impl FileSystem for SeatbeltEnv {
     }
     async fn create_temp_dir(&self, p: &str) -> Result<PathBuf, FileError> {
         self.fs.create_temp_dir(p).await
+    }
+    async fn file_identity(
+        &self,
+        p: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        self.fs.file_identity(p).await
     }
 }
 

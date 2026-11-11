@@ -154,6 +154,19 @@ impl FileSystem for HostExecutionEnv {
         tokio::fs::canonicalize(&path).await.map_err(Self::map_io)
     }
 
+    async fn file_identity(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        let path = self.absolute_path(path)?;
+        let meta = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(Self::map_io)?;
+        Ok(meta
+            .is_file()
+            .then(|| crate::harness::types::FileIdentity::from_metadata(&meta)))
+    }
+
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError> {
         let base = std::env::temp_dir();
         let name = format!("{prefix}-{}", loop_ai::new_id());

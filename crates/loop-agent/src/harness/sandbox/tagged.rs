@@ -176,4 +176,10 @@ impl FileSystem for TaggedEnv {
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError> {
         self.host.create_temp_dir(prefix).await
     }
+    async fn file_identity(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        self.host.file_identity(path).await
+    }
 }
