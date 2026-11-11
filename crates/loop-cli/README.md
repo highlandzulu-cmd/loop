@@ -76,7 +76,7 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 `/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
 
-### MCP server mode
+## MCP server mode
 
 `loop --serve-mcp` starts Loop as an MCP server (streamable HTTP) instead of the chat. `--mcp-host` sets the interface (default `127.0.0.1`), `--mcp-port` the port (default `3100`), and `--mcp-token <token>` requires `Authorization: Bearer <token>` on every request; a non-loopback `--mcp-host` requires a token. Tool calls are judged by the [permission mode](../../docs/permissions.md), and with nobody to ask, calls that need approval are refused unless you pass `--permission-mode full-access`.
 
