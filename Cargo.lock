@@ -4799,6 +4799,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

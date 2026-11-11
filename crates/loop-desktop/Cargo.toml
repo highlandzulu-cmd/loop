@@ -46,3 +46,6 @@ similar = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
