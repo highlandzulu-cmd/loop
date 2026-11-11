@@ -29,3 +29,4 @@ anyhow.workspace = true
 loop-orchestration.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+tokio-util.workspace = true

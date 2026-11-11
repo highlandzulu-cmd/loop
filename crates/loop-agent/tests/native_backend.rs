@@ -453,3 +453,52 @@ async fn a_user_command_defaults_to_the_bash_maximum() {
         .unwrap_err();
     assert!(refused.to_string().contains("30000"), "{refused}");
 }
+
+/// A cancel after the turn's end, while its tree writes are pending, still
+/// releases the held end; the next prompt's updates flow.
+#[tokio::test]
+async fn a_cancel_while_the_turn_end_is_held_does_not_block_the_stream() {
+    let harness = harness(
+        vec![
+            FauxResponse::Text("first".into()),
+            FauxResponse::Text("second".into()),
+        ],
+        Vec::new(),
+    )
+    .await;
+    let backend = NativeBackend::new(Arc::clone(&harness)).await;
+    let session = backend.current_session().await;
+    let mut rx = backend.subscribe();
+    let cancel = std::sync::Mutex::new(Some((Arc::clone(&backend), session.clone())));
+    harness.subscribe(move |event: loop_agent::AgentEvent| {
+        if matches!(event, loop_agent::AgentEvent::AgentEnd { .. }) {
+            if let Some((backend, session)) = cancel.lock().unwrap().take() {
+                backend.cancel(&session);
+            }
+        }
+        async {}
+    });
+    let first = backend.prompt(&session, text("one")).await.unwrap();
+    let _ = first.outcome().await;
+    assert!(collect_turn(&mut rx)
+        .await
+        .iter()
+        .any(|e| matches!(e.update, SessionUpdate::TurnEnded { .. })));
+    let second = backend.prompt(&session, text("two")).await.unwrap();
+    assert!(matches!(second.outcome().await, TurnOutcome::Completed(_)));
+    let updates: Vec<_> = collect_turn(&mut rx)
+        .await
+        .into_iter()
+        .map(|e| e.update)
+        .collect();
+    assert!(
+        matches!(
+            updates.last(),
+            Some(SessionUpdate::TurnEnded {
+                stop: StopReason::EndTurn,
+                ..
+            })
+        ),
+        "{updates:?}"
+    );
+}
