@@ -4,10 +4,14 @@ Hypothesis H3. Probe run on 2026-11-11. Branch `probe/e7-turn-queue`.
 
 ## Result in one paragraph
 
-E7 passes the task gate. In 1,000 random schedules against an in-process
-Runtime with the `faux` provider, there were 0 deadlocks, 0 lost permits, 0
-over-limit active turns, 0 over-limit loaded Sessions, 0 prompts without
-exactly one terminal record, and 0 panics. The probe found one small defect
+E7 passes the task gate. The gate run is 1,000 random schedules, all at the
+default limits (16 Sessions, 8 active turns), against an in-process Runtime
+with the `faux` provider (`E7_LIMITS=default`, 553 s). It has 0 deadlocks, 0
+lost permits (849 of 849 permit probes exact; 151 schedules shut down with
+turns in flight and have no probe), 0 over-limit active turns, 0 over-limit
+loaded Sessions, 0 prompts without exactly one terminal record, and 0 panics.
+A second run of 1,000 schedules with mixed smaller limits (593 at 16/8, 407
+smaller) adds contention. It also passes (437 s). The probe found one small defect
 (D1): a cancel that arrives while the native backend prepares a prompt ended
 the turn as `Failed` and not as `Cancelled`. It is fixed by a four-line change
 in `runtime.rs` (separate commit). The first run found it 5 times in 1,000
@@ -17,7 +21,7 @@ schedules. The second run, with the fix, found it 0 times.
 
 | Question | Answer from E7 |
 |---|---|
-| Is the turn queue free of deadlock and lost permits (A4: "The turn queue has no deadlock")? | **Yes**, for the cases below. 1,000 of 1,000 schedules pass after the D1 fix. |
+| Is the turn queue free of deadlock and lost permits (A4: "The turn queue has no deadlock")? | **Yes**, for the cases below. Liveness and terminal records: 1,000 of 1,000 schedules, in each of two runs, after the D1 fix. Permits: 849 of 849 probes (gate run), 842 of 842 (mixed run). The shutdown-in-flight schedules have no permit probe. |
 | Does it block "Runtime as default"? | **No.** D1 is cosmetic (wrong outcome name, no lost state) and is fixed. |
 | Permit release and reacquire rules, and admission | No defect found in the rules as built. The parent releases its permit while it waits for a Subagent and reacquires it after. The shutdown case is below (note N1). |
 
@@ -49,9 +53,9 @@ and a replay command.
   parallel children); and nested Subagents (a child that spawns a child).
 - **Runtime.** One Runtime per schedule, in one process, with one agent
   directory per schedule. Permission mode `full-access`, sandbox off.
-- **Limits.** 593 of 1,000 schedules use the default limits (16 Sessions, 8
-  active turns). The others use 2/1, 3/2, 4/2, 5/3, 8/4 (Sessions/turns) to
-  create more contention.
+- **Limits.** Gate run: every schedule uses the default limits (16 Sessions, 8
+  active turns). Mixed run: 593 of 1,000 schedules use the defaults. The others
+  use 2/1, 3/2, 4/2, 5/3, 8/4 (Sessions/turns) to create more contention.
 - **Event Log.** `SlowLog` wraps `MemoryEventLog`. It delays every append by a
   seeded random time (0, 2, 10 or 30 ms maximum per schedule). This is the
   "slow event-log write" hook. It also counts open `turn_started` to
@@ -68,8 +72,7 @@ and a replay command.
   nearest operation is a prompt on a busy Session, which the Runtime refuses
   with `Busy`. The harness does that.
 - **Replay.** The schedule repeats from the seed. Thread timing does not, so a
-  replay can take another interleaving. An earlier flag (note N1, before the
-  harness accepted it) passed on replay in 3 of 4 schedules.
+  replay can take another interleaving.
 
 ### Checks per schedule
 
@@ -96,9 +99,39 @@ and a replay command.
 
 ## Numbers
 
-Final run (with the D1 fix, commit `62fa2ba`), seed 20261111, 4 schedules in
-parallel, 437 s wall time. The first run (harness `46fd40e`, without the fix)
-took 390 s.
+### Gate run: default limits only (16/8), with the D1 fix
+
+Command: `E7_LIMITS=default E7_SCHEDULES=1000 E7_SEED=20261111 E7_PARALLEL=4`,
+commit `62fa2ba`, 553 s wall time (budget: 15 minutes). Result: **PASS**.
+
+| Quantity | Gate run |
+|---|---|
+| Schedules / failed | 1,000 / 0 |
+| Schedules with Subagents | 388 |
+| Deadlocks or hangs | 0 |
+| Permit probes exact (8 of 8 start, the 9th waits) | 849 of 849 |
+| Peak loaded Sessions | 16 (limit 16) |
+| Peak live model calls (never-cancelled prompts) | 8 (limit 8) |
+| Peak acknowledged prompts at once (so prompts queued beyond 8) | 16 |
+| Prompt calls / acknowledged | 103,552 / 44,743 |
+| Refused `Busy` / refused for another expected reason | 46,736 / 12,073 |
+| `prompt_sent` records (roots and children) | 56,675 |
+| `turn_ended` / `prompt_settled` (cancelled or closed before a turn ran) | 55,096 / 1,579 |
+| Prompts with no or two terminal records | 0 |
+| Outcomes completed / cancelled / failed | 30,218 / 13,769 / 756 (47 of the failed: `semaphore closed` at shutdown, note N1; the rest injected model errors) |
+| Child prompts (Subagents) | 4,291 |
+| `new_session` accepted / refused `Busy` at the limit | 23,676 / 258 |
+| Forced closes / plain closes accepted | 4,298 / 1,353 |
+| Schedules that shut down with turns in flight | 151 |
+| `SessionClosed` with `aborted: true` | 0 |
+| Panics | 0 |
+| Schedule time p50 / p99 / max | 1.95 s / 6.3 s / 12.3 s |
+| Cancel latency, n=6,943: p50 / p99 / max / over 1 s | 59 ms / 472 ms / 2,115 ms / 15 |
+
+### Mixed-limit run, with the D1 fix
+
+Seed 20261111, 4 schedules in parallel, commit `62fa2ba`, 437 s. The first
+run (harness `46fd40e`, without the fix, mixed limits) took 390 s.
 
 | Quantity | Final run | First run (no fix) |
 |---|---|---|
@@ -107,7 +140,7 @@ took 390 s.
 | Schedules with default limits (16/8) | 593 | 593 |
 | Schedules with Subagents | 392 | 392 |
 | Deadlocks or hangs | **0** | 0 |
-| Lost permits (probe runs exact: 842 of 842) | **0** | 0 |
+| Lost permits (probe runs exact: 842 of 842; no probe in 158 shutdown-in-flight schedules) | **0** | 0 |
 | Over-release (more than the limit started) | **0** | 0 |
 | Peak loaded Sessions | 16 (limit 16) | 16 |
 | Peak live model calls (never-cancelled prompts) | 8 (limit 8) | 8 |
@@ -143,11 +176,11 @@ after a timed cancel):
 | 200 schedules, 1 at a time | 906 | 54 ms | 453 ms | 696 ms | 0 |
 | First run, 4 in parallel | 4,684 | 53 ms | 414 ms | 903 ms | 0 |
 
-The machine was busy (load average 11 to 13 from other agents' builds) during
-every run, so these times are not a clean measure. The latency includes the
+The machine was busy (load average 7 to 13 from other agents' builds) during
+every run, so these times are indicative only, not a clean measure. The latency includes the
 random Event Log delay (up to 30 ms per append, several appends per cancel)
-and the model call delay. The 10 cases over 1 s were seen only with 4 schedules
-in parallel on a loaded machine. The E7 line in `stress-tests.md` asks for
+and the model call delay. The cases over 1 s (10 in the mixed run, 15 in the gate run) were seen only
+with 4 schedules in parallel on a loaded machine. The E7 line in `stress-tests.md` asks for
 "cancellation settles within 1 s". This is **not proved**: repeat it in a quiet
 slot with `E7_PARALLEL=1` and no slow log.
 
@@ -172,9 +205,14 @@ slot with `E7_PARALLEL=1` and no slow log.
   (ignored). It failed before the fix and passes after it (commit `21e7c54`
   adds it, `7e5ae2b` fixes).
 - **Fix** (`7e5ae2b`, four lines at `runtime.rs:2549`). A `Failed` with category
-  `Cancelled` becomes `TurnOutcome::Cancelled`. Not done: the same change in
-  `native_backend.rs`, which other backends use. All other `loop-runtime`
-  tests pass.
+  `Cancelled` becomes `TurnOutcome::Cancelled`. I did not change
+  `native_backend.rs`. All other non-ignored `loop-runtime` tests pass. The
+  fix changes the outcome a Surface sees, so the supervisor can drop the
+  commit. In the repo, the ACP backend already maps a `Cancelled` error
+  category to a `Cancelled` outcome (`crates/extend/loop-acp/src/backend.rs:1067`),
+  so the fix makes the native path agree with it. I found no code that
+  branches on a `Failed` outcome with that category (search of
+  `ErrorCategory::Cancelled` in `crates`).
 
 ### Notes (not defects)
 
@@ -182,19 +220,22 @@ slot with `E7_PARALLEL=1` and no slow log.
   first (`runtime.rs:1544`). A prompt that waits for a permit then ends as
   `Failed("semaphore closed")` and not `Cancelled`. This happened 70 times in
   158 schedules that shut down with turns in flight. The log is correct
-  (`prompt_settled`). The text shows an internal word. Suggest `Cancelled` or a
-  "Runtime stopped" message. Not changed.
+  (`prompt_settled`). This is the same class as D1: a prompt ends as `Failed`
+  on a stop the caller asked for, with an internal word in the text. I left it
+  unfixed, because a stop of the whole Runtime may deserve a distinct outcome.
+  Suggest `Cancelled` or a "Runtime stopped" message.
 - **N2. At the Session limit.** `new_session` and `load_session` return `Busy`
   when every loaded Session is busy, watched, a Subagent, or has a parent
   waiting. They unload the least recently active idle Session otherwise. At
   quiescence with no watchers, `new_session` never refused (842 probes).
 - **N3. Pre-existing lint failure, not caused by this branch.**
-  `cargo clippy -p loop-runtime --all-targets --locked -- -D warnings` fails on
+  `cargo clippy -p loop-runtime --all-targets --locked -- -D warnings` fails,
+  with and without `--features orchestration`, with one error:
   `crates/loop-runtime/tests/e3_enforcement.rs:980` (`explicit_auto_deref`,
-  new clippy 1.98). Not touched. The E7 file and `runtime.rs` are clean with
-  and without `--features orchestration` (checked with
-  `--test e7_turn_queue` and `--lib --tests`). `cargo fmt --all -- --check`
-  passes.
+  clippy 1.98). `git diff origin/staging -- crates/loop-runtime/tests/e3_enforcement.rs`
+  is empty, so the file is as on `staging`. I did not touch it. No other error
+  appears, so `e7_turn_queue.rs` and `runtime.rs` are clean. I read this output
+  on commit `c92df7b`. `cargo fmt --all -- --check` passes.
 - **N4. Stderr noise.** The Runtime prints one line per unloaded Session. Run
   with `2>&1 | grep -v "unloading idle"`.
 
@@ -224,9 +265,10 @@ The E7 line in `docs/stress-tests.md` is wider than the task gate. Not done:
 ## Decision
 
 - Mark A4 ("The turn queue has no deadlock") as **passed** at the task gate:
-  1,000 of 1,000 schedules, seed 20261111, commit `62fa2ba`.
+  the default-limit run, 1,000 of 1,000 schedules, seed 20261111, commit
+  `62fa2ba` (permits: 849 of 849 probes).
 - Keep the D1 fix. Keep `e7_turn_queue.rs` in `staging` as a regression test
-  (ignored by default; runs in about 7 minutes).
+  (ignored by default; the full run takes 7 to 9 minutes).
 - Before the multi-Surface release, run E7 again in a quiet slot, with
   `E7_PARALLEL=1`, to settle the 1 s cancel line, and add the FIFO and
   parked-approval cases from the full E7 line.
