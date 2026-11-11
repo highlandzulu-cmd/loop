@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use tokio::sync::broadcast;
 
 use crate::effort::{effective_effort, native_efforts, parse_thinking, NATIVE_EFFORTS};
-use crate::harness::agent_harness::AgentHarness;
+use crate::harness::agent_harness::{AgentHarness, TurnWritten};
 use crate::harness::session::format_session_stats;
 use crate::harness::session::types::{
     PendingSessionWrite, PERMISSION_MODE_ENTRY, RESPONSE_TIMEOUT_ENTRY, SANDBOX_ENTRY,
@@ -207,6 +207,9 @@ struct StreamState {
     /// the stream (the Runtime's Event Log) then never records a turn end
     /// the tree does not hold.
     held: Vec<(Option<TurnId>, SessionUpdate)>,
+    /// A prompt's turn is not yet in the tree: hold its end. Set and cleared
+    /// only by [`TurnHold`], under this lock.
+    holding: bool,
 }
 
 impl StreamState {
@@ -225,22 +228,83 @@ impl StreamState {
         let _ = self.updates.send(envelope);
     }
 
-    /// Send the held updates. With `failure`, the turn's tree writes failed:
-    /// the held turn end reports that failure instead of its own stop.
-    /// True when a turn end was held.
+    /// Stop holding and send the held updates. With `failure`, the turn's
+    /// tree writes failed: the first held turn end (the prompt's own turn)
+    /// reports that failure instead of its own stop. True when a turn end
+    /// was held.
     fn release(&mut self, instance: &BackendInstanceId, failure: Option<&ErrorInfo>) -> bool {
+        self.holding = false;
         let mut ended = false;
         for (turn, mut update) in std::mem::take(&mut self.held) {
             if let SessionUpdate::TurnEnded { stop, error, .. } = &mut update {
-                ended = true;
-                if let Some(info) = failure {
-                    *stop = StopReason::Error;
-                    *error = Some(info.clone());
+                if !ended {
+                    if let Some(info) = failure {
+                        *stop = StopReason::Error;
+                        *error = Some(info.clone());
+                    }
                 }
+                ended = true;
             }
             self.send(instance, turn, update);
         }
         ended
+    }
+}
+
+/// Holds a prompted turn's end on the stream until the harness has written
+/// the turn to the tree ([`TurnHold::written`]). If the prompt task ends any
+/// other way (a panic, an abort) before that, dropping the last handle
+/// releases the held updates with an internal error, so the stream never
+/// stays blocked.
+struct TurnHold {
+    instance: BackendInstanceId,
+    stream: Arc<Mutex<StreamState>>,
+    config: Arc<Mutex<ConfigState>>,
+    /// The prompt's turn end already reported a tree write failure.
+    failure_reported: AtomicBool,
+}
+
+impl TurnHold {
+    fn start(
+        instance: BackendInstanceId,
+        stream: Arc<Mutex<StreamState>>,
+        config: Arc<Mutex<ConfigState>>,
+    ) -> Arc<Self> {
+        stream.lock().holding = true;
+        Arc::new(Self {
+            instance,
+            stream,
+            config,
+            failure_reported: AtomicBool::new(false),
+        })
+    }
+
+    /// The turn is in the tree (or its write failed with `failure`): send
+    /// its end and what came after it.
+    fn written(&self, failure: Option<&ErrorInfo>) {
+        let released = self.stream.lock().release(&self.instance, failure);
+        if released {
+            if failure.is_some() {
+                self.failure_reported.store(true, Ordering::Release);
+            }
+            apply_pending(&self.instance, &self.stream, &self.config);
+        }
+    }
+}
+
+impl Drop for TurnHold {
+    fn drop(&mut self) {
+        let unfinished = {
+            let state = self.stream.lock();
+            state.holding || !state.held.is_empty()
+        };
+        if unfinished {
+            let info = ErrorInfo::new(
+                ErrorCategory::Internal,
+                "the turn stopped before it was saved",
+            );
+            self.written(Some(&info));
+        }
     }
 }
 
@@ -259,6 +323,7 @@ impl NativeBackend {
             mapper: NativeEventMapper::new(),
             turns: Default::default(),
             held: Vec::new(),
+            holding: false,
         }));
         let level = harness.thinking_level().await;
         let default_model = harness.model().await;
@@ -294,10 +359,8 @@ impl NativeBackend {
         backend.read_config().await;
         let instance = backend.instance.clone();
         let config = Arc::clone(&backend.config);
-        let prompting = Arc::clone(&backend.prompting);
         harness.subscribe(move |event: AgentEvent| {
-            let hold = prompting.load(Ordering::Acquire);
-            if translate(&instance, &stream, &event, hold) {
+            if translate(&instance, &stream, &event) {
                 apply_pending(&instance, &stream, &config);
             }
             async {}
@@ -673,17 +736,17 @@ impl NativeBackend {
 }
 
 /// Translate and send `event`'s updates. True when a turn ended and its end
-/// was sent. With `hold` (a prompt is running), a turn end and what follows
-/// it are kept back until the prompt releases them.
+/// was sent. While a [`TurnHold`] holds (a prompt's turn is not yet in the
+/// tree), a turn end and what follows it are kept back until it releases them.
 fn translate(
     instance: &BackendInstanceId,
     stream: &Mutex<StreamState>,
     event: &AgentEvent,
-    hold: bool,
 ) -> bool {
     let mut state = stream.lock();
     let updates = state.mapper.map(event);
-    let mut ended = false;
+    // Nothing holds any more: what is left goes out first, in order.
+    let mut ended = !state.holding && !state.held.is_empty() && state.release(instance, None);
     for update in updates {
         let is_end = matches!(update, SessionUpdate::TurnEnded { .. });
         let turn = match &update {
@@ -692,7 +755,7 @@ fn translate(
             }
             _ => state.mapper.current_turn().cloned(),
         };
-        if !state.held.is_empty() || (hold && is_end) {
+        if state.holding && (is_end || !state.held.is_empty()) {
             state.held.push((turn, update));
             continue;
         }
@@ -983,8 +1046,16 @@ impl AgentBackend for NativeBackend {
         let stream = Arc::clone(&self.stream);
         let turns_before = self.stream.lock().mapper.turns_started();
         let config = Arc::clone(&self.config);
+        let hold = TurnHold::start(instance.clone(), Arc::clone(&stream), Arc::clone(&config));
         tokio::spawn(async move {
-            let result = harness.prompt(input).await;
+            let on_written = Arc::clone(&hold);
+            let written: TurnWritten = Box::new(move |failure| {
+                // The same text `harness_error` gives the returned error.
+                let info = failure
+                    .map(|e| ErrorInfo::new(ErrorCategory::Internal, format!("session: {e}")));
+                on_written.written(info.as_ref());
+            });
+            let result = harness.prompt_then_written(input, written).await;
             let rejected_busy = matches!(result, Err(AgentHarnessError::Busy));
             // A run that returned a message already ended its turn on the
             // stream, even when the message is an error.
@@ -1009,17 +1080,12 @@ impl AgentBackend for NativeBackend {
                     other => ErrorInfo::new(ErrorCategory::Internal, other.to_string()),
                 }),
             };
-            // The harness has written the turn to the tree (or failed to):
-            // only now may its end reach the stream. A run that failed after
-            // its turn ended (its tree writes failed) ends that turn failed.
-            let write_failure = match &outcome {
-                TurnOutcome::Failed(info) if !ran && !rejected_busy => Some(info),
-                _ => None,
-            };
-            let released = stream.lock().release(&instance, write_failure);
-            if released {
-                apply_pending(&instance, &stream, &config);
-            }
+            // Normally the harness released the turn's end after its tree
+            // writes. A run that never wrote (refused before its turn) has
+            // nothing held; anything left is sent now, as it is.
+            hold.written(None);
+            let reported = hold.failure_reported.load(Ordering::Acquire);
+            drop(hold);
             drop(slot);
             match &outcome {
                 // Another caller of the harness is running a turn; that
@@ -1028,7 +1094,7 @@ impl AgentBackend for NativeBackend {
                     error_notice(&instance, &stream, info);
                 }
                 // The held turn end already reported this failure.
-                TurnOutcome::Failed(_) if released && !ran => {}
+                TurnOutcome::Failed(_) if reported && !ran => {}
                 TurnOutcome::Failed(info) if !ran => {
                     close_failed_turn(&instance, &stream, turns_before, info);
                     apply_pending(&instance, &stream, &config);
@@ -1402,5 +1468,110 @@ impl NativeBackend {
             .await
             .map_err(harness_error)?;
         Ok(self.announce_change().await)
+    }
+}
+
+#[cfg(test)]
+mod hold_tests {
+    use super::*;
+
+    fn parts() -> (
+        BackendInstanceId,
+        Arc<Mutex<StreamState>>,
+        Arc<Mutex<ConfigState>>,
+        broadcast::Receiver<UpdateEnvelope>,
+    ) {
+        let (updates, rx) = broadcast::channel(64);
+        let stream = Arc::new(Mutex::new(StreamState {
+            session: SessionKey("s".into()),
+            seq: 0,
+            updates,
+            mapper: NativeEventMapper::new(),
+            turns: Default::default(),
+            held: Vec::new(),
+            holding: false,
+        }));
+        let config = Arc::new(Mutex::new(ConfigState {
+            session: SessionKey("s".into()),
+            revision: 0,
+            name: None,
+            level: AgentThinkingLevel::Off,
+            config: SessionConfig::default(),
+            effective: SessionConfig::default(),
+            pending: None,
+            sandbox_choice: None,
+            sandbox_deferred: false,
+        }));
+        (BackendInstanceId::from(NATIVE_INSTANCE), stream, config, rx)
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<UpdateEnvelope>) -> Vec<SessionUpdate> {
+        std::iter::from_fn(|| rx.try_recv().ok().map(|e| e.update)).collect()
+    }
+
+    fn ends(updates: &[SessionUpdate]) -> Vec<(StopReason, bool)> {
+        updates
+            .iter()
+            .filter_map(|u| match u {
+                SessionUpdate::TurnEnded { stop, error, .. } => Some((*stop, error.is_some())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn turn(instance: &BackendInstanceId, stream: &Mutex<StreamState>) {
+        translate(instance, stream, &AgentEvent::AgentStart);
+        translate(instance, stream, &AgentEvent::AgentEnd { messages: vec![] });
+    }
+
+    #[test]
+    fn a_held_end_waits_for_the_tree_and_later_turns_flow() {
+        let (instance, stream, config, mut rx) = parts();
+        let hold = TurnHold::start(instance.clone(), Arc::clone(&stream), config);
+        turn(&instance, &stream);
+        assert!(
+            ends(&drain(&mut rx)).is_empty(),
+            "the end waits for the tree"
+        );
+        hold.written(None);
+        assert_eq!(ends(&drain(&mut rx)), [(StopReason::EndTurn, false)]);
+        // A turn end after the release (before the prompt slot drops) flows.
+        turn(&instance, &stream);
+        assert_eq!(ends(&drain(&mut rx)), [(StopReason::EndTurn, false)]);
+        drop(hold);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_the_held_window_releases_the_end_as_failed() {
+        let (instance, stream, config, mut rx) = parts();
+        let hold = TurnHold::start(instance.clone(), Arc::clone(&stream), config);
+        let (i, s) = (instance.clone(), Arc::clone(&stream));
+        let task = tokio::spawn(async move {
+            let _hold = hold;
+            turn(&i, &s);
+            panic!("the harness panicked before its tree writes");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        let updates = drain(&mut rx);
+        assert_eq!(ends(&updates), [(StopReason::Error, true)]);
+        // Later updates are not held.
+        turn(&instance, &stream);
+        assert_eq!(ends(&drain(&mut rx)), [(StopReason::EndTurn, false)]);
+    }
+
+    #[test]
+    fn a_write_failure_rewrites_only_the_first_held_end() {
+        let (instance, stream, config, mut rx) = parts();
+        let hold = TurnHold::start(instance.clone(), Arc::clone(&stream), config);
+        turn(&instance, &stream);
+        turn(&instance, &stream);
+        let info = ErrorInfo::new(ErrorCategory::Internal, "session: storage: full");
+        hold.written(Some(&info));
+        assert!(hold.failure_reported.load(Ordering::Acquire));
+        assert_eq!(
+            ends(&drain(&mut rx)),
+            [(StopReason::Error, true), (StopReason::EndTurn, false)]
+        );
     }
 }

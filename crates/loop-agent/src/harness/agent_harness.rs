@@ -97,6 +97,10 @@ pub struct TurnSnapshot {
 /// Whether a tool is offered to the model ([`AgentHarness::set_tool_filter`]).
 pub type ToolFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
+/// Called once a prompted turn's tree writes are done, with the write that
+/// failed, if any. See [`AgentHarness::prompt_then_written`].
+pub type TurnWritten = Box<dyn FnOnce(Option<&crate::harness::types::SessionError>) + Send>;
+
 /// Agent harness.
 pub struct AgentHarness {
     models: Arc<Models>,
@@ -1340,7 +1344,22 @@ impl AgentHarness {
         input: impl Into<PromptInput>,
     ) -> Result<AgentMessage, AgentHarnessError> {
         self.assert_not_shut_down()?;
-        self.run_turn(Some(input.into())).await
+        self.run_turn(Some(input.into()), None).await
+    }
+
+    /// [`prompt`](Self::prompt), and call `written` once the turn's tree
+    /// writes are done: after the last `append_entry` and before the
+    /// `Settled` hooks run. Its argument is the tree write that failed, if
+    /// one did (then the prompt returns that failure too). Not called when
+    /// the prompt is refused before its turn starts (busy, no model, lost
+    /// lease).
+    pub async fn prompt_then_written(
+        &self,
+        input: impl Into<PromptInput>,
+        written: TurnWritten,
+    ) -> Result<AgentMessage, AgentHarnessError> {
+        self.assert_not_shut_down()?;
+        self.run_turn(Some(input.into()), Some(written)).await
     }
 
     /// Prompt with images.
@@ -1356,6 +1375,7 @@ impl AgentHarness {
     async fn run_turn(
         &self,
         input: Option<PromptInput>,
+        written: Option<TurnWritten>,
     ) -> Result<AgentMessage, AgentHarnessError> {
         // Fail before touching phase or session, so nothing is recorded for the prompt.
         self.require_model().await?;
@@ -1393,6 +1413,7 @@ impl AgentHarness {
         let writes = std::mem::take(&mut *self.pending_writes.lock());
         // Aborted turns should leave no session footprint so a follow-up prompt
         // (or UI "stop") behaves as if the turn never ran.
+        let mut write_error = None;
         if !token.is_cancelled() {
             let session = self.session.lock().await;
             let store = session.store();
@@ -1403,11 +1424,19 @@ impl AgentHarness {
                     // A turn the Session does not hold is not complete. Later
                     // entries would hang off the wrong parent, so stop here.
                     if result.is_ok() {
-                        result = Err(AgentHarnessError::Session(e));
+                        write_error = Some(e);
                     }
                     break;
                 }
             }
+        }
+        // The tree now holds the turn (or the write failed): tell the caller
+        // before user hooks can delay it.
+        if let Some(written) = written {
+            written(write_error.as_ref());
+        }
+        if let Some(e) = write_error {
+            result = Err(AgentHarnessError::Session(e));
         }
 
         *self.phase.lock() = AgentHarnessPhase::Idle;
