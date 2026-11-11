@@ -260,10 +260,84 @@ stands, for the reasons below.
 - A prompt cancelled or refused before its turn started, as the last prompt
   of a Session in a generation that crashed, is now also marked
   `runtime_restarted`, although it did nothing. This is a false "uncertain",
-  not a lost record.
+  not a lost record. (Fixed in review: see finding 3 below.)
 - Turns the harness runs without `NativeBackend::prompt` (no prompt in
   flight) are not held; their `turn_ended` can still commit before the tree.
 - Embedded owners are unchanged (no Event Log).
+
+## Re-run after review fixes
+
+Run on 2026-11-11. Code: branch `probe/e1-recovery`, commit `01216bc`
+(review fixes in `68e7082`, `20aaba9`, `01216bc`). Same command, same seeds,
+200 trials each.
+
+| Criterion | Set A (seed 20261111) | Set B (seed 424242) | Pass? |
+|---|---|---|---|
+| Acknowledged mutations lost | 0 of 20,944 (7,081 Runtime + 13,863 embedded) | 0 of 21,214 (7,214 + 14,000) | Yes |
+| Duplicate side effects | 0 | 0 | Yes |
+| Duplicate recovery records | 0 (and 0 turns found by the extra start after a clean stop) | 0 (0) | Yes |
+| Takeovers of a live owner | 0 of 4,800 (all refused) | 0 of 4,800 | Yes |
+| Every interrupted turn marked uncertain (Runtime) | 0 of 800 not marked | 0 of 800 not marked | Yes |
+
+Interrupted Runtime turns, set A (set B): 680 (691) marked
+`runtime_restarted`, 52 (62) finished in both stores with only the
+acknowledgement lost, 68 (47) never started. D1 cases: 0 (0). D2 cases: 0
+(0). Run time 100 s (101 s), 0 trial failures, 0 notes. E1 still passes.
+
+### Review findings and how each was handled
+
+1. **High: build break with `--features orchestration`.** `translate` has
+   three arguments again. The hold is no longer a parameter: it is
+   `StreamState::holding`, set only by a prompt's `TurnHold`. The workflow
+   path never holds.
+2. **High: an un-released hold blocked the stream.** `TurnHold`
+   (`native_backend.rs`) sets and clears the hold under the stream lock. If
+   it is dropped while still holding (panic, task abort), it releases the
+   held updates with an internal error. After the release, `translate` does
+   not hold, so a turn end between the release and the end of the prompt
+   flows. Tests: `hold_tests` (panic in the held window, a turn end after the
+   release) and `a_cancel_while_the_turn_end_is_held_does_not_block_the_stream`.
+3. **Medium: false uncertain marks.** The Runtime logs a new log-only event
+   `prompt_settled` when a prompt exits after `prompt_sent` but before the
+   backend takes it (cancel in the permit queue, closing, busy, cancelled
+   before it started, Session check failed, invalid input). Recovery clears
+   that prompt. No wire change: only Updates go to Surfaces. Tests:
+   `a_prompt_cancelled_in_the_queue_is_not_recovered_as_uncertain`,
+   `a_prompt_the_backend_refused_is_not_recovered_as_uncertain` (invalid
+   input; a busy refusal takes the same path), `a_settled_prompt_is_not_unfinished`.
+4. **Medium: recovery loaded prompt content.** The recovery query returns
+   `{}` as the `prompt_sent` payload. Migration `003_recovery_kinds.sql`
+   adds the index `events_generation_kind` on `(generation, kind)`. Test:
+   `sqlite_recovery_does_not_load_prompt_content`.
+5. **Medium: Settled hooks delayed `turn_ended`.** New
+   `AgentHarness::prompt_then_written`: the harness calls back after the
+   tree writes and before the `Settled` hooks. The native backend releases
+   the held end in that callback.
+6. **Low: failure rewrite mislabelled the stop.** Only a failed tree write
+   (`append_entry`, reported through the callback) rewrites the end to
+   `stop: error`, and only the first held end. Test:
+   `a_write_failure_rewrites_only_the_first_held_end`.
+7. **Low: `loop-desktop/src/controller.rs:630` calls `harness.prompt`
+   directly.** Not changed. Turns run that way are not held, so their
+   `turn_ended` can still reach a log before the tree. The desktop does not
+   use the Runtime Event Log on that path today.
+8. **Low: tests.** D1 now blocks the tree writes until the log has
+   committed `turn_ended` (or 3 s passed), not for a fixed 1 s; it still
+   fails on the pre-fix code. D2 also checks the id `recovered-prompt-4` and
+   that a second `recover()` ends nothing. D3 also checks one `stop: error`
+   end and no error notice.
+
+### Remaining risks after review
+
+- A crash between the prompt's exit and the commit of `prompt_settled`
+  still gives a false uncertain mark (narrow window).
+- A Runtime turn task that is aborted (not a normal exit) logs no
+  `prompt_settled`.
+- A native prompt accepted by the backend, then refused by the harness as
+  busy (another caller started a turn), is not settled; it relies on the
+  other turn's `turn_started` to clear the prompt.
+- Turns run outside `NativeBackend::prompt` (desktop, finding 7) are not
+  held.
 
 ## Recommendation
 
