@@ -226,3 +226,87 @@ async fn run_budget_ends_a_stalled_generation_without_user_abort() {
     assert!(events.iter().any(|event| matches!(event, AgentEvent::MessageEnd { message } if message.as_assistant().is_some_and(|m| m.stop_reason == loop_ai::StopReason::Error && m.error_message.as_deref().is_some_and(|e| e.contains("run_budget"))))));
     assert!(matches!(events.last(), Some(AgentEvent::AgentEnd { .. })));
 }
+
+/// A text response that stops on the output limit (`max_tokens`).
+fn length_stop(model: &loop_ai::Model, text: &str) -> FauxResponse {
+    use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
+    let mut message = AssistantMessage::pending(model);
+    message
+        .content
+        .push(AssistantContent::Text(loop_ai::TextContent {
+            text: text.into(),
+            text_signature: None,
+        }));
+    message.stop_reason = StopReason::Length;
+    FauxResponse::Events(vec![
+        AssistantMessageEvent::Start {
+            partial: AssistantMessage::pending(model),
+        },
+        AssistantMessageEvent::Done {
+            reason: StopReason::Length,
+            message,
+        },
+    ])
+}
+
+async fn run_script(build: impl FnOnce(&loop_ai::Model) -> Vec<FauxResponse>) -> Vec<AgentMessage> {
+    let script = FauxScript::new();
+    let (models, model) = setup_faux(script.clone());
+    script.extend(build(&model));
+    let stream_fn = stream_fn_from_models(Arc::new(models));
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: vec![],
+        tools: None,
+    };
+    let emit = Arc::new(|_ev: AgentEvent| {
+        Box::pin(async {}) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    });
+    run_agent_loop(
+        vec![AgentMessage::user_text("write it all")],
+        context,
+        AgentLoopConfig::new(model),
+        emit,
+        None,
+        Some(stream_fn),
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a_length_stop_without_tool_calls_asks_the_model_to_continue() {
+    let msgs = run_script(|m| {
+        vec![
+            length_stop(m, "part one"),
+            FauxResponse::Text("part two".into()),
+        ]
+    })
+    .await;
+    let assistants: Vec<_> = msgs.iter().filter_map(AgentMessage::as_assistant).collect();
+    assert_eq!(assistants.len(), 2, "{msgs:?}");
+    assert_eq!(assistants[1].stop_reason, loop_ai::StopReason::Stop);
+    // One continuation prompt between the two answers.
+    let users = msgs.iter().filter(|m| m.role() == "user").count();
+    assert_eq!(users, 2, "the prompt and one continuation: {msgs:?}");
+}
+
+#[tokio::test]
+async fn length_continuations_stop_after_three() {
+    let msgs = run_script(|m| {
+        (0..6)
+            .map(|i| length_stop(m, &format!("part {i}")))
+            .collect()
+    })
+    .await;
+    let assistants: Vec<_> = msgs.iter().filter_map(AgentMessage::as_assistant).collect();
+    assert_eq!(
+        assistants.len(),
+        4,
+        "the first answer and three continuations"
+    );
+    assert_eq!(
+        assistants.last().unwrap().stop_reason,
+        loop_ai::StopReason::Length
+    );
+}

@@ -306,3 +306,58 @@ async fn the_turn_is_saved_before_print_returns() {
         .collect();
     assert_eq!(roles, ["user", "assistant"]);
 }
+
+/// A text response that stops on the output limit (`max_tokens`).
+fn length_stop(text: &str) -> FauxResponse {
+    use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
+    let model = Models::new();
+    model.set_provider(faux_provider(FauxScript::new()));
+    let model = model.get_model("faux", "faux-model").unwrap();
+    let mut message = AssistantMessage::pending(&model);
+    if !text.is_empty() {
+        message
+            .content
+            .push(AssistantContent::Text(loop_ai::TextContent {
+                text: text.into(),
+                text_signature: None,
+            }));
+    }
+    message.stop_reason = StopReason::Length;
+    FauxResponse::Events(vec![
+        AssistantMessageEvent::Start {
+            partial: AssistantMessage::pending(&model),
+        },
+        AssistantMessageEvent::Done {
+            reason: StopReason::Length,
+            message,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn a_turn_that_ends_on_the_output_limit_fails() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(
+        (0..4).map(|i| length_stop(&format!("part {i}"))).collect(),
+        true,
+    )
+    .await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |_| {}).await;
+    assert_ne!(report.exit_code(), 0, "{report:?}");
+    let error = report.end.error().unwrap();
+    assert!(error.contains("output limit"), "{error}");
+}
+
+#[tokio::test]
+async fn a_turn_with_no_final_text_fails() {
+    use loop_cli::print_mode::run_turn;
+    let backend = backend(vec![FauxResponse::Text(String::new())], true).await;
+    let session = backend.current_session().await;
+    let report = run_turn(backend.as_ref(), &session, "hi".into(), |_| {}).await;
+    assert_ne!(report.exit_code(), 0, "{report:?}");
+    assert!(
+        report.end.error().unwrap().contains("no text"),
+        "{report:?}"
+    );
+}

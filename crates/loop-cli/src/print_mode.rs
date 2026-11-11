@@ -504,7 +504,7 @@ pub async fn run_turn(
                 report.end = match (error, stop) {
                     (Some(error), _) => TurnEnd::Failed(error.message),
                     (None, StopReason::Cancelled) => TurnEnd::Cancelled,
-                    (None, _) => TurnEnd::Completed,
+                    (None, stop) => completed(stop, &report.text),
                 };
                 // The backend saves the turn after it ends on the stream;
                 // `--print` exits right after this, so wait for that (with
@@ -519,13 +519,27 @@ pub async fn run_turn(
     report.end = match turn.outcome().await {
         TurnOutcome::Completed(stop) => {
             report.stop = Some(stop);
-            TurnEnd::Completed
+            completed(stop, &report.text)
         }
         TurnOutcome::Cancelled => TurnEnd::Cancelled,
         TurnOutcome::Failed(error) => TurnEnd::Failed(error.message),
         TurnOutcome::Uncertain => TurnEnd::Uncertain,
     };
     report
+}
+
+/// How a turn that ended without an error went: a turn cut at the output
+/// limit, or one with no final text, has no answer to print, so it fails.
+fn completed(stop: StopReason, text: &str) -> TurnEnd {
+    if stop == StopReason::MaxTokens {
+        TurnEnd::Failed(
+            "the model stopped at its output limit (max_tokens); the answer is incomplete".into(),
+        )
+    } else if text.trim().is_empty() {
+        TurnEnd::Failed("the agent ended the turn with no text".into())
+    } else {
+        TurnEnd::Completed
+    }
 }
 
 /// The assistant's text, or an error when the run stopped on error / abort.

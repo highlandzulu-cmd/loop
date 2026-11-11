@@ -275,6 +275,14 @@ async fn run_loop_observed(
     result
 }
 
+/// How many times one prompt may ask the model to continue after it stopped
+/// on its output limit with no tool call.
+const MAX_LENGTH_CONTINUATIONS: u32 = 3;
+
+/// The user turn sent after a response stopped on the output limit.
+const LENGTH_CONTINUE_PROMPT: &str = "Your last response stopped at the output token limit. \
+Continue from where you stopped. Do not repeat what you already wrote.";
+
 async fn run_loop(
     current_context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
@@ -285,6 +293,7 @@ async fn run_loop(
 ) -> Result<(), AgentLoopError> {
     let mut first_turn = true;
     let mut turn_index = 0u64;
+    let mut length_continuations = 0u32;
     let mut pending_messages = if let Some(getter) = &config.get_steering_messages {
         getter().await
     } else {
@@ -433,6 +442,17 @@ async fn run_loop(
             } else {
                 Vec::new()
             };
+
+            // A response cut at the output limit with no tool call would end
+            // the run with a half answer: ask the model to go on, a few times.
+            if message.stop_reason == StopReason::Length
+                && tool_calls.is_empty()
+                && pending_messages.is_empty()
+                && length_continuations < MAX_LENGTH_CONTINUATIONS
+            {
+                length_continuations += 1;
+                pending_messages.push(AgentMessage::user_text(LENGTH_CONTINUE_PROMPT));
+            }
         }
 
         let follow_up = if let Some(getter) = &config.get_follow_up_messages {
@@ -441,6 +461,7 @@ async fn run_loop(
             Vec::new()
         };
         if !follow_up.is_empty() {
+            length_continuations = 0;
             pending_messages = follow_up;
             continue;
         }
