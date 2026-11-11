@@ -153,9 +153,10 @@ impl Provider {
         &self,
         model: &Model,
         context: &Context,
-        options: StreamOptions,
+        mut options: StreamOptions,
         auth: ModelAuth,
     ) -> AssistantMessageEventStream {
+        options.resolve_timeouts(model);
         match self.adapter_for(model) {
             Some(adapter) => adapter.stream(model, context, options, auth),
             None => error_stream(
@@ -173,9 +174,10 @@ impl Provider {
         &self,
         model: &Model,
         context: &Context,
-        options: SimpleStreamOptions,
+        mut options: SimpleStreamOptions,
         auth: ModelAuth,
     ) -> AssistantMessageEventStream {
+        options.base.resolve_timeouts(model);
         match self.adapter_for(model) {
             Some(adapter) => adapter.stream_simple(model, context, options, auth),
             None => error_stream(
@@ -331,7 +333,7 @@ impl Models {
             let ctx = RefreshModelsContext {
                 api_key,
                 store: Some(Arc::clone(&self.models_store)),
-                allow_network,
+                allow_network: allow_network && !self.credentials.is_logged_out(&provider.id),
                 force: options.force,
             };
 
@@ -489,7 +491,8 @@ impl Models {
 
             let mut inner = provider.stream(&model, &context, options, auth);
             let mut saw_terminal = false;
-            while let Some(ev) = inner.next().await {
+            while let Some(ev) = tokio::select! { biased; _ = handle.receiver_cancel().cancelled_owned() => None, event = inner.next() => event }
+            {
                 let terminal = ev.is_terminal();
                 handle.push(ev);
                 if terminal {
@@ -573,7 +576,8 @@ impl Models {
 
             let mut inner = provider.stream_simple(&model, &context, options, auth);
             let mut saw_terminal = false;
-            while let Some(ev) = inner.next().await {
+            while let Some(ev) = tokio::select! { biased; _ = handle.receiver_cancel().cancelled_owned() => None, event = inner.next() => event }
+            {
                 let terminal = ev.is_terminal();
                 handle.push(ev);
                 if terminal {

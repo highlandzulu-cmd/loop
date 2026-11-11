@@ -6,7 +6,8 @@
 
 use loop_ai::auth::{Credential, CredentialStore};
 use loop_ai::providers::{
-    custom_provider, provider_preset, CustomProviderConfig, ProviderPreset, PROVIDER_PRESETS,
+    custom_provider, provider_preset, CustomModelSpec, CustomProviderConfig, ProviderPreset,
+    PROVIDER_PRESETS,
 };
 use loop_ai::{Models, Provider};
 use serde::{Deserialize, Serialize};
@@ -23,6 +24,36 @@ pub struct CustomProviderEntry {
     pub name: String,
     /// Base URL including the version path, e.g. `http://localhost:11434/v1`.
     pub base_url: String,
+    /// Pinned model metadata. Omitted entries use the server's metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<CustomProviderModel>>,
+}
+
+/// Explicit capabilities for one custom model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomProviderModel {
+    /// Exact model id from the provider.
+    pub id: String,
+    /// Whether the model supports thinking.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Request format; omitted uses automatic compatibility detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_format: Option<loop_ai::ThinkingFormat>,
+}
+
+impl CustomProviderModel {
+    pub(crate) fn spec(&self) -> CustomModelSpec {
+        let mut spec = CustomModelSpec::new(&self.id).with_reasoning(self.reasoning);
+        if let Some(format) = self.thinking_format {
+            spec = spec.with_compat(loop_ai::OpenAICompletionsCompat {
+                thinking_format: Some(format),
+                ..Default::default()
+            });
+        }
+        spec
+    }
 }
 
 impl CustomProviderEntry {
@@ -33,16 +64,21 @@ impl CustomProviderEntry {
             name: Some(self.name.clone()),
             base_url: self.base_url.clone(),
             api_key_env: vec![],
-            models: vec![],
+            models: self
+                .models
+                .iter()
+                .flatten()
+                .map(CustomProviderModel::spec)
+                .collect(),
             headers: None,
         })
     }
 }
 
 /// What `/login` collected.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderLoginRequest {
-    /// A built-in provider (Soket, OpenRouter, OpenAI).
+    /// A built-in provider (Soket, OpenRouter, OpenAI, Anthropic, Gemini).
     Preset {
         /// Preset id.
         id: String,
@@ -57,6 +93,15 @@ pub enum ProviderLoginRequest {
         base_url: String,
         /// API key; `None` for keyless local servers.
         api_key: Option<String>,
+        /// Model capabilities; omitted preserves saved metadata on reconnect.
+        models: Option<Vec<CustomProviderModel>>,
+    },
+    /// A web-search backend (`tavily`, `brave`) for the `web_search` tool.
+    WebSearch {
+        /// Backend id.
+        id: String,
+        /// API key.
+        api_key: String,
     },
 }
 
@@ -72,6 +117,10 @@ impl std::fmt::Debug for ProviderLoginRequest {
                 .field("name", name)
                 .field("base_url", base_url)
                 .finish_non_exhaustive(),
+            Self::WebSearch { id, .. } => f
+                .debug_struct("WebSearch")
+                .field("id", id)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -80,7 +129,7 @@ impl ProviderLoginRequest {
     /// Provider id this request configures.
     pub fn provider_id(&self) -> String {
         match self {
-            Self::Preset { id, .. } => id.trim().to_ascii_lowercase(),
+            Self::Preset { id, .. } | Self::WebSearch { id, .. } => id.trim().to_ascii_lowercase(),
             Self::Custom { name, .. } => slugify(name),
         }
     }
@@ -92,6 +141,7 @@ impl ProviderLoginRequest {
                 provider_preset(id).map_or_else(|| id.clone(), |p| p.name.into())
             }
             Self::Custom { name, .. } => name.trim().to_string(),
+            Self::WebSearch { id, .. } => web_search_display_name(id),
         }
     }
 
@@ -100,6 +150,7 @@ impl ProviderLoginRequest {
         let key = match self {
             Self::Preset { api_key, .. } => Some(api_key.as_str()),
             Self::Custom { api_key, .. } => api_key.as_deref(),
+            Self::WebSearch { api_key, .. } => Some(api_key.as_str()),
         };
         key.map(str::trim).filter(|k| !k.is_empty())
     }
@@ -108,19 +159,22 @@ impl ProviderLoginRequest {
     pub fn preset(&self) -> Option<&'static ProviderPreset> {
         match self {
             Self::Preset { id, .. } => provider_preset(id),
-            Self::Custom { .. } => None,
+            Self::Custom { .. } | Self::WebSearch { .. } => None,
         }
     }
 
     /// The settings entry to save (custom providers only).
     pub fn custom_entry(&self) -> Option<CustomProviderEntry> {
         match self {
-            Self::Custom { base_url, .. } => Some(CustomProviderEntry {
+            Self::Custom {
+                base_url, models, ..
+            } => Some(CustomProviderEntry {
                 id: self.provider_id(),
                 name: self.display_name(),
                 base_url: base_url.trim().trim_end_matches('/').to_string(),
+                models: models.clone(),
             }),
-            Self::Preset { .. } => None,
+            Self::Preset { .. } | Self::WebSearch { .. } => None,
         }
     }
 
@@ -144,9 +198,30 @@ impl ProviderLoginRequest {
                 }
                 validate_http_url("Base URL", base_url)?;
             }
+            Self::WebSearch { id, .. } => {
+                if !is_web_search_provider(&self.provider_id()) {
+                    anyhow::bail!("unknown web-search provider `{id}`");
+                }
+                if self.api_key().is_none() {
+                    anyhow::bail!("{} needs an API key", self.display_name());
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// Whether `id` names a built-in web-search backend (see loop-agent's
+/// `WEB_SEARCH_BACKENDS` registry — the single source of truth).
+pub fn is_web_search_provider(id: &str) -> bool {
+    loop_agent::harness::web_search_backend(id).is_some()
+}
+
+/// Display name for a web-search backend id.
+pub fn web_search_display_name(id: &str) -> String {
+    loop_agent::harness::web_search_backend(id)
+        .map(|info| info.display_name.to_string())
+        .unwrap_or_else(|| id.trim().to_string())
 }
 
 /// `"My Gateway!"` → `"my-gateway"`.
@@ -182,14 +257,20 @@ pub fn connected_providers(
     let mut ids: Vec<String> = PROVIDER_PRESETS
         .iter()
         .filter(|p| {
-            store.get(p.id).is_some()
-                || p.api_key_envs
-                    .iter()
-                    .any(|e| env(e).is_some_and(|v| !v.trim().is_empty()))
+            !store.is_logged_out(p.id)
+                && (store.get(p.id).is_some()
+                    || p.api_key_envs
+                        .iter()
+                        .any(|e| env(e).is_some_and(|v| !v.trim().is_empty())))
         })
         .map(|p| p.id.to_string())
         .collect();
-    ids.extend(custom.iter().map(|c| c.id.clone()));
+    ids.extend(
+        custom
+            .iter()
+            .filter(|c| !store.is_logged_out(&c.id))
+            .map(|c| c.id.clone()),
+    );
     ids
 }
 
@@ -245,6 +326,7 @@ mod tests {
             name: name.into(),
             base_url: base_url.into(),
             api_key: key.map(Into::into),
+            models: None,
         }
     }
 
@@ -253,6 +335,22 @@ mod tests {
             id: id.into(),
             api_key: key.into(),
         }
+    }
+
+    #[test]
+    fn saved_custom_model_metadata_registers_reasoning() {
+        let entry: CustomProviderEntry = serde_json::from_value(serde_json::json!({
+            "id": "g", "name": "Gateway", "baseUrl": "http://localhost/v1",
+            "models": [{"id": "glm", "reasoning": true, "thinkingFormat": "zai"}]
+        }))
+        .unwrap();
+        let models = entry.provider().get_models();
+        assert_eq!(models.len(), 1);
+        assert!(models[0].reasoning);
+        assert_eq!(
+            models[0].compat.as_ref().unwrap().thinking_format,
+            Some(loop_ai::ThinkingFormat::Zai)
+        );
     }
 
     #[test]
@@ -282,6 +380,7 @@ mod tests {
                 id: "lm-studio".into(),
                 name: "LM Studio".into(),
                 base_url: "http://localhost:1234/v1".into(),
+                models: None,
             }
         );
         assert!(custom("???", "http://x", None).validate().is_err());
@@ -311,6 +410,7 @@ mod tests {
             id: "lm-studio".into(),
             name: "LM Studio".into(),
             base_url: "http://localhost:1234/v1".into(),
+            models: None,
         }];
         assert_eq!(
             connected_providers(&store, &customs, |_| None),
@@ -374,6 +474,7 @@ mod tests {
             id: "g".into(),
             name: "G".into(),
             base_url: url.into(),
+            models: None,
         };
         upsert_custom_provider(&mut entries, entry("http://a"));
         upsert_custom_provider(&mut entries, entry("http://b"));
@@ -389,9 +490,10 @@ mod tests {
                 id: "g".into(),
                 name: "G".into(),
                 base_url: "http://localhost:1/v1".into(),
+                models: None,
             }],
         );
-        for id in ["soket", "openrouter", "openai", "g"] {
+        for id in ["soket", "openrouter", "openai", "anthropic", "gemini", "g"] {
             assert!(models.get_provider(id).is_some(), "{id}");
         }
     }

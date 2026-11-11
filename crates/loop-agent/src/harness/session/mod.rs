@@ -7,6 +7,9 @@ mod memory_store;
 mod repository;
 mod search;
 pub mod stats;
+mod summary;
+mod transfer;
+mod tree;
 pub mod types;
 
 #[cfg(feature = "sqlite")]
@@ -24,6 +27,11 @@ pub use stats::{
     ContextUsage, LatestTurnUsage, SessionStats, SessionStatsInput, UsageBreakdownEntry,
     UsageTotals, CACHE_TTL_MS,
 };
+pub use summary::{list_session_summaries, summarize_session, SessionSummary};
+pub use transfer::{
+    import_session_file, SessionFile, SESSION_FILE_VERSION, TOOL_APPROVAL_LABEL_NAMESPACE,
+};
+pub use tree::{session_tree_rows, SessionTreeRow, SessionTreeRowKind};
 pub use types::*;
 
 #[cfg(feature = "sqlite")]

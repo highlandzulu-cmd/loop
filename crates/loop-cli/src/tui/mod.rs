@@ -1,5 +1,6 @@
 //! Pi-style inline UI: transcript in terminal scrollback, footer redrawn in place.
 
+pub mod attachments;
 pub mod editor;
 pub mod file_mentions;
 pub mod highlight;
@@ -93,6 +94,11 @@ pub enum ChatItem {
     Error {
         text: String,
     },
+    /// The agent's checklist (the `todo` tool, or an ACP agent's plan), as
+    /// it stood after one update.
+    Plan {
+        entries: Vec<loop_protocol::PlanEntry>,
+    },
 }
 
 /// One MCP server in a [`ChatItem::Mcp`] listing.
@@ -105,17 +111,6 @@ pub struct McpServerListing {
     pub error: Option<String>,
     /// Configured but turned off. Shown even when collapsed; tools stay hidden.
     pub disabled: bool,
-}
-
-/// Error line for an assistant message that ended in an error. Aborts (the user's own
-/// esc) stay quiet.
-pub fn assistant_error_item(message: &loop_ai::AssistantMessage) -> Option<ChatItem> {
-    if message.stop_reason != loop_ai::StopReason::Error {
-        return None;
-    }
-    message.failure().map(|error| ChatItem::Error {
-        text: format!("error: {error}"),
-    })
 }
 
 /// One row in a navigable picker (commands / models).
@@ -140,6 +135,12 @@ pub enum PickerView {
         selected: usize,
         hint: String,
     },
+    /// `/sessions`: like `Models`, with room for a conversation title.
+    Sessions {
+        rows: Vec<PickerRow>,
+        selected: usize,
+        hint: String,
+    },
     Setup {
         prompt: crate::setup_prompt::SetupPrompt,
         /// First-run provider setup: esc quits instead of cancelling.
@@ -150,7 +151,9 @@ pub enum PickerView {
         path: String,
         /// 0 = Accept, 1 = Accept all (session), 2 = Reject.
         selected: usize,
+        accept_label: String,
         accept_all_label: String,
+        reject_label: String,
         reason: String,
         reason_focused: bool,
     },
@@ -181,6 +184,9 @@ pub struct FooterOpts<'a> {
     pub model_line: &'a str,
     /// Right of the bottom status row (e.g. `12,345 · 23% · 29,440/128,000`).
     pub usage_line: &'a str,
+    /// Shown in the error colour before the path while it is set, e.g. the
+    /// full-access warning.
+    pub warning: Option<&'a str>,
 }
 
 /// Whether a transcript item is finished and safe to flush into scrollback.
@@ -195,6 +201,7 @@ pub fn item_is_committed(
         | ChatItem::System { .. }
         | ChatItem::Mcp { .. }
         | ChatItem::Error { .. }
+        | ChatItem::Plan { .. }
         | ChatItem::Shell { .. } => true,
         ChatItem::Queued { .. } => false,
         ChatItem::Assistant { .. } => streaming_assistant != Some(index),
@@ -230,6 +237,7 @@ pub fn welcome_lines(
     theme: &Theme,
     version: &str,
     model: Option<&loop_ai::Model>,
+    agent: Option<&str>,
     model_note: Option<&str>,
     endpoint: &str,
     session_id: &str,
@@ -271,19 +279,37 @@ pub fn welcome_lines(
 
     // Info card
     let border = theme.style("border");
-    let rows: Vec<(&str, String)> = match model {
-        Some(model) => vec![
-            ("Provider", model.provider.clone()),
-            ("Model", model.id.clone()),
-            ("Endpoint", endpoint.to_string()),
-            ("Session", session_id.to_string()),
+    let rows: Vec<(&str, String)> = match (agent, model) {
+        (Some(agent), _) => vec![
+            ("Model", format!("{agent} · subscription")),
+            (
+                "Session",
+                "opens when the subscription is ready".to_string(),
+            ),
         ],
-        None => vec![
+        (None, Some(model)) => {
+            let mut rows = vec![
+                ("Provider", model.provider.clone()),
+                ("Model", model.id.clone()),
+            ];
+            // An unknown endpoint is left out rather than guessed.
+            if !endpoint.is_empty() {
+                rows.push(("Endpoint", endpoint.to_string()));
+            }
+            rows.push(("Session", session_id.to_string()));
+            rows
+        }
+        (None, None) => vec![
             ("Model", "none — run /model".to_string()),
             ("Session", session_id.to_string()),
         ],
     };
-    let (dot_style, status_text) = if needs_setup {
+    let (dot_style, status_text) = if let Some(agent) = agent {
+        (
+            theme.style("success"),
+            format!("starting {agent} — /model switches models or providers"),
+        )
+    } else if needs_setup {
         (
             theme.style("warning"),
             "setup — connect a model provider to begin (/login)".to_string(),
@@ -697,7 +723,63 @@ pub fn format_item_lines(
             }
             lines.push(Line::from(""));
         }
+        ChatItem::Plan { entries } => lines.extend(format_plan(entries, theme, w)),
     }
+    lines
+}
+
+/// The checklist: a head with progress, then one row per step.
+fn format_plan(
+    entries: &[loop_protocol::PlanEntry],
+    theme: &Theme,
+    w: usize,
+) -> Vec<Line<'static>> {
+    use loop_protocol::PlanEntryStatus;
+    let done = entries
+        .iter()
+        .filter(|entry| entry.status == PlanEntryStatus::Completed)
+        .count();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" ● ".to_string(), theme.accent()),
+        Span::styled(
+            "Checklist".to_string(),
+            theme.style("toolTitle").add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" · {done}/{} done", entries.len()), theme.dim()),
+    ])];
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "   (cleared)".to_string(),
+            theme.dim(),
+        )));
+    }
+    for entry in entries {
+        let (mark, style) = match entry.status {
+            PlanEntryStatus::Completed => ("✔", theme.dim().add_modifier(Modifier::CROSSED_OUT)),
+            PlanEntryStatus::InProgress => ("◼", theme.accent().add_modifier(Modifier::BOLD)),
+            _ => ("☐", theme.style("toolOutput")),
+        };
+        let mark_style = if entry.status == PlanEntryStatus::Completed {
+            theme.style("success")
+        } else {
+            style
+        };
+        for (i, row) in soft_wrap(&entry.content, w.saturating_sub(5).max(1))
+            .into_iter()
+            .enumerate()
+        {
+            let lead = if i == 0 {
+                format!("   {mark} ")
+            } else {
+                "     ".into()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(lead, mark_style),
+                Span::styled(row, style),
+            ]));
+        }
+    }
+    lines.push(Line::from(""));
     lines
 }
 
@@ -1035,7 +1117,9 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
     let lines = match picker {
         PickerView::None => Vec::new(),
         PickerView::Setup { prompt, first_run } => setup_lines(prompt, *first_run, theme),
-        PickerView::Commands { rows, selected } => picker_lines(rows, *selected, theme, false),
+        PickerView::Commands { rows, selected } => {
+            picker_lines(rows, *selected, theme, false, LABEL_MAX)
+        }
         PickerView::Models {
             rows,
             selected,
@@ -1045,13 +1129,27 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                 hint.clone(),
                 theme.style("warning"),
             ))];
-            out.extend(picker_lines(rows, *selected, theme, true));
+            out.extend(picker_lines(rows, *selected, theme, true, LABEL_MAX));
+            out
+        }
+        PickerView::Sessions {
+            rows,
+            selected,
+            hint,
+        } => {
+            let mut out = vec![Line::from(Span::styled(
+                hint.clone(),
+                theme.style("warning"),
+            ))];
+            out.extend(picker_lines(rows, *selected, theme, true, TITLE_MAX));
             out
         }
         PickerView::FileReview {
             path,
             selected,
+            accept_label,
             accept_all_label,
+            reject_label,
             reason,
             reason_focused,
         } => {
@@ -1082,9 +1180,9 @@ fn draw_picker(frame: &mut Frame, area: Rect, theme: &Theme, picker: &PickerView
                         theme.style("text").add_modifier(Modifier::BOLD),
                     ),
                 ]),
-                opt(0, "Accept", "success"),
+                opt(0, accept_label, "success"),
                 opt(1, accept_all_label, "success"),
-                opt(2, "Reject", "error"),
+                opt(2, reject_label, "error"),
                 Line::from(Span::styled(reason_line, theme.muted())),
                 Line::from(Span::styled(
                     "  ↑↓ choose · tab reason · enter confirm · esc reject".to_string(),
@@ -1116,6 +1214,13 @@ fn setup_lines(
         )),
     ];
     if let Some((rows, selected)) = prompt.options() {
+        let width = rows
+            .iter()
+            .map(|(label, _)| label.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max(14)
+            + 2;
         for (i, (label, description)) in rows.into_iter().enumerate() {
             let (marker, label_style) = if i == selected {
                 ("  ▸ ", theme.accent().add_modifier(Modifier::BOLD))
@@ -1124,7 +1229,7 @@ fn setup_lines(
             };
             lines.push(Line::from(vec![
                 Span::styled(marker.to_string(), theme.accent()),
-                Span::styled(format!("{label:<16}"), label_style),
+                Span::styled(format!("{label:<width$}"), label_style),
                 Span::styled(description.to_string(), theme.dim()),
             ]));
         }
@@ -1158,11 +1263,17 @@ fn setup_line_count(prompt: &crate::setup_prompt::SetupPrompt, _first_run: bool)
     (3 + rows + usize::from(prompt.env_hint().is_some())) as u16
 }
 
+/// Widest label column in most pickers.
+const LABEL_MAX: usize = 28;
+/// Widest title column in the session picker.
+const TITLE_MAX: usize = 60;
+
 fn picker_lines(
     rows: &[PickerRow],
     selected: usize,
     theme: &Theme,
     _show_mark: bool,
+    label_max: usize,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     if rows.is_empty() {
@@ -1184,7 +1295,7 @@ fn picker_lines(
         .map(|r| UnicodeWidthStr::width(r.label.as_str()))
         .max()
         .unwrap_or(16)
-        .clamp(16, 28);
+        .clamp(16, label_max);
     for (i, row) in rows.iter().enumerate().take(end).skip(start) {
         let active = i == selected;
         let arrow = if active { "❯" } else { " " };
@@ -1228,11 +1339,14 @@ fn draw_status(frame: &mut Frame, area: Rect, opts: &FooterOpts<'_>) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
+    let warning = opts.warning.map(|w| format!("{w}  ")).unwrap_or_default();
     let top = Line::from(vec![
+        Span::styled(warning.clone(), opts.theme.error()),
         Span::styled(opts.path_line.to_string(), opts.theme.muted()),
         Span::raw(" ".repeat(area.width.saturating_sub(
-            (UnicodeWidthStr::width(opts.path_line) + UnicodeWidthStr::width(opts.model_line))
-                as u16,
+            (UnicodeWidthStr::width(warning.as_str())
+                + UnicodeWidthStr::width(opts.path_line)
+                + UnicodeWidthStr::width(opts.model_line)) as u16,
         ) as usize)),
         Span::styled(opts.model_line.to_string(), opts.theme.muted()),
     ]);
@@ -1334,7 +1448,7 @@ fn picker_height(picker: &PickerView) -> u16 {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 1 // page indicator
         }
-        PickerView::Models { rows, .. } => {
+        PickerView::Models { rows, .. } | PickerView::Sessions { rows, .. } => {
             let n = rows.len().min(PICKER_PAGE) as u16;
             n + 2 // hint + page
         }
@@ -1542,7 +1656,9 @@ fn highlight_tool_detail(
             highlight::highlight_lines(detail, None, path, theme, fallback)
         }
         // Bash stdout stays plain — coloring ls/etc would fight the existing look.
-        "bash" => highlight::highlight_lines(detail, None, None, theme, fallback),
+        "bash" | "grep" | "glob" | "ls" => {
+            highlight::highlight_lines(detail, None, None, theme, fallback)
+        }
         _ => highlight::highlight_lines(detail, Some("json"), None, theme, fallback),
     }
 }
@@ -1624,6 +1740,14 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
     match name {
         "read" | "write" | "edit" => pick(&["path"]).unwrap_or_else(|| "…".into()),
         "bash" => pick(&["command"]).unwrap_or_else(|| "…".into()),
+        "grep" | "glob" => {
+            let pattern = pick(&["pattern"]).unwrap_or_else(|| "…".into());
+            match pick(&["path"]) {
+                Some(path) => format!("{pattern} in {path}"),
+                None => pattern,
+            }
+        }
+        "ls" => pick(&["path"]).unwrap_or_else(|| ".".into()),
         _ => {
             let s = args.to_string();
             let mut t: String = s.chars().take(40).collect();
@@ -1635,177 +1759,6 @@ pub fn tool_args_summary(name: &str, args: &serde_json::Value) -> String {
     }
 }
 
-fn user_message_text(u: &loop_ai::UserMessage) -> String {
-    use loop_ai::{UserContent, UserMessageContent};
-    match &u.content {
-        UserMessageContent::Text(s) => s.clone(),
-        UserMessageContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|c| match c {
-                UserContent::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join(""),
-    }
-}
-
-fn tool_result_text(tr: &loop_ai::ToolResultMessage) -> String {
-    use loop_ai::ToolResultContent;
-    tr.content
-        .iter()
-        .filter_map(|c| match c {
-            ToolResultContent::Text(t) => Some(t.text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Rebuild the TUI transcript from persisted session messages (for `--resume`).
-pub fn chat_items_from_agent_messages(
-    messages: &[loop_agent::types::AgentMessage],
-) -> Vec<ChatItem> {
-    use loop_agent::types::{AgentMessage, CustomAgentMessage};
-    use loop_ai::{AssistantContent, Message};
-
-    let mut chat = Vec::new();
-    for msg in messages {
-        match msg {
-            AgentMessage::Llm(Message::User(u)) => {
-                let text = user_message_text(u);
-                if !text.is_empty() {
-                    chat.push(ChatItem::User { text });
-                }
-            }
-            AgentMessage::Llm(Message::Assistant(a)) => {
-                for block in &a.content {
-                    match block {
-                        AssistantContent::Thinking(t) => {
-                            if !t.thinking.is_empty() {
-                                chat.push(ChatItem::Thinking {
-                                    text: t.thinking.clone(),
-                                    done: true,
-                                });
-                            }
-                        }
-                        AssistantContent::Text(t) => {
-                            if !t.text.is_empty() {
-                                chat.push(ChatItem::Assistant {
-                                    text: t.text.clone(),
-                                });
-                            }
-                        }
-                        AssistantContent::ToolCall(tc) => {
-                            let detail =
-                                serde_json::to_string_pretty(&tc.arguments).unwrap_or_default();
-                            let summary = tool_args_summary(&tc.name, &tc.arguments);
-                            chat.push(ChatItem::Tool {
-                                id: tc.id.clone(),
-                                name: tc.name.clone(),
-                                summary,
-                                detail,
-                                status: CardStatus::Pending,
-                            });
-                        }
-                    }
-                }
-                chat.extend(assistant_error_item(a));
-            }
-            AgentMessage::Llm(Message::ToolResult(tr)) => {
-                let result_text = tool_result_text(tr);
-                let st = if tr.is_error {
-                    CardStatus::Error
-                } else {
-                    CardStatus::Success
-                };
-                if let Some(idx) = find_tool_index(&chat, &tr.tool_call_id) {
-                    if let Some(ChatItem::Tool {
-                        name,
-                        detail,
-                        status,
-                        summary,
-                        ..
-                    }) = chat.get_mut(idx)
-                    {
-                        *name = tr.tool_name.clone();
-                        *status = st;
-                        if !result_text.is_empty() {
-                            if detail.is_empty() {
-                                *detail = result_text;
-                            } else {
-                                detail.push_str("\n---\n");
-                                detail.push_str(&result_text);
-                            }
-                        }
-                        if summary.is_empty() {
-                            *summary = if tr.is_error {
-                                "error".into()
-                            } else {
-                                "done".into()
-                            };
-                        }
-                    }
-                } else {
-                    chat.push(ChatItem::Tool {
-                        id: tr.tool_call_id.clone(),
-                        name: tr.tool_name.clone(),
-                        summary: if tr.is_error {
-                            "error".into()
-                        } else {
-                            "done".into()
-                        },
-                        detail: result_text,
-                        status: st,
-                    });
-                }
-            }
-            AgentMessage::Custom(CustomAgentMessage::CompactionSummary { summary, .. }) => {
-                chat.push(ChatItem::System {
-                    text: format!("compaction summary\n{summary}"),
-                });
-            }
-            AgentMessage::Custom(CustomAgentMessage::BranchSummary { summary, .. }) => {
-                chat.push(ChatItem::System {
-                    text: format!("branch summary\n{summary}"),
-                });
-            }
-            AgentMessage::Custom(CustomAgentMessage::BashExecution {
-                command,
-                output,
-                exit_code,
-                ..
-            }) => {
-                let mut summary: String = command.chars().take(48).collect();
-                if command.chars().count() > 48 {
-                    summary.push('…');
-                }
-                let status = match exit_code {
-                    Some(0) | None => CardStatus::Success,
-                    Some(_) => CardStatus::Error,
-                };
-                chat.push(ChatItem::Tool {
-                    id: format!("bash-exec-{}", chat.len()),
-                    name: "bash".into(),
-                    summary,
-                    detail: format!("$ {command}\n{output}"),
-                    status,
-                });
-            }
-            AgentMessage::Custom(CustomAgentMessage::Custom {
-                custom_type,
-                content,
-                ..
-            }) => {
-                chat.push(ChatItem::System {
-                    text: format!("{custom_type}: {content}"),
-                });
-            }
-        }
-    }
-    chat
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1814,6 +1767,23 @@ mod tests {
         AssistantContent, AssistantMessage, Message, StopReason, TextContent, ThinkingContent,
         ToolCall, ToolResultContent, ToolResultMessage, Usage, UserMessage, UserMessageContent,
     };
+
+    #[test]
+    fn search_tools_have_short_summaries() {
+        let summary = |name: &str, args: serde_json::Value| tool_args_summary(name, &args);
+        assert_eq!(
+            summary(
+                "grep",
+                serde_json::json!({"pattern": "TODO", "path": "src"})
+            ),
+            "TODO in src"
+        );
+        assert_eq!(
+            summary("glob", serde_json::json!({"pattern": "*.rs"})),
+            "*.rs"
+        );
+        assert_eq!(summary("ls", serde_json::json!({})), ".");
+    }
 
     #[test]
     fn resume_transcript_reconstructs_user_assistant_tools() {
@@ -1867,7 +1837,8 @@ mod tests {
             })),
         ];
 
-        let items = chat_items_from_agent_messages(&messages);
+        let items =
+            crate::app::chat_from_transcript(loop_agent::protocol_events::replay(&messages));
         assert!(matches!(&items[0], ChatItem::User { text } if text == "list files"));
         assert!(
             matches!(&items[1], ChatItem::Thinking { text, done: true } if text == "I should use bash")
@@ -2056,12 +2027,21 @@ mod tests {
     }
 
     fn banner_text(model: Option<&loop_ai::Model>, note: Option<&str>) -> String {
+        banner_text_at(model, note, "http://e")
+    }
+
+    fn banner_text_at(
+        model: Option<&loop_ai::Model>,
+        note: Option<&str>,
+        endpoint: &str,
+    ) -> String {
         welcome_lines(
             &Theme::dark(),
             "v",
             model,
+            None,
             note,
-            "http://e",
+            endpoint,
             "sess",
             0,
             0,
@@ -2077,6 +2057,24 @@ mod tests {
         })
         .collect::<Vec<_>>()
         .join("\n")
+    }
+
+    #[test]
+    fn banner_omits_an_unknown_endpoint_instead_of_guessing() {
+        let model = loop_ai::Models::new()
+            .get_model("faux", "faux-model")
+            .unwrap_or_else(|| {
+                let models = loop_ai::Models::new();
+                models.set_provider(loop_ai::providers::faux_provider(
+                    loop_ai::providers::FauxScript::new(),
+                ));
+                models.get_model("faux", "faux-model").unwrap()
+            });
+        let known = banner_text_at(Some(&model), None, "http://e");
+        assert!(known.contains("Endpoint"), "{known}");
+        let unknown = banner_text_at(Some(&model), None, "");
+        assert!(!unknown.contains("Endpoint"), "{unknown}");
+        assert!(unknown.contains("Session"), "{unknown}");
     }
 
     #[test]
@@ -2111,10 +2109,10 @@ mod tests {
         aborted.stop_reason = StopReason::Aborted;
         aborted.error_message = Some("Operation aborted".into());
 
-        let chat = chat_items_from_agent_messages(&[
+        let chat = crate::app::chat_from_transcript(loop_agent::protocol_events::replay(&[
             AgentMessage::assistant(failed),
             AgentMessage::assistant(aborted),
-        ]);
+        ]));
         let errors: Vec<_> = chat
             .iter()
             .filter_map(|c| match c {
@@ -2123,6 +2121,52 @@ mod tests {
             })
             .collect();
         assert_eq!(errors, ["error: HTTP 401 Unauthorized: Invalid API key"]);
+    }
+
+    #[test]
+    fn the_footer_shows_a_warning_in_the_error_color() {
+        let theme = Theme::dark();
+        let backend = ratatui::backend::TestBackend::new(100, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                draw_footer(
+                    f,
+                    FooterOpts {
+                        theme: &theme,
+                        live_lines: &[],
+                        input: "",
+                        cursor: 0,
+                        working: false,
+                        spinner_frame: 0,
+                        status: "ready",
+                        picker: &PickerView::None,
+                        setup_mode: false,
+                        mask_input: false,
+                        setup_placeholder: "",
+                        path_line: "~/loop",
+                        model_line: "full access · soket/m",
+                        usage_line: "",
+                        warning: Some("⚠ full access"),
+                    },
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let y = rows
+            .iter()
+            .position(|row| row.contains("⚠ full access"))
+            .expect("banner drawn");
+        assert!(rows[y].contains("~/loop"));
+        let x = rows[y].chars().position(|c| c == '⚠').unwrap() as u16;
+        assert_eq!(buffer[(x, y as u16)].fg, theme.error().fg.unwrap());
     }
 
     #[test]
@@ -2156,9 +2200,12 @@ mod tests {
         let host = TracingSetup::LangfuseHost;
         let otlp = TracingSetup::OtlpEndpoint;
         for prompt in [
-            SetupPrompt::Provider(crate::provider_setup::ProviderSetup::start(None).unwrap()),
             SetupPrompt::Provider(
-                crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap(),
+                crate::provider_setup::ProviderSetup::start(None, Vec::new(), Vec::new()).unwrap(),
+            ),
+            SetupPrompt::Provider(
+                crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                    .unwrap(),
             ),
             SetupPrompt::Tracing(picker),
             SetupPrompt::Tracing(host),
@@ -2217,9 +2264,13 @@ mod tests {
             public_key: "p".into(),
         };
         assert!(last_line(SetupPrompt::Tracing(secret)).contains("enter save"));
-        let key = crate::provider_setup::ProviderSetup::start(Some("soket")).unwrap();
+        let key =
+            crate::provider_setup::ProviderSetup::start(Some("soket"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(key)).contains("enter save"));
-        let name = crate::provider_setup::ProviderSetup::start(Some("custom")).unwrap();
+        let name =
+            crate::provider_setup::ProviderSetup::start(Some("custom"), Vec::new(), Vec::new())
+                .unwrap();
         assert!(last_line(SetupPrompt::Provider(name)).contains("enter next"));
     }
 

@@ -61,19 +61,24 @@ Loop is a Cargo workspace. Put changes in the narrowest crate that fits.
 
 | Crate | Responsibility |
 |---|---|
+| `loop-protocol` | Versioned event model and `AgentBackend` interface every backend and surface shares |
 | `loop-ai` | Unified LLM provider API (Soket, OpenAI-compatible, OpenRouter, faux test provider) |
 | `loop-agent` | Agent loop, `AgentHarness`, tools, sessions, skills, execution environments, sandbox backends |
 | `loop-orchestration` | Multi-agent orchestration |
 | `loop-mcp` | Model Context Protocol client/server integration |
+| `loop-acp` | Runs any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
 | `loop-app-core` | Shared application runtime: config, tool approval, settings |
 | `loop-cli` | The `loop` binary and its ratatui TUI |
 | `loop-desktop` | GPUI desktop app (experimental, nightly toolchain) |
-| `loop-telemetry` | Optional OpenTelemetry tracing (`telemetry` feature) |
+| `loop-telemetry` | Optional OpenTelemetry tracing and the anonymous local usage log (`telemetry` feature) |
+| `loop-dashboard` | Terminal usage view over the usage log (`/usage`; `usage` feature of `loop-cli`) |
 | `loop-test-support` | Shared test fixtures and helpers |
 
 Dependencies flow one way:
 
-- `loop-ai` is the base.
+- `loop-protocol` is the base for backends and surfaces; it depends on no other Loop crate.
+- `loop-acp` depends only on `loop-protocol`.
+- `loop-ai` is the base of Loop's own agent.
 - `loop-mcp`, `loop-orchestration`, and `loop-telemetry` depend only on `loop-ai`.
 - `loop-agent` composes them, through optional features.
 - `loop-app-core` builds on `loop-agent`.
@@ -86,7 +91,7 @@ Lower crates must not depend on higher ones, and a library crate must never depe
 | Tool | Requirement |
 |---|---|
 | Rust | Latest **stable** via [rustup](https://rustup.rs/), with `rustfmt` and `clippy` components |
-| MSRV | **1.85** (`rust-version` in the root `Cargo.toml`). Do not use language or `std` features newer than this without raising the MSRV in a dedicated PR. |
+| MSRV | **1.88** (`rust-version` in the root `Cargo.toml`). Do not use language or `std` features newer than this without raising the MSRV in a dedicated PR. |
 | Git | 2.30+ (for `rebase --signoff`) |
 | Podman | Optional. Linux only, needed to work on or test the podman/krun sandbox backends |
 
@@ -117,8 +122,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --exclude loop-desktop --all-targets --locked -- -D warnings
 
 # 3. Tests (mirrors .github/workflows/ci.yml)
-cargo test -p loop-ai -p loop-agent -p loop-mcp -p loop-orchestration \
-           -p loop-app-core -p loop-cli --locked
+cargo test --locked                        # every crate except loop-desktop
 
 # 4. Telemetry feature build + tests (if you touched tracing, spans, or loop-telemetry)
 cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
@@ -127,7 +131,7 @@ cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
 
 Notes:
 
-- CI (`.github/workflows/ci.yml`) runs the format and lint checks on Linux, and the tests on Linux, macOS and Windows. Run them locally first to avoid a red build.
+- CI (`.github/workflows/ci.yml`) runs the format and lint checks on Linux, and the tests on Linux and macOS. Run them locally first to avoid a red build. It also lints and tests with `--features loop-cli/orchestration`; if you touch orchestration code, run `cargo clippy -p loop-agent -p loop-runtime -p loop-cli --features loop-cli/orchestration --all-targets --locked -- -D warnings`. See [docs/ci.md](../docs/ci.md).
 - **`--locked` is mandatory.** Do not change `Cargo.lock` unless your PR intentionally adds or updates a dependency. For version bumps use `cargo update -w`, not `cargo generate-lockfile`; the GPUI git dependencies must not be re-resolved (see the comment in `Cargo.toml`).
 - **Live tests** that call real providers or krun microVMs are opt-in through `LOOP_TEST_*` environment variables (for example `LOOP_TEST_BASE_URL`, `LOOP_TEST_MODEL`, `LOOP_TEST_KRUN`). They must skip cleanly when those variables are unset, and they must never run in default CI.
 - If you touch `loop-desktop`, also run `cargo clippy -p loop-desktop -- -D warnings` from `crates/loop-desktop` (nightly).

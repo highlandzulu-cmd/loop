@@ -24,6 +24,11 @@ loop is a **developer preview (alpha)**. Settings, session files and CLI flags c
 | **loop-ai** | [`crates/loop-ai`](crates/loop-ai) | Unified LLM API, Soket provider (`/v1/models` refresh), OpenAI-compat + faux |
 | **loop-agent** | [`crates/loop-agent`](crates/loop-agent) | Agent loop, AgentHarness, tools, sessions, sandbox, skills |
 | **loop-cli** | [`crates/loop-cli`](crates/loop-cli) | Interactive `loop` TUI (ratatui) |
+| **loop-update** | [`crates/ops/loop-update`](crates/ops/loop-update) | Release checks, verified updates, rollback and uninstall |
+| **loop-protocol** | [`crates/core/loop-protocol`](crates/core/loop-protocol) | Versioned event model and backend interface shared by every agent and surface |
+| **loop-wire** | [`crates/core/loop-wire`](crates/core/loop-wire) | JSON-RPC 2.0 and the transports that carry `loop-protocol` over a real connection |
+| **loop-acp** | [`crates/extend/loop-acp`](crates/extend/loop-acp) | Run any Agent Client Protocol agent (Codex, Claude, Gemini, …) as a backend |
+| **loop-dashboard** | [`crates/extend/loop-dashboard`](crates/extend/loop-dashboard) | Terminal usage view (`/usage`, `loop usage`) built from the anonymous usage log |
 
 ## Quick start
 
@@ -42,13 +47,27 @@ curl -fsSL https://loop.soket.ai/install | bash -s -- --no-modify-path
 
 From a clone of this repo you can also run `./install.sh`. Assets come from [soketlabs/loop releases](https://github.com/soketlabs/loop/releases).
 
+For installer-owned binaries, opening the terminal chat checks GitHub in the background. If a newer
+release is available, it shows a notice with the `loop update` command. It does
+not install updates at startup. Offline checks do not block the chat.
+
+```bash
+loop update --check          # show the latest release
+loop update                  # verify and install it
+loop rollback                # restore the previous binary
+loop uninstall               # remove program files; keep all user data
+```
+
+See [Install and update](docs/install-update.md) for custom paths, pinned
+versions, recovery and package-manager installs.
+
 Build from source:
 
 ```bash
 cargo run -p loop-cli
 ```
 
-First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or any OpenAI-compatible API (`/login` later to add more). Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY` or `OPENAI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
+First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, Anthropic, Gemini, or any OpenAI-compatible API (`/login` later to add more). `/login` also signs in to a **ChatGPT Plus/Pro subscription** (served by Codex through `codex-acp`, which needs Node.js); its models then appear in `/model` as `chatgpt/<model>`. Alternatively set `SOKET_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` or `GEMINI_API_KEY`. Config lives under `~/.loop/agent/`. See [`crates/loop-cli/README.md`](crates/loop-cli/README.md).
 
 ### Supported platforms
 
@@ -58,33 +77,97 @@ First run asks you to connect a model provider: Soket, OpenRouter, OpenAI, or an
 | macOS (Intel) | x86_64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux (glibc) | x86_64, arm64 | Supported | `curl -fsSL https://loop.soket.ai/install \| bash` |
 | Linux via WSL | x86_64, arm64 | Supported (uses the Linux build) | `curl -fsSL https://loop.soket.ai/install \| bash` inside WSL |
-| Windows (native) | x86_64 | In testing | Not yet officially supported; the `x86_64-pc-windows-msvc` build is published but its installer is still being tested |
 | Linux (musl, e.g. Alpine) | any | Not supported | [Build from source](#build--test) |
+
+Loop supports Linux and macOS only. Native Windows is not supported; use WSL.
 
 ### Feature support
 
-| Feature | Linux | macOS | Windows |
-|---------|-------|-------|---------|
-| Sandboxing | Supported | Planned | Planned |
-| Compaction (manual) | Supported | Supported | In testing |
-| mcp-serve | Supported | Supported | In testing |
+| Feature | Linux | macOS |
+|---------|-------|-------|
+| Sandboxing | Podman | Seatbelt (partial) |
+| Compaction (manual) | Supported | Supported |
+| mcp-serve | Supported | Supported |
 
 The installer detects your OS and CPU, downloads the latest matching release from GitHub, verifies its SHA-256 checksum, installs to `~/.loop/bin`, and adds that directory to your `PATH`. Re-running it is safe: it skips the download if you already have the latest version (use `--force` to reinstall).
 
+### Sandboxing
+
+#### Linux
+
+`/sandbox local` uses Podman with full isolation and runc by default. Use
+`--partial` or an installed runtime flag (`--crun`, `--runsc`, `--krun`) to choose
+another supported mode.
+
+#### macOS
+
+`/sandbox local` uses Seatbelt with partial isolation. Shell writes are limited
+to the project, private sandbox temp directory and `sandbox.allowWrite`; built-in file
+tools also enforce write and secret-path restrictions. Shell network access is
+off unless `sandbox.network` is enabled. Runtime Unix sockets and agent
+credentials remain denied even when networking or broad write grants are enabled.
+For Rust development, add `~/.cargo` to `sandbox.allowWrite` (and `~/.rustup` if
+rustup needs to update installation metadata). `--full` is not available yet.
+
+`/sandbox status` shows the runtime, isolation, shell network policy and writable
+paths. Host web/MCP capabilities are separate from the shell sandbox. See
+[configuration](docs/configuration.md) and the
+[macOS boundary](docs/design/macos-sandbox.md).
+
+### Shared Runtime (Linux and macOS)
+
+Plain `loop` is a Runtime client. It reuses the Runtime for your agent
+directory, or starts one, and opens a new Session in the current folder. Work
+keeps running when you quit, and approvals wait until a Surface answers.
+`loop --continue` and `loop --resume` attach to an existing Session, and
+`loop --connect <socket|ws://…>` picks a particular Runtime. `--print`, ACP
+agents and a Runtime that won't start use the in-process path instead.
+
+```bash
+loop                       # new Session; starts the Runtime if needed
+loop --continue            # attach to this folder's latest Session
+loop --resume              # choose a Session
+loop --connect ws://127.0.0.1:8765 --token-file ~/runtime.token
+```
+
+You can also manage the Runtime yourself:
+
+```bash
+loop runtime start         # start the Runtime (foreground; Ctrl+C stops it)
+loop runtime status        # is it running, and how many Sessions are loaded
+loop session new           # new Session in this folder, then follow it live
+loop session list          # list Sessions
+loop session attach <id>   # replay a Session and follow it
+loop session close <id>    # unload a Session; its history is kept
+loop runtime stop          # stop the Runtime from another terminal
+```
+
+After a crash, restarting `loop runtime start` marks interrupted turns as uncertain
+instead of retrying them. See [The Runtime](docs/runtime.md) for remote use,
+environment rules and idle shutdown.
+
 ## Supported models
 
-loop connects to model providers through an OpenAI-compatible Chat Completions API. Connect a provider on first run or with `/login`.
+Connect a provider on first run or with `/login`. Anthropic, OpenAI and Gemini use each provider's own API, so you get its prompt caching and keep the model's reasoning across tool calls. Every other provider uses an OpenAI-compatible Chat Completions API.
 
-| Provider | Connect | API key variable |
-|---|---|---|
-| Soket | `/login soket` | `SOKET_API_KEY` |
-| OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` |
-| OpenAI | `/login openai` | `OPENAI_API_KEY` |
-| Any OpenAI-compatible API (for example Together, Groq, vLLM, Ollama, LM Studio) | `/login custom` (name, base URL, optional key) | none |
+| Provider | Connect | API key variable | API |
+|---|---|---|---|
+| Soket | `/login soket` | `SOKET_API_KEY` | Chat Completions |
+| OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` | Chat Completions |
+| OpenAI | `/login openai` | `OPENAI_API_KEY` | Responses |
+| Anthropic | `/login anthropic` | `ANTHROPIC_API_KEY` | Messages |
+| Gemini | `/login gemini` | `GEMINI_API_KEY` or `GOOGLE_API_KEY` | Gemini API (API key only) |
+| Any OpenAI-compatible API (for example Together, Groq, vLLM, Ollama, LM Studio) | `/login custom` (name, base URL, optional key) | none | Chat Completions |
 
-The model list comes from each provider's `/models` endpoint. Use `/model` to select a model.
+The model list comes from each provider's model listing. Use `/model` to select a model.
 
-Not supported yet: the native Anthropic Messages API and the OpenAI Responses API.
+What the native APIs add:
+
+- **Anthropic** (`/v1/messages`): prompt caching on the system prompt, tools and conversation, with cache reads and writes in usage; extended thinking, with thinking blocks sent back unchanged during a tool loop.
+- **OpenAI** (`/v1/responses`): stateless requests (`store: false`) that carry the model's encrypted reasoning from one tool call to the next; cached and reasoning tokens in usage.
+- **Gemini** (`streamGenerateContent`): thinking with thought signatures sent back on later requests; cached tokens in usage. Gemini connects with an API key from Google AI Studio only.
+
+To run one prompt from a script, use `loop --print "<prompt>"`. Add `--output-format json` or `stream-json` for machine-readable output; see [Running Loop from scripts](docs/print-mode.md) for the formats and exit codes.
 
 ## Configuration
 
@@ -101,14 +184,18 @@ cargo test -p loop-agent
 cargo test -p loop-cli
 ```
 
-### Tracing (optional `telemetry` feature)
+### Usage log and tracing
 
-OpenTelemetry tracing to Langfuse or any OTLP collector is off by default, so the standard build carries no OpenTelemetry dependencies. Build with the feature to get `/tracing` in the TUI and the `--trace-*` flags for benchmark runs with `--print`:
+Loop always keeps an **anonymous usage log** on your machine. It records the shape of each run and nothing else: model and provider names, token usage, timings, tool names (including MCP `mcp__<server>__<tool>`), skill names, session ids, run labels and error levels. It never records prompts, completions, tool arguments or results, error messages or file paths, and nothing is sent anywhere. Each loop process writes one `loop-<time>-<pid>.jsonl` file under `~/.loop/agent/usage` (readable only by you on Linux and macOS). Files older than 30 days are deleted when loop starts. This is a usage record, not an audit log.
+
+To see your usage, type `/usage` inside loop, or run `loop usage`. It opens a full-screen view in the terminal. **Now** shows the running session, Codex `/status`-style: model, permissions, sandbox, a context window gauge, the main agent and running subagents, and loaded skills, MCP servers, extensions and hooks. **Usage**, **Models**, **Tools**, **Agents** and **Sessions** show history from the usage log: tokens and calls per day, latency and time to first token per model, tool use by source, main and subagent runs, skill and MCP server use, and recent sessions. Press `q` to return to the chat.
+
+Full traces can also go to Langfuse or any OTLP collector. Run `/tracing setup`, or set `LANGFUSE_HOST`, `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY`. `/tracing disable` stops that export; the usage log stays on. The `--trace-*` flags label benchmark runs with `--print`.
+
+All of this is the `telemetry` feature, which is on by default. To build without it:
 
 ```bash
-cargo build -p loop-cli --release --features telemetry
-cargo test -p loop-telemetry -p loop-agent -p loop-app-core -p loop-cli \
-  --features loop-agent/telemetry,loop-app-core/telemetry,loop-cli/telemetry
+cargo build -p loop-cli --release --no-default-features
 ```
 
 Maintainers: see [docs/releasing.md](docs/releasing.md) to cut a release.

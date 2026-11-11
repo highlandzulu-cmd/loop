@@ -97,6 +97,7 @@ impl PodmanClient for FakePodman {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: 0,
+                    truncated: false,
                 });
             }
             if let Some(path) = path_after(&script, "cat >> ") {
@@ -112,6 +113,7 @@ impl PodmanClient for FakePodman {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: 0,
+                    truncated: false,
                 });
             }
             if let Some(path) = path_after(&script, "cat -- ") {
@@ -120,11 +122,13 @@ impl PodmanClient for FakePodman {
                         stdout: String::from_utf8_lossy(data).into_owned(),
                         stderr: String::new(),
                         exit_code: 0,
+                        truncated: false,
                     }),
                     None => Ok(ShellOutput {
                         stdout: String::new(),
                         stderr: "No such file".into(),
                         exit_code: 1,
+                        truncated: false,
                     }),
                 };
             }
@@ -136,12 +140,14 @@ impl PodmanClient for FakePodman {
                             stdout: base64::engine::general_purpose::STANDARD.encode(data),
                             stderr: String::new(),
                             exit_code: 0,
+                            truncated: false,
                         })
                     }
                     None => Ok(ShellOutput {
                         stdout: String::new(),
                         stderr: "No such file".into(),
                         exit_code: 1,
+                        truncated: false,
                     }),
                 };
             }
@@ -152,6 +158,7 @@ impl PodmanClient for FakePodman {
                         stdout: format!("FILE\n{}\n", data.len()),
                         stderr: String::new(),
                         exit_code: 0,
+                        truncated: false,
                     });
                 }
                 if self.dirs.lock().contains(&path) {
@@ -159,12 +166,14 @@ impl PodmanClient for FakePodman {
                         stdout: "DIR\n0\n".into(),
                         stderr: String::new(),
                         exit_code: 0,
+                        truncated: false,
                     });
                 }
                 return Ok(ShellOutput {
                     stdout: "MISSING\n".into(),
                     stderr: String::new(),
                     exit_code: 1,
+                    truncated: false,
                 });
             }
             if script.contains("if [ -e ") {
@@ -175,6 +184,7 @@ impl PodmanClient for FakePodman {
                     stdout: if exists { "1\n" } else { "0\n" }.into(),
                     stderr: String::new(),
                     exit_code: 0,
+                    truncated: false,
                 });
             }
             if let Some(path) = path_after(&script, "mkdir -p -- ") {
@@ -184,6 +194,7 @@ impl PodmanClient for FakePodman {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: 0,
+                    truncated: false,
                 });
             }
             if let Some(path) = path_after(&script, "rm -rf -- ") {
@@ -193,12 +204,14 @@ impl PodmanClient for FakePodman {
                     stdout: String::new(),
                     stderr: String::new(),
                     exit_code: 0,
+                    truncated: false,
                 });
             }
             return Ok(ShellOutput {
                 stdout: format!("ok:{script}"),
                 stderr: String::new(),
                 exit_code: 0,
+                truncated: false,
             });
         }
 

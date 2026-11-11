@@ -154,6 +154,19 @@ impl FileSystem for HostExecutionEnv {
         tokio::fs::canonicalize(&path).await.map_err(Self::map_io)
     }
 
+    async fn file_identity(
+        &self,
+        path: &Path,
+    ) -> Result<Option<crate::harness::types::FileIdentity>, FileError> {
+        let path = self.absolute_path(path)?;
+        let meta = tokio::fs::symlink_metadata(&path)
+            .await
+            .map_err(Self::map_io)?;
+        Ok(meta
+            .is_file()
+            .then(|| crate::harness::types::FileIdentity::from_metadata(&meta)))
+    }
+
     async fn create_temp_dir(&self, prefix: &str) -> Result<PathBuf, FileError> {
         let base = std::env::temp_dir();
         let name = format!("{prefix}-{}", loop_ai::new_id());
@@ -177,151 +190,270 @@ impl Shell for HostExecutionEnv {
     ) -> Result<ShellOutput, ExecutionError> {
         let cwd = options.cwd.clone().unwrap_or_else(|| self.cwd.clone());
 
-        let mut cmd = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", command]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", command]);
-            c
-        };
-        cmd.current_dir(&cwd)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", command]);
+        cmd.current_dir(&cwd);
         if !options.inherit_env {
             cmd.env_clear();
         }
         if let Some(env) = &options.env {
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
+            cmd.envs(env);
         }
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stdout pipe"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stderr pipe"))?;
-
-        let combined = Arc::new(Mutex::new(String::new()));
-        let stdout_acc = Arc::new(Mutex::new(String::new()));
-        let stderr_acc = Arc::new(Mutex::new(String::new()));
-        let last_emit = Arc::new(Mutex::new(
-            Instant::now()
-                .checked_sub(OUTPUT_EMIT_INTERVAL)
-                .unwrap_or_else(Instant::now),
-        ));
-        let on_output = options.on_output.clone();
-
-        let stdout_task = {
-            let combined = Arc::clone(&combined);
-            let stdout_acc = Arc::clone(&stdout_acc);
-            let last_emit = Arc::clone(&last_emit);
-            let on_output = on_output.clone();
-            tokio::spawn(async move {
-                read_stream(stdout, combined, stdout_acc, last_emit, on_output).await;
-            })
-        };
-        let stderr_task = {
-            let combined = Arc::clone(&combined);
-            let stderr_acc = Arc::clone(&stderr_acc);
-            let last_emit = Arc::clone(&last_emit);
-            let on_output = on_output.clone();
-            tokio::spawn(async move {
-                read_stream(stderr, combined, stderr_acc, last_emit, on_output).await;
-            })
-        };
-
-        let status = match (&options.cancel, options.timeout_ms) {
-            (Some(cancel), Some(ms)) => {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::Aborted,
-                            "operation aborted",
-                        ));
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(ms)) => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::TimedOut,
-                            "command timed out",
-                        ));
-                    }
-                    res = child.wait() => res.map_err(|e| {
-                        ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
-                    })?,
-                }
-            }
-            (Some(cancel), None) => {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::Aborted,
-                            "operation aborted",
-                        ));
-                    }
-                    res = child.wait() => res.map_err(|e| {
-                        ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
-                    })?,
-                }
-            }
-            (None, Some(ms)) => {
-                match tokio::time::timeout(Duration::from_millis(ms), child.wait()).await {
-                    Ok(res) => {
-                        res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
-                    }
-                    Err(_) => {
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
-                        let _ = tokio::join!(stdout_task, stderr_task);
-                        return Err(ExecutionError::new(
-                            ExecutionErrorCode::TimedOut,
-                            "command timed out",
-                        ));
-                    }
-                }
-            }
-            (None, None) => child
-                .wait()
-                .await
-                .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?,
-        };
-
-        let _ = tokio::join!(stdout_task, stderr_task);
-
-        let stdout_text = stdout_acc.lock().await.clone();
-        let stderr_text = stderr_acc.lock().await.clone();
-        let combined_text = combined.lock().await.clone();
-
-        if let Some(cb) = &on_output {
-            cb(&combined_text);
-        }
-
-        Ok(ShellOutput {
-            stdout: stdout_text,
-            stderr: stderr_text,
-            exit_code: status.code().unwrap_or(-1),
-        })
+        exec_command(cmd, options, false, None).await
     }
+}
+
+/// Shared process-group, cancellation and bounded-output runner.
+pub(crate) async fn exec_command(
+    mut cmd: Command,
+    options: ShellExecOptions,
+    stop_background: bool,
+    _marker: Option<PathBuf>,
+) -> Result<ShellOutput, ExecutionError> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    if stop_background {
+        // SAFETY: setsid is async-signal-safe and no allocator/locks are used
+        // between fork and exec. Do not setpgid first: a group leader cannot setsid.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        cmd.process_group(0);
+    }
+
+    #[cfg(target_os = "macos")]
+    let descendants = _marker
+        .as_deref()
+        .map(super::process_tree::Descendants::new)
+        .transpose()
+        .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+    if options.cancel.as_ref().is_some_and(|c| c.is_cancelled()) {
+        return Err(ExecutionError::new(
+            ExecutionErrorCode::Aborted,
+            "operation aborted",
+        ));
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ExecutionError::new(ExecutionErrorCode::SpawnFailed, e.to_string()))?;
+    // Kills the tree if this future is dropped before the command ends.
+    let mut tree = TreeKiller {
+        pid: child.id(),
+        #[cfg(target_os = "macos")]
+        descendants,
+    };
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| ExecutionError::new(ExecutionErrorCode::Io, "missing stderr pipe"))?;
+
+    let combined = Arc::new(Mutex::new(String::new()));
+    let stdout_acc = Arc::new(Mutex::new(String::new()));
+    let stderr_acc = Arc::new(Mutex::new(String::new()));
+    let last_emit = Arc::new(Mutex::new(
+        Instant::now()
+            .checked_sub(OUTPUT_EMIT_INTERVAL)
+            .unwrap_or_else(Instant::now),
+    ));
+    let on_output = options.on_output.clone();
+    let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let mut stdout_task = PipeTask({
+        let combined = Arc::clone(&combined);
+        let stdout_acc = Arc::clone(&stdout_acc);
+        let last_emit = Arc::clone(&last_emit);
+        let on_output = on_output.clone();
+        let cut = Arc::clone(&cut);
+        tokio::spawn(async move {
+            read_stream(stdout, combined, stdout_acc, last_emit, on_output, cut).await;
+        })
+    });
+    let mut stderr_task = PipeTask({
+        let combined = Arc::clone(&combined);
+        let stderr_acc = Arc::clone(&stderr_acc);
+        let last_emit = Arc::clone(&last_emit);
+        let on_output = on_output.clone();
+        let cut = Arc::clone(&cut);
+        tokio::spawn(async move {
+            read_stream(stderr, combined, stderr_acc, last_emit, on_output, cut).await;
+        })
+    });
+
+    let status = match (&options.cancel, options.timeout_ms) {
+        (Some(cancel), Some(ms)) => {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let cleanup = tree.kill();
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::Aborted,
+                        "operation aborted",
+                    ));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(ms)) => {
+                    let cleanup = tree.kill();
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::TimedOut,
+                        "command timed out",
+                    ));
+                }
+                res = child.wait() => res.map_err(|e| {
+                    ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
+                })?,
+            }
+        }
+        (Some(cancel), None) => {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    let cleanup = tree.kill();
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::Aborted,
+                        "operation aborted",
+                    ));
+                }
+                res = child.wait() => res.map_err(|e| {
+                    ExecutionError::new(ExecutionErrorCode::Io, e.to_string())
+                })?,
+            }
+        }
+        (None, Some(ms)) => {
+            match tokio::time::timeout(Duration::from_millis(ms), child.wait()).await {
+                Ok(res) => {
+                    res.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?
+                }
+                Err(_) => {
+                    let cleanup = tree.kill();
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+                    drain(&mut stdout_task, &mut stderr_task).await;
+                    cleanup?;
+                    return Err(ExecutionError::new(
+                        ExecutionErrorCode::TimedOut,
+                        "command timed out",
+                    ));
+                }
+            }
+        }
+        (None, None) => child
+            .wait()
+            .await
+            .map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?,
+    };
+
+    let cleanup = if stop_background {
+        tree.kill()
+    } else {
+        tree.pid = None;
+        Ok(())
+    };
+    drain(&mut stdout_task, &mut stderr_task).await;
+    cleanup?;
+
+    let stdout_text = stdout_acc.lock().await.clone();
+    let stderr_text = stderr_acc.lock().await.clone();
+    let combined_text = combined.lock().await.clone();
+
+    if let Some(cb) = &on_output {
+        cb(&combined_text);
+    }
+
+    Ok(ShellOutput {
+        stdout: stdout_text,
+        stderr: stderr_text,
+        exit_code: status.code().unwrap_or(-1),
+        truncated: cut.load(std::sync::atomic::Ordering::Acquire),
+    })
+}
+
+struct PipeTask(tokio::task::JoinHandle<()>);
+
+impl Drop for PipeTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn drain(stdout: &mut PipeTask, stderr: &mut PipeTask) {
+    if tokio::time::timeout(Duration::from_millis(250), async {
+        let _ = tokio::join!(&mut stdout.0, &mut stderr.0);
+    })
+    .await
+    .is_err()
+    {
+        stdout.0.abort();
+        stderr.0.abort();
+    }
+}
+
+/// Kills a process and everything in its process group, unless disarmed. Without it, a grandchild such as the `sleep`
+/// in `sh -c "sleep 60; echo"` keeps the output pipes open after a timeout.
+struct TreeKiller {
+    pid: Option<u32>,
+    #[cfg(target_os = "macos")]
+    descendants: Option<super::process_tree::Descendants>,
+}
+
+impl TreeKiller {
+    fn kill(&mut self) -> Result<(), ExecutionError> {
+        #[cfg(target_os = "macos")]
+        let result = self.descendants.take().map(|d| d.kill()).transpose();
+        let Some(pid) = self.pid.take() else {
+            return Ok(());
+        };
+        // SAFETY: child PIDs fit pid_t; a negative PID targets its dedicated
+        // process group. Never launch a PATH-resolved cleanup helper on the host.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+        #[cfg(target_os = "macos")]
+        result.map_err(|e| ExecutionError::new(ExecutionErrorCode::Io, e.to_string()))?;
+        Ok(())
+    }
+}
+
+impl Drop for TreeKiller {
+    fn drop(&mut self) {
+        if let Err(error) = self.kill() {
+            tracing::error!(%error, "process cleanup failed while dropping execution");
+        }
+    }
+}
+
+// Keep draining after the cap, so a noisy command never blocks on a full pipe.
+const OUTPUT_CAP: usize = 1024 * 1024;
+
+/// Append what fits under the cap; false when part of `chunk` was dropped.
+fn push_capped(acc: &mut String, chunk: &str) -> bool {
+    let mut end = chunk.len().min(OUTPUT_CAP.saturating_sub(acc.len()));
+    while !chunk.is_char_boundary(end) {
+        end -= 1;
+    }
+    acc.push_str(&chunk[..end]);
+    end == chunk.len()
 }
 
 async fn read_stream<R: AsyncReadExt + Unpin>(
@@ -330,6 +462,7 @@ async fn read_stream<R: AsyncReadExt + Unpin>(
     stream_acc: Arc<Mutex<String>>,
     last_emit: Arc<Mutex<Instant>>,
     on_output: Option<crate::harness::types::ShellOutputCallback>,
+    cut: Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut buf = [0u8; 8192];
     loop {
@@ -339,11 +472,13 @@ async fn read_stream<R: AsyncReadExt + Unpin>(
                 let chunk = sanitize_binary_output(&buf[..n]);
                 {
                     let mut acc = stream_acc.lock().await;
-                    acc.push_str(&chunk);
+                    if !push_capped(&mut acc, &chunk) {
+                        cut.store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 let snapshot = {
                     let mut c = combined.lock().await;
-                    c.push_str(&chunk);
+                    let _ = push_capped(&mut c, &chunk);
                     c.clone()
                 };
                 if let Some(cb) = &on_output {
@@ -363,5 +498,68 @@ async fn read_stream<R: AsyncReadExt + Unpin>(
             }
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    async fn run(
+        command: &str,
+        timeout_ms: Option<u64>,
+        cancel: Option<CancellationToken>,
+    ) -> Result<ShellOutput, ExecutionError> {
+        HostExecutionEnv::new(std::env::temp_dir())
+            .exec(
+                command,
+                ShellExecOptions {
+                    timeout_ms,
+                    cancel,
+                    ..Default::default()
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn a_timeout_stops_what_the_command_started() {
+        let started = Instant::now();
+        let err = run("sleep 5; echo done", Some(200), None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ExecutionErrorCode::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_stops_what_the_command_started() {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            trigger.cancel();
+        });
+        let started = Instant::now();
+        let err = run("sleep 5; echo done", Some(60_000), Some(cancel))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ExecutionErrorCode::Aborted);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn commands_do_not_read_loops_stdin() {
+        let out = run("cat; echo end", Some(5_000), None).await.unwrap();
+        assert_eq!(out.stdout.trim(), "end");
     }
 }

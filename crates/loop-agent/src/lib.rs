@@ -7,8 +7,11 @@
 
 pub mod agent;
 pub mod agent_loop;
+pub mod effort;
 pub mod harness;
 pub mod messages;
+pub mod native_backend;
+pub mod protocol_events;
 pub mod stream_fn;
 #[cfg(feature = "telemetry")]
 mod telemetry;

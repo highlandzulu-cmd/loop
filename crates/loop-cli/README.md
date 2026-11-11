@@ -28,10 +28,13 @@ On first start, Loop asks you to **connect a model provider** (unless a provider
 | OpenRouter | `/login openrouter` | `OPENROUTER_API_KEY` |
 | OpenAI | `/login openai` | `OPENAI_API_KEY` |
 | Any OpenAI-compatible API (Together, Groq, vLLM, Ollama, LM Studio, …) | `/login custom` (name, base URL, optional key) | — |
+| TinyFish (web search) | `/login tinyfish` | `TINYFISH_API_KEY` |
+| Tavily (web search) | `/login tavily` | `TAVILY_API_KEY` |
+| Brave Search (web search) | `/login brave` | `BRAVE_API_KEY` |
 
-Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`.
+Models are listed from each provider's `/models` endpoint; `/model` shows Soket first, then other connected providers. `/logout <provider>` disconnects one. Keys are stored in `~/.loop/agent/auth.json` (mode `0600`); custom providers are saved in `settings.json`. The web-search keys enable the `web_search` tool (see [Web tools](#web-tools)).
 
-Default provider/model: **`soket` / `qwen3-30b`** at `https://api.soket.ai/v1`. The model catalog is refreshed from `GET /v1/models` and cached in `models-store.json`.
+Select a model with `/model`. Soket uses `https://api.soket.ai/v1`; its model catalog is refreshed from `GET /v1/models` and cached in `models-store.json`.
 
 ## Config layout
 
@@ -69,7 +72,36 @@ Context files are loaded automatically from the agent dir, `~/.claude/CLAUDE.md`
 
 ## Slash commands (highlights)
 
-`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/new`, `/review`, `/compact`, `/resume`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+`/theme`, `/sandbox`, `/model`, `/settings`, `/login`, `/logout`, `/websearch`, `/new`, `/review`, `/compact`, `/sessions`, `/resume`, `/name`, `/export`, `/import`, `/tree`, `/fork`, `/clone`, `/trust`, `/reload`, `/skills`, `/changelog`, `/hotkeys`, `/help`, `/quit`, plus `/skill:name` and prompt templates.
+
+`/changelog` shows the notes published with this version's GitHub release. It needs network access; a build from source that isn't a release has none and says so.
+
+## Sessions
+
+`/sessions` (or `/resume` with no id) lists this folder's earlier sessions, newest first: Loop's own and subscription ones (such as ChatGPT). Each row shows the title, the session id, the model or subscription, the number of messages and when it was last used. Type to filter by title or id; **Enter** resumes and **Esc** cancels.
+
+- **Title:** the session's `/name` when set, otherwise its first prompt.
+- **`/resume <id>`** resumes directly. A unique prefix of the id is enough.
+- **From the shell:** `loop --resume` with no id opens the picker, and `loop --continue` resumes the most recent session.
+- **`/tree`** shows the session as a tree: prompts (`❯`) and answers, indented where you went back and tried something else, with `●` where you are. Below them are the session this one was forked or cloned from and the sessions forked or cloned from it (`⑂`).
+  - **Enter on a prompt** goes back to just before it and puts it in the input box. Edit it and send to start a new branch; the old branch stays in `/tree`.
+  - **Enter on an answer** goes back to that point; your next prompt continues from there.
+  - **Enter on a `⑂` row** switches to that session.
+- **`/export [path]`** saves the current session twice, side by side: a Markdown transcript (`path.md`) and a session file (`path.loop.jsonl`). With no path they are `loop-<id>.md` and `loop-<id>.loop.jsonl` in this folder. The transcript leaves out thinking and images and keeps the first 20 lines of each tool result. Only the active branch is saved. Subscription sessions can't be exported. If either file already exists, Loop asks first and writes nothing: run the same `/export` again to overwrite, or add `--force` to skip the check.
+- **`/import <file.loop.jsonl>`** opens an exported session file as a new session in this folder and switches to it, so you can continue it. "Accept all … for this session" approvals in the file are not imported.
+- **Not listed:**
+  - sessions with no messages;
+  - subscription sessions from before this version, which have no recorded title. `--resume <id>` still opens those.
+
+## Images
+
+When the model reads images, you can send them with a message:
+
+- **Ctrl+V** attaches the image on the clipboard (a screenshot, for example) on macOS and on Linux under X11. Wayland isn't supported yet; use a file path there.
+- **Drag an image file** into the terminal, or paste its path: Loop attaches the image instead of pasting the path.
+- **`@path/to/image.png`** in a message sends that file too.
+
+An attached image shows as a chip such as `[image #1]` in the input. Delete the chip to drop the image. PNG, JPEG, GIF and WebP files up to 5 MB are accepted. With a model that doesn't read images, Loop says so and pastes the path as text.
 
 ## Local shell (`!command`)
 
@@ -85,7 +117,7 @@ Type `!ls -la` (or any shell command) to run it in the current sandbox/host envi
 | `ctrl+c` | Clear (twice quits) |
 | `ctrl+l` | Model picker |
 | `ctrl+p` | Cycle models |
-| `shift+tab` | Cycle thinking |
+| `shift+tab` | Cycle reasoning effort (also `/effort [level]`) |
 | `ctrl+t` | Toggle thinking visibility |
 | `ctrl+x` | Copy last assistant message |
 | `ctrl+g` | External editor (`$EDITOR`) |
@@ -98,6 +130,20 @@ See `/hotkeys`. Override in `keybindings.json`.
 Ship `dark` and `light`. Custom JSON themes use the same color tokens. Change with `/theme name` or `settings.theme`.
 
 ## Sandbox
+
+### macOS
+
+`/sandbox local` uses Seatbelt partial isolation, with shell networking off by
+default. Commands may write the project, private sandbox temp directory and configured
+`sandbox.allowWrite` paths. File tools enforce write and secret-path restrictions
+too. Agent credentials, Runtime state/control sockets and common credential
+folders remain denied even under broad grants. Use `sandbox.allowWrite: ["~/.cargo"]`
+for Rust cache writes; add `~/.rustup` if rustup needs installation writes.
+`--full` and Linux runtime flags are unavailable. `/sandbox status` shows the
+runtime, isolation, shell networking and writable paths. Host web/MCP services
+are separate capabilities. See [the boundary](../../docs/design/macos-sandbox.md).
+
+### Linux
 
 `/sandbox` / `/sandbox status` — boxed status (on/off, kind, runtime; not sent to the model)  
 `/sandbox off` — host tools  
@@ -124,7 +170,7 @@ If deps for the chosen runtime are missing, Loop prints install instructions and
 
 ## File edit review / tool approval
 
-On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPermissions`). File edits open Cursor or VS Code with `--diff`. Options:
+In `ask` mode (the default), `write` / `edit` / `bash` pause for approval, per `toolPermissions`. File edits open Cursor or VS Code with `--diff`. Options:
 
 1. **Accept** — this change only  
 2. **Accept all … for this session** — remembered on the session (survives resume)  
@@ -132,7 +178,7 @@ On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPerm
 
 ```json
 {
-  "fileEditReview": "newSession",
+  "permissionMode": "ask",
   "diffEditor": "cursor",
   "toolPermissions": {
     "write": "ask",
@@ -143,15 +189,78 @@ On **new sessions**, `write` / `edit` / `bash` pause for approval (per `toolPerm
 }
 ```
 
-- `fileEditReview`: `newSession` (default) · `always` · `never` — when `ask` tools prompt  
-- `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`  
-- Interactive workflows are wired for `write`, `edit`, and `bash` (others can be configured for later)  
-- `/review [newSession|always|never]` toggles the ask policy
+- `toolPermissions`: per-tool `ask` | `allow` | `deny` in `~/.loop/agent/settings.json`, with
+  patterns such as `bash(git status*)`  
+- `permissionMode` / `--permission-mode` / `/permissions`: `read-only` · `ask` (default) ·
+  `accept-edits` · `full-access`. See [docs/permissions.md](../../docs/permissions.md)
+- Interactive workflows are wired for `write`, `edit`, `bash`, `web_fetch`, and `web_search`
+- `/review` shows the session's approvals and `toolPermissions`
+
+## Built-in tools
+
+- **`read`, `write`, `edit`, `bash`:** files and the shell, under the permission mode.
+- **`grep`, `glob`, `ls`:** search file contents, find files by pattern, and list a directory. They only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; output stops at 500 lines with a truncated note.
+- **`todo`:** the model's checklist for multi-step work. Each update shows in the transcript as a checklist (`☐` pending, `◼` in progress, `✔` done). The checklist is part of the session, so `/resume`, `/fork` and `/clone` keep it.
+
+## Web tools
+
+`web_fetch` is built in: it fetches an http(s) URL and returns the body as text
+(HTML pages become plain text). Only public internet hosts are reachable —
+loopback, private, link-local and reserved addresses are refused before any
+connection (redirects re-checked per hop), and bodies are capped and truncated.
+It runs in the Loop process, not inside the sandbox.
+
+`web_search` returns ranked results (title, URL, snippet). Connect a backend
+with the login wizard — the key is verified with a probe search, stored in
+`auth.json`, and the tool is enabled immediately (no restart):
+
+| Provider | Connect | Env alternative |
+|---|---|---|
+| Soket (default) | `/login soket` | `SOKET_API_KEY` |
+| Tavily | `/login tavily` | `TAVILY_API_KEY` |
+| TinyFish | `/login tinyfish` | `TINYFISH_API_KEY` |
+| Brave Search | `/login brave` | `BRAVE_API_KEY` |
+
+`/logout <provider>` disconnects that provider until a successful `/login`,
+even when its key is set in the environment. `/logout soket` disconnects
+Soket models, search, and fetch; automatic fetching then uses direct requests.
+A fetch explicitly pinned to Soket is unavailable until login. Other search
+providers and subscription agents retain their own tools. External tool cards
+show the subscription name, such as `ChatGPT · Web search`.
+
+`/websearch` and `--no-web` control Loop's own tools, not a subscription agent's tools. Hand-written config in
+`settings.json` is also supported:
+
+```json
+{
+  "webFetch": { "allowPrivateAddresses": false },
+  "webSearch": { "provider": "tavily" }
+}
+```
+
+- `webFetch.allowPrivateAddresses`: `true` permits localhost/intranet URLs (for
+  self-hosted mirrors; fails closed by default)
+- `webSearch.apiKeyEnv`: custom env-var names, checked before the saved key
+- `webSearch.baseUrl`: point at a self-hosted search proxy
+- `webSearch.allowPrivateAddresses`: allow a private `baseUrl`
+- Both tools default to `ask` in `toolPermissions`; the approval prompt shows
+  the URL / query, with an *Accept all web requests for this session* option
+- Key resolution order: `webSearch.apiKeyEnv` env vars → the saved `/login`
+  key → the provider's default env var. With none present, Loop starts
+  without `web_search` and prints a note
+
+## Diagnostics
+
+Interactive mode keeps diagnostic logs out of the terminal UI. Recoverable
+reasoning fallbacks appear as a short notice once per model. Use `--debug`
+to save detailed logs under `target/debug/logs`; print mode still logs to stderr.
 
 ## Extensions & hooks
 
 - **Rhai**: `register_command`, `notify`, stubs for `register_tool` / `on` / …
-- **JSON hooks**: `on` lifecycle names (`before_agent_start`, `session_before_compact`, …)
+- **JSON hooks**: `tool_call` / `tool_result` with `match` rules, lifecycle names
+  (`before_agent_start`, `session_before_compact`, …), and command hooks that run a program.
+  See [docs/hooks.md](../../docs/hooks.md)
 
 Examples under [`examples/`](examples/).
 
@@ -159,7 +268,8 @@ Examples under [`examples/`](examples/).
 
 ```
 loop [--provider soket] [--model qwen3-30b] [--theme dark]
-     [--resume <id>] [--print "prompt"] [--no-context-files]
+     [--resume [<id>]] [--continue] [--print "prompt"] [--no-context-files]
+     [--permission-mode read-only|ask|accept-edits|full-access]
 loop config
 ```
 

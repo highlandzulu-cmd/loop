@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::{json, Value};
 
 use crate::api::detect_compat::resolve_compat;
+use crate::api::sse::{send_request, StreamFail};
 use crate::api::transform_messages::transform_messages;
 use crate::auth::ModelAuth;
 use crate::models::ApiAdapter;
@@ -17,7 +17,7 @@ use crate::types::{
     AssistantContent, AssistantMessage, AssistantMessageEvent, Context, MaxTokensField, Message,
     Model, ProviderResponse, ResolvedOpenAICompletionsCompat, SimpleStreamOptions, StopReason,
     StreamOptions, TextContent, ThinkingContent, ThinkingFormat, ThinkingLevel, ToolCall,
-    ToolResultContent, Usage, UserContent, UserMessageContent, API_OPENAI_COMPLETIONS,
+    ToolResultContent, Usage, UserContent, UserMessageContent,
 };
 use crate::utils::{calculate_cost, parse_streaming_json};
 
@@ -96,14 +96,17 @@ impl OpenAICompletionsAdapter {
         let context = context.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = run_stream(
-                client,
-                model.clone(),
-                context,
-                options,
-                auth,
-                reasoning,
-                handle.clone(),
+            if let Err(err) = super::sse::until_closed(
+                &handle,
+                run_stream(
+                    client,
+                    model.clone(),
+                    context,
+                    options,
+                    auth,
+                    reasoning,
+                    handle.clone(),
+                ),
             )
             .await
             {
@@ -123,20 +126,18 @@ impl OpenAICompletionsAdapter {
     }
 }
 
-struct StreamFail {
-    message: String,
-    aborted: bool,
-}
-
 async fn run_stream(
     client: reqwest::Client,
     model: Model,
     context: Context,
-    options: StreamOptions,
+    mut options: StreamOptions,
     auth: ModelAuth,
     reasoning: Option<ThinkingLevel>,
     handle: crate::stream::AssistantMessageEventStreamHandle,
 ) -> Result<(), StreamFail> {
+    options
+        .generation_started_at
+        .get_or_insert_with(tokio::time::Instant::now);
     if let Some(token) = &options.cancel {
         if token.is_cancelled() {
             return Err(StreamFail {
@@ -190,68 +191,41 @@ async fn run_stream(
         }
     }
 
-    let req = client.post(&url).headers(headers).json(&payload);
-    // Do not set an overall reqwest timeout here — it would abort long SSE bodies.
-    // Bound only time-to-first-byte (headers) via `response_header_timeout_ms`.
-
     let cancel = options.cancel.clone();
-    let response_fut = req.send();
-    // None => default 60s; Some(0) => no limit; Some(n) => n ms.
-    const DEFAULT_TTFB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-    let ttfb: Option<std::time::Duration> = match options.response_header_timeout_ms {
-        None => Some(DEFAULT_TTFB_TIMEOUT),
-        Some(0) => None,
-        Some(ms) => Some(std::time::Duration::from_millis(ms)),
-    };
-
-    let response = match (cancel.as_ref(), ttfb) {
-        (Some(token), Some(bound)) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = tokio::time::timeout(bound, response_fut) => {
-                    match res {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            return Err(StreamFail {
-                                message: format!(
-                                    "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                                    bound.as_secs()
-                                ),
-                                aborted: false,
-                            });
-                        }
-                    }
-                }
+    let mut response = send_request(&client, &url, headers.clone(), &payload, &options).await?;
+    // Some OpenAI-compatible servers reject reasoning parameters for models
+    // they serve. Retry once without them and remember the model.
+    let sent_reasoning = [
+        "reasoning_effort",
+        "reasoning",
+        "thinking",
+        "enable_thinking",
+    ]
+    .iter()
+    .any(|field| payload.get(field).is_some())
+        || payload
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking"))
+            .is_some();
+    let status = response.status().as_u16();
+    if sent_reasoning && matches!(status, 400 | 422) {
+        let body = super::sse::error_body(response, &options).await?;
+        if !rejects_reasoning(&body) {
+            return Err(StreamFail {
+                message: crate::utils::summarize_http_error(status, &body),
+                aborted: false,
+            });
+        }
+        tracing::warn!(model = %model.id, "the provider rejected reasoning parameters; retrying without them");
+        mark_reasoning_rejected(&model);
+        payload = build_payload(&model, &context, &messages, &options, &compat, None)?;
+        if let Some(cb) = &options.on_payload {
+            if let Some(replaced) = cb(&payload, &model) {
+                payload = replaced;
             }
         }
-        (Some(token), None) => {
-            tokio::select! {
-                _ = token.cancelled() => {
-                    return Err(StreamFail { message: "aborted".into(), aborted: true });
-                }
-                res = response_fut => res,
-            }
-        }
-        (None, Some(bound)) => match tokio::time::timeout(bound, response_fut).await {
-            Ok(inner) => inner,
-            Err(_) => {
-                return Err(StreamFail {
-                    message: format!(
-                        "timed out waiting for model response ({}s); set responseHeaderTimeoutMs to 0 for long-running waits",
-                        bound.as_secs()
-                    ),
-                    aborted: false,
-                });
-            }
-        },
-        (None, None) => response_fut.await,
+        response = send_request(&client, &url, headers, &payload, &options).await?;
     }
-    .map_err(|e| StreamFail {
-        message: e.to_string(),
-        aborted: false,
-    })?;
 
     let status = response.status();
     let mut resp_headers = HashMap::new();
@@ -271,7 +245,7 @@ async fn run_stream(
     }
 
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = super::sse::error_body(response, &options).await?;
         return Err(StreamFail {
             message: crate::utils::summarize_http_error(status.as_u16(), &body),
             aborted: false,
@@ -291,63 +265,51 @@ async fn run_stream(
     let mut tool_args: HashMap<usize, String> = HashMap::new();
     let mut finish_reason: Option<String> = None;
 
-    let byte_stream = response.bytes_stream();
-    let mut event_stream = byte_stream.eventsource();
-
-    // If no SSE chunk arrives within this window, treat the connection as stalled.
-    const SSE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-
+    let mut event_stream = super::sse::tracked_events(response, &options);
+    let mut completed = false;
     loop {
         let next = if let Some(token) = &cancel {
             tokio::select! {
+                biased;
                 _ = token.cancelled() => {
                     partial.stop_reason = StopReason::Aborted;
                     partial.error_message = Some("aborted".into());
                     close_open_blocks(&mut partial, &mut text_index, &mut thinking_index, &mut tool_map, &mut tool_args, &handle);
-                    handle.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: partial,
-                    });
+                handle.push(AssistantMessageEvent::Error { reason: StopReason::Aborted, error: partial });
                     return Ok(());
                 }
-                ev = tokio::time::timeout(SSE_IDLE_TIMEOUT, event_stream.next()) => {
-                    match ev {
-                        Ok(inner) => inner,
-                        Err(_) => {
-                            return Err(StreamFail {
-                                message: format!("server stopped responding (no data for {}s)", SSE_IDLE_TIMEOUT.as_secs()),
-                                aborted: false,
-                            });
-                        }
-                    }
-                }
+                ev = event_stream.next() => ev,
             }
         } else {
-            match tokio::time::timeout(SSE_IDLE_TIMEOUT, event_stream.next()).await {
-                Ok(inner) => inner,
-                Err(_) => {
-                    return Err(StreamFail {
-                        message: format!(
-                            "server stopped responding (no data for {}s)",
-                            SSE_IDLE_TIMEOUT.as_secs()
-                        ),
-                        aborted: false,
-                    });
-                }
+            event_stream.next().await
+        };
+        let Some(event) = next else { break };
+        let event = match event {
+            Ok(event) => event,
+            Err(error) => {
+                partial.stop_reason = StopReason::Error;
+                partial.error_message = Some(error);
+                close_open_blocks(
+                    &mut partial,
+                    &mut text_index,
+                    &mut thinking_index,
+                    &mut tool_map,
+                    &mut tool_args,
+                    &handle,
+                );
+                handle.push(AssistantMessageEvent::Error {
+                    reason: StopReason::Error,
+                    error: partial,
+                });
+                return Ok(());
             }
         };
-
-        let Some(event) = next else { break };
-        let event = event.map_err(|e| StreamFail {
-            message: format!("sse error: {e}"),
-            aborted: false,
-        })?;
-
         let data = event.data.trim();
         if data.is_empty() {
             continue;
         }
         if data == "[DONE]" {
+            completed = true;
             break;
         }
 
@@ -533,6 +495,28 @@ async fn run_stream(
         }
     }
 
+    if !completed && finish_reason.is_none()
+        || tool_args
+            .values()
+            .any(|raw| serde_json::from_str::<Value>(raw).is_err())
+    {
+        partial.stop_reason = StopReason::Error;
+        partial.error_message = Some("incomplete model response or invalid tool arguments".into());
+        close_open_blocks(
+            &mut partial,
+            &mut text_index,
+            &mut thinking_index,
+            &mut tool_map,
+            &mut tool_args,
+            &handle,
+        );
+        handle.push(AssistantMessageEvent::Error {
+            reason: StopReason::Error,
+            error: partial,
+        });
+        return Ok(());
+    }
+
     // Close open blocks.
     if let Some(idx) = text_index.take() {
         let text = text_content(&partial, idx);
@@ -550,7 +534,9 @@ async fn run_stream(
             partial: partial.clone(),
         });
     }
-    for (_stream_idx, content_index) in tool_map {
+    let mut tool_indexes: Vec<usize> = tool_map.into_values().collect();
+    tool_indexes.sort_unstable();
+    for content_index in tool_indexes {
         if let AssistantContent::ToolCall(call) = &partial.content[content_index] {
             let finalized = {
                 let raw = tool_args.get(&content_index).cloned().unwrap_or_default();
@@ -574,14 +560,10 @@ async fn run_stream(
     }
 
     calculate_cost(&model, &mut partial.usage);
-    if partial.usage.total_tokens == 0 {
-        partial.usage.total_tokens = partial.usage.input + partial.usage.output;
-    }
 
     let reason = map_finish_reason(finish_reason.as_deref(), &partial, &compat);
     partial.stop_reason = reason;
     partial.raw_stop_reason = finish_reason;
-    partial.api = API_OPENAI_COMPLETIONS.to_string();
 
     if reason.is_error() {
         handle.push(AssistantMessageEvent::Error {
@@ -622,7 +604,9 @@ fn close_open_blocks(
             partial: partial.clone(),
         });
     }
-    for (_k, content_index) in tool_map.drain() {
+    let mut tool_indexes: Vec<usize> = tool_map.drain().map(|(_, i)| i).collect();
+    tool_indexes.sort_unstable();
+    for content_index in tool_indexes {
         if let AssistantContent::ToolCall(call) = &partial.content[content_index] {
             let mut finalized = call.clone();
             if let Some(raw) = tool_args.get(&content_index) {
@@ -666,26 +650,28 @@ fn extract_reasoning_delta(delta: &Value) -> Option<String> {
     None
 }
 
+/// `prompt_tokens` includes cached tokens; [`Usage::input`] counts only the uncached ones.
 fn apply_usage(usage: &mut Usage, value: &Value) {
-    if let Some(v) = value.get("prompt_tokens").and_then(|v| v.as_u64()) {
-        usage.input = v;
+    let prompt = value.get("prompt_tokens").and_then(|v| v.as_u64());
+    let cached = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(|v| v.as_u64());
+    if let Some(v) = cached {
+        usage.cache_read = v;
+    }
+    if let Some(v) = prompt {
+        usage.input = v.saturating_sub(usage.cache_read);
     }
     if let Some(v) = value.get("completion_tokens").and_then(|v| v.as_u64()) {
         usage.output = v;
     }
-    if let Some(v) = value.get("total_tokens").and_then(|v| v.as_u64()) {
-        usage.total_tokens = v;
+    if let Some(v) = value
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(|v| v.as_u64())
+    {
+        usage.reasoning = Some(v);
     }
-    if let Some(details) = value.get("prompt_tokens_details") {
-        if let Some(v) = details.get("cached_tokens").and_then(|v| v.as_u64()) {
-            usage.cache_read = v;
-        }
-    }
-    if let Some(details) = value.get("completion_tokens_details") {
-        if let Some(v) = details.get("reasoning_tokens").and_then(|v| v.as_u64()) {
-            usage.reasoning = Some(v);
-        }
-    }
+    usage.total_tokens = usage.input + usage.output + usage.cache_read + usage.cache_write;
 }
 
 fn map_finish_reason(
@@ -844,8 +830,18 @@ fn apply_reasoning(
     compat: &ResolvedOpenAICompletionsCompat,
     reasoning: Option<ThinkingLevel>,
 ) {
+    if reasoning.is_none()
+        && model.reasoning
+        && compat.thinking_format == ThinkingFormat::Zai
+        && !reasoning_rejected(model)
+    {
+        payload["thinking"] = json!({ "type": "disabled" });
+    }
     let Some(level) = reasoning else { return };
     if !model.reasoning && !compat.supports_reasoning_effort {
+        return;
+    }
+    if reasoning_rejected(model) {
         return;
     }
     let effort = thinking_level_str(level);
@@ -887,6 +883,64 @@ fn apply_reasoning(
             payload["reasoning"] = json!({ "effort": effort });
         }
     }
+}
+
+/// Models whose server rejected reasoning parameters in this process, as
+/// `provider/id`.
+static REASONING_REJECTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn model_key(model: &Model) -> String {
+    format!("{}/{}", model.provider, model.id)
+}
+
+fn mark_reasoning_rejected(model: &Model) {
+    let mut rejected = REASONING_REJECTED.lock().unwrap_or_else(|p| p.into_inner());
+    let key = model_key(model);
+    if !rejected.contains(&key) {
+        rejected.push(key);
+    }
+}
+
+/// Whether `model`'s server rejected reasoning parameters earlier in this
+/// process. Requests for it are then sent without them.
+pub fn reasoning_rejected(model: &Model) -> bool {
+    REASONING_REJECTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&model_key(model))
+}
+
+/// Forget a learned rejection after a model's endpoint or thinking format changes.
+pub fn clear_reasoning_rejection(model: &Model) {
+    let key = model_key(model);
+    REASONING_REJECTED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|rejected| rejected != &key);
+}
+
+/// Whether an error body says a reasoning parameter is not supported.
+fn rejects_reasoning(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    let names_reasoning = [
+        "reasoning_effort",
+        "reasoning",
+        "enable_thinking",
+        "thinking",
+    ]
+    .iter()
+    .any(|p| body.contains(p));
+    let unsupported = [
+        "not support",
+        "unsupported",
+        "unrecognized",
+        "unknown parameter",
+        "extra inputs are not permitted",
+        "not allowed",
+    ]
+    .iter()
+    .any(|p| body.contains(p));
+    names_reasoning && unsupported
 }
 
 fn thinking_level_str(level: ThinkingLevel) -> &'static str {

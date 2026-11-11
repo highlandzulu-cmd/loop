@@ -1,6 +1,11 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
 mod file_mutation_queue;
+mod plan;
+mod search;
+mod todo;
+#[cfg(feature = "web")]
+pub mod web;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,13 +13,20 @@ use std::sync::Arc;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
+pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
+pub use search::{
+    create_glob_tool, create_grep_tool, create_ls_tool, search_tools_with_filter, SearchFilter,
+    SEARCH_MAX_RESULTS,
+};
+pub use todo::{create_todo_tool, todos_from_details};
+
 use crate::harness::tools::file_mutation_queue::with_file_mutation_queue;
-use crate::harness::types::{ExecutionEnv, ShellExecOptions};
+use crate::harness::types::{ExecutionEnv, FileErrorCode, FileIdentity, ShellExecOptions};
 use crate::harness::utils::{execute_shell_with_capture, truncate_head, DEFAULT_MAX_BYTES};
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{ImageContent, TextContent, ToolResultContent};
 
-fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
+pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
         "type": "object",
         "properties": properties,
@@ -23,7 +35,7 @@ fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json
     })
 }
 
-fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
+pub(crate) fn arg_str(args: &serde_json::Value, key: &str) -> Result<String, String> {
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
@@ -112,16 +124,30 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                     let env = Arc::clone(&env);
                     let content = content.clone();
                     async move {
-                        let (created, previous) = match env.read_text_file(&abs).await {
-                            Ok(text) => (false, text),
-                            Err(_) => (true, String::new()),
+                        // Only a missing file counts as created. Any other
+                        // error (a directory, no permission) fails the write
+                        // before it happens, and an existing file that is
+                        // not text gets a byte snapshot, so a rejected
+                        // review restores it instead of deleting it.
+                        let previous = match env.file_info(&abs).await {
+                            Ok(_) => Some(env.read_binary_file(&abs).await.map_err(|e| {
+                                format!("cannot snapshot {} for review: {e}", abs.display())
+                            })?),
+                            Err(e) if e.code == FileErrorCode::NotFound => None,
+                            Err(e) => return Err(e.to_string()),
                         };
-                        let previous_path =
-                            write_review_snapshot(&abs, &previous).map_err(|e| e.to_string())?;
-                        let diff = unified_diff(&previous, &content, &abs);
+                        let created = previous.is_none();
+                        let previous = previous.unwrap_or_default();
+                        let previous_path = write_review_snapshot(env.as_ref(), &abs, &previous)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        let diff =
+                            unified_diff(&String::from_utf8_lossy(&previous), &content, &abs);
                         env.write_file(&abs, content.as_bytes())
                             .await
                             .map_err(|e| e.to_string())?;
+                        let (target_path, created_identity) =
+                            written_target(env.as_ref(), &abs, created).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
@@ -132,6 +158,9 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "bytes": content.len(),
                                 "created": created,
                                 "previousPath": previous_path,
+                                "targetPath": target_path,
+                                "createdPath": created_identity.map(|_| &target_path),
+                                "createdIdentity": created_identity,
                                 "diff": diff,
                             }),
                             usage: None,
@@ -187,11 +216,14 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                             fuzzy_replace(&original, &old_text, &new_text)?
                         };
                         let previous_path =
-                            write_review_snapshot(&abs, &original).map_err(|e| e.to_string())?;
+                            write_review_snapshot(env.as_ref(), &abs, original.as_bytes())
+                                .await
+                                .map_err(|e| e.to_string())?;
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
                             .map_err(|e| e.to_string())?;
+                        let (target_path, _) = written_target(env.as_ref(), &abs, false).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Edited {}", abs.display()),
@@ -202,6 +234,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "diff": diff,
                                 "created": false,
                                 "previousPath": previous_path,
+                                "targetPath": target_path,
                             }),
                             usage: None,
                             added_tool_names: None,
@@ -216,14 +249,37 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
 }
 
 /// Persist pre-edit contents so the CLI can open a diff and revert on reject.
-fn write_review_snapshot(path: &Path, contents: &str) -> std::io::Result<PathBuf> {
-    let dir = std::env::temp_dir().join("loop-file-review");
-    std::fs::create_dir_all(&dir)?;
+async fn write_review_snapshot(
+    env: &dyn ExecutionEnv,
+    path: &Path,
+    contents: &[u8],
+) -> Result<PathBuf, crate::harness::types::FileError> {
+    let dir = env.create_temp_dir(".loop-file-review").await?;
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
-    let id = loop_ai::new_id();
-    let out = dir.join(format!("{id}-{stem}.before"));
-    std::fs::write(&out, contents)?;
+    let out = dir.join(format!("{stem}.before"));
+    env.write_file(&out, contents).await?;
     Ok(out)
+}
+
+/// The file a write to `abs` landed in, resolved once right after the
+/// write (a symlink is followed here, never at review time), and, when the
+/// write created it, its identity. A review that rejects the write removes
+/// only that path, and only while its identity still matches.
+async fn written_target(
+    env: &dyn ExecutionEnv,
+    abs: &Path,
+    created: bool,
+) -> (PathBuf, Option<FileIdentity>) {
+    let target = env
+        .canonical_path(abs)
+        .await
+        .unwrap_or_else(|_| abs.to_path_buf());
+    let identity = if created {
+        env.file_identity(&target).await.ok().flatten()
+    } else {
+        None
+    };
+    (target, identity)
 }
 
 fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<String, String> {
@@ -360,10 +416,49 @@ pub type BashPrepare = Arc<
         + Sync,
 >;
 
+/// How long a bash command may run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BashLimits {
+    /// Used when the call names no `timeoutMs`.
+    pub default_timeout_ms: u64,
+    /// The most a call may ask for.
+    pub max_timeout_ms: u64,
+}
+
+impl Default for BashLimits {
+    fn default() -> Self {
+        Self {
+            default_timeout_ms: 120_000,
+            max_timeout_ms: 600_000,
+        }
+    }
+}
+
+impl BashLimits {
+    /// The timeout for a call that asked for `requested` ms: the default
+    /// when it asked for none, never more than the maximum.
+    pub fn timeout_for(self, requested: Option<u64>) -> u64 {
+        let max = self.max_timeout_ms.max(1);
+        requested
+            .filter(|ms| *ms > 0)
+            .unwrap_or(self.default_timeout_ms)
+            .clamp(1, max)
+    }
+}
+
 /// Create bash tool with optional prepare hook returning (command, cwd).
 pub fn create_bash_tool_with_prepare(
     env: Arc<dyn ExecutionEnv>,
     prepare: Option<BashPrepare>,
+) -> AgentTool {
+    create_bash_tool_with(env, prepare, BashLimits::default())
+}
+
+/// Create bash tool with a prepare hook and timeout `limits`.
+pub fn create_bash_tool_with(
+    env: Arc<dyn ExecutionEnv>,
+    prepare: Option<BashPrepare>,
+    limits: BashLimits,
 ) -> AgentTool {
     AgentTool::simple(
         "bash",
@@ -372,7 +467,16 @@ pub fn create_bash_tool_with_prepare(
         schema_object(
             json!({
                 "command": {"type": "string"},
-                "cwd": {"type": "string"}
+                "cwd": {"type": "string"},
+                "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": format!(
+                        "Milliseconds before the command is stopped (default {}, at most {}). \
+                         Raise it for long builds and test runs.",
+                        limits.default_timeout_ms, limits.max_timeout_ms
+                    )
+                }
             }),
             &["command"],
         ),
@@ -392,11 +496,11 @@ pub fn create_bash_tool_with_prepare(
                         cwd = d;
                     }
                 }
-                const DEFAULT_BASH_TIMEOUT_MS: u64 = 120_000;
+                let timeout_ms = limits.timeout_for(args.get("timeoutMs").and_then(|v| v.as_u64()));
                 let mut options = ShellExecOptions {
                     cwd,
                     cancel,
-                    timeout_ms: Some(DEFAULT_BASH_TIMEOUT_MS),
+                    timeout_ms: Some(timeout_ms),
                     ..Default::default()
                 };
                 // Ensure relative cwd resolves against env.cwd
@@ -419,7 +523,20 @@ pub fn create_bash_tool_with_prepare(
                         });
                     }));
                 }
-                let captured = execute_shell_with_capture(env, &command, options, None).await?;
+                let captured = execute_shell_with_capture(env, &command, options, None)
+                    .await
+                    .map_err(|e| {
+                        if e.contains("timed out") {
+                            format!(
+                                "command timed out after {}s; pass timeoutMs (at most {}) to \
+                                 give it longer",
+                                timeout_ms / 1000,
+                                limits.max_timeout_ms
+                            )
+                        } else {
+                            e
+                        }
+                    })?;
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
                         text: captured.text.clone(),
@@ -437,4 +554,48 @@ pub fn create_bash_tool_with_prepare(
             }
         },
     )
+}
+
+#[cfg(test)]
+mod bash_limit_tests {
+    use super::*;
+
+    #[test]
+    fn timeouts_default_and_cap() {
+        let limits = BashLimits {
+            default_timeout_ms: 120_000,
+            max_timeout_ms: 600_000,
+        };
+        assert_eq!(limits.timeout_for(None), 120_000);
+        assert_eq!(limits.timeout_for(Some(0)), 120_000);
+        assert_eq!(limits.timeout_for(Some(300_000)), 300_000);
+        assert_eq!(limits.timeout_for(Some(9_000_000)), 600_000);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_call_can_ask_for_less_time_and_learns_how_to_ask_for_more() {
+        let env: Arc<dyn ExecutionEnv> =
+            Arc::new(crate::harness::HostExecutionEnv::new(std::env::temp_dir()));
+        let tool = create_bash_tool_with(
+            env,
+            None,
+            BashLimits {
+                default_timeout_ms: 60_000,
+                max_timeout_ms: 120_000,
+            },
+        );
+        let started = std::time::Instant::now();
+        let err = (tool.execute)(
+            "c1".into(),
+            json!({"command": "sleep 5", "timeoutMs": 200}),
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        assert!(err.contains("pass timeoutMs (at most 120000)"), "{err}");
+        assert!(tool.parameters["properties"]["timeoutMs"].is_object());
+    }
 }
