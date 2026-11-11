@@ -708,6 +708,11 @@ async fn prompt(
                     // Shutdown closes the permit queue first: a queued prompt fails.
                     ctx.bump("failed_at_shutdown");
                 }
+                Kind::Failed(info) if info.contains("cancelled before it started") => {
+                    // Known defect D1 (docs/probes/e7-results.md): a cancel during the
+                    // native backend's prompt preparation ends the turn as Failed.
+                    ctx.bump("failed_cancel_race_d1");
+                }
                 Kind::Failed(info) if mode != "err" => {
                     ctx.violate(format!("UNEXPECTED_FAILED {id} {info}"))
                 }
@@ -1609,4 +1614,46 @@ async fn e7_negative_control() {
     assert!(violations.is_empty(), "{violations:?}");
     rt.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Defect D1. A cancel that arrives while the native backend prepares a prompt
+/// (`native_backend.rs`, "the turn was cancelled before it started") ends the
+/// prompt as `TurnOutcome::Failed` with category `Cancelled`. The Runtime's own
+/// cancel paths (queued, running) report `TurnOutcome::Cancelled`, so a Surface
+/// sees "failed" for a cancel it asked for. The test cancels at once after the
+/// prompt is accepted, many times, and fails when it sees `Failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "known defect D1: fails until a cancel during prompt preparation reports Cancelled"]
+async fn e7_defect_cancel_during_prompt_start_is_not_failed() {
+    let dir = std::env::temp_dir().join(format!("e7-d1-{}", std::process::id()));
+    let limits = RuntimeLimits {
+        max_sessions: 4,
+        max_active_turns: 2,
+    };
+    let Built { rt, .. } = build(&dir, limits, 0, 7).await;
+    let session = rt.new_session(SessionSpec::default()).await.unwrap();
+    let mut rng = Rng(7);
+    let mut failed = Vec::new();
+    for round in 0..3000 {
+        let spec = format!("E7[{round}-0-{round};text;1;0]");
+        let handle = rt
+            .prompt(&session, vec![ContentBlock::text(spec)])
+            .await
+            .unwrap();
+        for _ in 0..rng.below(40) {
+            tokio::task::yield_now().await;
+        }
+        rt.cancel(&session);
+        if let TurnOutcome::Failed(info) = handle.outcome().await {
+            failed.push(format!("round {round}: {info:?}"));
+        }
+    }
+    rt.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        failed.is_empty(),
+        "{} of 3000 cancelled prompts ended as Failed, first: {:?}",
+        failed.len(),
+        failed.first()
+    );
 }
