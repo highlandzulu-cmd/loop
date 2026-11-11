@@ -140,7 +140,10 @@ fn protected(path: &str, workspace: &std::path::Path) -> bool {
             .is_some_and(|n| n.to_ascii_lowercase().starts_with(".env"))
     };
     let written = Path::new(path);
-    if check(written) {
+    // An absolute path counts only below the workspace, as the resolved
+    // path does: a workspace under `~/.loop` or a `.git` directory is not
+    // protected as a whole.
+    if check(written.strip_prefix(workspace).unwrap_or(written)) {
         return true;
     }
     match super::policy::resolve(&workspace.join(written)) {
@@ -206,6 +209,20 @@ mod tests {
 
     fn call(tool: &str) -> Call {
         Call::new(tool, json!({}), "/ws")
+    }
+
+    #[test]
+    fn a_workspace_under_a_protected_name_is_not_protected() {
+        let base = tempfile::tempdir().unwrap();
+        for dir in [".loop/worktrees/ws", ".git/ws"] {
+            let ws = base.path().join(dir);
+            std::fs::create_dir_all(&ws).unwrap();
+            let abs = ws.join("src/main.rs");
+            assert!(!protected(&abs.to_string_lossy(), &ws), "{dir}");
+            assert!(!protected("src/main.rs", &ws), "{dir}");
+            assert!(protected(&ws.join(".git/config").to_string_lossy(), &ws));
+            assert!(protected(".env", &ws));
+        }
     }
 
     #[test]
