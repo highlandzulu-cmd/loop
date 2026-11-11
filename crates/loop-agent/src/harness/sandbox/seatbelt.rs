@@ -208,6 +208,44 @@ fn hold_lock(dir: &Path) -> std::io::Result<std::fs::File> {
         .map_err(|error| error.error)
 }
 
+/// The Seatbelt rule that lets xcrun write its cache files (`xcrun_db` and
+/// the `xcrun_db-XXXXXX` file it renames into place) in the user temp dir,
+/// `confstr(_CS_DARWIN_USER_TEMP_DIR)`. `None` when the dir is unknown or its
+/// path has characters the rule does not escape.
+#[cfg(target_os = "macos")]
+fn xcrun_cache_rule() -> Option<String> {
+    let mut buf = [0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: `buf` is valid for `buf.len()` bytes; confstr writes at most that
+    // many, NUL-terminated.
+    let n = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+    if n == 0 || n > buf.len() {
+        return None;
+    }
+    // SAFETY: confstr NUL-terminated the buffer.
+    let dir = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+        .to_str()
+        .ok()?;
+    // Seatbelt matches resolved paths: `/var` is a link to `/private/var`.
+    let dir = std::fs::canonicalize(dir).ok()?;
+    let dir = dir.to_str()?.trim_end_matches('/');
+    if dir.is_empty()
+        || !dir
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '.'))
+    {
+        return None;
+    }
+    let dir = dir.replace('.', "\\.");
+    Some(format!(
+        "(allow file-write* (regex #\"^{dir}/xcrun_db(-[A-Za-z0-9]+)?$\"))\n"
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn xcrun_cache_rule() -> Option<String> {
+    None
+}
+
 /// Remove `/tmp/loop-seatbelt-*` and `/tmp/loop-command-*` directories this
 /// user left behind: their lock is free (its process ended), or, without a
 /// lock, they are more than a day old (an older build). Never follows links.
@@ -592,6 +630,13 @@ impl SeatbeltPolicy {
 (allow file-write* (literal (param "DEV_NULL")))
 "#,
         );
+        // xcrun (the `/usr/bin/git` shim) caches tool lookups in `xcrun_db` in
+        // the user temp dir, through a `xcrun_db-XXXXXX` file it renames. Without
+        // this it prints "couldn't create cache file" on every run when the
+        // cache is missing. Only those two names are writable, not the dir.
+        if let Some(rule) = xcrun_cache_rule() {
+            profile.push_str(&rule);
+        }
         let mut params = vec!["DEV_NULL=/dev/null".into()];
         for (i, path) in self.writes.iter().enumerate() {
             profile.push_str(&format!(

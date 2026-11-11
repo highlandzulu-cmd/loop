@@ -728,6 +728,42 @@ async fn system_git_status_is_quiet_inside_the_sandbox() {
     .unwrap();
 }
 
+/// The xcrun cache grant is two file names in the user temp dir, not the dir.
+#[tokio::test]
+async fn only_the_xcrun_cache_files_are_writable_in_the_user_temp_dir() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (_guard, root) = scratch();
+        let project = root.join("project");
+        let sandbox = seatbelt(&project, &root, json!({})).await.unwrap();
+        let mut buf = [0 as libc::c_char; libc::PATH_MAX as usize];
+        // SAFETY: `buf` is valid for `buf.len()` bytes.
+        let n =
+            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr(), buf.len()) };
+        assert!(n > 0 && n <= buf.len());
+        // SAFETY: confstr NUL-terminated the buffer.
+        let dir = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_str()
+            .unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let pid = std::process::id();
+        let other = dir.join(format!("loop-seatbelt-neighbour-{pid}"));
+        let nested = dir.join(format!("loop-seatbelt-dir-{pid}"));
+        let cache = dir.join(format!("xcrun_db-Probe{pid}"));
+        std::fs::create_dir(&nested).unwrap();
+        let nested_cache = nested.join("xcrun_db");
+        for (path, writable) in [(&other, false), (&nested_cache, false), (&cache, true)] {
+            let out = run(&sandbox, &format!("echo probe > '{}'", path.display())).await;
+            assert_eq!(out.exit_code == 0, writable, "{path:?}: {out:?}");
+            assert_eq!(path.exists(), writable, "{path:?}");
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = std::fs::remove_dir(&nested);
+        sandbox.destroy().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
 /// Git metadata that runs commands is protected in every repository the
 /// sandbox can write: the project, its submodules and nested repositories,
 /// including metadata created later. No `.git` entry can be created or
