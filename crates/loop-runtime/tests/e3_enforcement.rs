@@ -980,8 +980,10 @@ fn symlink_read_cases(v: &mut Vec<Case>) {
                         .note(note),
                 );
             }
-            // glob of a file link: lists the link's own name only. A
-            // control, and vacuous for the same reason.
+            // glob of a file link. The probe ran it as a control that
+            // listed the link's own name. Since the L9 fix the filter
+            // resolves the link to the denied file, so the name is hidden
+            // and the result reports it.
             v.push(
                 Case::new(
                     "symlink-read",
@@ -992,8 +994,7 @@ fn symlink_read_cases(v: &mut Vec<Case>) {
                 .user(rule.clone())
                 .prep(Prep::SecretLinks)
                 .check(Check::Result("notes".into()))
-                .allowed()
-                .note("glob a file link lists the link name only (vacuous control)"),
+                .note("glob a file link hides the link to the denied file"),
             );
             // The rule refuses the denied path itself.
             v.push(

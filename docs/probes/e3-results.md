@@ -358,3 +358,42 @@ The verdict of every case 000-142 is the same as in the run before the change (c
 The harness changes: `Prep::SecretLinks` and `Prep::EditLinks`, the `{HOME}` template, `symlink_read_cases`, the "hidden by permission rules" report in `reported()`, and the new test. The new cases were appended, so the ids of the old cases did not change.
 
 The reproductions run with `-- --ignored leaks::` (L8, L9, L10 fail until fixed).
+
+## Re-run after L8–L10 fixes
+
+Branch `fix/e3-l8-l10`, from `staging` 2f2933c. Same command, `E3_SEED=42`.
+
+### Fixes
+
+- **L8 (`read`, `write`, `edit` path rules).** `rule_for` (`crates/loop-app-core/src/permissions/rules.rs`) matches a path pattern against `PathForms`: the path as written (`~` expanded, absolute, relative to the workspace), the path with `.` and `..` removed, and the path resolved through symlinks (`policy::resolve`), both as the kernel opens it and after `..` is removed. The fixed directory part of an absolute or `~/` pattern is resolved too, so `/var/...` and `/private/var/...` match each other.
+  - `deny` and `ask` apply when any form matches. A path that cannot be resolved (a link loop) matches them.
+  - `allow` applies only when the written path and every resolved form match. A link or `..` out of an allowed directory is not allowed by that pattern.
+- **L9 (`grep`, `glob`, `ls`).** `search_may_show` uses the same match, with one resolution per path for the `read` rule and the tool's rule. `Walk::files` and `ls` call it for every entry, so the children of a directory link and a file link are checked by the file they name. A directory link to a denied directory is listed, but each file in it is hidden and counted. The filesystem is read only when a path pattern applies to the tool. Pattern prefixes are resolved once per 2 s per thread.
+- **L10 (approval prompt).** `write` and `edit` report `viaLink` when the target is not where the path says (only the working directory is resolved for the comparison, so a workspace below `/var` is not marked). The file-edit prompt then shows `link → target` in the title and in the detail. The same text goes to the `ApprovalPrompt` (TUI, desktop) and to the Runtime's `InteractionRequest::Permission`. The prompt still comes after the write (out of scope).
+- `docs/permissions.md` now describes path patterns exactly, and says that `read` rules do not cover the shell.
+
+### Tests
+
+- `leaks::l8_read_deny_rule_is_lexical`, `leaks::l9_search_filter_is_lexical` and `leaks::l10_approval_prompt_hides_symlink_target` are no longer ignored. They failed before the fix and pass after it. L8 also checks `sec/../.secret/e3key` (`..` after a link, which the kernel resolves from the link's target).
+- New unit tests in `rules.rs`: `path_rules_see_through_links_and_dot_dot`, `allow_patterns_need_the_written_and_the_resolved_path`, `normalising_paths`.
+- One harness change: the probe's control "glob a file link lists the link name only" now expects the link to be hidden (the filter resolves `notes` to the denied file). It is an ordinary check, with the same ids.
+
+### Full run
+
+| | Before (probe) | After the fixes |
+|---|---|---|
+| Cases | 247 | 247 |
+| LEAK | 87 (L6: 11, L7: 4, L8/L9: 72) | 15 (L6: 11, L7: 4) |
+| CONTROL-FAIL, UNREPORTED | 0, 0 | 0, 0 |
+| Run time | 103 s | 99 s |
+
+Leaks per path: `embedded` 15, `runtime`, `subagent`, `workflow`, `acp`: 0. All 104 `symlink-read` cases are ok.
+
+`E3|PROMPT`: in all 8 outside cells (4 cells × 2 transports) the title and the detail show the resolved target, for example `title="notes → {OUT}/target.txt"`, `detail={WS}/notes → {OUT}/target.txt`. The control `write plain.txt` shows `plain.txt` and `{WS}/plain.txt`, with no arrow.
+
+### Remaining risks
+
+- **Check and use are not atomic.** The rule is checked on the resolved path, and then the tool opens the path. A link that changes between the two can still reach a denied file.
+- **The shell is not covered.** `read` rules do not stop `cat` in `bash`. Use `bash` rules or the sandbox.
+- **Windows.** `canonicalize` gives `\\?\` paths. Deny rules still match the written form; an `allow` rule on an absolute path may stop matching and fall back to the plain rule.
+- **Directory names.** A search shows the name of a directory link to a denied directory (not its files), as for a normal denied directory.
