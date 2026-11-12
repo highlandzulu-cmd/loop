@@ -1,8 +1,11 @@
 //! Built-in coding tools over [`ExecutionEnv`](crate::harness::types::ExecutionEnv).
 
+mod command_policy;
+mod documents;
 mod file_mutation_queue;
 mod plan;
 mod search;
+pub mod shell;
 mod todo;
 #[cfg(feature = "web")]
 pub mod web;
@@ -13,6 +16,11 @@ use std::sync::Arc;
 use serde_json::json;
 use similar::{ChangeTag, TextDiff};
 
+pub use command_policy::check_command_policy;
+pub use documents::{
+    run_document_reader_child, set_document_reader, DocumentReader,
+    CHILD_ARG as DOCUMENT_READER_ARG,
+};
 pub use plan::{create_exit_plan_tool, EXIT_PLAN_TOOL};
 pub use search::{
     create_glob_tool, create_grep_tool, create_ls_tool, search_tools_with_filter, SearchFilter,
@@ -25,6 +33,64 @@ use crate::harness::types::{ExecutionEnv, FileErrorCode, FileIdentity, ShellExec
 use crate::harness::utils::{execute_shell_with_capture, truncate_head, DEFAULT_MAX_BYTES};
 use crate::types::{AgentTool, AgentToolResult};
 use loop_ai::{ImageContent, TextContent, ToolResultContent};
+
+/// Added to permission-denied errors from file writes and shell commands, so
+/// the agent fixes the mode instead of working on a copy elsewhere.
+pub const PERMISSION_DENIED_HINT: &str = "Hint: the file is not writable. If it is clearly \
+yours to change, run `chmod u+w <file>` and retry; otherwise say you could not change it. \
+Do not edit a copy elsewhere.";
+
+/// A failed file write as tool error text: a permission error on a file
+/// (not a sandbox refusal, which `chmod` cannot fix) carries
+/// [`PERMISSION_DENIED_HINT`], whichever environment raised it.
+fn write_error(error: crate::harness::types::FileError) -> String {
+    let text = error.to_string();
+    if error.code == FileErrorCode::PermissionDenied
+        && !text.contains(PERMISSION_DENIED_HINT)
+        && !text.contains("sandbox")
+    {
+        format!("{text}. {PERMISSION_DENIED_HINT}")
+    } else {
+        text
+    }
+}
+
+/// Whether failed bash output shows a file write refused by its mode, which
+/// [`PERMISSION_DENIED_HINT`] can fix: a redirect or `cannot create` from
+/// the shell, a refused `cp`/`mv`/`tee`/`touch`/`sed`, or a read-only file
+/// system. Not in a sandbox (where `chmod` does not help), and not for other
+/// refusals such as `Permission denied (publickey)`.
+fn bash_permission_hint(output: &str, exit_code: i32, sandboxed: bool) -> bool {
+    const WRITERS: &[&str] = &[
+        "bash:",
+        "sh:",
+        "zsh:",
+        "/bin/sh:",
+        "/bin/bash:",
+        "dash:",
+        "cp:",
+        "mv:",
+        "tee:",
+        "touch:",
+        "sed:",
+        "install:",
+        "ln:",
+        "mkdir:",
+    ];
+    if exit_code == 0 || sandboxed {
+        return false;
+    }
+    output.lines().any(|line| {
+        let line = line.trim().to_lowercase();
+        line.contains("read-only file system")
+            || (line.contains("permission denied")
+                && !line.contains("publickey")
+                && (line.contains("cannot create")
+                    || WRITERS
+                        .iter()
+                        .any(|w| line.starts_with(w) || line.starts_with(&w.replace(':', "")))))
+    })
+}
 
 pub(crate) fn schema_object(properties: serde_json::Value, required: &[&str]) -> serde_json::Value {
     json!({
@@ -47,12 +113,15 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "read",
         "Read",
-        "Read a file's contents (text or image).",
+        format!(
+            "Read a file's contents (text or image).{}",
+            documents::READ_GUIDE
+        ),
         schema_object(
             json!({"path": {"type": "string", "description": "File path"}}),
             &["path"],
         ),
-        move |_id, args, _cancel, _on_update| {
+        move |_id, args, cancel, _on_update| {
             let env = Arc::clone(&env);
             async move {
                 let path = arg_str(&args, "path")?;
@@ -82,6 +151,10 @@ pub fn create_read_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         terminate: None,
                     });
                 }
+                let document = documents::read(env.as_ref(), &abs, info.size, cancel.as_ref());
+                if let Some(result) = until_cancelled(cancel.as_ref(), document).await? {
+                    return result;
+                }
                 let text = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                 let (text, truncated) = truncate_head(&text, DEFAULT_MAX_BYTES);
                 Ok(AgentToolResult {
@@ -104,7 +177,10 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
     AgentTool::simple(
         "write",
         "Write",
-        "Write contents to a file (create or overwrite).",
+        format!(
+            "Write contents to a file (create or overwrite).{}",
+            documents::WRITE_GUIDE
+        ),
         schema_object(
             json!({
                 "path": {"type": "string"},
@@ -112,7 +188,7 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
             }),
             &["path", "content"],
         ),
-        move |_id, args, _cancel, _on_update| {
+        move |_id, args, cancel, _on_update| {
             let env = Arc::clone(&env);
             async move {
                 let path = arg_str(&args, "path")?;
@@ -123,7 +199,11 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     let content = content.clone();
+                    let cancel = cancel.clone();
                     async move {
+                        let cancel = cancel.as_ref();
+                        let bytes =
+                            until_cancelled(cancel, documents::encode(&abs, &content)).await??;
                         // Only a missing file counts as created. Any other
                         // error (a directory, no permission) fails the write
                         // before it happens, and an existing file that is
@@ -138,27 +218,69 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         };
                         let created = previous.is_none();
                         let previous = previous.unwrap_or_default();
+                        // A document diffs as its text, not as its bytes,
+                        // read back by the document reader.
+                        let previous_text = if created {
+                            documents::Previous::Text(String::new())
+                        } else {
+                            until_cancelled(
+                                cancel,
+                                documents::text_of(&abs, &previous, cancel, env.cwd()),
+                            )
+                            .await??
+                        };
+                        let rebuilt = !created && documents::is_document(&abs);
+                        let previous_text = match previous_text {
+                            documents::Previous::Text(text) => text,
+                            documents::Previous::Unreadable(why) => {
+                                return Err(format!(
+                                    "{} could not be read ({why}), so writing it from text \
+                                     would replace content you have not seen. Write the new \
+                                     document to another path instead.",
+                                    abs.display()
+                                ))
+                            }
+                            documents::Previous::TooLong => {
+                                return Err(format!(
+                                    "{} has more text than read can show, so writing it from \
+                                     text would drop the rest. Write the new document to \
+                                     another path instead.",
+                                    abs.display()
+                                ))
+                            }
+                        };
+                        let mut diff = unified_diff(&previous_text, &content, &abs);
+                        if rebuilt {
+                            diff = format!("# {}\n{diff}", documents::REBUILT_NOTE);
+                        }
+                        // Past this point the write runs to the end: a
+                        // cancel mid-write could leave half a file.
+                        if cancel.is_some_and(|c| c.is_cancelled()) {
+                            return Err("cancelled".into());
+                        }
                         let previous_path = write_review_snapshot(env.as_ref(), &abs, &previous)
                             .await
                             .map_err(|e| e.to_string())?;
-                        let diff =
-                            unified_diff(&String::from_utf8_lossy(&previous), &content, &abs);
-                        env.write_file(&abs, content.as_bytes())
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        env.write_file(&abs, &bytes).await.map_err(write_error)?;
                         let (target_path, created_identity) =
                             written_target(env.as_ref(), &abs, created).await;
+                        let via_link = through_link(env.as_ref(), &abs, &target_path).await;
+                        let mut text = format!("Wrote {} bytes to {}", bytes.len(), abs.display());
+                        if rebuilt {
+                            text = format!("{text}. {}", documents::REBUILT_NOTE);
+                        }
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
-                                text: format!("Wrote {} bytes to {}", content.len(), abs.display()),
+                                text,
                                 text_signature: None,
                             })],
                             details: json!({
                                 "path": abs,
-                                "bytes": content.len(),
+                                "bytes": bytes.len(),
                                 "created": created,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
+                                "viaLink": via_link,
                                 "createdPath": created_identity.map(|_| &target_path),
                                 "createdIdentity": created_identity,
                                 "diff": diff,
@@ -173,6 +295,21 @@ pub fn create_write_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
             }
         },
     )
+}
+
+/// `work`, or an error as soon as `cancel` fires (dropping `work`, which
+/// kills a document reader child).
+async fn until_cancelled<T>(
+    cancel: Option<&tokio_util::sync::CancellationToken>,
+    work: impl std::future::Future<Output = T>,
+) -> Result<T, String> {
+    match cancel {
+        Some(token) => tokio::select! {
+            r = work => Ok(r),
+            _ = token.cancelled() => Err("cancelled".into()),
+        },
+        None => Ok(work.await),
+    }
 }
 
 /// Create an edit tool (exact/fuzzy replace) bound to `env`.
@@ -209,6 +346,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                 with_file_mutation_queue(abs.clone(), || {
                     let env = Arc::clone(&env);
                     async move {
+                        documents::check_editable(&abs)?;
                         let original = env.read_text_file(&abs).await.map_err(|e| e.to_string())?;
                         let updated = if original.contains(&old_text) {
                             original.replacen(&old_text, &new_text, 1)
@@ -222,8 +360,9 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                         let diff = unified_diff(&original, &updated, &abs);
                         env.write_file(&abs, updated.as_bytes())
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(write_error)?;
                         let (target_path, _) = written_target(env.as_ref(), &abs, false).await;
+                        let via_link = through_link(env.as_ref(), &abs, &target_path).await;
                         Ok(AgentToolResult {
                             content: vec![ToolResultContent::Text(TextContent {
                                 text: format!("Edited {}", abs.display()),
@@ -235,6 +374,7 @@ pub fn create_edit_tool(env: Arc<dyn ExecutionEnv>) -> AgentTool {
                                 "created": false,
                                 "previousPath": previous_path,
                                 "targetPath": target_path,
+                                "viaLink": via_link,
                             }),
                             usage: None,
                             added_tool_names: None,
@@ -280,6 +420,29 @@ async fn written_target(
         None
     };
     (target, identity)
+}
+
+/// Whether a write to `abs` landed somewhere its path does not show: a
+/// symlink on the way took it to `target`. Only the working directory is
+/// resolved for the comparison, so a workspace below a link (such as `/var`
+/// on macOS) does not count, and a plain `..` does not either.
+async fn through_link(env: &dyn ExecutionEnv, abs: &Path, target: &Path) -> bool {
+    let cwd = env.cwd();
+    let expected = match (abs.strip_prefix(cwd), env.canonical_path(cwd).await) {
+        (Ok(rest), Ok(root)) => root.join(rest),
+        _ => abs.to_path_buf(),
+    };
+    let mut normal = PathBuf::new();
+    for part in expected.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normal.pop();
+            }
+            part => normal.push(part),
+        }
+    }
+    normal != target
 }
 
 fn fuzzy_replace(original: &str, old_text: &str, new_text: &str) -> Result<String, String> {
@@ -358,46 +521,6 @@ fn unified_diff(old: &str, new: &str, path: &Path) -> String {
         }
     }
     out
-}
-
-/// Default patterns that are always blocked regardless of user configuration.
-const DEFAULT_BLOCKED_PATTERNS: &[&str] = &[
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "mkfs.",
-    ":(){ :|:& };:",
-    "> /dev/sda",
-    "dd if=/dev/zero of=/dev/",
-    "chmod -r 777 /",
-    "chown -r",
-    "format c:",
-];
-
-/// Check a command against the blocklist. Returns `Err` with a rejection message
-/// if the command matches a blocked pattern.
-pub fn check_command_policy(command: &str, extra_blocked: &[String]) -> Result<(), String> {
-    let lower = command.to_lowercase();
-    let trimmed = lower.trim();
-
-    for pattern in DEFAULT_BLOCKED_PATTERNS {
-        if trimmed.contains(pattern) {
-            return Err(format!(
-                "Command blocked by safety policy: matches blocked pattern `{pattern}`"
-            ));
-        }
-    }
-
-    for pattern in extra_blocked {
-        let pat_lower = pattern.to_lowercase();
-        if trimmed.contains(&pat_lower) {
-            return Err(format!(
-                "Command blocked by safety policy: matches custom blocked pattern `{pattern}`"
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 /// Create a bash tool bound to `env`.
@@ -523,6 +646,7 @@ pub fn create_bash_tool_with(
                         });
                     }));
                 }
+                let sandboxed = env.sandboxed();
                 let captured = execute_shell_with_capture(env, &command, options, None)
                     .await
                     .map_err(|e| {
@@ -537,9 +661,14 @@ pub fn create_bash_tool_with(
                             e
                         }
                     })?;
+                let mut text = captured.text.clone();
+                if bash_permission_hint(&text, captured.exit_code, sandboxed) {
+                    text.push_str("\n\n");
+                    text.push_str(PERMISSION_DENIED_HINT);
+                }
                 Ok(AgentToolResult {
                     content: vec![ToolResultContent::Text(TextContent {
-                        text: captured.text.clone(),
+                        text,
                         text_signature: None,
                     })],
                     details: json!({
@@ -597,5 +726,89 @@ mod bash_limit_tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(4));
         assert!(err.contains("pass timeoutMs (at most 120000)"), "{err}");
         assert!(tool.parameters["properties"]["timeoutMs"].is_object());
+    }
+}
+
+#[cfg(test)]
+mod write_error_tests {
+    use super::*;
+    use crate::harness::types::FileError;
+
+    #[test]
+    fn permission_errors_get_the_hint_once_and_sandbox_refusals_none() {
+        let denied = |m: &str| FileError::new(FileErrorCode::PermissionDenied, m);
+        assert!(write_error(denied("Permission denied (os error 13)")).contains("chmod u+w"));
+        let hinted = write_error(denied(&format!("denied. {PERMISSION_DENIED_HINT}")));
+        assert_eq!(hinted.matches("chmod u+w").count(), 1, "{hinted}");
+        assert!(!write_error(denied("sandbox denies access to /etc/x")).contains("chmod"));
+        assert!(!write_error(FileError::new(FileErrorCode::Io, "disk full")).contains("chmod"));
+    }
+}
+
+#[cfg(test)]
+mod bash_hint_tests {
+    use super::*;
+
+    #[test]
+    fn only_write_failures_outside_a_sandbox_get_the_hint() {
+        for text in [
+            "bash: line 1: ro.txt: Permission denied",
+            "zsh:1: permission denied: ro.txt",
+            "sh: 1: cannot create ro.txt: Permission denied",
+            "touch: x: Read-only file system",
+            "sed: couldn't open temporary file ./sedX: Permission denied",
+            "cp: ro.txt: Permission denied",
+        ] {
+            assert!(bash_permission_hint(text, 1, false), "{text}");
+            assert!(!bash_permission_hint(text, 1, true), "sandboxed: {text}");
+            assert!(!bash_permission_hint(text, 0, false), "exit 0: {text}");
+        }
+        for text in [
+            "git@github.com: Permission denied (publickey).",
+            "ls: /root: Permission denied",
+            "error: could not compile",
+        ] {
+            assert!(!bash_permission_hint(text, 1, false), "{text}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod via_link_tests {
+    use super::*;
+
+    /// The working directory is reached through a link (as `/var` is on
+    /// macOS): a plain write is not marked, a write through a link is.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_link_below_the_cwd_marks_a_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(real.join("ws")).unwrap();
+        std::fs::create_dir_all(real.join("out")).unwrap();
+        std::fs::write(real.join("out/target.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(real.join("ws"), real.join("ws-link")).unwrap();
+        std::os::unix::fs::symlink(real.join("out/target.txt"), real.join("ws/notes")).unwrap();
+        let env: Arc<dyn ExecutionEnv> =
+            Arc::new(crate::harness::HostExecutionEnv::new(real.join("ws-link")));
+        let tool = create_write_tool(env);
+        let write = |path: &str| {
+            (tool.execute)(
+                "w".into(),
+                json!({"path": path, "content": "y"}),
+                None,
+                None,
+            )
+        };
+        let plain = write("plain.txt").await.unwrap();
+        assert_eq!(plain.details["viaLink"], json!(false));
+        let dotdot = write("../ws/other.txt").await.unwrap();
+        assert_eq!(dotdot.details["viaLink"], json!(false), "a plain `..`");
+        let linked = write("notes").await.unwrap();
+        assert_eq!(linked.details["viaLink"], json!(true));
+        assert_eq!(
+            linked.details["targetPath"],
+            json!(real.join("out/target.txt"))
+        );
     }
 }

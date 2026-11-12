@@ -1,6 +1,6 @@
 //! Global and project settings.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -190,7 +190,7 @@ pub struct Settings {
     /// Compaction.
     #[serde(default)]
     pub compaction: CompactionSettingsJson,
-    /// Models enabled for Ctrl+P cycling (globs).
+    /// Models enabled for Ctrl+P cycling: exact `id` or `provider/id`, no wildcards.
     #[serde(default)]
     pub enabled_models: Vec<String>,
     /// Extra skill paths / globs.
@@ -291,6 +291,13 @@ pub struct Settings {
     /// folders). A command-line flag overrides each.
     #[serde(default, skip_serializing_if = "RuntimeSettings::is_empty")]
     pub runtime: RuntimeSettings,
+    /// Top-level keys the file this value was loaded from names. `None` for a
+    /// value built in code or parsed from a string: `merge_project` then
+    /// treats a key as set when it differs from its default.
+    /// Public only so `..Settings::default()` keeps working in other crates.
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub explicit_keys: Option<BTreeSet<String>>,
 }
 
 /// `runtime` settings. Values are kept as written and checked when the
@@ -417,6 +424,7 @@ impl Default for Settings {
             providers: Vec::new(),
             agents: Vec::new(),
             runtime: RuntimeSettings::default(),
+            explicit_keys: None,
         }
     }
 }
@@ -477,14 +485,41 @@ impl Settings {
 
     /// Load from a JSON file, or defaults if missing.
     pub fn load_file(path: &Path) -> anyhow::Result<Self> {
+        let none_set = || Self {
+            explicit_keys: Some(BTreeSet::new()),
+            ..Self::default()
+        };
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(none_set());
         }
         let raw = std::fs::read_to_string(path)?;
         if raw.trim().is_empty() {
-            return Ok(Self::default());
+            return Ok(none_set());
         }
-        Ok(serde_json::from_str(&raw)?)
+        let mut settings: Self = serde_json::from_str(&raw)?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        settings.explicit_keys = Some(
+            value
+                .as_object()
+                .map(|object| object.keys().cloned().collect())
+                .unwrap_or_default(),
+        );
+        Ok(settings)
+    }
+
+    /// Whether this value, read as a project layer, sets `key` (its camelCase
+    /// JSON name). A key the file omits is filled in by serde with its
+    /// default and must not override the global value.
+    fn sets(&self, key: &str) -> bool {
+        if let Some(keys) = &self.explicit_keys {
+            return keys.contains(key);
+        }
+        let field = |settings: &Self| {
+            serde_json::to_value(settings)
+                .ok()
+                .and_then(|value| value.get(key).cloned())
+        };
+        field(self) != field(&Self::default())
     }
 
     /// Save to disk.
@@ -499,23 +534,48 @@ impl Settings {
 
     /// Deep-merge project settings over global (arrays replace).
     pub fn merge_project(&mut self, project: Settings) {
-        // Scalars / objects from project always override when present in file —
-        // we treat the deserialized project file as authoritative for set fields
-        // by replacing known top-level keys that differ from defaults only if
-        // the project file existed. Callers pass fully loaded project Settings.
+        // Only keys the project file names override global values (see
+        // `sets`); the security rules in `project_overlay` still apply.
         *self = project_overlay(self.clone(), project);
     }
 }
 
+/// Keys whose value `project_overlay` copies only when the project file names
+/// them (every one needs a `sets(..)` check there).
+const PROJECT_OVERRIDABLE_KEYS: [&str; 9] = [
+    "defaultThinkingLevel",
+    "theme",
+    "compaction",
+    "enableSkillCommands",
+    "quietStartup",
+    "hideThinkingBlock",
+    "doubleEscapeAction",
+    "uiMode",
+    "responseHeaderTimeoutMs",
+];
+
 fn project_overlay(mut base: Settings, project: Settings) -> Settings {
+    let set_keys: Vec<&str> = PROJECT_OVERRIDABLE_KEYS
+        .into_iter()
+        .filter(|key| project.sets(key))
+        .collect();
+    let sets = |key: &str| set_keys.contains(&key);
     // Prefer project values when the project settings file was loaded (non-default merge).
     if let (Some(provider), Some(model)) = (project.default_provider, project.default_model) {
         base.default_provider = Some(provider);
         base.default_model = Some(model);
     }
-    base.default_thinking_level = project.default_thinking_level;
-    base.theme = project.theme;
-    base.compaction = project.compaction;
+    // Keys a project file omits come back from serde as defaults; only the
+    // ones it names override the global value.
+    if sets("defaultThinkingLevel") {
+        base.default_thinking_level = project.default_thinking_level.clone();
+    }
+    if sets("theme") {
+        base.theme = project.theme.clone();
+    }
+    if sets("compaction") {
+        base.compaction = project.compaction.clone();
+    }
     if !project.enabled_models.is_empty() {
         base.enabled_models = project.enabled_models;
     }
@@ -536,11 +596,21 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
     if !project.themes.is_empty() {
         base.themes = project.themes;
     }
-    base.enable_skill_commands = project.enable_skill_commands;
-    base.quiet_startup = project.quiet_startup;
-    base.hide_thinking_block = project.hide_thinking_block;
-    base.double_escape_action = project.double_escape_action;
-    base.ui_mode = project.ui_mode;
+    if sets("enableSkillCommands") {
+        base.enable_skill_commands = project.enable_skill_commands;
+    }
+    if sets("quietStartup") {
+        base.quiet_startup = project.quiet_startup;
+    }
+    if sets("hideThinkingBlock") {
+        base.hide_thinking_block = project.hide_thinking_block;
+    }
+    if sets("doubleEscapeAction") {
+        base.double_escape_action = project.double_escape_action.clone();
+    }
+    if sets("uiMode") {
+        base.ui_mode = project.ui_mode.clone();
+    }
     base.sandbox.overlay_project(project.sandbox);
     if let Some(project_fetch) = project.web_fetch {
         let global = base.web_fetch.unwrap_or_default();
@@ -633,7 +703,9 @@ fn project_overlay(mut base: Settings, project: Settings) -> Settings {
             .or_default()
             .overlay(&value);
     }
-    base.response_header_timeout_ms = project.response_header_timeout_ms;
+    if sets("responseHeaderTimeoutMs") {
+        base.response_header_timeout_ms = project.response_header_timeout_ms;
+    }
     base
 }
 
@@ -648,13 +720,7 @@ pub fn load_settings(
     if project_trusted {
         let project_settings = get_project_dir(cwd).join("settings.json");
         if project_settings.exists() {
-            let mut project = Settings::load_file(&project_settings)?;
-            let raw: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&project_settings)?)?;
-            if raw.get("responseHeaderTimeoutMs").is_none() {
-                project.response_header_timeout_ms = settings.response_header_timeout_ms;
-            }
-            settings.merge_project(project);
+            settings.merge_project(Settings::load_file(&project_settings)?);
         }
     }
     // The host's own choices for this workspace win over project files.
@@ -1087,6 +1153,111 @@ mod tests {
                 .map(String::as_str),
             Some("allow")
         );
+    }
+
+    /// Keys a project file may set freely: global value, project value, and
+    /// the key's default (the project value equals it in the last case).
+    fn plain_overlay_cases() -> Vec<(&'static str, serde_json::Value, serde_json::Value)> {
+        use serde_json::json;
+        vec![
+            ("defaultThinkingLevel", json!("high"), json!("low")),
+            ("theme", json!("light"), json!("solarized")),
+            (
+                "compaction",
+                json!({"enabled": false, "reserveTokens": 1000, "keepRecentTokens": 2000}),
+                json!({"enabled": true, "reserveTokens": 5000, "keepRecentTokens": 6000}),
+            ),
+            ("enableSkillCommands", json!(false), json!(true)),
+            ("quietStartup", json!(true), json!(false)),
+            ("hideThinkingBlock", json!(true), json!(false)),
+            ("doubleEscapeAction", json!("fork"), json!("none")),
+            ("uiMode", json!("fullscreen"), json!("normal")),
+            ("responseHeaderTimeoutMs", json!(30_000), json!(45_000)),
+        ]
+    }
+
+    fn overlay_from_files(global: &str, project: &str) -> serde_json::Value {
+        let dir = tempfile::tempdir().unwrap();
+        let global_path = dir.path().join("global.json");
+        let project_path = dir.path().join("project.json");
+        std::fs::write(&global_path, global).unwrap();
+        std::fs::write(&project_path, project).unwrap();
+        let mut settings = Settings::load_file(&global_path).unwrap();
+        settings.merge_project(Settings::load_file(&project_path).unwrap());
+        serde_json::to_value(&settings).unwrap()
+    }
+
+    #[test]
+    fn project_file_without_a_key_keeps_the_global_value() {
+        for (key, global_value, _) in plain_overlay_cases() {
+            let global = serde_json::json!({ key: global_value }).to_string();
+            let merged = overlay_from_files(&global, r#"{"mcpServers":{}}"#);
+            assert_eq!(merged[key], global_value, "{key} reset by a project file");
+        }
+        // An empty project file changes nothing either.
+        let all: serde_json::Map<_, _> = plain_overlay_cases()
+            .into_iter()
+            .map(|(key, value, _)| (key.to_owned(), value))
+            .collect();
+        let global = serde_json::Value::Object(all.clone()).to_string();
+        let merged = overlay_from_files(&global, "");
+        for (key, value) in all {
+            assert_eq!(merged[&key], value, "{key} reset by an empty project file");
+        }
+    }
+
+    #[test]
+    fn project_file_sets_only_the_keys_it_names() {
+        for (key, global_value, project_value) in plain_overlay_cases() {
+            let global = serde_json::json!({ key: global_value }).to_string();
+            let project = serde_json::json!({ key: project_value }).to_string();
+            let merged = overlay_from_files(&global, &project);
+            assert_eq!(merged[key], project_value, "{key} not taken from project");
+        }
+    }
+
+    #[test]
+    fn project_may_set_a_key_to_its_default_value() {
+        let merged = overlay_from_files(
+            r#"{"theme":"light","uiMode":"fullscreen","responseHeaderTimeoutMs":30000}"#,
+            r#"{"theme":"dark","uiMode":"normal","responseHeaderTimeoutMs":120000}"#,
+        );
+        assert_eq!(merged["theme"], "dark");
+        assert_eq!(merged["uiMode"], "normal");
+        assert_eq!(merged["responseHeaderTimeoutMs"], 120_000);
+    }
+
+    #[test]
+    fn load_settings_keeps_global_values_a_project_does_not_set() {
+        let agent_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings_path(agent_dir.path()),
+            r#"{"theme":"light","defaultThinkingLevel":"high","uiMode":"fullscreen","responseHeaderTimeoutMs":30000}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(get_project_dir(cwd.path())).unwrap();
+        std::fs::write(
+            get_project_dir(cwd.path()).join("settings.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let loaded = load_settings(agent_dir.path(), cwd.path(), true).unwrap();
+        assert_eq!(loaded.theme, "light");
+        assert_eq!(loaded.default_thinking_level, "high");
+        assert_eq!(loaded.ui_mode, "fullscreen");
+        assert_eq!(loaded.response_header_timeout_ms, 30_000);
+        assert!(loaded.mcp_servers.contains_key("fs"));
+    }
+
+    #[test]
+    fn programmatic_project_settings_override_only_non_default_values() {
+        let mut global: Settings =
+            serde_json::from_str(r#"{"theme":"light","uiMode":"fullscreen"}"#).unwrap();
+        let project: Settings = serde_json::from_str(r#"{"theme":"solarized"}"#).unwrap();
+        global.merge_project(project);
+        assert_eq!(global.theme, "solarized");
+        assert_eq!(global.ui_mode, "fullscreen");
     }
 
     #[test]

@@ -234,8 +234,9 @@ jobs:
       # Same packages as the Linux desktop release build.
       - name: Install Linux dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          # Retries: the runner's DNS sometimes fails for a short time.
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y \
             libfontconfig1-dev libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libwayland-dev libvulkan-dev
 

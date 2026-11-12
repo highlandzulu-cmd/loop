@@ -48,7 +48,7 @@ pub async fn start(args: StartArgs) -> anyhow::Result<()> {
     if let Some(mode) = &args.permission_mode {
         if PermissionMode::parse(mode).is_none() {
             anyhow::bail!(
-                "unknown --permission-mode `{mode}`: use read-only, ask, accept-edits or full-access"
+                "unknown --permission-mode `{mode}`: use read-only, ask, accept-edits, full-access or plan"
             );
         }
     }

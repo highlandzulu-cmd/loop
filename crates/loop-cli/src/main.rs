@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long, global = true)]
     no_web: bool,
 
-    /// Permission mode: read-only, ask (default), accept-edits or full-access.
+    /// Permission mode: read-only, ask (default), accept-edits, full-access or plan.
     #[arg(long, global = true, value_name = "MODE")]
     permission_mode: Option<String>,
 
@@ -261,8 +261,17 @@ enum SessionCommand {
     },
 }
 
+fn main() {
+    // First, before the async runtime and argument parsing: `loop
+    // __doc-to-text <format>` is the document reader child the read and
+    // write tools start, and in every other process this binary becomes
+    // that reader.
+    loop_agent::harness::run_document_reader_child();
+    async_main();
+}
+
 #[tokio::main]
-async fn main() {
+async fn async_main() {
     if let Err(e) = real_main().await {
         eprintln!("loop: {e:#}");
         std::process::exit(1);
@@ -532,7 +541,7 @@ async fn real_main() -> anyhow::Result<()> {
     if let Some(mode) = &cli.permission_mode {
         if loop_app_core::permissions::PermissionMode::parse(mode).is_none() {
             anyhow::bail!(
-                "unknown --permission-mode `{mode}`: use read-only, ask, accept-edits or full-access"
+                "unknown --permission-mode `{mode}`: use read-only, ask, accept-edits, full-access or plan"
             );
         }
     }

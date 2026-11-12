@@ -556,18 +556,14 @@ impl ToolApprovalBridge {
             }
         }
 
-        let display = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| path.display().to_string());
-
+        let target = review.target_path.as_deref().filter(|_| review.via_link);
+        let (summary, detail) = file_edit_prompt(&path, target);
         let decision = self
             .ask_user(
                 ApprovalKind::FileEdit,
                 name,
-                display,
-                path.display().to_string(),
+                summary,
+                detail,
                 cancel.as_ref(),
             )
             .await;
@@ -742,11 +738,100 @@ pub fn permissions_from_settings(
     out
 }
 
+/// The title and detail of a file-edit prompt for `path`. A write through
+/// a symlink names its real `target` first, because the TUI shows only the
+/// title, on one line: `writes to "/real/key" via link "notes"`. The
+/// detail gives the target and the link on two lines. Names a model or a
+/// repository chose are quoted with control and bidi characters escaped, so a
+/// newline, an escape sequence or a fake ` → ` in a name cannot hide the
+/// target; a long name is shortened in the middle in the title.
+pub(crate) fn file_edit_prompt(path: &Path, target: Option<&Path>) -> (String, String) {
+    let name = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let full = path.display().to_string();
+    match target {
+        Some(target) => {
+            let target = target.display().to_string();
+            (
+                format!(
+                    "writes to {} via link {}",
+                    quoted(&shorten(&target, 80)),
+                    quoted(&shorten(&name, 40))
+                ),
+                format!(
+                    "writes to {}\nthrough link {}",
+                    quoted(&target),
+                    quoted(&full)
+                ),
+            )
+        }
+        None => (escaped(&name), escaped(&full)),
+    }
+}
+
+/// `s` as is, or [`quoted`] when it has a character a terminal would not
+/// show as itself.
+fn escaped(s: &str) -> String {
+    if s.chars().any(hidden) {
+        quoted(s)
+    } else {
+        s.to_owned()
+    }
+}
+
+/// `s` in double quotes, with Rust's escapes (`\n`, `\u{1b}`) and every
+/// other [`hidden`] character as `\u{…}`.
+fn quoted(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        if hidden(c) && !c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.extend(c.escape_debug());
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Control characters, and the format characters that reorder or hide
+/// text: bidi controls, zero-width characters, line and paragraph
+/// separators, the byte order mark.
+fn hidden(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00ad}'
+                | '\u{061c}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2060}'..='\u{2069}'
+                | '\u{feff}'
+        )
+}
+
+/// `s` cut to about `max` characters, keeping its start and its end.
+fn shorten(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_owned();
+    }
+    let keep = max.saturating_sub(1) / 2;
+    let head: String = chars[..keep].iter().collect();
+    let tail: String = chars[chars.len() - keep..].iter().collect();
+    format!("{head}…{tail}")
+}
+
 /// What a write or edit result recorded for its review.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct FileReview {
     created: bool,
     target_path: Option<PathBuf>,
+    /// Whether a symlink took the write somewhere its path does not show.
+    via_link: bool,
     created_path: Option<PathBuf>,
     created_identity: Option<loop_agent::harness::types::FileIdentity>,
 }
@@ -760,6 +845,10 @@ impl FileReview {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             target_path: path("targetPath"),
+            via_link: details
+                .get("viaLink")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             created_path: path("createdPath"),
             created_identity: details
                 .get("createdIdentity")
@@ -842,6 +931,99 @@ pub fn open_diff(editor: &str, left: &Path, right: &Path) -> Result<(), String> 
 
 #[cfg(test)]
 mod tests {
+
+    mod file_edit_prompt {
+        use super::super::file_edit_prompt;
+        use std::path::Path;
+
+        fn linked(name: &str) -> (String, String) {
+            let path = Path::new("/ws").join(name);
+            file_edit_prompt(&path, Some(Path::new("/outside/key")))
+        }
+
+        #[test]
+        fn the_target_comes_first_and_names_are_quoted() {
+            let (summary, detail) = linked("notes");
+            assert_eq!(summary, "writes to \"/outside/key\" via link \"notes\"");
+            assert_eq!(
+                detail,
+                "writes to \"/outside/key\"\nthrough link \"/ws/notes\""
+            );
+        }
+
+        #[test]
+        fn a_long_link_name_is_shortened_in_the_middle() {
+            let name = format!("{}END", "a".repeat(200));
+            let (summary, detail) = linked(&name);
+            assert!(
+                summary.starts_with("writes to \"/outside/key\""),
+                "{summary}"
+            );
+            assert!(summary.chars().count() < 100, "{summary}");
+            assert!(
+                summary.contains('…') && summary.contains("END\""),
+                "{summary}"
+            );
+            assert!(detail.contains(&name), "the detail keeps the full path");
+        }
+
+        #[test]
+        fn a_name_cannot_fake_the_target() {
+            // A file name cannot hold `/`; the directories of the path can.
+            let (summary, detail) = linked("notes → /tmp/notes.txt");
+            assert!(
+                summary.starts_with("writes to \"/outside/key\""),
+                "{summary}"
+            );
+            assert!(
+                detail.starts_with("writes to \"/outside/key\"\n"),
+                "{detail}"
+            );
+            assert!(
+                detail.ends_with("through link \"/ws/notes → /tmp/notes.txt\""),
+                "{detail}"
+            );
+            let (summary, _) = linked("notes → x");
+            assert!(summary.ends_with("via link \"notes → x\""), "{summary}");
+        }
+
+        #[test]
+        fn bidi_and_zero_width_characters_are_escaped() {
+            for name in ["a\u{202e}txt.exe", "pla\u{200b}in.txt", "a\u{2028}b"] {
+                let path = Path::new("/ws").join(name);
+                let (plain, detail) = file_edit_prompt(&path, None);
+                assert!(plain.starts_with('"') && plain.is_ascii(), "{plain}");
+                assert!(detail.is_ascii(), "{detail}");
+                let (summary, detail) = linked(name);
+                assert!(
+                    summary.is_ascii() && detail.is_ascii(),
+                    "{summary} {detail}"
+                );
+            }
+        }
+
+        #[test]
+        fn control_characters_are_escaped() {
+            let (summary, detail) = linked("notes\n\u{1b}[2Kok");
+            assert!(
+                !summary.contains('\n') && !summary.contains('\u{1b}'),
+                "{summary}"
+            );
+            assert!(
+                summary.contains("\\n") && summary.contains("\\u{1b}"),
+                "{summary}"
+            );
+            assert_eq!(detail.matches('\n').count(), 1, "{detail}");
+            let (plain, plain_detail) = file_edit_prompt(Path::new("/ws/a\nb.txt"), None);
+            assert_eq!(plain, "\"a\\nb.txt\"");
+            assert!(!plain_detail.contains('\n'), "{plain_detail}");
+            let (plain, plain_detail) = file_edit_prompt(Path::new("/ws/plain.txt"), None);
+            assert_eq!(
+                (plain.as_str(), plain_detail.as_str()),
+                ("plain.txt", "/ws/plain.txt")
+            );
+        }
+    }
     use super::*;
 
     #[test]
@@ -915,6 +1097,30 @@ mod tests {
             assert_eq!(details["created"], false);
             reject(&bridge, &details).await;
             assert_eq!(std::fs::read(&file).unwrap(), bytes);
+        }
+
+        #[tokio::test]
+        async fn rejected_document_overwrite_restores_the_original_bytes() {
+            loop_agent::harness::set_document_reader(
+                loop_agent::harness::DocumentReader::InProcess,
+            );
+            let ws = tempfile::tempdir().unwrap();
+            let (bridge, env) = bridge(ws.path());
+            let tool = create_write_tool(Arc::clone(&env));
+            let args = json!({"path": "report.docx", "content": "# Original\n\n- kept"});
+            (tool.execute)("w1".into(), args, None, None).await.unwrap();
+            let file = ws.path().join("report.docx");
+            let original = std::fs::read(&file).unwrap();
+            let args = json!({"path": "report.docx", "content": "# Rewritten"});
+            let details = (tool.execute)("w2".into(), args, None, None)
+                .await
+                .unwrap()
+                .details;
+            assert_eq!(details["created"], false);
+            assert!(details["diff"].as_str().unwrap().contains("rebuilt"));
+            assert_ne!(std::fs::read(&file).unwrap(), original);
+            reject(&bridge, &details).await;
+            assert_eq!(std::fs::read(&file).unwrap(), original);
         }
 
         #[tokio::test]

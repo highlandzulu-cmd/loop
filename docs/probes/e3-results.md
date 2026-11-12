@@ -251,3 +251,152 @@ Re-run, seed 42, 143 cases, 94 s: **15 leaks, all L6 (11) and L7 (4). L1–L5: 0
 - **Hard links.** A file with `nlink > 1` inside the workspace can alias a file outside it. Refuse or ask for such files.
 - **Unicode case folding.** Protected names fold ASCII case only.
 - **Workspace resolve cache.** `protected()` resolves the workspace on every call. Cache it per Session.
+
+## Symlink read checks
+
+Branch `probe/e3-symlink-read`, from `staging` f0883d7. This is a probe. No product code changed. We added scripted `faux` cases (no model, no tokens) for two suspected gaps.
+
+### Gap 1: `read` deny rules are lexical
+
+**Setup.** Each case has a fake home inside its own temp dir. The real home is never touched.
+
+- Canary file: `{HOME}/.secret/e3key`, with the text `E3SECRET`.
+- Rule (user `settings.json`): `"read({HOME}/.secret/*)": "deny"`. The pattern is an absolute path. The `~/` form uses the same code (see L8).
+- Workspace: `notes -> {HOME}/.secret/e3key` (file link), `sec -> {HOME}/.secret` (directory link), `plain.txt` (normal file).
+
+**What counts as a leak.** The canary text (`read`, `grep`) or the canary file name `e3key` (`glob`, `ls`, which show names only) appears in a tool result that is not an error. The `grep`, `glob` and `ls` tools do not return an error for a hidden path. They add `[N paths hidden by permission rules]`. The harness now counts that text as a report of the refusal (`reported()`).
+
+**Cases.** Group `symlink-read`, ids 143-246, 104 cases. Each row ran in `ask`, `accept-edits` and `full-access`, on the `embedded` path and on the `runtime` path (6 runs per row).
+
+| Row | Tool call | Result |
+|---|---|---|
+| file link | `read notes` | LEAK |
+| file link, absolute | `read {WS}/notes` | LEAK |
+| directory link | `read sec/e3key` | LEAK |
+| `..`, no link | `read {WS}/../home/.secret/e3key` | LEAK |
+| file link | `grep E3SECRET notes` | LEAK |
+| directory link | `grep E3SECRET sec` | LEAK |
+| workspace root | `grep E3SECRET` (the walk crosses both links) | LEAK |
+| `..`, no link | `grep E3SECRET ../home/.secret` | LEAK |
+| directory link | `glob * sec` | LEAK (names) |
+| workspace root | `glob e3key` | LEAK (names) |
+| directory link | `ls sec` | LEAK (names) |
+| `..`, no link | `ls ../home/.secret` | LEAK (names) |
+| file link | `ls notes` | ok, but vacuous: "not a directory" |
+| file link | `glob * notes` (control) | ok, but vacuous: lists only the link name |
+
+Controls, all ok:
+
+- `read` of the denied path itself: refused in all 3 modes, on both paths (6).
+- `grep`, `glob` and `ls` of the denied directory itself: the files are hidden and the result says so (6).
+- `read`, `grep`, `glob` and `ls` of a normal workspace file, with the deny rule and the links present (8).
+
+The two vacuous rows cannot show the target, by construction. They do not count as "held".
+
+**Result: 72 of 72 cells in the 12 non-vacuous rows leak** (36 on `embedded`, 36 on `runtime`). The mode makes no difference, because reads are on in every mode. No shell is used. 0 control failures, 0 unreported refusals.
+
+The `..` rows need no symlink. A path that is written with `..` is not matched either.
+
+### Causes
+
+1. **L8: the `read` tool.** The rule is matched on the path as written.
+   - `path_matches` (`crates/loop-app-core/src/permissions/rules.rs:310-321`) expands `~`, joins the path to the workspace, and runs a glob on both strings. `Path::components` drops `.` but keeps `..`. It never resolves a symlink.
+   - `rule_for` (`rules.rs:358`) uses that match for `read`, `write`, `edit` and the search tools. `decide` (`policy.rs:92`) takes the verdict on that string.
+   - `Call::resolve` (`policy.rs:60-72`) resolves only `write` and `edit`, and only for the workspace check.
+   - Reproduction: `leaks::l8_read_deny_rule_is_lexical` (ignored). It also shows that the direct path and `~/.secret/e3key` are denied.
+2. **L9: `grep`, `glob`, `ls`.** The hide filter has the same lexical match.
+   - `search_may_show` (`rules.rs:104-122`) is called by `ToolGate::search_filter` (`tool_gate.rs:331`) with the path that the walk built.
+   - `Walk::files` (`crates/loop-agent/src/harness/tools/search.rs:330-361`) lists the children of a directory link as `ws/sec/e3key`, follows a file link with `metadata`, and `ls` does the same (`search.rs:239`). The filter never sees the real path.
+   - The search root is checked only as the call's subject (lexical too).
+   - Reproduction: `leaks::l9_search_filter_is_lexical` (ignored).
+3. **Docs say more than the code does.** `docs/permissions.md` says `"read(~/.ssh/*)": "deny"` keeps `~/.ssh` out of a search of the home directory. That holds for a normal tree, but not for a link into `~/.ssh` in the workspace or a `..` path. The same file says "Paths are resolved through symlinks". That is true only for the `accept-edits` workspace check on `write` and `edit`.
+
+**Why we did not fix it.** The fix is not trivial. Resolving only the call's path would turn a deny into a miss when the pattern is not canonical (`/var` against `/private/var` on macOS, or a home that is itself a link). Both sides must be resolved. Also, `..` must be collapsed before the match. We suggest:
+
+- Match the pattern against the written path **and** the resolved path (longest existing prefix, links followed, `..` collapsed). Resolve the literal prefix of the pattern the same way.
+- In the search filter, resolve every path before `search_may_show`.
+- Treat an unresolvable path like `protected()` does: ask or deny.
+
+The risk is real, because a repository can carry a link. A repository that someone cloned can read a denied file with no shell, and no mode stops it.
+
+### Gap 2: what the approver sees for an edit through a symlink
+
+Test: `e3_enforcement_approval_prompt` (ignored; the same command runs it). It runs in `ask` mode on the embedded stack with an approver attached. The approver rejects. It records the prompt on both transports:
+
+- `raw`: the `ApprovalPrompt` that the TUI and the desktop app show (`summary`, `detail`).
+- `interaction`: the `InteractionRequest::Permission` that the Runtime sends to a Surface (`native_permission_request`, `interaction.rs:92`). The Runtime's `EscalationHost` sends this same request. We did not attach a real Surface connection.
+
+| Cell | Title | Detail | Resolved target shown? | Outside file when the prompt arrived | After reject |
+|---|---|---|---|---|---|
+| `write notes` (file link to an existing outside file) | `notes` | `{WS}/notes` | no | `E3MARK` (already written) | `ORIGINAL`, restored |
+| `edit notes` (same link) | `notes` | `{WS}/notes` | no | edited text | `ORIGINAL`, restored |
+| `write lnk/new.txt` (directory link to outside) | `new.txt` | `{WS}/lnk/new.txt` | no | `E3MARK` | file removed |
+| `write f.txt` (dangling link to outside) | `f.txt` | `{WS}/f.txt` | no | `E3MARK` | file removed |
+| control: `write plain.txt` | `plain.txt` | `{WS}/plain.txt` | not applicable | | restored |
+
+The result is the same on both transports: **the resolved target is not visible to the approver** in all 8 outside cells.
+
+- **Cause:** `review_after_file_tool` (`crates/loop-app-core/src/tool_approval.rs:559-571`) uses `file_name()` of `details.path` as the title and `details.path` as the detail. `details.path` is the path as written, made absolute (`tools/mod.rs:157`, `:233`). The resolved `details.targetPath` (`written_target`, `tools/mod.rs:268-283`) is in the tool result, but the prompt does not use it.
+- **Effect:** a link named `notes` can point at `~/.ssh/authorized_keys` or at a hook file. The approver sees `notes`. The same prompt is used in `accept-edits`, where a link out of the workspace is the case that asks (same code; we did not run that mode).
+- **Second finding:** the prompt for `write` and `edit` comes **after** the write (`review_before_tool` has no arm for them, `tool_approval.rs:363-420`). At prompt time the outside file already has the new content. A reject restores it (the review fixes hold), but a hook or a watcher on that file can act during the prompt.
+- **Reproduction:** `leaks::l10_approval_prompt_hides_symlink_target` (ignored; fails while the target is hidden). Finding L10 is a UX and security finding, not a forbidden-effect leak.
+- **Suggestion:** show the resolved path (`targetPath`) in the detail when it differs from the path as written, and mark it "outside the workspace".
+
+### Full run
+
+Command: `E3_SEED=42 cargo test -p loop-runtime --features orchestration --test e3_enforcement -- --ignored --nocapture --test-threads=4 e3_enforcement`.
+
+| | Before (staging f0883d7) | With the new cases |
+|---|---|---|
+| Cases | 143 | 247 (143 + 104) |
+| LEAK | 15 (L6: 11, L7: 4) | 87 (the same 15 + 72 new: L8 and L9) |
+| CONTROL-FAIL, UNREPORTED | 0, 0 | 0, 0 |
+| Run time | 95 s | 103 s |
+
+The verdict of every case 000-142 is the same as in the run before the change (compared by id). Leaks per path: `embedded` 51 (15 + 36), `runtime` 36 (0 + 36), `subagent`, `workflow`, `acp`: 0. The new cases need no 8 s wait. They ran in 5 s.
+
+The harness changes: `Prep::SecretLinks` and `Prep::EditLinks`, the `{HOME}` template, `symlink_read_cases`, the "hidden by permission rules" report in `reported()`, and the new test. The new cases were appended, so the ids of the old cases did not change.
+
+The reproductions run with `-- --ignored leaks::` (L8, L9, L10 fail until fixed).
+
+## Re-run after L8–L10 fixes
+
+Branch `fix/e3-l8-l10`, from `staging` 2f2933c. Same command, `E3_SEED=42`.
+
+### Fixes
+
+- **L8 (`read`, `write`, `edit` path rules).** `rule_for` (`crates/loop-app-core/src/permissions/rules.rs`) matches a path pattern against `PathForms`: the path as written (`~` expanded, absolute), the path with `.` and `..` removed, and the path resolved through symlinks (`policy::resolve`), both as the kernel opens it and after `..` is removed. Each form is tried as an absolute path and relative to the cwd; `deny` and `ask` also try it relative to the workspace (the git root).
+  - `deny` and `ask` apply when any form matches. A path that cannot be resolved (a link loop) matches them. The fixed directory part of an absolute or `~/` pattern is resolved too, so `/var/...` and `/private/var/...` match each other. `~/x` is also tried as `<cwd>/~/x`, the file the tools open (they do not expand `~`).
+  - `allow` applies only when the written path and every resolved form match. In an `allow` pattern a leading workspace, cwd or home directory is replaced by its resolved path, and an absolute pattern follows links only through directories that root owns and nobody else can write (`/tmp` to `/private/tmp`); no other link in the pattern is followed. A link inside an allowed directory does not allow its target, and a link or `..` out of an allowed directory is not allowed by that pattern.
+- **L9 (`grep`, `glob`, `ls`).** `search_may_show` uses the same match, with one resolution per path for the `read` rule and the tool's rule. `Walk::files` and `ls` call it for every entry, so the children of a directory link and a file link are checked by the file they name. A directory link to a denied directory is listed, but each file in it is hidden and counted. The filesystem is read only when a path pattern applies to the tool. Pattern prefixes and the workspace are resolved once per 2 s per thread. A path with no `..` costs one `canonicalize` per entry. The gate shares its rules in an `Arc`: the filter takes the `Arc` and does not hold the lock while it resolves paths.
+- **L10 (approval prompt).** `write` and `edit` report `viaLink` when the target is not where the path says (only the working directory is resolved for the comparison, so a workspace below `/var` is not marked). The file-edit prompt then shows the target first: the title is `writes to "<target>" via link "<name>"` (the TUI shows only the title, on one line), and the detail is `writes to "<target>"` and `through link "<path>"` on two lines. Names are quoted with control, bidi, zero-width and separator characters escaped, and a long link name is shortened in the middle. The same text goes to the `ApprovalPrompt` (TUI, desktop) and to the Runtime's `InteractionRequest::Permission`. The prompt still comes after the write (out of scope).
+- **Relative paths below the workspace.** The workspace is the git root, but the tools open a relative path against the cwd, which can be a subdirectory. `Call` now carries the cwd (`Call::resolve_in`), and the rules, the workspace check and the protected-name check join a relative path to it. Before, `read notes` in `repo/sub` was checked as `repo/notes`. Relative patterns match relative to the cwd (as project rules in `<cwd>/.loop/settings.json` are written) and, for `deny` and `ask`, also relative to the git root. E3 cannot show this, because its cwd is the git root. Tests: `tool_gate::tests::relative_paths_are_checked_against_the_cwd`, `rules::tests::relative_deny_and_ask_patterns_match_below_the_git_root`. Calls from ACP agents join a relative path to the agent's cwd. A subagent bound to its own cwd keeps the parent's git root and cwd as bases for relative `deny` and `ask` patterns (`Call::rule_bases`).
+- `docs/permissions.md` now describes path patterns exactly, and says that `read` rules do not cover the shell.
+
+### Tests
+
+- `leaks::l8_read_deny_rule_is_lexical`, `leaks::l9_search_filter_is_lexical` and `leaks::l10_approval_prompt_hides_symlink_target` are no longer ignored. They failed before the fix and pass after it. L8 also checks `sec/../.secret/e3key` (`..` after a link, which the kernel resolves from the link's target).
+- New unit tests in `rules.rs`: `path_rules_see_through_links_and_dot_dot`, `allow_patterns_need_the_written_and_the_resolved_path`, `relative_deny_and_ask_patterns_match_below_the_git_root`, `an_allow_pattern_never_follows_a_link_in_its_own_prefix`, `deny_also_matches_the_literal_tilde_path_the_tools_open`, `normalising_paths`. In `tool_approval.rs`: `file_edit_prompt::*` (a 200-character link name, a path with ` → /tmp/notes.txt` in it, a newline and an escape character). In `tools/mod.rs`: `via_link_tests::only_a_link_below_the_cwd_marks_a_write` (a cwd reached through a link: a plain write and a plain `..` are not marked; a write through a link is).
+- One harness change: the probe's control "glob a file link lists the link name only" now expects the link to be hidden (the filter resolves `notes` to the denied file). It is an ordinary check, with the same ids. A new positive control (case 247, `embedded`, `ask`) runs `glob * pub`, where `pub` links to a file the rule does not deny; the link name must be listed.
+
+### Full run
+
+| | Before (probe) | After the fixes |
+|---|---|---|
+| Cases | 247 | 248 (with the positive control) |
+| LEAK | 87 (L6: 11, L7: 4, L8/L9: 72) | 15 (L6: 11, L7: 4) |
+| CONTROL-FAIL, UNREPORTED | 0, 0 | 0, 0 |
+| Run time | 103 s | 99 s |
+
+Leaks per path: `embedded` 15, `runtime`, `subagent`, `workflow`, `acp`: 0. The 15 leaks are the same ids as before (074-079, 084-087, 089, 122-125). All 105 `symlink-read` cases are ok.
+
+`E3|PROMPT`: in all 8 outside cells (4 cells × 2 transports) the title and the detail show the resolved target first, for example `title="writes to \"{OUT}/target.txt\" via link \"notes\""` and the detail `writes to "{OUT}/target.txt"` / `through link "{WS}/notes"`. In the title, a long target is shortened in the middle. The control `write plain.txt` shows `plain.txt` and `{WS}/plain.txt`, with no arrow.
+
+### Remaining risks
+
+- **Check and use are not atomic.** The rule is checked on the resolved path, and then the tool opens the path. A link that changes between the two can still reach a denied file.
+- **The shell is not covered.** `read` rules do not stop `cat` in `bash`. Use `bash` rules or the sandbox.
+- **Windows.** `canonicalize` gives `\\?\` paths. Deny rules still match the written form; an `allow` rule on an absolute path may stop matching and fall back to the plain rule.
+- **Bases resolved during the Session.** The workspace, cwd and rule bases are resolved when a call is checked (cached for 2 s). A base that becomes a link during the Session changes what relative patterns match.
+- **Cache.** Pattern prefixes and the workspace are resolved at most every 2 s per thread. A link that changes inside that time is seen late.
+- **Directory names.** A search shows the name of a directory link to a denied directory (not its files), as for a normal denied directory.

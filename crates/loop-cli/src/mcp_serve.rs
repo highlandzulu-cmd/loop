@@ -116,7 +116,7 @@ pub async fn run_mcp_server(
         && runtime.permission_mode() == loop_app_core::permissions::PermissionMode::FullAccess
     {
         eprintln!(
-            "warning: full access with no --token: any local process can run tools without approval"
+            "warning: full access with no --mcp-token: any local process can run tools without approval"
         );
     }
     if auth_enabled {

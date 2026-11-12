@@ -13,13 +13,16 @@
 //! `deny` beats `ask` beats `allow`. A bash command is split at `;`, `&&`,
 //! `||`, `|` and `&`: an `allow` pattern applies only when every part
 //! matches one, and a command with `$(…)` or backticks never matches an
-//! `allow` pattern. A pattern `ask` still asks in `accept-edits`.
+//! `allow` pattern. A path pattern matches the path as written and the
+//! file it names through symlinks and `..`: `deny` and `ask` when any form
+//! matches, `allow` only when all do. A pattern `ask` still asks in
+//! `accept-edits`.
 //!
 //! - [`capability`]: Capabilities, their states and scopes.
 //! - [`layers`]: Policy layers that only tighten, with Locks.
 //! - [`mode`]: the four modes, as presets over Capabilities.
 //! - [`rules`]: `toolPermissions` patterns and bash command splitting.
-//! - [`policy`]: [`decide`], a pure function of the mode, the rules and a
+//! - [`policy`]: [`decide`], a function of the mode, the rules and a
 //!   [`Call`] the gate resolved first.
 
 pub mod capability;
@@ -33,5 +36,6 @@ pub use layers::{Ceiling, Layer, LayerSource, Policy};
 pub use mode::PermissionMode;
 pub use policy::{available, decide, inside_workspace, workspace_root, Call, Decision};
 pub use rules::{
-    read_only_command, rule_for, search_may_show, split_command, Rule, ToolPermission,
+    read_only_command, rule_for, search_may_show, search_may_show_in, split_command, Rule,
+    ToolPermission,
 };

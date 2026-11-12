@@ -141,6 +141,11 @@ fn openai_chat_model(id: &str) -> bool {
     CHAT_PREFIXES.iter().any(|p| id.starts_with(p)) && !NOT_CHAT.iter().any(|n| id.contains(n))
 }
 
+/// OpenRouter's `/models` lists `:batch` variants that only its Batch API serves; drop them.
+fn openrouter_chat_model(id: &str) -> bool {
+    !id.ends_with(":batch")
+}
+
 /// Reasoning and vision by model family; OpenAI's listing doesn't say.
 fn openai_model_traits(model: &mut Model) {
     let id = model.id.as_str();
@@ -202,7 +207,7 @@ pub const PROVIDER_PRESETS: &[ProviderPreset] = &[
             max_tokens: 16_384,
             reasoning: false,
         },
-        model_filter: None,
+        model_filter: Some(openrouter_chat_model),
         model_traits: None,
         fallback_models: None,
         key_check_path: Some("/key"),
@@ -380,6 +385,27 @@ mod tests {
             "gpt-3.5-turbo-instruct",
         ] {
             assert!(!openai_chat_model(drop), "{drop}");
+        }
+    }
+
+    #[test]
+    fn openrouter_filter_drops_batch_variants() {
+        let keep = provider_preset("openrouter")
+            .unwrap()
+            .model_filter
+            .expect("openrouter has a model filter");
+        for id in [
+            "deepseek/deepseek-v4.1-flash",
+            "z-ai/glm-5.2:free",
+            "anthropic/claude-sonnet-5.5",
+        ] {
+            assert!(keep(id), "{id}");
+        }
+        for id in [
+            "deepseek/deepseek-v4.1-flash:batch",
+            "anthropic/claude-sonnet-5.5:batch",
+        ] {
+            assert!(!keep(id), "{id}");
         }
     }
 }

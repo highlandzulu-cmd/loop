@@ -1,11 +1,11 @@
 # Permissions
 
-Every tool call Loop makes passes one check, whether it comes from the chat, `--print`, `mcp serve`, a `/workflow` task, or a subscription agent's permission request. The check runs in this order:
+Every tool call Loop makes passes one check, whether it comes from the chat, `--print`, `--serve-mcp`, a `/workflow` task, or a subscription agent's permission request. The check runs in this order:
 
 1. **Deny rules** (`toolPermissions` entries set to `deny`) and the `read-only` mode refuse the call.
 2. **Hooks** (`tool_call`) may block the call or allow it without asking. See [hooks](hooks.md).
 3. **The permission mode** allows the call or asks.
-4. **Asking**: the TUI and desktop app show a prompt. With nobody to ask (`--print`, `mcp serve`), the call is refused, and the model is told which flag or rule would allow it.
+4. **Asking**: the TUI and desktop app show a prompt. With nobody to ask (`--print`, `--serve-mcp`), the call is refused, and the model is told which flag or rule would allow it.
 
 ## Modes
 
@@ -17,11 +17,12 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 | `full-access` | allow | allow | allow | allow |
 | `plan` | as `read-only`, until you approve the plan ([below](#plan-mode)) | deny | read-only commands only | as `read-only` |
 
-- **Search tools** (`grep`, `glob` and `ls`) only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; `.git/` is never searched. They also skip every file a `read` deny rule (or the tool's own pattern deny) refuses for that file's path, so `"read(~/.ssh/*)": "deny"` keeps `~/.ssh` out of a search of your home directory; the result says how many paths were hidden.
+- **Search tools** (`grep`, `glob` and `ls`) only read, so every mode runs them without asking. `grep` and `glob` respect `.gitignore` and skip hidden files unless the call asks for them; `.git/` is never searched. They also skip every file a `read` deny rule (or the tool's own pattern deny) refuses, matched like a `read` call (see "Path patterns" under [Rules](#rules)): on the path the search reached and on the file it names through symlinks and `..`. So `"read(~/.ssh/*)": "deny"` keeps the files in `~/.ssh` out of a search of your home directory, and out of a search of a workspace that has a link into `~/.ssh`; the result says how many paths were hidden. The names of directories stay visible.
 - **Protected names in `accept-edits`:** `.git`, `.loop` and `.env*` match without case (`.GIT` too), on the path as written and after symlinks are resolved. Only the part below the workspace counts. A path Loop cannot resolve asks.
-- **The workspace** is the git root of the directory Loop runs in, or that directory itself. Paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
+- **The workspace** is the git root of the directory Loop runs in, or that directory itself. For the `accept-edits` workspace check, paths are resolved through symlinks, so a link that points outside the workspace counts as outside.
+- **A write or edit through a symlink** shows where it lands in the approval prompt. The title starts with the real target; the detail gives the target and the link on two lines. Names are quoted, control characters are escaped, and a long link name is shortened in the middle.
 - **`read-only` is a ceiling.** A hook can't allow a call that changes files or runs commands.
-- **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop mcp serve`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
+- **What `read-only` turns off is taken away, not just refused.** The model isn't offered `write`, `edit`, or MCP tools that their server doesn't mark read-only, in the agent loop or through `loop --serve-mcp`. `bash` stays, for read-only commands. Switching mode changes the toolset from the next turn.
 - **Bash in `read-only`** runs a command only when every part of it reads: `ls`, `pwd`, `cat`, `head`, `tail`, `wc`, `grep`, `rg`, `find`, `tree`, `file`, `stat`, `du`, `which`, `echo`, `sort`, `uniq`, `diff`, and `git status`, `log`, `diff`, `show`, `blame`, `ls-files`, `rev-parse`, and `branch` when it only lists. Output redirects (`>`), `$(…)`, backticks, variable assignments, and options that write or run programs (`find -exec`/`-delete`, `sort -o`, `rg --pre`, `git --output`) are refused.
 - **MCP tools in `read-only`** run when their server marks them read-only (`readOnlyHint`). The server sets that hint, so deny a tool in `toolPermissions` if you don't trust it.
 - **Session approvals:** "Accept all … for this session" in a prompt stops further prompts for that group (file edits, bash or web) in this session, including after `--resume`.
@@ -51,8 +52,8 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
 - **Switching:** `/permissions full-access` asks you to repeat the command before it switches.
 - **While on:** the footer shows a red `⚠ full access · tools run without approval` banner.
 - **Startup:** starting in this mode prints a warning.
-- **Unattended runs** (`--print`, `mcp serve`) need the flag `--permission-mode full-access`. The setting alone falls back to `ask` there, with a notice.
-- **`mcp serve` without `--token`:** it warns, because any local process could then run tools without approval.
+- **Unattended runs** (`--print`, `--serve-mcp`) need the flag `--permission-mode full-access`. The setting alone falls back to `ask` there, with a notice.
+- **`--serve-mcp` in this mode without `--mcp-token`:** it warns, because any local process could then run tools without approval.
 
 ## Rules
 
@@ -80,6 +81,12 @@ Every tool call Loop makes passes one check, whether it comes from the chat, `--
   - A `deny` or `ask` pattern applies if **any** part matches it.
   - An `allow` pattern applies only if **every** part matches an `allow` pattern. So `git status && rm -rf x` still asks.
   - A command that uses `$(…)`, backticks or `<(…)` never matches an `allow` pattern.
+- **Path patterns** (`read`, `write`, `edit`, `grep`, `glob`, `ls`) match the path as written (`~/` expanded) and the file it names: the path with `.` and `..` removed, and the path resolved through symlinks, both as the system opens it and after `..` is removed. Each form is tried as an absolute path and relative to the directory Loop runs in (the cwd). `deny` and `ask` patterns are also tried relative to the workspace (the git root).
+  - A `deny` or `ask` pattern applies if it matches **any** of these forms. A link or `..` into a denied directory is denied too. The fixed directory part of an absolute or `~/` pattern is also resolved through symlinks, so `/var/x/*` also matches `/private/var/x/*` on macOS. The tools do not expand `~`, so a `deny` or `ask` pattern also sees `~/x` as `<cwd>/~/x`.
+  - An `allow` pattern applies only if it matches the path as written **and** every resolved form. A relative `allow` pattern is relative to the cwd only. In an `allow` pattern, a leading workspace, cwd or home directory is replaced by its resolved path, and an absolute pattern follows links only through directories that root owns and nobody else can write (so `/tmp/*` also matches `/private/tmp/*` on macOS); it stops at the first other directory. No other link in the pattern is followed. So a link inside an allowed directory does not allow the file it points to, by its link path or by its own path, and a link out of an allowed directory is not allowed by that pattern.
+  - A path Loop cannot resolve (a symlink loop) matches every `deny` and `ask` pattern and no `allow` pattern.
+  - A relative path in a call from a subscription agent (ACP) is joined to the agent's cwd. A subagent that runs in its own directory keeps its parent's git root and cwd as bases for relative `deny` and `ask` patterns.
+  - **Read rules do not cover the shell.** `"read(~/.ssh/*)": "deny"` stops the `read`, `grep`, `glob` and `ls` tools; `cat ~/.ssh/id_rsa` in `bash` is matched only by `bash` rules, which read the command as text. To keep commands out of files, use the sandbox (`sandbox.mode: local`; on macOS, `sandbox.denyHomeReads`). The sandbox has its own read limits; it does not read `toolPermissions`.
 - **A pattern `ask` still asks in `accept-edits`.**
 - **Loop has an approval prompt only for `write`, `edit`, `bash`, `web_fetch`, `web_search` and plan mode's `exit_plan`.** An `ask` rule on any other tool (for example `read(~/.ssh/*)` or an MCP tool) refuses the call. Use `allow` or `deny` for those.
 - **A project's `.loop/settings.json`** can add `ask` and `deny` rules or make a rule stricter. It can't add `allow` rules or loosen a global rule.
@@ -107,13 +114,19 @@ Codex runs some commands without asking: read-only commands in `read-only` mode,
 
 ## Upgrading from 0.4
 
-- **`--print` and `mcp serve` refuse tools that need approval.** In `ask` mode that is `write`, `edit` and `bash`. The model is told why. For unattended edits use `--permission-mode accept-edits`. Bash still needs `full-access` or an allow rule such as `"bash(cargo test*)": "allow"`.
+- **`--print` and `--serve-mcp` refuse tools that need approval.** In `ask` mode that is `write`, `edit` and `bash`. The model is told why. For unattended edits use `--permission-mode accept-edits`. Bash still needs `full-access` or an allow rule such as `"bash(cargo test*)": "allow"`.
 - **Resumed sessions ask too.** Before, `fileEditReview: newSession` (the default) turned prompts off after `--resume`. Now the mode decides; approvals you accepted for the session still apply.
 - **`fileEditReview: never`** turned off every prompt. With no `permissionMode` set, it now starts Loop in `accept-edits`, with a notice at each start; setting `permissionMode` removes the notice. `newSession` and `always` no longer change anything, and `/review` only shows the session's approvals.
 - **`web_fetch` and `web_search` are allowed by default.** A settings file that already says `ask` for them keeps asking. To be asked before each request, set `"web_fetch": "ask"` and `"web_search": "ask"` in `toolPermissions`.
 - **A hook file with a `tool_call` block and no `match`** now blocks every tool call. Loop warns about such files at startup.
 - **ChatGPT (Codex) in `ask` mode** runs in Codex's `read-only` mode, so it asks before each edit. Before, it ran in Codex's own default, which edits without asking.
 - **A project's `.loop/settings.json`** can no longer loosen `toolPermissions` or `fileEditReview`.
+
+## `bash` block list
+
+Some `bash` commands are refused in every mode, `full-access` included: recursive `rm`, `chmod`, `chown` and `chgrp` on `/`, your home directory (`~`, `$HOME` or its path) or a top-level system directory (`/usr`, `/etc`, `/Users`, …), and `mkfs`, a fork bomb, `dd` onto a disk device, `> /dev/sda` and `format c:`. Loop also checks scripts given to `sh -c`, `su -c`, `eval`, `ssh`, a here-string or a shell's stdin. `rm -rf /tmp/x`, `rm -rf ./build` and `chmod -R u+w ./src` run.
+
+The block list is a best-effort guard against accidents, **not a security boundary**. It reads the command as text, so it misses what programs, variables and scripts do: `find / -delete`, `xargs rm -rf`, `rm -rf "$DIR"` and `cd / && rm -rf *` all pass. The boundary is the sandbox and the permission rules above: deny rules, modes and hooks.
 
 ## `bash` time limits
 

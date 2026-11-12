@@ -313,6 +313,20 @@ fn model(request: &RecordedRequest, gate: &Gate) -> FakeResponse {
                     return text_reply("reply serial");
                 }
             }
+            if text.contains("STREAM-BASH") {
+                let call = json!({"index":0,"id":"call-stream","type":"function",
+                    "function":{"name":"bash","arguments":json!({
+                        "command": "for i in $(seq 1 400); do echo line $i; done"
+                    }).to_string()}});
+                return FakeResponse::new(
+                    200,
+                    "text/event-stream",
+                    sse(&[
+                        json!({"index":0,"delta":{"role":"assistant","tool_calls":[call]},"finish_reason":null}),
+                        json!({"index":0,"delta":{},"finish_reason":"tool_calls"}),
+                    ]),
+                );
+            }
             if text.contains("NEEDS-APPROVAL") {
                 if text.contains("GATED") {
                     gate.pass();
@@ -618,6 +632,56 @@ async fn session_updates(
     seen
 }
 
+/// A wire client never sees progress for a bash call after its completed
+/// update, so a Surface cannot show the finished call as running again.
+#[tokio::test]
+async fn no_tool_update_reaches_a_client_after_the_call_completed() {
+    bounded(async {
+        let fx = Fixture::new();
+        // Bash runs without an approval in this test.
+        std::fs::write(
+            fx.agent.join("settings.json"),
+            json!({"defaultProvider":"fake","defaultModel":"fake-model",
+                "toolPermissions":{"bash":"allow"}})
+            .to_string(),
+        )
+        .unwrap();
+        let serve = fx.serve().await;
+        let client = fx.client().await;
+        let mut updates = client.subscribe();
+        let session = client
+            .new_session(SessionSpec {
+                cwd: Some(fx.work.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let turn = client
+            .prompt(&session, vec![ContentBlock::text("STREAM-BASH")])
+            .await
+            .unwrap();
+        assert!(matches!(turn.outcome().await, TurnOutcome::Completed(_)));
+        let latest = client.attach(&session, 0).await.unwrap().latest_seq;
+        let seen = session_updates(&mut updates, &session, latest).await;
+        let mut completed = false;
+        for envelope in &seen {
+            if let SessionUpdate::ToolCallUpdate(update) = &envelope.update {
+                if update.id.as_str() != "call-stream" {
+                    continue;
+                }
+                assert!(!completed, "an update after the completed one: {update:?}");
+                completed = matches!(
+                    update.status,
+                    Some(loop_protocol::ToolCallStatus::Completed)
+                );
+            }
+        }
+        assert!(completed, "the bash call never completed: {seen:?}");
+        serve.stop().await;
+    })
+    .await
+}
+
 #[tokio::test]
 async fn reattach_from_a_saved_cursor_replays_exactly_what_was_missed() {
     bounded(async {
@@ -755,7 +819,8 @@ async fn kill_9_mid_turn_then_restart_ends_the_turn_uncertain_and_the_session_wo
             .expect("loop session attach did not notice the lost Runtime")
             .unwrap();
         assert!(!status.success(), "{}", surface.output());
-        assert!(surface.output().contains("Lost contact with Runtime"));
+        // The reader tasks can still hold the last bytes after the exit.
+        surface.wait_text("Lost contact with Runtime").await;
         drop(serve);
 
         let serve = fx.serve().await;

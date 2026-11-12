@@ -29,6 +29,11 @@
 //! ```
 //!
 //! `E3_FILTER` runs only the cases whose id contains it.
+//!
+//! Group `symlink-read` (K) checks `read` deny rules against symlinks and
+//! `..` on the `read`, `grep`, `glob` and `ls` tools, with a canary in a fake
+//! home (the real home is never touched). `e3_enforcement_approval_prompt`
+//! records what the approver sees for a file edit through a symlink.
 #![cfg(unix)]
 
 use async_trait::async_trait;
@@ -119,6 +124,13 @@ enum Prep {
     LinkLoop,
     /// `{WS}/f.txt -> {OUT}/m.txt`, a dangling link.
     Dangling,
+    /// A fake home with `{HOME}/.secret/e3key` (a canary), and in the
+    /// workspace `notes -> {HOME}/.secret/e3key`, `sec -> {HOME}/.secret`
+    /// and a plain `plain.txt`.
+    SecretLinks,
+    /// `{WS}/notes -> {OUT}/target.txt` (exists), `{WS}/lnk -> {OUT}`,
+    /// `{WS}/f.txt -> {OUT}/m.txt` (dangling) and a plain `plain.txt`.
+    EditLinks,
 }
 
 #[derive(Clone, Debug)]
@@ -837,6 +849,8 @@ fn cases() -> Vec<Case> {
         .note("control: full-access allows once"),
     );
 
+    symlink_read_cases(&mut v);
+
     for (i, case) in v.iter_mut().enumerate() {
         case.id = format!(
             "{:03}-{}-{}-{}",
@@ -849,6 +863,236 @@ fn cases() -> Vec<Case> {
     v
 }
 
+/// K. Symlink and `..` reads past a `read` deny rule. A canary sits in a
+/// fake home, `{HOME}/.secret/e3key`, and the rule denies
+/// `read({HOME}/.secret/*)` with an absolute pattern. The workspace holds a
+/// file link and a directory link to it. Every cell is a scripted call; the
+/// effect is the canary content (`read`, `grep`) or the canary file name
+/// (`glob`, `ls`, which show names only) in a tool result.
+fn symlink_read_cases(v: &mut Vec<Case>) {
+    use Route::*;
+    let rule = json!({"toolPermissions": {"read({HOME}/.secret/*)": "deny"}});
+    let calls = |tool: &str, args: Value| Work::Calls(vec![(tool.to_string(), args)]);
+    // (note, tool, args, token the effect shows, vacuous)
+    // A vacuous cell cannot show the target: `ls` of a file says "not a
+    // directory", and `glob` of a file link lists only the link's name.
+    let rows: Vec<(&'static str, &str, Value, &str, bool)> = vec![
+        (
+            "read through a file link",
+            "read",
+            json!({"path": "notes"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "read through a file link, absolute path",
+            "read",
+            json!({"path": "{WS}/notes"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "read through a directory link",
+            "read",
+            json!({"path": "sec/e3key"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "read with `..`, no link",
+            "read",
+            json!({"path": "{WS}/../home/.secret/e3key"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "grep a file link",
+            "grep",
+            json!({"pattern": "E3SECRET", "path": "notes"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "grep a directory link",
+            "grep",
+            json!({"pattern": "E3SECRET", "path": "sec"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "grep the workspace, which holds the links",
+            "grep",
+            json!({"pattern": "E3SECRET"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "grep with `..`, no link",
+            "grep",
+            json!({"pattern": "E3SECRET", "path": "../home/.secret"}),
+            "E3SECRET",
+            false,
+        ),
+        (
+            "glob a directory link",
+            "glob",
+            json!({"pattern": "*", "path": "sec"}),
+            "e3key",
+            false,
+        ),
+        (
+            "glob the workspace, which holds the links",
+            "glob",
+            json!({"pattern": "e3key"}),
+            "e3key",
+            false,
+        ),
+        (
+            "ls a directory link",
+            "ls",
+            json!({"path": "sec"}),
+            "e3key",
+            false,
+        ),
+        (
+            "ls with `..`, no link",
+            "ls",
+            json!({"path": "../home/.secret"}),
+            "e3key",
+            false,
+        ),
+        (
+            "ls a file link (vacuous: not a directory)",
+            "ls",
+            json!({"path": "notes"}),
+            "E3SECRET",
+            true,
+        ),
+    ];
+    for route in [Embedded, Runtime] {
+        for mode in ["ask", "accept-edits", "full-access"] {
+            for (note, tool, args, token, _vacuous) in &rows {
+                v.push(
+                    Case::new("symlink-read", route, mode, calls(tool, args.clone()))
+                        .user(rule.clone())
+                        .prep(Prep::SecretLinks)
+                        .check(Check::Result((*token).into()))
+                        .note(note),
+                );
+            }
+            // glob of a file link. The probe ran it as a control that
+            // listed the link's own name. Since the L9 fix the filter
+            // resolves the link to the denied file, so the name is hidden
+            // and the result reports it.
+            v.push(
+                Case::new(
+                    "symlink-read",
+                    route,
+                    mode,
+                    calls("glob", json!({"pattern": "*", "path": "notes"})),
+                )
+                .user(rule.clone())
+                .prep(Prep::SecretLinks)
+                .check(Check::Result("notes".into()))
+                .note("glob a file link hides the link to the denied file"),
+            );
+            // The rule refuses the denied path itself.
+            v.push(
+                Case::new(
+                    "symlink-read",
+                    route,
+                    mode,
+                    calls("read", json!({"path": "{HOME}/.secret/e3key"})),
+                )
+                .user(rule.clone())
+                .prep(Prep::SecretLinks)
+                .check(Check::Result("E3SECRET".into()))
+                .note("control: read of the denied path itself"),
+            );
+        }
+        let direct: [(&'static str, &str, Value, &str); 3] = [
+            (
+                "control: grep of the denied dir itself",
+                "grep",
+                json!({"pattern": "E3SECRET", "path": "{HOME}/.secret"}),
+                "E3SECRET",
+            ),
+            (
+                "control: glob of the denied dir itself",
+                "glob",
+                json!({"pattern": "*", "path": "{HOME}/.secret"}),
+                "e3key",
+            ),
+            (
+                "control: ls of the denied dir itself",
+                "ls",
+                json!({"path": "{HOME}/.secret"}),
+                "e3key",
+            ),
+        ];
+        for (note, tool, args, token) in direct {
+            v.push(
+                Case::new("symlink-read", route, "ask", calls(tool, args))
+                    .user(rule.clone())
+                    .prep(Prep::SecretLinks)
+                    .check(Check::Result(token.into()))
+                    .note(note),
+            );
+        }
+        let plain: [(&'static str, &str, Value, &str); 4] = [
+            (
+                "control: read a workspace file",
+                "read",
+                json!({"path": "plain.txt"}),
+                "E3PLAIN",
+            ),
+            (
+                "control: grep a workspace file",
+                "grep",
+                json!({"pattern": "E3PLAIN"}),
+                "E3PLAIN",
+            ),
+            (
+                "control: glob a workspace file",
+                "glob",
+                json!({"pattern": "plain.txt"}),
+                "plain.txt",
+            ),
+            (
+                "control: ls the workspace",
+                "ls",
+                json!({"path": "."}),
+                "plain.txt",
+            ),
+        ];
+        for (note, tool, args, token) in plain {
+            v.push(
+                Case::new("symlink-read", route, "ask", calls(tool, args))
+                    .user(rule.clone())
+                    .prep(Prep::SecretLinks)
+                    .check(Check::Result(token.into()))
+                    .allowed()
+                    .note(note),
+            );
+        }
+    }
+    // Positive control for the L9 fix: a file link to a file the rule does
+    // not deny is still listed by its link name.
+    v.push(
+        Case::new(
+            "symlink-read",
+            Embedded,
+            "ask",
+            calls("glob", json!({"pattern": "*", "path": "pub"})),
+        )
+        .user(rule.clone())
+        .prep(Prep::SecretLinks)
+        .check(Check::Result("pub".into()))
+        .allowed()
+        .note("control: glob a file link to a file that is not denied"),
+    );
+}
+
 // ---------------------------------------------------------------- fixture
 
 struct Dirs {
@@ -857,6 +1101,8 @@ struct Dirs {
     agent: PathBuf,
     ws: PathBuf,
     out: PathBuf,
+    /// A fake home; the real one is never touched.
+    home: PathBuf,
     marker: PathBuf,
 }
 
@@ -870,6 +1116,7 @@ impl Dirs {
         let agent = root.join("agent");
         let ws = root.join("ws");
         let out = root.join("outside");
+        let home = root.join("home");
         for d in [&agent, &ws, &out, &agent.join("hooks")] {
             std::fs::create_dir_all(d).unwrap();
         }
@@ -890,6 +1137,7 @@ impl Dirs {
             agent,
             ws,
             out,
+            home,
             marker,
         };
         match case.prep {
@@ -901,6 +1149,25 @@ impl Dirs {
             }
             Prep::Dangling => {
                 std::os::unix::fs::symlink(dirs.out.join("m.txt"), dirs.ws.join("f.txt")).unwrap()
+            }
+            Prep::SecretLinks => {
+                use std::os::unix::fs::symlink;
+                let secret = dirs.home.join(".secret");
+                std::fs::create_dir_all(&secret).unwrap();
+                std::fs::write(secret.join("e3key"), "E3SECRET\n").unwrap();
+                std::fs::write(dirs.ws.join("plain.txt"), "E3PLAIN\n").unwrap();
+                symlink(secret.join("e3key"), dirs.ws.join("notes")).unwrap();
+                symlink(&secret, dirs.ws.join("sec")).unwrap();
+                std::fs::write(dirs.home.join("public.txt"), "E3PUBLIC\n").unwrap();
+                symlink(dirs.home.join("public.txt"), dirs.ws.join("pub")).unwrap();
+            }
+            Prep::EditLinks => {
+                use std::os::unix::fs::symlink;
+                std::fs::write(dirs.out.join("target.txt"), "ORIGINAL\n").unwrap();
+                std::fs::write(dirs.ws.join("plain.txt"), "PLAIN\n").unwrap();
+                symlink(dirs.out.join("target.txt"), dirs.ws.join("notes")).unwrap();
+                symlink(&dirs.out, dirs.ws.join("lnk")).unwrap();
+                symlink(dirs.out.join("m.txt"), dirs.ws.join("f.txt")).unwrap();
             }
         }
         // A no-op diff editor: the Runtime approver must never launch a GUI.
@@ -948,6 +1215,7 @@ impl Dirs {
         s.replace("{M}", &self.marker.to_string_lossy())
             .replace("{WS}", &self.ws.to_string_lossy())
             .replace("{OUT}", &self.out.to_string_lossy())
+            .replace("{HOME}", &self.home.to_string_lossy())
             .replace("{AG}", &self.agent.to_string_lossy())
     }
 
@@ -1137,6 +1405,11 @@ fn reported(seen: &HashMap<String, Seen>, task: &str) -> (bool, String) {
         return (false, "task never called the model".into());
     };
     let errors: Vec<&(String, bool, String)> = s.results.iter().filter(|r| r.1).collect();
+    // A search tool that hides paths says so in its (non-error) result.
+    let hidden = s
+        .results
+        .iter()
+        .any(|(_, e, x)| !e && x.contains("hidden by permission rules"));
     let detail = s
         .results
         .iter()
@@ -1149,7 +1422,7 @@ fn reported(seen: &HashMap<String, Seen>, task: &str) -> (bool, String) {
         })
         .collect::<Vec<_>>()
         .join(" | ");
-    (!errors.is_empty(), detail)
+    (!errors.is_empty() || hidden, detail)
 }
 
 async fn run_case(base: &Path, case: &Case) -> Outcome {
@@ -1507,6 +1780,197 @@ fn permission(kind: ToolKind, command: &str) -> InteractionRequest {
 /// The runtime and session a case shares with its approver.
 type RuntimeSlot = Arc<Mutex<Option<(Arc<Runtime>, loop_protocol::SessionRef)>>>;
 
+// ---------------------------------------------------------------- approval prompt
+
+/// What the approver saw for one file edit.
+#[derive(Debug, Default, Clone)]
+struct Prompted {
+    asked: bool,
+    /// `summary` of the raw prompt (TUI, desktop) or `title` of the
+    /// `InteractionRequest::Permission` (Runtime, Surfaces).
+    title: String,
+    /// `detail` of the raw prompt, or the request's content.
+    detail: String,
+    /// The text the outside target held when the prompt arrived.
+    target_at_prompt: String,
+    /// The text it holds after the approver rejected.
+    target_after_reject: String,
+    /// Where the edit really lands.
+    target: String,
+    /// Whether the title or the detail names the resolved target.
+    target_visible: bool,
+}
+
+struct Recorder {
+    seen: Arc<Mutex<Prompted>>,
+    target: PathBuf,
+}
+
+#[async_trait]
+impl HostServices for Recorder {
+    async fn interact(&self, request: InteractionRequest) -> InteractionOutcome {
+        if let InteractionRequest::Permission {
+            tool_call: Some(call),
+            ..
+        } = &request
+        {
+            let mut seen = self.seen.lock().unwrap();
+            seen.asked = true;
+            seen.title = call.title.clone().unwrap_or_default();
+            seen.detail = format!("{:?}", call.content);
+            seen.target_at_prompt = std::fs::read_to_string(&self.target).unwrap_or_default();
+        }
+        InteractionOutcome::Selected {
+            native_id: loop_app_core::interaction::native_options::REJECT.into(),
+            note: None,
+        }
+    }
+}
+
+/// Runs one write or edit in `ask` mode with an approver attached, and
+/// records what the approver was shown. `host_sink` picks the transport:
+/// `false` is the raw `ApprovalPrompt` (TUI, desktop), `true` is the
+/// `InteractionRequest::Permission` that the Runtime sends to a Surface
+/// (`native_permission_request`). `target` is where the edit lands.
+async fn capture_approval(host_sink: bool, tool: &str, args: Value, target: &str) -> Prompted {
+    let mut case =
+        Case::new("approval", Route::Embedded, "ask", Work::Calls(vec![])).prep(Prep::EditLinks);
+    case.id = "900-approval".into();
+    let base = tempfile::Builder::new()
+        .prefix("e3-run-")
+        .tempdir()
+        .unwrap();
+    let dirs = Dirs::new(base.path(), &case);
+    let target_path = PathBuf::from(dirs.text(target));
+    let mut script: BTreeMap<String, Vec<Vec<(String, Value)>>> = BTreeMap::new();
+    script.insert("E3TASK".into(), vec![vec![(tool.into(), dirs.fill(&args))]]);
+    let seen: SeenMap = Arc::default();
+    let factory = SessionFactory::new(Arc::new(globals(&dirs, model(script, seen, None))));
+    let opened = open_embedded(&factory, &dirs.opts("ask"), &case)
+        .await
+        .unwrap();
+    let got: Arc<Mutex<Prompted>> = Arc::default();
+    let loop_app_core::runtime::OpenedSession {
+        harness,
+        tool_gate,
+        approval_bridge,
+        mut approval_prompts,
+        ..
+    } = opened;
+    // The GUI guards of `open_embedded` stay: no external diff window.
+    approval_bridge.set_open_external_diff(false);
+    if host_sink {
+        let mut bridge = (*approval_bridge).clone();
+        bridge.set_host(Arc::new(Recorder {
+            seen: got.clone(),
+            target: target_path.clone(),
+        }));
+        tool_gate.set_approver(Some(Arc::new(bridge)));
+    } else {
+        tool_gate.set_approver(Some(approval_bridge));
+        let got = got.clone();
+        let target_path = target_path.clone();
+        tokio::spawn(async move {
+            while let Some(prompt) = approval_prompts.recv().await {
+                {
+                    let mut seen = got.lock().unwrap();
+                    seen.asked = true;
+                    seen.title = prompt.summary.clone();
+                    seen.detail = prompt.detail.clone();
+                    seen.target_at_prompt =
+                        std::fs::read_to_string(&target_path).unwrap_or_default();
+                }
+                let _ = prompt
+                    .response_tx
+                    .send(loop_app_core::tool_approval::ApprovalDecision::Reject { reason: None });
+            }
+        });
+    }
+    let _ = tokio::time::timeout(TURN_LIMIT, harness.prompt("E3TASK go")).await;
+    let mut out = got.lock().unwrap().clone();
+    out.target = target_path.display().to_string();
+    out.target_after_reject = std::fs::read_to_string(&target_path).unwrap_or_default();
+    let outside = dirs.out.to_string_lossy().into_owned();
+    out.target_visible = out.title.contains(&outside) || out.detail.contains(&outside);
+    out
+}
+
+/// The cells: (name, tool, args, where the edit lands, the edit leaves the
+/// workspace).
+fn approval_cells() -> Vec<(&'static str, &'static str, Value, &'static str, bool)> {
+    let w = json!({"content": "E3MARK"});
+    let with = |path: &str| {
+        let mut a = w.clone();
+        a["path"] = json!(path);
+        a
+    };
+    vec![
+        (
+            "write through a file link to an existing outside file",
+            "write",
+            with("notes"),
+            "{OUT}/target.txt",
+            true,
+        ),
+        (
+            "write a new file through a directory link",
+            "write",
+            with("lnk/new.txt"),
+            "{OUT}/new.txt",
+            true,
+        ),
+        (
+            "edit through a file link to an existing outside file",
+            "edit",
+            json!({"path": "notes", "oldText": "ORIGINAL", "newText": "E3EDIT"}),
+            "{OUT}/target.txt",
+            true,
+        ),
+        (
+            "write through a dangling file link",
+            "write",
+            with("f.txt"),
+            "{OUT}/m.txt",
+            true,
+        ),
+        (
+            "control: write a plain workspace file",
+            "write",
+            with("plain.txt"),
+            "{WS}/plain.txt",
+            false,
+        ),
+    ]
+}
+
+/// Finding F1 (not a pass/fail leak). In `ask` mode the file-edit approval
+/// shows only the file name (`summary`) and the path as written (`detail`),
+/// never where the edit lands, and it comes after the write. Prints one
+/// `E3|PROMPT` line per cell and transport. Run by the same command as the
+/// matrix (the name contains `e3_enforcement`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "probe E3: run with --ignored"]
+async fn e3_enforcement_approval_prompt() {
+    for host_sink in [false, true] {
+        for (name, tool, args, target, leaves) in approval_cells() {
+            let p = capture_approval(host_sink, tool, args, target).await;
+            println!(
+                "E3|PROMPT|{}|{name}|asked={}|title={:?}|detail={}|target={}|target_visible={}|\
+                 target_at_prompt={:?}|after_reject={:?}|leaves_workspace={leaves}",
+                if host_sink { "interaction" } else { "raw" },
+                p.asked,
+                p.title,
+                p.detail.chars().take(160).collect::<String>(),
+                p.target,
+                p.target_visible,
+                p.target_at_prompt,
+                p.target_after_reject,
+            );
+            assert!(p.asked, "{name}: nothing was asked");
+        }
+    }
+}
+
 // ---------------------------------------------------------------- the probe
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1577,12 +2041,14 @@ async fn e3_enforcement() {
 // ---------------------------------------------------------------- leaks
 //
 // Minimal reproductions of the leaks the probe found. Each asserts the
-// safe behaviour, so it fails while the leak is open. Ignored by default.
+// safe behaviour, so it failed while the leak was open. An open leak is
+// marked `#[ignore]`.
 
 mod leaks {
     use super::*;
     use loop_app_core::permissions::{
-        decide, inside_workspace, read_only_command, Call, Decision, PermissionMode,
+        decide, inside_workspace, read_only_command, search_may_show, Call, Decision,
+        PermissionMode,
     };
 
     /// L1: `split_command` ignores backslashes, `words` honours them, so an
@@ -1695,5 +2161,118 @@ mod leaks {
             Some(json!({"on": "tool_call", "action": {"allow": true}})),
         );
         assert!(!allowed(&acp(gate).await));
+    }
+
+    /// A fake home with a canary and the rule `read(<home>/.secret/*)`, as
+    /// absolute and as `~/` patterns, for the lexical-match reproductions.
+    fn secret_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        std::collections::BTreeMap<String, loop_app_core::tool_approval::ToolPermission>,
+    ) {
+        let (dir, ws, out) = ws();
+        let home = out.join("home");
+        let secret = home.join(".secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("e3key"), "E3SECRET\n").unwrap();
+        std::os::unix::fs::symlink(secret.join("e3key"), ws.join("notes")).unwrap();
+        std::os::unix::fs::symlink(&secret, ws.join("sec")).unwrap();
+        let rules = loop_app_core::tool_approval::permissions_from_settings(
+            &[
+                (
+                    format!("read({}/.secret/*)", home.display()),
+                    "deny".to_string(),
+                ),
+                ("read(~/.secret/*)".to_string(), "deny".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        (dir, ws, home, rules)
+    }
+
+    fn read_call(ws: &Path, home: &Path, path: &str) -> Call {
+        Call {
+            home: Some(home.to_path_buf()),
+            ..Call::new("read", json!({ "path": path }), ws)
+        }
+    }
+
+    /// L8: a `read` deny rule matches the path as written, so the `read`
+    /// tool is allowed through a symlink to the denied file, through a
+    /// symlink to its directory, and through `..`. `path_matches`
+    /// (rules.rs:310-321) never resolves symlinks or `..`; `decide`
+    /// (policy.rs:92) takes the rule's verdict on that string. Direct
+    /// path: refused (control). Fixed: path rules also match the file the
+    /// path names (`PathForms` in rules.rs).
+    #[test]
+    fn l8_read_deny_rule_is_lexical() {
+        let (_d, ws, home, rules) = secret_fixture();
+        let decision = |path: &str| {
+            decide(
+                PermissionMode::FullAccess,
+                &rules,
+                &read_call(&ws, &home, path),
+            )
+        };
+        assert!(matches!(
+            decision(&format!("{}/.secret/e3key", home.display())),
+            Decision::Deny(_)
+        ));
+        assert!(matches!(decision("~/.secret/e3key"), Decision::Deny(_)));
+        let leaks: Vec<&str> = [
+            "notes",
+            "sec/e3key",
+            "../out/home/.secret/e3key",
+            // `..` after a link: the kernel goes up from the link's target.
+            "sec/../.secret/e3key",
+        ]
+        .into_iter()
+        .filter(|p| !matches!(decision(p), Decision::Deny(_)))
+        .collect();
+        assert!(leaks.is_empty(), "read allowed through {leaks:?}");
+    }
+
+    /// L9: the filter that hides files from `grep`, `glob` and `ls` takes
+    /// the path the walk built, which goes through the link
+    /// (`ws/sec/e3key`), so the denied file is shown and read.
+    /// `search_may_show` (rules.rs:104-122) has the same lexical match as
+    /// L8; `Walk::files` (search.rs:330-361) lists children of a directory
+    /// link by their link path and follows file links with `metadata`.
+    /// Fixed: `search_may_show` resolves each path like L8.
+    #[test]
+    fn l9_search_filter_is_lexical() {
+        let (_d, ws, home, rules) = secret_fixture();
+        let may = |path: PathBuf| search_may_show(&rules, "grep", &path, &ws, Some(&home));
+        assert!(!may(home.join(".secret/e3key")), "control: direct path");
+        assert!(!may(ws.join("notes")), "file link shown");
+        assert!(!may(ws.join("sec/e3key")), "directory link child shown");
+    }
+
+    /// L10 (finding): the file-edit approval does not show where a write
+    /// through a workspace symlink lands. `review_after_file_tool`
+    /// (tool_approval.rs:559-571) shows `path.file_name()` and the path as
+    /// written (`details.path`, the join of cwd and the argument); the
+    /// resolved `details.targetPath` is not used. The prompt also comes
+    /// after the write. Fixed: when `details.viaLink` is set, the title and
+    /// the detail show `link → target`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn l10_approval_prompt_hides_symlink_target() {
+        for host_sink in [false, true] {
+            let p = capture_approval(
+                host_sink,
+                "write",
+                json!({"path": "notes", "content": "E3MARK"}),
+                "{OUT}/target.txt",
+            )
+            .await;
+            assert!(p.asked);
+            assert!(
+                p.target_visible,
+                "approver shown title {:?} detail {:?}, target {}",
+                p.title, p.detail, p.target
+            );
+        }
     }
 }

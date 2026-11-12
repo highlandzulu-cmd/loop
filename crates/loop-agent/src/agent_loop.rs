@@ -275,6 +275,22 @@ async fn run_loop_observed(
     result
 }
 
+/// How many times one prompt may ask the model to continue after it stopped
+/// on its output limit with no tool call.
+const MAX_LENGTH_CONTINUATIONS: u32 = 3;
+
+/// The user turn sent after a response stopped on the output limit.
+pub const LENGTH_CONTINUE_PROMPT: &str = "Your last response stopped at the output token limit. \
+Continue from where you stopped. Do not repeat what you already wrote.";
+
+/// Whether a length stop means the context window is full, not that the
+/// answer was long: asking to continue would only fail again.
+fn context_full(model: &loop_ai::Model, message: &AssistantMessage) -> bool {
+    message.usage.output == 0
+        || loop_ai::is_context_overflow(model, message)
+        || message.raw_stop_reason.as_deref() == Some("model_context_window_exceeded")
+}
+
 async fn run_loop(
     current_context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
@@ -285,6 +301,7 @@ async fn run_loop(
 ) -> Result<(), AgentLoopError> {
     let mut first_turn = true;
     let mut turn_index = 0u64;
+    let mut length_continuations = 0u32;
     let mut pending_messages = if let Some(getter) = &config.get_steering_messages {
         getter().await
     } else {
@@ -433,6 +450,19 @@ async fn run_loop(
             } else {
                 Vec::new()
             };
+
+            // A response cut at the output limit with no tool call would end
+            // the run with a half answer: ask the model to go on, a few times.
+            if message.stop_reason == StopReason::Length
+                && tool_calls.is_empty()
+                && pending_messages.is_empty()
+                && length_continuations < MAX_LENGTH_CONTINUATIONS
+                && !cancel.is_some_and(CancellationToken::is_cancelled)
+                && !context_full(&config.model, &message)
+            {
+                length_continuations += 1;
+                pending_messages.push(AgentMessage::user_text(LENGTH_CONTINUE_PROMPT));
+            }
         }
 
         let follow_up = if let Some(getter) = &config.get_follow_up_messages {
@@ -441,6 +471,7 @@ async fn run_loop(
             Vec::new()
         };
         if !follow_up.is_empty() {
+            length_continuations = 0;
             pending_messages = follow_up;
             continue;
         }
@@ -1013,6 +1044,13 @@ async fn prepare_tool_call_inner(
     }
 }
 
+/// The latest progress update of a running tool, waiting to be emitted.
+enum UpdateSlot {
+    Empty,
+    Update(Box<AgentToolResult>),
+    Done,
+}
+
 struct ExecutedOutcome {
     result: AgentToolResult,
     is_error: bool,
@@ -1026,30 +1064,58 @@ async fn execute_prepared_tool_call(
     emit: &AgentEventSink,
     config: &AgentLoopConfig,
 ) -> ExecutedOutcome {
+    // Progress updates go through one slot that holds only the latest (bash
+    // sends its whole output each time), emitted in order before the tool's
+    // end: a task per update could land after the end and show a finished
+    // call as running again, and a queue could grow behind a slow listener.
     let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let accepting_cb = Arc::clone(&accepting);
-    let emit_cb = Arc::clone(emit);
-    let tool_call_id = tool_call.id.clone();
-    let tool_name = tool_call.name.clone();
-    let args_for_cb = tool_call.arguments.clone();
-
-    let on_update: AgentToolUpdateCallback = Arc::new(move |partial| {
-        if !accepting_cb.load(std::sync::atomic::Ordering::SeqCst) {
-            return;
-        }
-        let emit = Arc::clone(&emit_cb);
-        let tool_call_id = tool_call_id.clone();
-        let tool_name = tool_name.clone();
-        let args = args_for_cb.clone();
+    let slot = Arc::new((
+        parking_lot::Mutex::new(UpdateSlot::Empty),
+        tokio::sync::Notify::new(),
+    ));
+    let forward = {
+        let emit = Arc::clone(emit);
+        let slot = Arc::clone(&slot);
+        let tool_call_id = tool_call.id.clone();
+        let tool_name = tool_call.name.clone();
+        let args = tool_call.arguments.clone();
         tokio::spawn(async move {
-            emit(AgentEvent::ToolExecutionUpdate {
-                tool_call_id,
-                tool_name,
-                args,
-                partial_result: partial,
-            })
-            .await;
-        });
+            loop {
+                let next = {
+                    let mut guard = slot.0.lock();
+                    match &*guard {
+                        UpdateSlot::Done => UpdateSlot::Done,
+                        _ => std::mem::replace(&mut *guard, UpdateSlot::Empty),
+                    }
+                };
+                match next {
+                    UpdateSlot::Empty => slot.1.notified().await,
+                    // A tool may keep its callback alive: `Done` ends the wait.
+                    UpdateSlot::Done => break,
+                    UpdateSlot::Update(partial) => {
+                        emit(AgentEvent::ToolExecutionUpdate {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                            partial_result: *partial,
+                        })
+                        .await;
+                    }
+                }
+            }
+        })
+    };
+    let accepting_cb = Arc::clone(&accepting);
+    let slot_cb = Arc::clone(&slot);
+    let on_update: AgentToolUpdateCallback = Arc::new(move |partial| {
+        if accepting_cb.load(std::sync::atomic::Ordering::SeqCst) {
+            let mut guard = slot_cb.0.lock();
+            if !matches!(*guard, UpdateSlot::Done) {
+                *guard = UpdateSlot::Update(Box::new(partial));
+                drop(guard);
+                slot_cb.1.notify_one();
+            }
+        }
     });
 
     let span = tool_span(
@@ -1063,6 +1129,10 @@ async fn execute_prepared_tool_call(
         .await;
 
     accepting.store(false, std::sync::atomic::Ordering::SeqCst);
+    // The end carries the full result, so an update still waiting is dropped.
+    *slot.0.lock() = UpdateSlot::Done;
+    slot.1.notify_one();
+    let _ = forward.await;
 
     let outcome = match result {
         Ok(result) => ExecutedOutcome {

@@ -805,20 +805,25 @@ fn build_payload(
 
     apply_reasoning(&mut payload, model, compat, reasoning);
 
-    let mut metadata = options
-        .metadata
-        .as_ref()
-        .map(|m| {
-            m.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect::<serde_json::Map<String, Value>>()
-        })
-        .unwrap_or_default();
-    if let Some(session_id) = &options.session_id {
-        metadata.insert("session_id".into(), json!(session_id));
-    }
-    if !metadata.is_empty() {
-        payload["metadata"] = Value::Object(metadata);
+    // `metadata` is a Soket-side extension; strict servers reject unknown
+    // fields (Z.ai answers 400 "Invalid API parameter"), so it is only sent
+    // where the endpoint is known to accept it.
+    if compat.supports_metadata {
+        let mut metadata = options
+            .metadata
+            .as_ref()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect::<serde_json::Map<String, Value>>()
+            })
+            .unwrap_or_default();
+        if let Some(session_id) = &options.session_id {
+            metadata.insert("session_id".into(), json!(session_id));
+        }
+        if !metadata.is_empty() {
+            payload["metadata"] = Value::Object(metadata);
+        }
     }
 
     Ok(payload)
@@ -1045,5 +1050,94 @@ fn convert_message(
             }
             Ok(Some(out))
         }
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use crate::api::detect_compat::resolve_compat;
+    use crate::providers::soket_seed_models;
+    use crate::types::OpenAICompletionsCompat;
+
+    fn payload_for(base_url: &str) -> Value {
+        let mut model = soket_seed_models()[0].clone();
+        model.base_url = base_url.into();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: None,
+        };
+        let messages = vec![Message::user_text("hi")];
+        let options = StreamOptions {
+            session_id: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let compat = resolve_compat(base_url, None);
+        build_payload(&model, &context, &messages, &options, &compat, None)
+            .map_err(|e| e.message)
+            .expect("payload builds")
+    }
+
+    /// Like `payload_for`, but resolves compat the way the stream path does:
+    /// from the model's base URL and its own `compat` override.
+    fn payload_with_override(base_url: &str, supports_metadata: Option<bool>) -> Value {
+        let mut model = soket_seed_models()[0].clone();
+        model.base_url = base_url.into();
+        model.compat = Some(OpenAICompletionsCompat {
+            supports_metadata,
+            ..Default::default()
+        });
+        let context = Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: None,
+        };
+        let messages = vec![Message::user_text("hi")];
+        let options = StreamOptions {
+            session_id: Some("sess-1".into()),
+            ..Default::default()
+        };
+        let compat = resolve_compat(&model.base_url, model.compat.as_ref());
+        build_payload(&model, &context, &messages, &options, &compat, None)
+            .map_err(|e| e.message)
+            .expect("payload builds")
+    }
+
+    #[test]
+    fn the_soket_base_url_constant_sends_metadata() {
+        let payload = payload_for(crate::providers::SOKET_BASE_URL);
+        assert_eq!(payload["metadata"]["session_id"], json!("sess-1"));
+    }
+
+    #[test]
+    fn a_per_model_override_wins_over_the_base_url() {
+        // A gateway that accepts `metadata` can opt in.
+        let on = payload_with_override("https://gateway.example.com/v1", Some(true));
+        assert_eq!(on["metadata"]["session_id"], json!("sess-1"));
+        // A Soket model can opt out.
+        let off = payload_with_override(crate::providers::SOKET_BASE_URL, Some(false));
+        assert!(off.get("metadata").is_none());
+        // `None` keeps the detected default for the URL.
+        let soket = payload_with_override(crate::providers::SOKET_BASE_URL, None);
+        assert_eq!(soket["metadata"]["session_id"], json!("sess-1"));
+        let other = payload_with_override("https://gateway.example.com/v1", None);
+        assert!(other.get("metadata").is_none());
+    }
+
+    #[test]
+    fn metadata_is_sent_only_where_supported() {
+        // Soket accepts (and expects) the session-affinity metadata object.
+        let soket = payload_for("https://api.soket.ai/v1");
+        assert_eq!(soket["metadata"]["session_id"], json!("sess-1"));
+
+        // Z.ai rejects unknown fields with HTTP 400 "Invalid API parameter".
+        let zai = payload_for("https://api.z.ai/api/paas/v4");
+        assert!(zai.get("metadata").is_none());
+
+        // So does every other non-Soket endpoint by default.
+        assert!(payload_for("https://api.openai.com/v1")
+            .get("metadata")
+            .is_none());
     }
 }

@@ -153,6 +153,23 @@ async fn write_tool_reports_kind_location_and_diff() {
         "hi\n"
     );
 
+    let position = |want: fn(&SessionUpdate) -> bool| updates.iter().position(want);
+    let preparing = position(|u| {
+        matches!(u, SessionUpdate::ToolCallPreparing { id, name, kind }
+            if id.as_str() == "call-1" && name == "write" && *kind == ToolKind::Edit)
+    })
+    .expect("tool call announced while its input streams");
+    let reported = position(|u| matches!(u, SessionUpdate::ToolCall(_))).unwrap();
+    assert!(preparing < reported, "announced before it is reported");
+    assert_eq!(
+        updates
+            .iter()
+            .filter(|u| matches!(u, SessionUpdate::ToolCallPreparing { .. }))
+            .count(),
+        1,
+        "announced once"
+    );
+
     let started = updates
         .iter()
         .find_map(|u| match u {
@@ -225,4 +242,52 @@ async fn turn_ids_increase_per_run() {
     };
     assert_ne!(id(&first), id(&second));
     assert!(mapper.current_turn().is_some());
+}
+
+/// A text response that stops on the output limit.
+fn length_stop(text: &str) -> FauxResponse {
+    use loop_ai::{AssistantContent, AssistantMessage, AssistantMessageEvent, StopReason};
+    let models = Models::new();
+    models.set_provider(faux_provider(FauxScript::new()));
+    let model = models.get_model("faux", "faux-model").unwrap();
+    let mut message = AssistantMessage::pending(&model);
+    message
+        .content
+        .push(AssistantContent::Text(loop_ai::TextContent {
+            text: text.into(),
+            text_signature: None,
+        }));
+    message.usage.output = 100;
+    message.stop_reason = StopReason::Length;
+    FauxResponse::Events(vec![
+        AssistantMessageEvent::Start {
+            partial: AssistantMessage::pending(&model),
+        },
+        AssistantMessageEvent::Done {
+            reason: StopReason::Length,
+            message,
+        },
+    ])
+}
+
+#[tokio::test]
+async fn a_turn_cut_at_the_output_limit_warns_and_ends_max_tokens() {
+    let (updates, _dir) = run(
+        (0..4).map(|i| length_stop(&format!("part {i}"))).collect(),
+        "hi",
+    )
+    .await;
+    assert!(matches!(
+        turn_end(&updates),
+        SessionUpdate::TurnEnded {
+            stop: StopReason::MaxTokens,
+            error: None,
+            ..
+        }
+    ));
+    let warned = updates.iter().any(|u| {
+        matches!(u, SessionUpdate::Notice { level: loop_protocol::NoticeLevel::Warning, text }
+            if text.contains("output limit"))
+    });
+    assert!(warned, "{updates:#?}");
 }

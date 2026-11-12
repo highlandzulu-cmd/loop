@@ -15,7 +15,8 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::layout::Size;
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
@@ -450,7 +451,7 @@ async fn run_loop(
     let mut expand_details = false;
     let mut redraw_request = false;
     let mut purge_ui_events = false;
-    let mut last_width = terminal.size()?.width;
+    let mut last_size = terminal.size()?;
     let mut hide_thinking = runtime.local_preferences().hide_thinking;
     let mut pending_setup: Option<SetupPrompt> = if runtime.needs_provider_setup() {
         ProviderSetup::start(None, login_agents(runtime), runtime.connected_providers())
@@ -546,6 +547,25 @@ async fn run_loop(
     let mut dashboard: Option<dashboard::Screen> = None;
 
     while !should_quit {
+        // While `/usage` is open the dashboard owns the screen: autoresizing the
+        // chat terminal now would draw into its alternate screen. The close path
+        // below re-syncs the size.
+        #[cfg(feature = "usage")]
+        let dashboard_open = dashboard.is_some();
+        #[cfg(not(feature = "usage"))]
+        let dashboard_open = false;
+        if let (false, Ok(current_size)) = (dashboard_open, terminal.size()) {
+            if current_size.width != last_size.width || current_size.height != last_size.height {
+                note_terminal_resize(
+                    terminal,
+                    current_size.width,
+                    current_size.height,
+                    &mut last_size,
+                    &mut redraw_request,
+                );
+            }
+        }
+
         if runtime.take_transcript_redraw() {
             reset_and_redraw(
                 terminal,
@@ -604,7 +624,11 @@ async fn run_loop(
                     let resized = dashboard.take().map(dashboard::Screen::close);
                     if let Some(width) = resized.transpose()?.flatten() {
                         let _ = terminal.autoresize();
-                        last_width = width;
+                        if let Ok(size) = terminal.size() {
+                            last_size = size;
+                        } else {
+                            last_size.width = width;
+                        }
                         redraw_request = true;
                     }
                     continue;
@@ -645,6 +669,25 @@ async fn run_loop(
             hide_thinking,
         )? {
             redraw_request = true;
+        }
+
+        if redraw_request {
+            redraw_request = false;
+            reset_and_redraw(
+                terminal,
+                runtime,
+                version,
+                &chat,
+                &mut flushed,
+                &mut live_frozen,
+                streaming_assistant,
+                streaming_thinking,
+                expand_details,
+                hide_thinking,
+            )?;
+            if let Ok(sz) = terminal.size() {
+                last_size = sz;
+            }
         }
 
         let model_line = match runtime.active_model_label() {
@@ -935,15 +978,20 @@ async fn run_loop(
             refresh_token_bar = false;
         }
         let usage_line = token_bar.usage_line();
-        let term_width = terminal.size()?.width;
-        let live_h =
-            footer_live_height(FOOTER_HEIGHT, term_width, input.as_str(), &picker) as usize;
+        let term_size = terminal.size().unwrap_or(last_size);
+        let effective_footer_height = FOOTER_HEIGHT.min(term_size.height.saturating_sub(1).max(1));
+        let live_h = footer_live_height(
+            effective_footer_height,
+            term_size.width,
+            input.as_str(),
+            &picker,
+        ) as usize;
         let live_lines = format_live_lines(
             &live,
             runtime.theme(),
             expand_details,
             hide_thinking,
-            term_width,
+            term_size.width,
             working,
             spinner_frame,
             &status_line,
@@ -1032,11 +1080,13 @@ async fn run_loop(
                         &mut chat,
                     );
                     for ev in &batch {
-                        if let Event::Resize(w, _) = ev {
+                        if let Event::Resize(w, h) = ev {
+                            let (w, h) = current_terminal_size(terminal, *w, *h);
                             note_terminal_resize(
                                 terminal,
-                                *w,
-                                &mut last_width,
+                                w,
+                                h,
+                                &mut last_size,
                                 &mut redraw_request,
                             );
                         }
@@ -1108,8 +1158,9 @@ async fn run_loop(
                         .await?;
                         token_bar.sync_window(runtime);
                     }
-                    Event::Resize(w, _) => {
-                        note_terminal_resize(terminal, w, &mut last_width, &mut redraw_request);
+                    Event::Resize(w, h) => {
+                        let (w, h) = current_terminal_size(terminal, w, h);
+                        note_terminal_resize(terminal, w, h, &mut last_size, &mut redraw_request);
                     }
                     _ => {}
                 }
@@ -1156,6 +1207,9 @@ async fn run_loop(
                 expand_details,
                 hide_thinking,
             )?;
+            if let Ok(sz) = terminal.size() {
+                last_size = sz;
+            }
         }
 
         drain_ui_events(
@@ -2290,17 +2344,34 @@ fn unbracketed_paste_keys(events: &[Event]) -> Option<Vec<KeyEvent>> {
     Some(keys)
 }
 
-fn note_terminal_resize(
-    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+/// The live terminal size. A drag queues many resize events; the size inside an
+/// old event is stale and would trigger a second redraw on the next loop.
+fn current_terminal_size<B: Backend>(
+    terminal: &Terminal<B>,
+    event_width: u16,
+    event_height: u16,
+) -> (u16, u16) {
+    terminal
+        .size()
+        .map(|size| (size.width, size.height))
+        .unwrap_or((event_width, event_height))
+}
+
+fn note_terminal_resize<B: Backend>(
+    terminal: &mut Terminal<B>,
     width: u16,
-    last_width: &mut u16,
+    height: u16,
+    last_size: &mut Size,
     redraw_request: &mut bool,
 ) {
     let _ = terminal.autoresize();
     // Re-wrapping invalidates the whole transcript.
-    if width != *last_width {
-        *last_width = width;
-        *redraw_request = true;
+    if width != last_size.width || height != last_size.height {
+        if width != last_size.width {
+            *redraw_request = true;
+        }
+        last_size.width = width;
+        last_size.height = height;
     }
 }
 
@@ -3215,7 +3286,7 @@ async fn handle_key(
                         command,
                     )
                     .await;
-                } else if line.starts_with('/') {
+                } else if let Some(cmd) = commands::parse_command(&line) {
                     let skill_names: Vec<_> = runtime
                         .resource_view()
                         .skills
@@ -3232,7 +3303,7 @@ async fn handle_key(
                         .iter()
                         .map(|p| p.name.clone())
                         .collect();
-                    if let Some(cmd) = commands::parse_command(&line) {
+                    if commands::is_command(&cmd, &skill_names, &template_names) {
                         let effect = commands::dispatch(&cmd, &skill_names, &template_names);
                         *should_quit = apply_effect(
                             effect,
@@ -3260,6 +3331,21 @@ async fn handle_key(
                             refresh_token_bar,
                         )
                         .await?;
+                    } else {
+                        let images = images_for(runtime, attachments, chat, &line);
+                        submit_user_text(
+                            runtime,
+                            chat,
+                            status,
+                            turn_step,
+                            streaming_assistant,
+                            streaming_thinking,
+                            working,
+                            message_queue,
+                            line,
+                            images,
+                            tx,
+                        );
                     }
                 } else {
                     let images = images_for(runtime, attachments, chat, &line);
@@ -4431,6 +4517,11 @@ fn handle_update(
                 card_status(call.status),
             );
         }
+        SessionUpdate::ToolCallPreparing { name, .. } => {
+            if live {
+                *turn_step = format!("tool · {}", tool_display_name(source, &name));
+            }
+        }
         SessionUpdate::ToolCallUpdate(mut update) => {
             let todo_done = source.is_none()
                 && matches!(
@@ -4531,15 +4622,22 @@ fn apply_tool_update(
         _ => None,
     };
     let Some(is_error) = finished else {
+        // Progress never reopens a finished call: late output of a command
+        // must not show it running again, in its card or in the status line.
+        let idx = find_tool_index(chat, &id);
+        if idx.is_some_and(|idx| {
+            matches!(chat.get(idx), Some(ChatItem::Tool { status, .. }) if *status != CardStatus::Pending)
+        }) {
+            return;
+        }
         // Still running: show partial output until the result arrives.
         if live {
             if let Some(name) = &update.name {
                 *turn_step = format!("tool · {name}");
             }
         }
-        if let Some(idx) = find_tool_index(chat, &id) {
-            if let Some(ChatItem::Tool { detail, status, .. }) = chat.get_mut(idx) {
-                *status = CardStatus::Pending;
+        if let Some(idx) = idx {
+            if let Some(ChatItem::Tool { detail, .. }) = chat.get_mut(idx) {
                 if detail.is_empty() && !output.is_empty() {
                     *detail = format!("(partial) {output}");
                 }
@@ -6447,6 +6545,46 @@ mod tests {
             .iter()
             .any(|item| matches!(item, ChatItem::Assistant { text } if text == "hello")));
     }
+
+    #[test]
+    fn current_terminal_size_ignores_stale_event_size() {
+        let backend = ratatui::backend::TestBackend::new(90, 40);
+        let terminal = Terminal::new(backend).unwrap();
+        assert_eq!(current_terminal_size(&terminal, 80, 24), (90, 40));
+    }
+
+    #[test]
+    fn note_terminal_resize_updates_size_and_flags_width_change() {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut last_size = Size {
+            width: 80,
+            height: 24,
+        };
+        let mut redraw_request = false;
+
+        // Height only change: updates size, does not request full transcript re-wrap
+        note_terminal_resize(&mut terminal, 80, 30, &mut last_size, &mut redraw_request);
+        assert_eq!(
+            last_size,
+            Size {
+                width: 80,
+                height: 30
+            }
+        );
+        assert!(!redraw_request);
+
+        // Width change: updates size and triggers redraw_request
+        note_terminal_resize(&mut terminal, 100, 30, &mut last_size, &mut redraw_request);
+        assert_eq!(
+            last_size,
+            Size {
+                width: 100,
+                height: 30
+            }
+        );
+        assert!(redraw_request);
+    }
 }
 
 #[cfg(test)]
@@ -6679,6 +6817,50 @@ mod plan_tests {
         assert!(text.contains("✔ read the code"), "{text}");
         assert!(text.contains("◼ fix it"), "{text}");
         assert!(text.contains("☐ test"), "{text}");
+    }
+
+    /// Late output of a finished command must not mark its card running
+    /// again: partial updates may reach the TUI after the result.
+    #[test]
+    fn a_late_partial_update_keeps_a_finished_tool_done() {
+        let call = SessionUpdate::ToolCall(ToolCall {
+            id: ToolCallId("b1".into()),
+            name: Some("bash".into()),
+            title: "bash".into(),
+            kind: ToolKind::Execute,
+            status: ToolCallStatus::InProgress,
+            content: vec![],
+            locations: vec![],
+            raw_input: Some(serde_json::json!({"command": "ls -la"})),
+        });
+        let mut done = ToolCallUpdate::new(ToolCallId("b1".into()));
+        done.name = Some("bash".into());
+        done.status = Some(ToolCallStatus::Completed);
+        let mut partial = ToolCallUpdate::new(ToolCallId("b1".into()));
+        partial.content = Some(vec![]);
+        let chat = chat_from_transcript(vec![
+            call,
+            SessionUpdate::ToolCallUpdate(done),
+            SessionUpdate::ToolCallUpdate(partial),
+        ]);
+        assert!(
+            matches!(
+                &chat[..],
+                [ChatItem::Tool {
+                    status: CardStatus::Success,
+                    ..
+                }]
+            ),
+            "{chat:?}"
+        );
+
+        // Live, the status line does not go back to the tool either.
+        let mut chat = chat;
+        let mut step = String::new();
+        let mut late = ToolCallUpdate::new(ToolCallId("b1".into()));
+        late.name = Some("bash".into());
+        apply_tool_update(late, true, &mut chat, &mut step);
+        assert_eq!(step, "", "{chat:?}");
     }
 
     #[test]

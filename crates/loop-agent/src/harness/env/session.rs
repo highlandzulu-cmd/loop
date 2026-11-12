@@ -35,6 +35,10 @@ impl SessionExecutionEnv {
 }
 #[async_trait]
 impl Shell for SessionExecutionEnv {
+    fn sandboxed(&self) -> bool {
+        self.inner.sandboxed()
+    }
+
     async fn exec(
         &self,
         command: &str,
