@@ -468,6 +468,16 @@ async fn summarize(
     }
 }
 
+/// Output budget of a summary request: `wanted`, but never more than the model can write, since
+/// a provider rejects a request that asks for more than the model's maximum output.
+fn summary_output_tokens(model: &Model, wanted: u64) -> u64 {
+    if model.max_tokens == 0 {
+        wanted
+    } else {
+        wanted.min(model.max_tokens)
+    }
+}
+
 enum SummaryFailure {
     /// The request itself failed.
     Request(String),
@@ -497,7 +507,7 @@ async fn summarize_once(
     max_output_tokens: u64,
 ) -> Result<String, SummaryFailure> {
     options.reasoning = Some(ThinkingLevel::Minimal);
-    options.base.max_tokens = Some(max_output_tokens as u32);
+    options.base.max_tokens = Some(summary_output_tokens(model, max_output_tokens) as u32);
     let context = Context {
         system_prompt: Some(SUMMARY_SYSTEM.to_string()),
         messages: vec![Message::user_text(format!(
@@ -692,6 +702,31 @@ mod tests {
             v.push(assistant(&format!("step {i} {}", "x".repeat(400))));
         }
         v
+    }
+
+    #[test]
+    fn summary_never_asks_for_more_output_than_the_model_has() {
+        let mut model = loop_ai::providers::soket_seed_models().remove(0);
+        model.max_tokens = 2_048;
+        assert_eq!(
+            summary_output_tokens(&model, SUMMARY_MAX_OUTPUT_TOKENS),
+            2_048
+        );
+        assert_eq!(
+            summary_output_tokens(&model, SUMMARY_RETRY_OUTPUT_TOKENS),
+            2_048
+        );
+        model.max_tokens = 16_384;
+        assert_eq!(
+            summary_output_tokens(&model, SUMMARY_RETRY_OUTPUT_TOKENS),
+            SUMMARY_RETRY_OUTPUT_TOKENS
+        );
+        // Unknown maximum: ask for what the summary needs.
+        model.max_tokens = 0;
+        assert_eq!(
+            summary_output_tokens(&model, SUMMARY_MAX_OUTPUT_TOKENS),
+            SUMMARY_MAX_OUTPUT_TOKENS
+        );
     }
 
     #[test]

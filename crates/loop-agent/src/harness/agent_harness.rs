@@ -1565,8 +1565,11 @@ impl AgentHarness {
             let compaction_writes = Arc::clone(&self.pending_writes);
             let stream_fn = Arc::clone(&self.stream_fn);
             let model = snapshot.model.clone();
-            let summary_options = snapshot.stream_options.clone();
+            // Cancelling the run also cancels a summary request in flight.
+            let mut summary_options = snapshot.stream_options.clone();
+            summary_options.base.cancel = Some(token.clone());
             let backoff = Arc::new(parking_lot::Mutex::new(SummaryBackoff::default()));
+            let cancel = token.clone();
             config.prepare_next_turn = Some(Arc::new({
                 let stream_fn = Arc::clone(&stream_fn);
                 let model = model.clone();
@@ -1575,6 +1578,7 @@ impl AgentHarness {
                 let compaction_writes = Arc::clone(&compaction_writes);
                 move |turn: ShouldStopAfterTurnContext| {
                     let backoff = Arc::clone(&backoff);
+                    let cancel = cancel.clone();
                     let compaction_writes = Arc::clone(&compaction_writes);
                     let stream_fn = Arc::clone(&stream_fn);
                     let model = model.clone();
@@ -1599,6 +1603,8 @@ impl AgentHarness {
                                 backoff.lock().succeeded();
                                 done?
                             }
+                            // The user stopped the run: not a failed summary.
+                            Err(_) if cancel.is_cancelled() => return None,
                             Err(error) => {
                                 tracing::warn!("auto-compaction failed: {error}");
                                 // Say so once; the retries that follow are quiet.
